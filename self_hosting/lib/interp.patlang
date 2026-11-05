@@ -1,3 +1,4 @@
+include "context.patlang"
 # =============================================================================
 # Meta-circular PatLang interpreter -- through SLICE 4 (full IR instruction
 # set) plus proper error propagation and a "feature complete" host-function
@@ -217,7 +218,7 @@ end
 # decision tree, so there's nothing for nested if/else to express here
 # that a flat "if this one, handle it and return" chain doesn't already
 # say more plainly.
-make a function called interp_call_host takes name, args returns result
+make a function called interp_call_host takes ctx, name, args returns result
   # --- core ---
   if name == "list_get" then return ["Ok", args[0][args[1]]] end
   if name == "list_len" then return ["Ok", args[0].length] end
@@ -336,8 +337,11 @@ make a function called interp_call_host takes name, args returns result
   # defined class do not.
   if name == "class_def" then return ["Ok", class_def(args[0], args[1], args[2], args[3], args[4])] end
   if name == "new" then return ["Ok", new(args[0], args[1])] end
-  if name == "set_var" then return ["Ok", set_var(args[0], args[1])] end
-  if name == "get" then return ["Ok", get(args[0], args[1])] end
+  if name == "set_var" then return ["Ok", ctx_set(ctx, args[0], args[1])] end
+  if name == "get" then
+    if args[0] == "__vars" then return ["Ok", ctx_get(ctx, args[1])] end
+    return ["Ok", get(args[0], args[1])]
+  end
   if name == "send" then
     if args.length == 2 then return ["Ok", send(args[0], args[1])] end
     if args.length == 3 then return ["Ok", send(args[0], args[1], args[2])] end
@@ -429,7 +433,7 @@ make a function called interp_call_host takes name, args returns result
     if err[0] != "" then
       return ["Err", format_parse_error(err[0], err[1], expanded)]
     end
-    return interpret_ir(lower_program(ast))
+    return interpret_ir_ctx(ctx, lower_program(ast))
   end
   return ["Err", "host function '" + name + "' not supported by interpret_ir (codegen_bootstrap's legacy compiler-meta tools -- parse_tiny_source/lower_and_compile/emit_rust_for/copy_file/remove_file/patc_compile_from_argv/get_argv -- are deliberately out of scope: half debug-scaffolding, superseded here by the cleaner compile_patlang/interpret_patlang pair above; bare rustc_build/rustc_build_chunked*/run_ir are likewise out of scope, since compile_patlang/interpret_patlang already cover the same need in one call)"]
 end
@@ -449,8 +453,8 @@ end
 # state, since a `when` block registered inside one call frame must stay
 # registered for `emit` calls from anywhere else in the same run.
 
-make a function called interp_event_handlers_get takes name returns handlers
-  let all = get("__vars", "__interp_event_handlers")
+make a function called interp_event_handlers_get takes ctx, name returns handlers
+  let all = ctx_get(ctx, "__interp_event_handlers")
   if not all then
     return []
   end
@@ -464,8 +468,8 @@ make a function called interp_event_handlers_get takes name returns handlers
   return []
 end
 
-make a function called interp_event_handler_add takes name, closure returns done
-  let all = get("__vars", "__interp_event_handlers")
+make a function called interp_event_handler_add takes ctx, name, closure returns done
+  let all = ctx_get(ctx, "__interp_event_handlers")
   if not all then
     let all = []
   end
@@ -481,7 +485,7 @@ make a function called interp_event_handler_add takes name, closure returns done
   if not found then
     let all = list_push(all, [name, [closure]])
   end
-  set_var("__interp_event_handlers", all)
+  ctx_set(ctx, "__interp_event_handlers", all)
   return true
 end
 
@@ -490,8 +494,8 @@ end
 # args = captured_values ++ [name, payload] -- matching lower_when's
 # auto-bound ["event_name", "event_data"] closure params exactly, same
 # as the native side's full_args construction.
-make a function called interp_emit takes funcs, name, payload returns result
-  let handlers = interp_event_handlers_get(name)
+make a function called interp_emit takes ctx, funcs, name, payload returns result
+  let handlers = interp_event_handlers_get(ctx, name)
   let last = 0
   let i = 0
   while i < handlers.length do
@@ -505,7 +509,7 @@ make a function called interp_emit takes funcs, name, payload returns result
     if callee == 0 then
       return ["Err", "emit: handler function '" + func_name + "' not found"]
     end
-    let call_result = interp_run_function(funcs, callee, all_args)
+    let call_result = interp_run_function(ctx, funcs, callee, all_args)
     if call_result[0] == "Err" then
       return call_result
     end
@@ -518,7 +522,7 @@ end
 # apply(fname, args...) -> calls the program function named `args[0]`
 # with `args[1:]`, enabling higher-order style (map/filter over named
 # functions). Mirrors ir/interpreter.rs's own "apply" arm.
-make a function called interp_apply takes funcs, args returns result
+make a function called interp_apply takes ctx, funcs, args returns result
   let fname = args[0]
   let callee = find_func(funcs, fname)
   if callee == 0 then
@@ -530,7 +534,7 @@ make a function called interp_apply takes funcs, args returns result
     let rest = list_push(rest, args[i])
     let i = i + 1
   end
-  return interp_run_function(funcs, callee, rest)
+  return interp_run_function(ctx, funcs, callee, rest)
 end
 
 make a function called interp_bin takes op, a, b returns v
@@ -602,18 +606,18 @@ end
 # Step budget for world_run's max_steps: each call and each backward jump
 # spends one step from __interp_steps, same counting rule as the Rust
 # interpreter's step_tick. Lives in __vars, so a world swap resets it.
-make a function called interp_budget_spent takes op, instr, pc returns spent
-  if not get("__vars", "__interp_budget_on") then
+make a function called interp_budget_spent takes ctx, op, instr, pc returns spent
+  if not ctx_get(ctx, "__interp_budget_on") then
     return false
   end
   if op != "Call" and op != "CallValue" and not (op == "Jump" and instr[1] <= pc) then
     return false
   end
-  let left = get("__vars", "__interp_steps")
+  let left = ctx_get(ctx, "__interp_steps")
   if left <= 0 then
     return true
   end
-  set_var("__interp_steps", left - 1)
+  ctx_set(ctx, "__interp_steps", left - 1)
   return false
 end
 
@@ -630,7 +634,7 @@ class Interpreter {
   field fname = "main"
   field lines = []
 
-  make a function called run takes self returns result
+  make a function called run takes self, ctx returns result
     while get(self, "running") do
       let instrs = get(self, "instrs")
       let pc = get(self, "pc")
@@ -642,10 +646,10 @@ class Interpreter {
         # debug state, so ordinary (non-debug) interpretation pays only that
         # one cheap lookup per instruction. See dbg_check_pause's own
         # comment for the full pause/resume story via fiber_yield.
-        dbg_check_pause(self, get(self, "fname"), get(self, "lines"), pc)
+        dbg_check_pause(ctx, self, get(self, "fname"), get(self, "lines"), pc)
         let instr = instrs[pc]
         let op = instr[0]
-        if interp_budget_spent(op, instr, pc) then
+        if interp_budget_spent(ctx, op, instr, pc) then
           self.error_msg = "step budget exhausted"
           self.has_error = true
           self.running = false
@@ -711,11 +715,11 @@ class Interpreter {
           # Instr::CallHost dispatch exactly: these two names are special-
           # cased in the INTERPRETER itself, not the plain host-fn table.
           if instr[1] == "register_event_handler" then
-            interp_event_handler_add(popped[0][0], popped[0][1])
+            interp_event_handler_add(ctx, popped[0][0], popped[0][1])
             self.stack = list_push(popped[1], 0)
             self.pc = pc + 1
           elif instr[1] == "emit" then
-            let emit_result = interp_emit(get(self, "funcs"), popped[0][0], popped[0][1])
+            let emit_result = interp_emit(ctx, get(self, "funcs"), popped[0][0], popped[0][1])
             if emit_result[0] == "Err" then
               self.error_msg = emit_result[1]
               self.has_error = true
@@ -730,7 +734,7 @@ class Interpreter {
             # higher-order style (map/filter over named functions). Same
             # "needs funcs, needs interp_run_function" reasoning as emit,
             # just simpler (no captured-values/registry involved).
-            let apply_result = interp_apply(get(self, "funcs"), popped[0])
+            let apply_result = interp_apply(ctx, get(self, "funcs"), popped[0])
             if apply_result[0] == "Err" then
               self.error_msg = apply_result[1]
               self.has_error = true
@@ -740,7 +744,7 @@ class Interpreter {
               self.pc = pc + 1
             end
           else
-            let call_result = interp_call_host(instr[1], popped[0])
+            let call_result = interp_call_host(ctx, instr[1], popped[0])
             if call_result[0] == "Err" then
               self.error_msg = call_result[1]
               self.has_error = true
@@ -762,9 +766,9 @@ class Interpreter {
             self.has_error = true
             self.running = false
           else
-            dbg_call_stack_push(instr[1])
-            let call_result = interp_run_function(get(self, "funcs"), callee, popped[0])
-            dbg_call_stack_pop()
+            dbg_call_stack_push(ctx, instr[1])
+            let call_result = interp_run_function(ctx, get(self, "funcs"), callee, popped[0])
+            dbg_call_stack_pop(ctx)
             if call_result[0] == "Err" then
               self.error_msg = call_result[1]
               self.has_error = true
@@ -797,9 +801,9 @@ class Interpreter {
             self.has_error = true
             self.running = false
           else
-            dbg_call_stack_push(func_name)
-            let call_result = interp_run_function(get(self, "funcs"), callee, all_args)
-            dbg_call_stack_pop()
+            dbg_call_stack_push(ctx, func_name)
+            let call_result = interp_run_function(ctx, get(self, "funcs"), callee, all_args)
+            dbg_call_stack_pop(ctx)
             if call_result[0] == "Err" then
               self.error_msg = call_result[1]
               self.has_error = true
@@ -830,16 +834,16 @@ class Interpreter {
 # reusing a fixed name across recursive calls would alias and corrupt
 # an outer frame's own live state. Same counter idiom lower.patlang
 # already uses for next_closure_name/next_budgeted_name/next_activate_name.
-make a function called next_interp_name returns name
-  let n = get("__vars", "__interp_seq")
+make a function called next_interp_name takes ctx returns name
+  let n = ctx_get(ctx, "__interp_seq")
   if not n then
     let n = 0
   end
-  set_var("__interp_seq", n + 1)
+  ctx_set(ctx, "__interp_seq", n + 1)
   return "__interp_" + n
 end
 
-make a function called interp_run_function takes funcs, func, arg_values returns result
+make a function called interp_run_function takes ctx, funcs, func, arg_values returns result
   let params = func[2]
   let instrs = func[3]
   let locals = []
@@ -848,7 +852,7 @@ make a function called interp_run_function takes funcs, func, arg_values returns
     let locals = locals_set(locals, params[pi], arg_values[pi])
     let pi = pi + 1
   end
-  let interp = new("Interpreter", next_interp_name())
+  let interp = new("Interpreter", next_interp_name(ctx))
   interp.funcs = funcs
   interp.instrs = instrs
   interp.locals = locals
@@ -860,7 +864,7 @@ make a function called interp_run_function takes funcs, func, arg_values returns
   if func.length > 4 then
     interp.lines = func[4]
   end
-  return send(interp, "run")
+  return send(interp, "run", ctx)
 end
 
 # ---- Debugger: breakpoints, stepping, call-stack, via fiber pause/resume ----
@@ -897,8 +901,8 @@ make a function called dbg_lines_lookup takes lines, pc returns line
   return 0
 end
 
-make a function called dbg_breakpoint_hit takes fname, line returns hit
-  let bps = get("__vars", "__dbg_breakpoints")
+make a function called dbg_breakpoint_hit takes ctx, fname, line returns hit
+  let bps = ctx_get(ctx, "__dbg_breakpoints")
   if not bps then
     return false
   end
@@ -912,16 +916,16 @@ make a function called dbg_breakpoint_hit takes fname, line returns hit
   return false
 end
 
-make a function called dbg_call_stack_snapshot returns cs
-  let cs = get("__vars", "__dbg_call_stack")
+make a function called dbg_call_stack_snapshot takes ctx returns cs
+  let cs = ctx_get(ctx, "__dbg_call_stack")
   if not cs then
     return []
   end
   return cs
 end
 
-make a function called dbg_call_stack_depth returns n
-  return dbg_call_stack_snapshot().length
+make a function called dbg_call_stack_depth takes ctx returns n
+  return dbg_call_stack_snapshot(ctx).length
 end
 
 # No list_slice/pop-last host builtin exists -- rebuild everything but the
@@ -936,15 +940,15 @@ make a function called dbg_list_drop_last takes lst returns out
   return out
 end
 
-make a function called dbg_call_stack_push takes fname returns done
-  set_var("__dbg_call_stack", list_push(dbg_call_stack_snapshot(), fname))
+make a function called dbg_call_stack_push takes ctx, fname returns done
+  ctx_set(ctx, "__dbg_call_stack", list_push(dbg_call_stack_snapshot(ctx), fname))
   return true
 end
 
-make a function called dbg_call_stack_pop returns done
-  let cs = dbg_call_stack_snapshot()
+make a function called dbg_call_stack_pop takes ctx returns done
+  let cs = dbg_call_stack_snapshot(ctx)
   if cs.length > 0 then
-    set_var("__dbg_call_stack", dbg_list_drop_last(cs))
+    ctx_set(ctx, "__dbg_call_stack", dbg_list_drop_last(cs))
   end
   return true
 end
@@ -955,24 +959,24 @@ end
 # just re-sends its whole current breakpoint list on every resume, rather
 # than needing a separate "just update breakpoints, don't resume" command
 # that this fiber-parked design has no clean way to express anyway).
-make a function called dbg_apply_command takes cmd returns done
+make a function called dbg_apply_command takes ctx, cmd returns done
   let kind = cmd[0]
   let bps = cmd[1]
   if bps then
-    set_var("__dbg_breakpoints", bps)
+    ctx_set(ctx, "__dbg_breakpoints", bps)
   end
   if kind == "continue" then
-    set_var("__dbg_mode", "run")
+    ctx_set(ctx, "__dbg_mode", "run")
   elif kind == "step_into" then
-    set_var("__dbg_mode", "into")
+    ctx_set(ctx, "__dbg_mode", "into")
   elif kind == "step_over" then
-    set_var("__dbg_mode", "over")
-    set_var("__dbg_target_depth", dbg_call_stack_depth())
+    ctx_set(ctx, "__dbg_mode", "over")
+    ctx_set(ctx, "__dbg_target_depth", dbg_call_stack_depth(ctx))
   elif kind == "step_out" then
-    set_var("__dbg_mode", "out")
-    set_var("__dbg_target_depth", dbg_call_stack_depth() - 1)
+    ctx_set(ctx, "__dbg_mode", "out")
+    ctx_set(ctx, "__dbg_target_depth", dbg_call_stack_depth(ctx) - 1)
   elif kind == "stop" then
-    set_var("__dbg_stop_requested", true)
+    ctx_set(ctx, "__dbg_stop_requested", true)
   end
   return true
 end
@@ -983,8 +987,8 @@ end
 # non-debug interpretation pays almost nothing extra. Only pauses (via
 # fiber_yield) at a statement boundary that's a breakpoint or satisfies
 # the current step mode.
-make a function called dbg_check_pause takes self, fname, lines, pc returns done
-  if get("__vars", "__dbg_stop_requested") then
+make a function called dbg_check_pause takes ctx, self, fname, lines, pc returns done
+  if ctx_get(ctx, "__dbg_stop_requested") then
     self.error_msg = "stopped by debugger"
     self.has_error = true
     self.running = false
@@ -994,23 +998,23 @@ make a function called dbg_check_pause takes self, fname, lines, pc returns done
   if line == 0 then
     return true
   end
-  let mode = get("__vars", "__dbg_mode")
+  let mode = ctx_get(ctx, "__dbg_mode")
   if not mode then
     let mode = "run"
   end
-  let should_pause = dbg_breakpoint_hit(fname, line)
+  let should_pause = dbg_breakpoint_hit(ctx, fname, line)
   if mode == "into" then
     let should_pause = true
   end
   if (mode == "over") or (mode == "out") then
-    if dbg_call_stack_depth() <= get("__vars", "__dbg_target_depth") then
+    if dbg_call_stack_depth(ctx) <= ctx_get(ctx, "__dbg_target_depth") then
       let should_pause = true
     end
   end
   if should_pause then
-    let cmd = fiber_yield(["Paused", fname, line, get(self, "locals"), dbg_call_stack_snapshot()])
-    dbg_apply_command(cmd)
-    if get("__vars", "__dbg_stop_requested") then
+    let cmd = fiber_yield(["Paused", fname, line, get(self, "locals"), dbg_call_stack_snapshot(ctx)])
+    dbg_apply_command(ctx, cmd)
+    if ctx_get(ctx, "__dbg_stop_requested") then
       self.error_msg = "stopped by debugger"
       self.has_error = true
       self.running = false
@@ -1028,18 +1032,19 @@ end
 # pauses, matching what a debugger's initial "run to first line" normally
 # does.
 make a function called dbg_fiber_entry takes bundle returns result
+  let ctx = context_new()
   let entry = bundle[0]
   let funcs = bundle[1]
-  set_var("__dbg_mode", "into")
-  set_var("__dbg_target_depth", 0)
-  set_var("__dbg_call_stack", [])
-  set_var("__dbg_stop_requested", false)
-  set_var("__interp_event_handlers", [])
+  ctx_set(ctx, "__dbg_mode", "into")
+  ctx_set(ctx, "__dbg_target_depth", 0)
+  ctx_set(ctx, "__dbg_call_stack", [])
+  ctx_set(ctx, "__dbg_stop_requested", false)
+  ctx_set(ctx, "__interp_event_handlers", [])
   let main_func = find_func(funcs, entry)
   if main_func == 0 then
     return ["Err", "entry function '" + entry + "' not found"]
   end
-  return interp_run_function(funcs, main_func, [])
+  return interp_run_function(ctx, funcs, main_func, [])
 end
 
 # dbg_start(source) -> ["Ok", fiber_id, first_state]. Compiles `source`
@@ -1122,14 +1127,18 @@ end
 # x64 already consume, so this is a genuine third final stage, not a
 # parallel reimplementation of the front end.
 make a function called interpret_ir takes ir returns result
+  return interpret_ir_ctx(context_new(), ir)
+end
+
+make a function called interpret_ir_ctx takes ctx, ir returns result
   let entry = ir[1]
   let funcs = ir[2]
-  set_var("__interp_event_handlers", [])
+  ctx_set(ctx, "__interp_event_handlers", [])
   let main_func = find_func(funcs, entry)
   if main_func == 0 then
     return ["Err", "entry function '" + entry + "' not found"]
   end
-  return interp_run_function(funcs, main_func, [])
+  return interp_run_function(ctx, funcs, main_func, [])
 end
 
 # ---- Debug trace JSON serialization (for the browser IDE) ----

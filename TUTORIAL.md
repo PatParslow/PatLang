@@ -708,7 +708,7 @@ Each card shows its PatLang source, self-reports timings via `now_ms()`,
 and shows the native transcript captured at build time, alongside the
 compiler's own metrics measured on its own source. Bigger examples: a
 point-of-sale (events + OO + logic facts), a test framework (unit,
-event-driven integration, and Gherkin features — `lib/test.patlang`)
+event-driven integration, and Gherkin features — `lib/gherkin.patlang`)
 running its whole suite in-browser, a **design-by-contract demo**
 (passing checks then one deliberate violation, to show enforcement fire),
 `patbuild` (a goal-oriented, manifest-driven build system), and

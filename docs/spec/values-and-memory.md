@@ -93,7 +93,67 @@ any event is (`emit`, `when`), with nothing specific to operators.
 ### 1.7 The two engines agree
 
 The interpreter and native code are two routes to one language. Every
-scenario in Part 1 must give the same observable result on both.
+scenario in Part 1 must give the same observable result on both, whichever
+directory the program is started in. A program file or an included file that
+cannot be read is an error on both, naming the file, and nothing of the program runs.
+
+### 1.8 Fibers, budgeted blocks and threads
+
+- `fiber_new(name)` makes a fiber of a named function. `fiber_resume(id, v)`
+  runs it until it yields or returns, handing it `v`, and gives what it yielded
+  or returned. `fiber_yield(v)` goes back to whoever resumed it, and gives what
+  the next resume hands it. `fiber_alive(id)` is true until it has returned.
+  Resuming a finished fiber, and yielding on no fiber, stop the program.
+- `budgeted(ms, handle) { body }` runs the body on a fiber until `ms` have passed,
+  checking at each back-edge of a loop lexically in the body, and yielding early
+  if the next iteration, judged by the recent ones, would pass the deadline. It
+  gives `["done", value]` or `["paused", handle]`; passing the handle back continues
+  the body. The body captures what it reads as a closure does.
+- `thread_spawn(closure)` calls a closure with no arguments on a thread of its own.
+  `thread_poll(id)` says, without waiting, whether it has finished. `thread_result(id)`
+  waits for it and gives what it returned, once: taking the result gives back all the
+  thread held, and a further call stops the program.
+- Any number of threads may run the same function at once, including the first time
+  it is called: each gives what one thread alone would.
+- A fiber's and a thread's memory is given back when it has ended and, for a thread,
+  its result has been taken. A fiber that never finishes keeps its stack and what its
+  frames hold, since its id can still resume it.
+
+### 1.9 Syntax definitions
+
+- `syntax NAME { ... }` defines a trigger keyword, tokens and rules. Each block
+  `trigger { ... }` is replaced by what its rules give, before the program is parsed.
+- A definition starts a line, and holds in its own file and the files collected after
+  it, each file coming after the files it includes.
+
+### 1.10 Text
+
+A string holds characters, whatever bytes they take. `.length`, indexes, `substr`,
+`char_code`, `chr` and the string cursor (`str_intern`, `sc_len`, `sc_code`, `sc_char`,
+`sc_substr`) all count characters; `byte_length` and `hash_string` see the UTF-8 bytes.
+An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
+the cursor.
+
+### 1.11 Numbers and bits as functions
+
+`pow` of an exact base to a whole power is exact, and otherwise a float. `sin`, `cos`,
+`tan`, `asin`, `acos`, `atan`, `atan2`, `log` and `exp` give floats. `ceil`, `trunc` and
+`round` are exact for exact numbers; `round` takes a half away from zero. `abs` of a
+complex number is its modulus. `to_fixed` rounds the float's exact value, a tie to even.
+
+### 1.12 Intervals
+
+`interval_make(lo, hi)` gives an `interval`, its ends any real numbers with `lo <= hi`;
+any other call stops the program at its `require`. `interval_lo` and `interval_hi` read
+the ends. An interval prints as `[lo,hi]` and stays an interval when its ends are equal.
+
+- `[a,b] + [c,d]` is `[a+c, b+d]`, `[a,b] - [c,d]` is `[a-d, b-c]`, and `[a,b] * [c,d]` runs
+  from the least to the greatest of the four products. `-[a,b]` is `[-b,-a]`. Each end
+  follows the rules of its own numbers (1.3), so no rounding is added.
+- A real operand counts as the interval from itself to itself. A complex operand, division
+  and `%` stop the program, naming the class.
+- Two intervals are equal when both ends are, and a real number equals the interval from
+  itself to itself. `<` and its relatives do not apply to intervals.
 
 ## Part 2: the new version's runtime and compiler
 

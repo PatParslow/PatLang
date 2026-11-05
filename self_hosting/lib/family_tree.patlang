@@ -41,29 +41,28 @@
 # PatLang lists, since list_contains/indexing over a handful of items
 # was never the cost problem.
 
+include "context.patlang"
 include "self_hosting/lib/sql.patlang"
 
-set_var("family_tree_gen", 0)
-set_var("family_tree_call_ctr", 0)
 
-make a function called family_run takes query returns result
-  let db = get("__vars", "family_tree_db")
+make a function called family_run takes ctx, query returns result
+  let db = ctx_get(ctx, "family_tree_db")
   let ast = sql_parse(query)
   let outcome = sql_execute(db, ast, "0")
-  set_var("family_tree_db", outcome[0])
+  ctx_set(ctx, "family_tree_db", outcome[0])
   return outcome[1]
 end
 
 # Same DELETE-not-CREATE reset as events_init() -- the SQL engine's
 # tables are VFS-persisted, not scoped to a db handle (see
 # life_events.patlang's events_init() for the full explanation).
-make a function called family_init returns done
-  set_var("family_tree_db", rdb_init())
-  set_var("family_tree_gen", to_num(get("__vars", "family_tree_gen")) + 1)
+make a function called family_init takes ctx returns done
+  ctx_set(ctx, "family_tree_db", rdb_init())
+  ctx_set(ctx, "family_tree_gen", ctx_num(ctx, "family_tree_gen") + 1)
   if rdb_table_exists("parents") then
-    family_run("DELETE FROM parents")
+    family_run(ctx, "DELETE FROM parents")
   else
-    family_run("CREATE TABLE parents (child_id STRING, parent_id STRING)")
+    family_run(ctx, "CREATE TABLE parents (child_id STRING, parent_id STRING)")
   end
   return true
 end
@@ -105,56 +104,56 @@ end
 # so 0 unambiguously means "no vec created yet" -- vec_new() itself
 # returns sequential ids starting at 0, which would otherwise be
 # indistinguishable from "unset".
-make a function called parents_key takes id returns key
-  return "family_parents_" + get("__vars", "family_tree_gen") + "_" + id
+make a function called parents_key takes ctx, id returns key
+  return "family_parents_" + ctx_text(ctx, "family_tree_gen") + "_" + id
 end
 
-make a function called children_key takes id returns key
-  return "family_children_" + get("__vars", "family_tree_gen") + "_" + id
+make a function called children_key takes ctx, id returns key
+  return "family_children_" + ctx_text(ctx, "family_tree_gen") + "_" + id
 end
 
-make a function called vec_handle_of takes key returns vec_id_or_neg1
-  let cached = to_num(get("__vars", key))
+make a function called vec_handle_of takes ctx, key returns vec_id_or_neg1
+  let cached = ctx_num(ctx, key)
   if cached == 0 then
     return 0 - 1
   end
   return cached - 1
 end
 
-make a function called vec_handle_of_or_create takes key returns vec_id
-  let vid = vec_handle_of(key)
+make a function called vec_handle_of_or_create takes ctx, key returns vec_id
+  let vid = vec_handle_of(ctx, key)
   if vid >= 0 then
     return vid
   end
   let v = vec_new()
-  set_var(key, v + 1)
+  ctx_set(ctx, key, v + 1)
   return v
 end
 
 # Both return [] when the individual has no recorded parents/children,
 # so callers never need to special-case "no vec created yet" themselves.
-make a function called parents_of takes id returns ids
-  let vid = vec_handle_of(parents_key(id))
+make a function called parents_of takes ctx, id returns ids
+  let vid = vec_handle_of(ctx, parents_key(ctx, id))
   if vid < 0 then
     return []
   end
   return vec_to_list(vid)
 end
 
-make a function called children_of takes id returns ids
-  let vid = vec_handle_of(children_key(id))
+make a function called children_of takes ctx, id returns ids
+  let vid = vec_handle_of(ctx, children_key(ctx, id))
   if vid < 0 then
     return []
   end
   return vec_to_list(vid)
 end
 
-make a function called all_ids_key returns key
-  return "family_all_ids_" + get("__vars", "family_tree_gen")
+make a function called all_ids_key takes ctx returns key
+  return "family_all_ids_" + ctx_text(ctx, "family_tree_gen")
 end
 
-make a function called seen_key takes id returns key
-  return "family_seen_" + get("__vars", "family_tree_gen") + "_" + id
+make a function called seen_key takes ctx, id returns key
+  return "family_seen_" + ctx_text(ctx, "family_tree_gen") + "_" + id
 end
 
 # Every individual ID ever mentioned as a child or parent, in first-seen
@@ -163,18 +162,18 @@ end
 # point. O(1) amortized per call: `seen_key`'s set_var flag (a hash map)
 # gives O(1) "have we already added this one" membership, avoiding a
 # list_contains scan over however many individuals exist so far.
-make a function called note_individual takes id returns done
-  let k = seen_key(id)
-  if get("__vars", k) == "1" then
+make a function called note_individual takes ctx, id returns done
+  let k = seen_key(ctx, id)
+  if ctx_get(ctx, k) == "1" then
     return true
   end
-  set_var(k, "1")
-  vec_push(vec_handle_of_or_create(all_ids_key()), id)
+  ctx_set(ctx, k, "1")
+  vec_push(vec_handle_of_or_create(ctx, all_ids_key(ctx)), id)
   return true
 end
 
-make a function called all_individuals returns ids
-  let vid = vec_handle_of(all_ids_key())
+make a function called all_individuals takes ctx returns ids
+  let vid = vec_handle_of(ctx, all_ids_key(ctx))
   if vid < 0 then
     return []
   end
@@ -189,15 +188,15 @@ end
 # The list_contains check here scans only `child`'s own parent list
 # (typically 0-2 entries), never the whole tree, so it stays O(1) in
 # practice despite being a linear scan.
-make a function called record_parent takes child, parent returns ok
-  if list_contains(parents_of(child), parent) then
+make a function called record_parent takes ctx, child, parent returns ok
+  if list_contains(parents_of(ctx, child), parent) then
     return false
   end
-  vec_push(vec_handle_of_or_create(parents_key(child)), parent)
-  vec_push(vec_handle_of_or_create(children_key(parent)), child)
-  note_individual(child)
-  note_individual(parent)
-  family_run("INSERT INTO parents (child_id, parent_id) VALUES ('" + sql_quote(child) + "', '" + sql_quote(parent) + "')")
+  vec_push(vec_handle_of_or_create(ctx, parents_key(ctx, child)), parent)
+  vec_push(vec_handle_of_or_create(ctx, children_key(ctx, parent)), child)
+  note_individual(ctx, child)
+  note_individual(ctx, parent)
+  family_run(ctx, "INSERT INTO parents (child_id, parent_id) VALUES ('" + sql_quote(child) + "', '" + sql_quote(parent) + "')")
   return true
 end
 
@@ -208,34 +207,34 @@ end
 # ancestor, or a layout would draw a parent-child edge pointing upward).
 # Memoized per generation via the same set_var index, since a layout
 # call queries every individual's level once each.
-make a function called level_key takes id returns key
-  return "family_level_" + get("__vars", "family_tree_gen") + "_" + id
+make a function called level_key takes ctx, id returns key
+  return "family_level_" + ctx_text(ctx, "family_tree_gen") + "_" + id
 end
 
-make a function called individual_level takes id returns level
+make a function called individual_level takes ctx, id returns level
   # Cached as (level + 1); 0 unambiguously means "not cached yet" (to_num
   # on an unset var/Unit comes back 0, which would otherwise be
   # indistinguishable from a real, cached level of 0).
-  let cached = to_num(get("__vars", level_key(id)))
+  let cached = to_num(ctx_get(ctx, level_key(ctx, id)))
   if cached > 0 then
     return cached - 1
   end
-  let ps = parents_of(id)
+  let ps = parents_of(ctx, id)
   let n = to_num(list_len(ps))
   if n == 0 then
-    set_var(level_key(id), 1)
+    ctx_set(ctx, level_key(ctx, id), 1)
     return 0
   end
   let best = 0
   let i = 0
   while i < n do
-    let lvl = individual_level(ps[i]) + 1
+    let lvl = individual_level(ctx, ps[i]) + 1
     if lvl > best then
       let best = lvl
     end
     let i = i + 1
   end
-  set_var(level_key(id), best + 1)
+  ctx_set(ctx, level_key(ctx, id), best + 1)
   return best
 end
 
@@ -245,14 +244,14 @@ end
 # within the SAME generation (e.g. family_tree_report calling both
 # ancestors_of and descendants_of back to back) must not see each
 # other's leftover visited flags.
-make a function called next_call_id returns id
-  let n = to_num(get("__vars", "family_tree_call_ctr")) + 1
-  set_var("family_tree_call_ctr", n)
+make a function called next_call_id takes ctx returns id
+  let n = ctx_num(ctx, "family_tree_call_ctr") + 1
+  ctx_set(ctx, "family_tree_call_ctr", n)
   return n
 end
 
-make a function called visited_key takes call_id, id returns key
-  return "family_visited_" + get("__vars", "family_tree_gen") + "_" + call_id + "_" + id
+make a function called visited_key takes ctx, call_id, id returns key
+  return "family_visited_" + ctx_text(ctx, "family_tree_gen") + "_" + call_id + "_" + id
 end
 
 # Every ancestor of `id`, in breadth-first discovery order, each
@@ -266,22 +265,22 @@ end
 # "before"/"after" timing note). A visited-set guard also makes this
 # safe against a malformed cyclic edge, though a real family tree should
 # never actually have one.
-make a function called ancestors_of takes id returns ids
-  let call_id = next_call_id()
+make a function called ancestors_of takes ctx, id returns ids
+  let call_id = next_call_id(ctx)
   let result_vec = vec_new()
-  set_var(visited_key(call_id, id), "1")
-  let frontier = parents_of(id)
+  ctx_set(ctx, visited_key(ctx, call_id, id), "1")
+  let frontier = parents_of(ctx, id)
   while to_num(list_len(frontier)) > 0 do
     let next_frontier_vec = vec_new()
     let i = 0
     let n = to_num(list_len(frontier))
     while i < n do
       let p = frontier[i]
-      let vk = visited_key(call_id, p)
-      if get("__vars", vk) != "1" then
-        set_var(vk, "1")
+      let vk = visited_key(ctx, call_id, p)
+      if ctx_get(ctx, vk) != "1" then
+        ctx_set(ctx, vk, "1")
         vec_push(result_vec, p)
-        let pps = parents_of(p)
+        let pps = parents_of(ctx, p)
         let j = 0
         let m = to_num(list_len(pps))
         while j < m do
@@ -296,22 +295,22 @@ make a function called ancestors_of takes id returns ids
   return vec_to_list(result_vec)
 end
 
-make a function called descendants_of takes id returns ids
-  let call_id = next_call_id()
+make a function called descendants_of takes ctx, id returns ids
+  let call_id = next_call_id(ctx)
   let result_vec = vec_new()
-  set_var(visited_key(call_id, id), "1")
-  let frontier = children_of(id)
+  ctx_set(ctx, visited_key(ctx, call_id, id), "1")
+  let frontier = children_of(ctx, id)
   while to_num(list_len(frontier)) > 0 do
     let next_frontier_vec = vec_new()
     let i = 0
     let n = to_num(list_len(frontier))
     while i < n do
       let c = frontier[i]
-      let vk = visited_key(call_id, c)
-      if get("__vars", vk) != "1" then
-        set_var(vk, "1")
+      let vk = visited_key(ctx, call_id, c)
+      if ctx_get(ctx, vk) != "1" then
+        ctx_set(ctx, vk, "1")
         vec_push(result_vec, c)
-        let ccs = children_of(c)
+        let ccs = children_of(ctx, c)
         let j = 0
         let m = to_num(list_len(ccs))
         while j < m do
@@ -326,8 +325,8 @@ make a function called descendants_of takes id returns ids
   return vec_to_list(result_vec)
 end
 
-make a function called is_ancestor takes x, y returns result
-  return list_contains(ancestors_of(y), x)
+make a function called is_ancestor takes ctx, x, y returns result
+  return list_contains(ancestors_of(ctx, y), x)
 end
 
 # Every individual sharing at least one recorded parent with `id`,
@@ -338,13 +337,13 @@ end
 # above): the result here is bounded by a person's own sibling count,
 # never by the size of the whole tree, so it was never the O(n^2) cost
 # problem the scale test found.
-make a function called siblings_of takes id returns ids
+make a function called siblings_of takes ctx, id returns ids
   let result = []
-  let ps = parents_of(id)
+  let ps = parents_of(ctx, id)
   let i = 0
   let n = to_num(list_len(ps))
   while i < n do
-    let sibs = children_of(ps[i])
+    let sibs = children_of(ctx, ps[i])
     let j = 0
     let m = to_num(list_len(sibs))
     while j < m do
@@ -359,11 +358,11 @@ make a function called siblings_of takes id returns ids
   return result
 end
 
-make a function called are_siblings takes x, y returns result
+make a function called are_siblings takes ctx, x, y returns result
   if x == y then
     return false
   end
-  return list_contains(siblings_of(x), y)
+  return list_contains(siblings_of(ctx, x), y)
 end
 
 # A human-readable text report for `id`: ancestors, descendants, and
@@ -371,12 +370,12 @@ end
 # graphical tree render -- the actual player-facing "who is this
 # character's family" query the wider fantpop-patlang goal describes,
 # in the simplest form that's actually queryable today.
-make a function called family_tree_report takes id returns report
+make a function called family_tree_report takes ctx, id returns report
   let sb = sb_new()
   sb_push(sb, "Family tree for " + id + ":\n")
-  sb_push(sb, "  Ancestors: " + join_with(ancestors_of(id), ", ") + "\n")
-  sb_push(sb, "  Descendants: " + join_with(descendants_of(id), ", ") + "\n")
-  sb_push(sb, "  Siblings: " + join_with(siblings_of(id), ", ") + "\n")
+  sb_push(sb, "  Ancestors: " + join_with(ancestors_of(ctx, id), ", ") + "\n")
+  sb_push(sb, "  Descendants: " + join_with(descendants_of(ctx, id), ", ") + "\n")
+  sb_push(sb, "  Siblings: " + join_with(siblings_of(ctx, id), ", ") + "\n")
   return sb_str(sb)
 end
 

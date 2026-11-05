@@ -110,6 +110,7 @@
 # -Datalog reachability over facts, not STRIPS world-state search -- a
 # real, separate rewrite, not attempted.
 
+include "context.patlang"
 include "synthesis_by_example.patlang"
 
 make a function called goap_expected_key takes examples returns key
@@ -124,12 +125,12 @@ make a function called goap_expected_key takes examples returns key
   return sb_str(out)
 end
 
-make a function called goap_preconds_for_args takes args, examples, registry returns preconds
+make a function called goap_preconds_for_args takes ctx, args, examples, registry returns preconds
   let out = []
   let i = 0
   let n = to_num(list_len(args))
   while i < n do
-    let akey = sbe_output_key(args[i], examples, registry)
+    let akey = sbe_output_key(ctx, args[i], examples, registry)
     let out = list_push(out, ["has_value", [akey, "1"]])
     let i = i + 1
   end
@@ -180,10 +181,10 @@ end
 # remove individual actions (no such primitive exists, or is needed --
 # see action_clear's own comment), clear the whole vec and replay only
 # size-1 (leaves, always kept) plus the sizes still inside the window.
-make a function called goap_rebuild_action_window takes action_log, current_size returns done
+make a function called goap_rebuild_action_window takes ctx, action_log, current_size returns done
   action_clear()
   goap_replay_records(get(action_log, "1"))
-  let window = sbe_window_size()
+  let window = sbe_window_size(ctx)
   let lo = current_size - window + 1
   if lo < 2 then
     let lo = 2
@@ -196,8 +197,8 @@ make a function called goap_rebuild_action_window takes action_log, current_size
   return true
 end
 
-make a function called goap_register_node takes node, examples, registry, seen, slot_nodes, expected_key, sample_bindings, index, action_log returns is_new
-  let key = sbe_output_key(node, examples, registry)
+make a function called goap_register_node takes ctx, node, examples, registry, seen, slot_nodes, expected_key, sample_bindings, index, action_log returns is_new
+  let key = sbe_output_key(ctx, node, examples, registry)
   if get(seen, key) then
     return false
   end
@@ -206,7 +207,7 @@ make a function called goap_register_node takes node, examples, registry, seen, 
   let tag = node[0]
   let preconds = []
   if tag == "Call" then
-    let preconds = goap_preconds_for_args(node[2], examples, registry)
+    let preconds = goap_preconds_for_args(ctx, node[2], examples, registry)
   end
   let size = sbe_size(node)
   let produce_rec = ["produce:" + key, preconds, [["has_value", [key, "1"]]], 1]
@@ -217,7 +218,7 @@ make a function called goap_register_node takes node, examples, registry, seen, 
     action_add(select_rec[0], select_rec[1], select_rec[2], [], select_rec[3])
     goap_action_log_add(action_log, size, select_rec)
   end
-  sbe_index_add(index, sbe_wrap(node, registry, sample_bindings))
+  sbe_index_add(ctx, index, sbe_wrap(ctx, node, registry, sample_bindings))
   return true
 end
 
@@ -233,11 +234,8 @@ end
 # reused as-is here rather than re-implemented -- only the CHEAP,
 # necessarily-sequential bookkeeping (seen/slot_nodes/action_log/
 # action_add, all Dict/vec mutation) stays outside the parallel section.
-make a function called goap_eval_candidate_worker takes node returns result
-  let examples = get("__vars", "goap_par_examples")
-  let registry = get("__vars", "goap_par_registry")
-  let sample_bindings = get("__vars", "goap_par_sample_bindings")
-  let key = sbe_output_key(node, examples, registry)
+make a function called goap_eval_candidate_worker takes ctx, node, examples, registry, sample_bindings returns result
+  let key = sbe_output_key(ctx, node, examples, registry)
   let tag = node[0]
   let arg_keys = []
   if tag == "Call" then
@@ -245,33 +243,42 @@ make a function called goap_eval_candidate_worker takes node returns result
     let i = 0
     let n = to_num(list_len(args))
     while i < n do
-      let arg_keys = list_push(arg_keys, sbe_output_key(args[i], examples, registry))
+      let arg_keys = list_push(arg_keys, sbe_output_key(ctx, args[i], examples, registry))
       let i = i + 1
     end
   end
-  let typed = sbe_wrap(node, registry, sample_bindings)
+  let typed = sbe_wrap(ctx, node, registry, sample_bindings)
   return [key, typed[2], typed[3], arg_keys]
 end
 
-make a function called goap_eval_candidate_chunk_worker takes chunk returns results
+make a function called goap_eval_candidates_in takes ctx, chunk, examples, registry, sample_bindings returns results
   let results = []
   let i = 0
   let n = to_num(list_len(chunk))
   while i < n do
-    let results = list_push(results, goap_eval_candidate_worker(chunk[i]))
+    let results = list_push(results, goap_eval_candidate_worker(ctx, chunk[i], examples, registry, sample_bindings))
     let i = i + 1
   end
   return results
 end
 
-make a function called goap_evaluate_candidates takes candidates, examples, registry, sample_bindings returns results
-  set_var("goap_par_examples", examples)
-  set_var("goap_par_registry", registry)
-  set_var("goap_par_sample_bindings", sample_bindings)
+# A parallel_map worker, with a context of its own: item is [chunk, examples,
+# registry, sample_bindings].
+make a function called goap_eval_candidate_chunk_worker takes item returns results
+  return goap_eval_candidates_in(context_new(), item[0], item[1], item[2], item[3])
+end
+
+make a function called goap_evaluate_candidates takes ctx, candidates, examples, registry, sample_bindings returns results
   let cn = to_num(list_len(candidates))
   if cn > sbe_parallel_threshold() then
     let chunks = sbe_chunk_list(candidates, sbe_parallel_chunk_count())
-    let chunk_results = parallel_map(chunks, "goap_eval_candidate_chunk_worker")
+    let items = []
+    let ci = 0
+    while ci < to_num(list_len(chunks)) do
+      let items = list_push(items, [chunks[ci], examples, registry, sample_bindings])
+      let ci = ci + 1
+    end
+    let chunk_results = parallel_map(items, "goap_eval_candidate_chunk_worker")
     let results = []
     let k = 0
     let kn = to_num(list_len(chunk_results))
@@ -281,10 +288,10 @@ make a function called goap_evaluate_candidates takes candidates, examples, regi
     end
     return results
   end
-  return goap_eval_candidate_chunk_worker(candidates)
+  return goap_eval_candidates_in(ctx, candidates, examples, registry, sample_bindings)
 end
 
-make a function called goap_register_evaluated takes node, r, seen, slot_nodes, expected_key, index, action_log returns is_new
+make a function called goap_register_evaluated takes ctx, node, r, seen, slot_nodes, expected_key, index, action_log returns is_new
   let key = r[0]
   if get(seen, key) then
     return false
@@ -308,25 +315,25 @@ make a function called goap_register_evaluated takes node, r, seen, slot_nodes, 
     action_add(select_rec[0], select_rec[1], select_rec[2], [], select_rec[3])
     goap_action_log_add(action_log, size, select_rec)
   end
-  sbe_index_add(index, [node, size, r[1], r[2]])
+  sbe_index_add(ctx, index, [node, size, r[1], r[2]])
   return true
 end
 
-make a function called goap_synthesize_from_examples takes examples, input_names, extra_consts, registry, primitive_names, max_size returns result
+make a function called goap_synthesize_from_examples takes ctx, examples, input_names, extra_consts, registry, primitive_names, max_size returns result
   let consts = sbe_list_concat(sbe_default_int_consts(), extra_consts)
   let sample_bindings = examples[0][0]
   let leaves = sbe_seed_leaves(input_names, consts)
-  let index = sbe_index_new()
-  let seen = new("Dict", "goap_seen_" + pr_next_id())
-  let slot_nodes = new("Dict", "goap_slots_" + pr_next_id())
-  let action_log = new("Dict", "goap_action_log_" + pr_next_id())
+  let index = sbe_index_new(ctx)
+  let seen = new("Dict", "goap_seen_" + pr_next_id(ctx))
+  let slot_nodes = new("Dict", "goap_slots_" + pr_next_id(ctx))
+  let action_log = new("Dict", "goap_action_log_" + pr_next_id(ctx))
   let expected_key = goap_expected_key(examples)
   let notes = []
 
   let i = 0
   let n = to_num(list_len(leaves))
   while i < n do
-    goap_register_node(leaves[i], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index, action_log)
+    goap_register_node(ctx, leaves[i], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index, action_log)
     let i = i + 1
   end
 
@@ -352,21 +359,21 @@ make a function called goap_synthesize_from_examples takes examples, input_names
         let prim_cost = to_num(entry[3])
         let candidates = sbe_build_calls(prim, arg_types, arg_contracts, size, index, prim_cost)
         let cn = to_num(list_len(candidates))
-        let results = goap_evaluate_candidates(candidates, examples, registry, sample_bindings)
+        let results = goap_evaluate_candidates(ctx, candidates, examples, registry, sample_bindings)
         let c = 0
         while c < cn do
-          goap_register_evaluated(candidates[c], results[c], seen, slot_nodes, expected_key, index, action_log)
+          goap_register_evaluated(ctx, candidates[c], results[c], seen, slot_nodes, expected_key, index, action_log)
           let c = c + 1
         end
       end
       let p = p + 1
     end
 
-    let evict_size = size - sbe_window_size()
+    let evict_size = size - sbe_window_size(ctx)
     if evict_size >= 2 then
       sbe_evict_size(index, evict_size)
     end
-    goap_rebuild_action_window(action_log, size)
+    goap_rebuild_action_window(ctx, action_log, size)
 
     let plan_labels = plan([["has_value", ["GOAL", "1"]]])
     if to_num(list_len(plan_labels)) > 0 then

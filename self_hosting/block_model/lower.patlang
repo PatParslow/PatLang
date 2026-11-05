@@ -233,8 +233,8 @@ make a function called bm_class_registry_set takes registry, name, fields return
   return list_push(registry, [name, fields])
 end
 
-make a function called bm_class_fields takes class_name returns fields
-  return bm_assoc_get(get("__vars", "bm_class_registry"), class_name)
+make a function called bm_class_fields takes ctx, class_name returns fields
+  return bm_assoc_get(ctx_read(ctx, "bm_class_registry"), class_name)
 end
 
 # Phase 12 adds `require`/`ensure`/`assert` (design-by-contract). The real
@@ -326,6 +326,7 @@ end
 # parameter to every one of bm_lower_expr's ~20 call sites for a decision
 # only one of them needs.
 
+include "../lib/context.patlang"
 include "block_ir.patlang"
 include "free_vars.patlang"
 include "flight_check.patlang"
@@ -357,15 +358,15 @@ make a function called bm_builtin_form_names returns names
   return ["new", "type_of", "read_file", "write_file", "query", "box_new", "box_get", "box_share", "box_set", "get_global", "set_global", "handler_new", "handler_register", "handler_lookup", "apply", "thread_spawn", "thread_result", "print", "fact", "fiber_yield", "emit"]
 end
 
-make a function called bm_user_fn_wins takes name, block_names returns yes
-  return bm_list_contains(block_names, name) and (not bm_is_fn_bound_name(name))
+make a function called bm_user_fn_wins takes ctx, name, block_names returns yes
+  return bm_list_contains(block_names, name) and (not bm_is_fn_bound_name(ctx, name))
 end
 
-make a function called bm_lower_declared_call takes name, args, instrs, block_names, immut_params returns out
+make a function called bm_lower_declared_call takes ctx, name, args, instrs, block_names, immut_params returns out
   let ai = 0
   let an = list_len(args)
   while ai < an do
-    let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(args, ai), instrs, block_names, immut_params)
     let ai = ai + 1
   end
   let instrs = list_push(instrs, ["Load", "__globals"])
@@ -458,7 +459,7 @@ make a function called bm_is_activate_call takes e returns yes
   return (list_get(e, 1) == "activate") and (list_len(list_get(e, 2)) == 1)
 end
 
-make a function called bm_expand_activate_list takes stmts returns out
+make a function called bm_expand_activate_list takes ctx, stmts returns out
   let out = []
   let n = list_len(stmts)
   let i = 0
@@ -466,7 +467,7 @@ make a function called bm_expand_activate_list takes stmts returns out
     let s = list_get(stmts, i)
     let ty = list_get(s, 0)
     if (ty == "Let") and bm_is_activate_call(list_get(s, 2)) then
-      let base = bm_next_synth_name("__act")
+      let base = bm_next_synth_name(ctx, "__act")
       let synth = bm_activate_synth(list_get(list_get(list_get(s, 2), 2), 0), base)
       let k = 0
       while k < list_len(synth) do
@@ -475,7 +476,7 @@ make a function called bm_expand_activate_list takes stmts returns out
       end
       let out = list_push(out, list_set(s, 2, ["Var", base + "_ok"]))
     elif (ty == "Expr") and bm_is_activate_call(list_get(s, 1)) then
-      let base = bm_next_synth_name("__act")
+      let base = bm_next_synth_name(ctx, "__act")
       let synth = bm_activate_synth(list_get(list_get(list_get(s, 1), 2), 0), base)
       let k = 0
       while k < list_len(synth) do
@@ -483,17 +484,17 @@ make a function called bm_expand_activate_list takes stmts returns out
         let k = k + 1
       end
     elif ty == "If" then
-      let s2 = list_set(s, 2, bm_expand_activate_list(list_get(s, 2)))
-      let out = list_push(out, list_set(s2, 3, bm_expand_activate_list(list_get(s, 3))))
+      let s2 = list_set(s, 2, bm_expand_activate_list(ctx, list_get(s, 2)))
+      let out = list_push(out, list_set(s2, 3, bm_expand_activate_list(ctx, list_get(s, 3))))
     elif ty == "While" then
-      let out = list_push(out, list_set(s, 2, bm_expand_activate_list(list_get(s, 2))))
+      let out = list_push(out, list_set(s, 2, bm_expand_activate_list(ctx, list_get(s, 2))))
     elif ty == "Match" then
       let arms = list_get(s, 2)
       let new_arms = []
       let ai = 0
       while ai < list_len(arms) do
         let arm = list_get(arms, ai)
-        let new_arms = list_push(new_arms, list_set(arm, 2, bm_expand_activate_list(list_get(arm, 2))))
+        let new_arms = list_push(new_arms, list_set(arm, 2, bm_expand_activate_list(ctx, list_get(arm, 2))))
         let ai = ai + 1
       end
       let out = list_push(out, list_set(s, 2, new_arms))
@@ -560,41 +561,41 @@ end
 # scene_build_lines segfault). Only a name that is also a declared
 # function is decided this way; any other bound name has nothing else to
 # call (a loop can reach the call again once its `let` has run).
-make a function called bm_is_fn_bound_name takes name returns yes
-  let bound = get("__vars", "bm_fn_bound_names")
+make a function called bm_is_fn_bound_name takes ctx, name returns yes
+  let bound = ctx_read(ctx, "bm_fn_bound_names")
   if type_of(bound) != "list" then
     return false
   end
   if not bm_list_contains(bound, name) then
     return false
   end
-  let declared = get("__vars", "bm_declared_fn_names")
+  let declared = ctx_read(ctx, "bm_declared_fn_names")
   if type_of(declared) != "list" then
     return true
   end
   if not bm_list_contains(declared, name) then
     return true
   end
-  let seen = get("__vars", "bm_fn_seen_names")
+  let seen = ctx_read(ctx, "bm_fn_seen_names")
   if type_of(seen) != "list" then
     return true
   end
   return bm_list_contains(seen, name)
 end
 
-make a function called bm_lower_closure_expr takes node, instrs, block_names, immut_params returns out
+make a function called bm_lower_closure_expr takes ctx, node, instrs, block_names, immut_params returns out
   let params = list_get(node, 1)
-  let body = bm_expand_activate_list(list_get(node, 2))
-  let outer_bound = get("__vars", "bm_fn_bound_names")
-  let outer_seen = get("__vars", "bm_fn_seen_names")
+  let body = bm_expand_activate_list(ctx, list_get(node, 2))
+  let outer_bound = ctx_read(ctx, "bm_fn_bound_names")
+  let outer_seen = ctx_read(ctx, "bm_fn_seen_names")
   let free = list_get(bm_fv_stmt_list(body, params, []), 1)
   let captured = bm_intersect_preserving_order(outer_bound, free)
-  let name = bm_next_synth_name("__closure")
+  let name = bm_next_synth_name(ctx, "__closure")
   # The closure body's own scope: __captured, its params, every captured
   # name, and whatever its body binds.
   let inner_names = bm_bound_names_of(bm_union_preserving_order(["__captured"], bm_union_preserving_order(params, captured)), body)
-  set_var("bm_fn_bound_names", inner_names)
-  set_var("bm_fn_seen_names", bm_union_preserving_order(["__captured"], bm_union_preserving_order(params, captured)))
+  ctx_set(ctx, "bm_fn_bound_names", inner_names)
+  ctx_set(ctx, "bm_fn_seen_names", bm_union_preserving_order(["__captured"], bm_union_preserving_order(params, captured)))
   let prologue = []
   let cn = list_len(captured)
   let ci = 0
@@ -615,11 +616,11 @@ make a function called bm_lower_closure_expr takes node, instrs, block_names, im
     let pi = pi + 1
   end
   let known = bm_union_preserving_order(captured, params)
-  let top = bm_lower_top_level_stmt_list(body, 0, prologue, block_names, get("__vars", "bm_ct_blocks_by_name"), inner_immut, known, [], [], ["none"])
-  set_var("bm_fn_bound_names", outer_bound)
-  set_var("bm_fn_seen_names", outer_seen)
+  let top = bm_lower_top_level_stmt_list(ctx, body, 0, prologue, block_names, ctx_read(ctx, "bm_ct_blocks_by_name"), inner_immut, known, [], [], ["none"])
+  ctx_set(ctx, "bm_fn_bound_names", outer_bound)
+  ctx_set(ctx, "bm_fn_seen_names", outer_seen)
   let closure_params = list_push(bm_union_preserving_order(["__captured"], params), "__globals")
-  let registry = get("__vars", "bm_closure_blocks")
+  let registry = ctx_read(ctx, "bm_closure_blocks")
   let registry = list_push(registry, ["BlockIR", name, closure_params, bm_hash_rewrite_instrs(list_get(top, 0))])
   let sn = list_len(list_get(top, 1))
   let si = 0
@@ -627,7 +628,7 @@ make a function called bm_lower_closure_expr takes node, instrs, block_names, im
     let registry = list_push(registry, list_get(list_get(top, 1), si))
     let si = si + 1
   end
-  set_var("bm_closure_blocks", registry)
+  ctx_set(ctx, "bm_closure_blocks", registry)
   # Creation site: ["__closure", name, [captured...], arity]. The arity lets
   # thread_spawn refuse a closure that takes parameters, however it was built.
   let instrs = list_push(instrs, ["Const", "str", "__closure"])
@@ -646,14 +647,14 @@ end
 # value and dispatch through CallDynamic (#153) with the captured list as the
 # first extra argument. Stack for CallDynamic: extra args, callee name,
 # __globals.
-make a function called bm_lower_closure_call takes name, args, instrs, block_names, immut_params returns out
+make a function called bm_lower_closure_call takes ctx, name, args, instrs, block_names, immut_params returns out
   let instrs = list_push(instrs, ["Load", name])
   let instrs = list_push(instrs, ["Const", "num", "2"])
   let instrs = list_push(instrs, ["CallHost", "list_get", 2])
   let an = list_len(args)
   let ai = 0
   while ai < an do
-    let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(args, ai), instrs, block_names, immut_params)
     let ai = ai + 1
   end
   let instrs = list_push(instrs, ["Load", name])
@@ -671,20 +672,20 @@ end
 # own declared parameters, and leaves the callee's return value on the
 # caller's stack. Shared by bm_lower_expr (value context, result kept) and
 # bm_lower_stmt (bare statement, result discarded by its own caller).
-make a function called bm_lower_apply takes call_args, instrs, block_names, immut_params returns out
+make a function called bm_lower_apply takes ctx, call_args, instrs, block_names, immut_params returns out
   let total = list_len(call_args)
   let extra = total - 1
   let ai = 1
   while ai < total do
-    let instrs = bm_lower_expr(list_get(call_args, ai), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(call_args, ai), instrs, block_names, immut_params)
     let ai = ai + 1
   end
-  let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+  let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
   let instrs = list_push(instrs, ["Load", "__globals"])
   return list_push(instrs, ["CallDynamic", extra])
 end
 
-make a function called bm_lower_expr takes node, instrs, block_names, immut_params returns out
+make a function called bm_lower_expr takes ctx, node, instrs, block_names, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Num" then
     return list_push(instrs, ["Const", "num", list_get(node, 1)])
@@ -695,7 +696,7 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Var" then
     # A bare `unit` that no enclosing scope binds is the Unit literal, same
     # rule as self_hosting/lib/lower.patlang's Var arm; a bound name wins.
-    if (list_get(node, 1) == "unit") and (not bm_is_fn_bound_name("unit")) then
+    if (list_get(node, 1) == "unit") and (not bm_is_fn_bound_name(ctx, "unit")) then
       return list_push(instrs, ["Const", "unit", ""])
     end
     return list_push(instrs, ["Load", list_get(node, 1)])
@@ -714,11 +715,11 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # just the missing-op error, when x == 0 should have short-
       # circuited "or" before ever evaluating it). Found while
       # re-attempting Phase 18's own checkpoint one level further out
-      # (self_hosting/lib/test.patlang's own run_feature uses `(c == 10)
+      # (self_hosting/lib/gherkin.patlang's own run_feature uses `(c == 10)
       # or (c == -1)`). Mirrors lower.patlang's own "and" arm exactly,
       # using this engine's own existing JumpIfFalse/Jump/Un/Const
       # instructions -- no new bytecode needed.
-      let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Un", "not"])
       let jif_pos = list_len(instrs)
       let instrs = list_push(instrs, ["JumpIfFalse", 0])
@@ -726,7 +727,7 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let jmp_pos = list_len(instrs)
       let instrs = list_push(instrs, ["Jump", 0])
       let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
-      let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(node, 3), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Un", "not"])
       let instrs = list_push(instrs, ["Un", "not"])
       let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
@@ -734,11 +735,11 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     elif op == "or" then
       # Mirrors lower.patlang's own "or" arm exactly -- see the "and"
       # case just above for the full rationale.
-      let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Un", "not"])
       let jif_pos = list_len(instrs)
       let instrs = list_push(instrs, ["JumpIfFalse", 0])
-      let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(node, 3), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Un", "not"])
       let instrs = list_push(instrs, ["Un", "not"])
       let jmp_pos = list_len(instrs)
@@ -748,11 +749,11 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
       return instrs
     end
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
-    let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 3), instrs, block_names, immut_params)
     return list_push(instrs, ["Bin", op])
   elif ty == "Un" then
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
   elif ty == "MethodCall" then
     # Issue #175: `obj.method(args)` is the host `send(obj, "method", args...)`,
@@ -761,11 +762,11 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     # what reaches here is a call on an ad hoc named object or a built-in
     # method, served by the host send.
     let margs = list_get(node, 3)
-    let instrs = bm_lower_expr(list_get(node, 1), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 1), instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Const", "str", list_get(node, 2)])
     let mi = 0
     while mi < list_len(margs) do
-      let instrs = bm_lower_expr(list_get(margs, mi), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(margs, mi), instrs, block_names, immut_params)
       let mi = mi + 1
     end
     return list_push(instrs, ["CallHost", "send", 2 + list_len(margs)])
@@ -775,16 +776,16 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     # __globals)`, where the body is a zero-parameter closure (#182) lowered
     # with the budget depth raised, so every `while` back-edge inside it gets
     # a `budget_check` (see bm_lower_while).
-    let instrs = bm_lower_expr(list_get(node, 1), instrs, block_names, immut_params)
-    set_var("bm_budgeted_depth", get("__vars", "bm_budgeted_depth") + 1)
-    let instrs = bm_lower_closure_expr(["Closure", [], list_get(node, 3)], instrs, block_names, immut_params)
-    set_var("bm_budgeted_depth", get("__vars", "bm_budgeted_depth") - 1)
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 1), instrs, block_names, immut_params)
+    ctx_set(ctx, "bm_budgeted_depth", ctx_num(ctx, "bm_budgeted_depth") + 1)
+    let instrs = bm_lower_closure_expr(ctx, ["Closure", [], list_get(node, 3)], instrs, block_names, immut_params)
+    ctx_set(ctx, "bm_budgeted_depth", ctx_num(ctx, "bm_budgeted_depth") - 1)
+    let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Load", "__globals"])
     return list_push(instrs, ["CallHost", "bm_budgeted_run", 4])
   elif ty == "Closure" then
     # Issue #182: see bm_lower_closure_expr.
-    return bm_lower_closure_expr(node, instrs, block_names, immut_params)
+    return bm_lower_closure_expr(ctx, node, instrs, block_names, immut_params)
   elif ty == "Member" then
     let obj_node = list_get(node, 1)
     let prop = list_get(node, 2)
@@ -799,7 +800,7 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # the interpreter at all -- confirmed via a direct repro,
       # `let s = "hello"; print(s.length)`, crashing with "host fn
       # 'mem_peek_qword' not found" before this fix).
-      let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, obj_node, instrs, block_names, immut_params)
       return list_push(instrs, ["CallHost", "len", 1])
     end
     # obj.prop (read), any OTHER property name -- reuses HandlerLookup
@@ -812,14 +813,14 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     # object from new("Class"). The two are told apart at run time by
     # type_of == "string", so `self.field` inside a method and `obj.field` on a
     # variable holding a name both work, next to Phase 13's Box objects.
-    if get("__vars", "bm_uses_box") != true then
+    if ctx_read(ctx, "bm_uses_box") != true then
       # No Box object can exist in this program: every receiver is a named object.
-      let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, obj_node, instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Const", "str", prop])
       return list_push(instrs, ["CallHost", "get", 2])
     end
-    let tmp = bm_next_synth_name("__mobj")
-    let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+    let tmp = bm_next_synth_name(ctx, "__mobj")
+    let instrs = bm_lower_expr(ctx, obj_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Store", tmp])
     let instrs = list_push(instrs, ["Load", tmp])
     let instrs = list_push(instrs, ["TypeOf"])
@@ -851,7 +852,7 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     let n = list_len(items)
     let ii = 0
     while ii < n do
-      let instrs = bm_lower_expr(list_get(items, ii), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(items, ii), instrs, block_names, immut_params)
       let ii = ii + 1
     end
     return list_push(instrs, ["BuildList", n])
@@ -864,14 +865,14 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     # the "Call" case below -- not a new Handler*-style engine primitive,
     # since indexing an ordinary List has nothing to do with this
     # engine's own Box/Handler object representation (Phase 13's header).
-    let instrs = bm_lower_expr(list_get(node, 1), instrs, block_names, immut_params)
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 1), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["CallHost", "list_get", 2])
   elif ty == "Call" then
     let name = list_get(node, 1)
     let args = list_get(node, 2)
-    if bm_user_fn_wins(name, block_names) then
-      return bm_lower_declared_call(name, args, instrs, block_names, immut_params)
+    if bm_user_fn_wins(ctx, name, block_names) then
+      return bm_lower_declared_call(ctx, name, args, instrs, block_names, immut_params)
     elif (name == "new") and (list_len(args) == 1) then
       # Issue #178: the two-or-more-argument form, new(class, name), creates a
       # NAMED object in the process-wide registry and is served by the generic
@@ -885,19 +886,19 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
         return instrs
       end
       let class_name = list_get(class_name_node, 1)
-      let fields = bm_class_fields(class_name)
+      let fields = bm_class_fields(ctx, class_name)
       if fields == false then
         bm_lower_unsupported("new(\"" + class_name + "\") -- no class named '" + class_name + "' was declared with `class " + class_name + " do ... end` (Phase 13 does not support the older name-registry new(...) form)")
         return instrs
       end
-      let tmp = bm_next_synth_name("__newobj")
+      let tmp = bm_next_synth_name(ctx, "__newobj")
       let instrs = list_push(instrs, ["HandlerNew"])
       let instrs = list_push(instrs, ["Store", tmp])
       let flds_n = list_len(fields)
       let fi = 0
       while fi < flds_n do
         let fld = list_get(fields, fi)
-        let instrs = bm_lower_expr(list_get(fld, 1), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(fld, 1), instrs, block_names, immut_params)
         let instrs = list_push(instrs, ["Const", "str", list_get(fld, 0)])
         let instrs = list_push(instrs, ["Load", tmp])
         let instrs = list_push(instrs, ["HandlerRegister"])
@@ -907,28 +908,28 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let instrs = list_push(instrs, ["Load", tmp])
       return list_push(instrs, ["BoxNew"])
     elif name == "type_of" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["TypeOf"])
     elif name == "read_file" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["ReadFile"])
     elif name == "write_file" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 1), instrs, block_names, immut_params)
       return list_push(instrs, ["WriteFile"])
     elif name == "query" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 2), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 2), instrs, block_names, immut_params)
       return list_push(instrs, ["Query"])
     elif name == "box_new" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["BoxNew"])
     elif name == "box_get" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["BoxGet"])
     elif name == "box_share" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["BoxShare"])
     elif name == "box_set" then
       let target = list_get(args, 0)
@@ -940,34 +941,34 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
         # immutable-reassignment check works (see that file's `Let` arm).
         return list_push(instrs, ["ContractFail", "box_set on read-only parameter '" + list_get(target, 1) + "' (declare it `mut_" + list_get(target, 1) + "` to allow mutation)"])
       end
-      let instrs = bm_lower_expr(target, instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, target, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 1), instrs, block_names, immut_params)
       return list_push(instrs, ["BoxSet"])
     elif name == "get_global" then
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Load", "__globals"])
       return list_push(instrs, ["GlobalGet"])
     elif name == "handler_new" then
       return list_push(instrs, ["HandlerNew"])
     elif name == "handler_register" then
-      let instrs = bm_lower_expr(list_get(args, 2), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 2), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["HandlerRegister"])
     elif name == "handler_lookup" then
-      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["HandlerLookup"])
     elif name == "apply" then
       # Issue #153: value-context apply(fname, a1, ..., an) -- the callee's
       # return value stays on the stack for the surrounding expression.
-      return bm_lower_apply(args, instrs, block_names, immut_params)
+      return bm_lower_apply(ctx, args, instrs, block_names, immut_params)
     elif (name == "parallel_map") and (list_len(args) == 2) then
       # The caller's current __globals goes to every worker (as a value; a
       # worker's changes are not written back), so a global set before the
       # call reads the same inside it, as interpreted (raytrace ch37).
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
-      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 1), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Load", "__globals"])
       return list_push(instrs, ["CallHost", "bm_parallel_map", 3])
     elif name == "thread_spawn" then
@@ -981,7 +982,7 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # then a bare ThreadSpawn instruction -- native_codegen.patlang
       # does the actual List -> real-closure conversion; the interpreter
       # rejects it outright (no real-engine equivalent exists to match).
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["ThreadSpawn"])
     elif name == "thread_result" then
       # Issue #184: thread_result(id) -- an ordinary generic-CallHost-
@@ -998,15 +999,15 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # bm_closure_entry-style callee is on the other end -- confirmed
       # directly: without this, thread_result(id) for a closure computing
       # 42 returned [42, []], not 42.
-      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, list_get(args, 0), instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["CallHost", "thread_result", 1])
       let instrs = list_push(instrs, ["Const", "num", "0"])
       return list_push(instrs, ["CallHost", "list_get", 2])
-    elif bm_is_fn_bound_name(name) then
+    elif bm_is_fn_bound_name(ctx, name) then
       # Issue #182: `f(a, b)` where f is a parameter or `let` of the current
       # function -- a call through a closure value. A local shadows a
       # declared function of the same name, as in the real engine.
-      return bm_lower_closure_call(name, args, instrs, block_names, immut_params)
+      return bm_lower_closure_call(ctx, name, args, instrs, block_names, immut_params)
     else
       # Phase 17/18's own named-but-deferred generic host-call fallback,
       # now filled in: any name not individually recognized above, not a
@@ -1028,7 +1029,7 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let ai = 0
       let an = list_len(args)
       while ai < an do
-        let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(args, ai), instrs, block_names, immut_params)
         let ai = ai + 1
       end
       return list_push(instrs, ["CallHost", name, an])
@@ -1056,7 +1057,7 @@ end
 # or a list in among them the jump was opaque, so the callee's parameters did
 # not own what they were given and every fresh argument of a tail call
 # (`return sum2(mk(x), mk(2))`) was never released.
-make a function called bm_lower_jump_call takes call_node, instrs, block_names, blocks_by_name, immut_params returns out
+make a function called bm_lower_jump_call takes ctx, call_node, instrs, block_names, blocks_by_name, immut_params returns out
   let target = list_get(call_node, 1)
   let args = list_get(call_node, 2)
   let target_blk = bm_assoc_get(blocks_by_name, target)
@@ -1067,7 +1068,7 @@ make a function called bm_lower_jump_call takes call_node, instrs, block_names, 
   let pushes = []
   let i = 0
   while i < n do
-    let frag = bm_lower_expr(list_get(args, i), [], block_names, immut_params)
+    let frag = bm_lower_expr(ctx, list_get(args, i), [], block_names, immut_params)
     let op = list_get(list_get(frag, 0), 0)
     if (list_len(frag) == 1) and ((op == "Load") or (op == "Const")) then
       let pushes = list_push(pushes, list_get(frag, 0))
@@ -1161,15 +1162,15 @@ make a function called bm_expr_to_text takes node returns s
   return "<expr>"
 end
 
-make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_name, immut_params returns out
+make a function called bm_lower_stmt takes ctx, node, instrs, block_names, blocks_by_name, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Let" then
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, list_get(node, 2), instrs, block_names, immut_params)
     # From here on `name(...)` calls through this local (bm_is_fn_bound_name).
-    let seen = get("__vars", "bm_fn_seen_names")
+    let seen = ctx_read(ctx, "bm_fn_seen_names")
     if type_of(seen) == "list" then
       if not bm_list_contains(seen, list_get(node, 1)) then
-        set_var("bm_fn_seen_names", list_push(seen, list_get(node, 1)))
+        ctx_set(ctx, "bm_fn_seen_names", list_push(seen, list_get(node, 1)))
       end
     end
     return list_push(instrs, ["Store", list_get(node, 1)])
@@ -1250,12 +1251,12 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # Issue #180: the real host contract_check(func_name, kind, text, ok), as the
     # real lowerer emits. It fails the way the real engine does when `ok` is
     # false and, when true, records a contract_holds fact solve() can query.
-    let instrs = list_push(instrs, ["Const", "str", get("__vars", "bm_current_fn")])
+    let instrs = list_push(instrs, ["Const", "str", ctx_read(ctx, "bm_current_fn")])
     let instrs = list_push(instrs, ["Const", "str", kind])
     let instrs = list_push(instrs, ["Const", "str", bm_expr_to_text(cond)])
-    let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, cond, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["CallHost", "contract_check", 4])
-    return list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+    return list_push(instrs, ["Store", bm_next_synth_name(ctx, "__discard")])
   elif ty == "MemberAssign" then
     # obj.prop = value -- reuses box_set's OWN mut-check and refcount
     # mutate-in-place-vs-clone mechanism unmodified (Phase 13's own header
@@ -1279,18 +1280,18 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # would give, so it's computed first and reloaded in the right order
     # rather than pushed in the wrong order (a real bug caught here via a
     # genuine segfault, not assumed correct from the shape alone).
-    if get("__vars", "bm_uses_box") != true then
+    if ctx_read(ctx, "bm_uses_box") != true then
       # No Box object can exist in this program: a write is the host send "set".
-      let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, obj_node, instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["Const", "str", "set"])
       let instrs = list_push(instrs, ["Const", "str", prop])
-      let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, value_node, instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["CallHost", "send", 4])
-      return list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+      return list_push(instrs, ["Store", bm_next_synth_name(ctx, "__discard")])
     end
-    let tmp = bm_next_synth_name("__objref")
-    let tmp2 = bm_next_synth_name("__objnewval")
-    let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+    let tmp = bm_next_synth_name(ctx, "__objref")
+    let tmp2 = bm_next_synth_name(ctx, "__objnewval")
+    let instrs = bm_lower_expr(ctx, obj_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Store", tmp])
     # Issue #175: a named object (the receiver is a string) is written with the
     # host `send(name, "set", prop, value)`, the same call the real lowerer
@@ -1304,9 +1305,9 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     let instrs = list_push(instrs, ["Load", tmp])
     let instrs = list_push(instrs, ["Const", "str", "set"])
     let instrs = list_push(instrs, ["Const", "str", prop])
-    let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, value_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["CallHost", "send", 4])
-    let instrs = list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+    let instrs = list_push(instrs, ["Store", bm_next_synth_name(ctx, "__discard")])
     let instrs = list_push(instrs, ["Jump", 0])
     let ma_jmp_pos = list_len(instrs) - 1
     let instrs = list_set(instrs, ma_jif_pos, ["JumpIfFalse", list_len(instrs)])
@@ -1317,7 +1318,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
       let instrs = list_push(instrs, ["ContractFail", "field write on read-only parameter '" + list_get(obj_node, 1) + "' (declare it `mut_" + list_get(obj_node, 1) + "` to allow mutation)"])
       return list_set(instrs, ma_jmp_pos, ["Jump", list_len(instrs)])
     end
-    let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, value_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Const", "str", prop])
     let instrs = list_push(instrs, ["Load", tmp])
     let instrs = list_push(instrs, ["BoxGet"])
@@ -1338,7 +1339,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     if list_get(obj_node, 0) == "Var" then
       let instrs = list_push(instrs, ["Store", list_get(obj_node, 1)])
     else
-      let instrs = list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+      let instrs = list_push(instrs, ["Store", bm_next_synth_name(ctx, "__discard")])
     end
     return list_set(instrs, ma_jmp_pos, ["Jump", list_len(instrs)])
   elif ty == "Match" then
@@ -1352,8 +1353,8 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # bug, not a silent no-op (the real engine's own issue #44 decision).
     let scrutinee_node = list_get(node, 1)
     let arms = list_get(node, 2)
-    let tmp = bm_next_synth_name("__match")
-    let instrs = bm_lower_expr(scrutinee_node, instrs, block_names, immut_params)
+    let tmp = bm_next_synth_name(ctx, "__match")
+    let instrs = bm_lower_expr(ctx, scrutinee_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Store", tmp])
     let scrutinee_var = ["Var", tmp]
     let end_jumps = []
@@ -1367,7 +1368,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
       let comp = bm_compile_pattern(pattern, scrutinee_var)
       let test_node = list_get(comp, 0)
       let let_stmts = list_get(comp, 1)
-      let instrs = bm_lower_expr(test_node, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(ctx, test_node, instrs, block_names, immut_params)
       let instrs = list_push(instrs, ["JumpIfFalse", 0])
       let jif_pattern_pos = list_len(instrs) - 1
       # Bindings a pattern introduced (PBind) must exist before the guard
@@ -1377,16 +1378,16 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
       let ln = list_len(let_stmts)
       let li = 0
       while li < ln do
-        let instrs = bm_lower_stmt(list_get(let_stmts, li), instrs, block_names, blocks_by_name, immut_params)
+        let instrs = bm_lower_stmt(ctx, list_get(let_stmts, li), instrs, block_names, blocks_by_name, immut_params)
         let li = li + 1
       end
       let jif_guard_pos = 0 - 1
       if guard != false then
-        let instrs = bm_lower_expr(guard, instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, guard, instrs, block_names, immut_params)
         let instrs = list_push(instrs, ["JumpIfFalse", 0])
         let jif_guard_pos = list_len(instrs) - 1
       end
-      let instrs = bm_lower_stmt_list(body, instrs, block_names, blocks_by_name, immut_params)
+      let instrs = bm_lower_stmt_list(ctx, body, instrs, block_names, blocks_by_name, immut_params)
       let instrs = list_push(instrs, ["Jump", 0])
       let end_jumps = list_push(end_jumps, list_len(instrs) - 1)
       let next_arm_pc = list_len(instrs)
@@ -1409,14 +1410,14 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     let cond = list_get(node, 1)
     let then_stmts = list_get(node, 2)
     let else_stmts = list_get(node, 3)
-    let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, cond, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["JumpIfFalse", 0])
     let jif_pos = list_len(instrs) - 1
-    let instrs = bm_lower_stmt_list(then_stmts, instrs, block_names, blocks_by_name, immut_params)
+    let instrs = bm_lower_stmt_list(ctx, then_stmts, instrs, block_names, blocks_by_name, immut_params)
     let instrs = list_push(instrs, ["Jump", 0])
     let jmp_pos = list_len(instrs) - 1
     let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
-    let instrs = bm_lower_stmt_list(else_stmts, instrs, block_names, blocks_by_name, immut_params)
+    let instrs = bm_lower_stmt_list(ctx, else_stmts, instrs, block_names, blocks_by_name, immut_params)
     let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
     return instrs
   elif ty == "Expr" then
@@ -1424,19 +1425,19 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     if list_get(call, 0) == "Call" then
       let name = list_get(call, 1)
       let call_args = list_get(call, 2)
-      if bm_user_fn_wins(name, block_names) then
-        let instrs = bm_lower_expr(call, instrs, block_names, immut_params)
+      if bm_user_fn_wins(ctx, name, block_names) then
+        let instrs = bm_lower_expr(ctx, call, instrs, block_names, immut_params)
         return list_push(instrs, ["Store", "__bm_discard"])
       elif name == "print" then
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
         return list_push(instrs, ["Print"])
       elif name == "set_global" then
         # Statement-only (unlike get_global): auto-writes "__globals"
         # directly, so it never leaves a value on the stack to consume --
         # exactly matching how the real ambient set_var(...) is used
         # today (a bare statement, never an expression).
-        let instrs = bm_lower_expr(list_get(call_args, 1), instrs, block_names, immut_params)
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 1), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
         let instrs = list_push(instrs, ["Load", "__globals"])
         return list_push(instrs, ["GlobalSet"])
       elif (name == "box_set") or (name == "box_share") or (name == "box_new") or (name == "box_get") or (name == "get_global") or (name == "handler_new") or (name == "handler_register") or (name == "handler_lookup") or (name == "type_of") or (name == "read_file") or (name == "write_file") or (name == "query") then
@@ -1455,21 +1456,21 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         # names funnel through it. Never previously exercised because no
         # earlier fixture chained two of these bare-statement calls (or
         # one plus anything else) in the same block.
-        let instrs = bm_lower_expr(call, instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, call, instrs, block_names, immut_params)
         return list_push(instrs, ["Store", "__bm_discard"])
       elif name == "fact" then
         # Bare statement, matching print/emit's own convention -- fact()
         # returns Unit in the real host function too, never consumed.
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
-        let instrs = bm_lower_expr(list_get(call_args, 1), instrs, block_names, immut_params)
-        let instrs = bm_lower_expr(list_get(call_args, 2), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 1), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 2), instrs, block_names, immut_params)
         return list_push(instrs, ["Fact"])
       elif name == "fiber_yield" then
         # Mid-block, same reasoning as emit's own lowering: fiber_yield
         # returns whatever the corresponding fiber_resume passed, and this
         # engine's programs need to keep running afterward, not jump away
         # permanently.
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
         return list_push(instrs, ["FiberYield"])
       elif name == "emit" then
         # Mid-block, unlike everything else emitted here (JumpBlock always
@@ -1477,8 +1478,8 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         # Phase 10 header for why: emit() genuinely returns control to the
         # statement after it, matching the real interpreter's own
         # call-with-return semantics, not a jump-and-never-return one.
-        let instrs = bm_lower_expr(list_get(call_args, 1), instrs, block_names, immut_params)
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 1), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
         let instrs = list_push(instrs, ["Load", "__globals"])
         return list_push(instrs, ["Emit"])
       elif name == "apply" then
@@ -1506,27 +1507,27 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         # schema_bdd.patlang's own apply(fn, state, inputs) calls. Shared
         # with bm_lower_expr's value-context "apply" case via
         # bm_lower_apply, so the two contexts cannot drift apart.
-        let instrs = bm_lower_apply(call_args, instrs, block_names, immut_params)
+        let instrs = bm_lower_apply(ctx, call_args, instrs, block_names, immut_params)
         return list_push(instrs, ["Store", "__bm_discard"])
       elif name == "thread_spawn" then
         let unused_spawn_check = bm_check_spawn_arg(call_args)
         # Issue #184: same as bm_lower_expr's own case, used as a bare
         # statement (the spawned-thread id is still produced and
         # discarded, matching apply's own bare-statement handling above).
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
         let instrs = list_push(instrs, ["ThreadSpawn"])
         return list_push(instrs, ["Store", "__bm_discard"])
       elif name == "thread_result" then
         # Issue #184: same as bm_lower_expr's own case, used as a bare
         # statement.
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(ctx, list_get(call_args, 0), instrs, block_names, immut_params)
         let instrs = list_push(instrs, ["CallHost", "thread_result", 1])
         let instrs = list_push(instrs, ["Const", "num", "0"])
         let instrs = list_push(instrs, ["CallHost", "list_get", 2])
         return list_push(instrs, ["Store", "__bm_discard"])
-      elif bm_is_fn_bound_name(name) then
+      elif bm_is_fn_bound_name(ctx, name) then
         # Issue #182: a call through a closure value used as a statement.
-        let instrs = bm_lower_closure_call(name, call_args, instrs, block_names, immut_params)
+        let instrs = bm_lower_closure_call(ctx, name, call_args, instrs, block_names, immut_params)
         return list_push(instrs, ["Store", "__bm_discard"])
       elif bm_list_contains(block_names, name) then
         # Phase 22: a real, previously-undisclosed, confirmed correctness
@@ -1552,7 +1553,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         let ai = 0
         let an = list_len(call_args)
         while ai < an do
-          let instrs = bm_lower_expr(list_get(call_args, ai), instrs, block_names, immut_params)
+          let instrs = bm_lower_expr(ctx, list_get(call_args, ai), instrs, block_names, immut_params)
           let ai = ai + 1
         end
         let instrs = list_push(instrs, ["Load", "__globals"])
@@ -1574,21 +1575,21 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         let ai = 0
         let an = list_len(call_args)
         while ai < an do
-          let instrs = bm_lower_expr(list_get(call_args, ai), instrs, block_names, immut_params)
+          let instrs = bm_lower_expr(ctx, list_get(call_args, ai), instrs, block_names, immut_params)
           let ai = ai + 1
         end
         let instrs = list_push(instrs, ["CallHost", name, an])
         return list_push(instrs, ["Store", "__bm_discard"])
       end
     end
-    let instrs = bm_lower_expr(call, instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, call, instrs, block_names, immut_params)
     return list_push(instrs, ["Store", "__bm_discard"])
   elif ty == "Return" then
     let e = list_get(node, 1)
-    if (list_get(e, 0) == "Call") and (not bm_lowering_library()) then
+    if (list_get(e, 0) == "Call") and (not bm_lowering_library(ctx)) then
       let name = list_get(e, 1)
       if bm_list_contains(block_names, name) then
-        return bm_lower_jump_call(e, instrs, block_names, blocks_by_name, immut_params)
+        return bm_lower_jump_call(ctx, e, instrs, block_names, blocks_by_name, immut_params)
       end
     end
     # Phase 21: any other EXPR shape (not itself a TAIL call to a
@@ -1601,7 +1602,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # supersedes the earlier, narrower restriction here (kept in this
     # file's own history/commit log, not restated) that only accepted a
     # tail call as EXPR at all.
-    let instrs = bm_lower_expr(e, instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(ctx, e, instrs, block_names, immut_params)
     return list_push(instrs, ["ReturnValue"])
   end
   bm_lower_unsupported("statement shape '" + ty + "'")
@@ -1633,14 +1634,14 @@ make a function called bm_relocate_jumps takes frag, base returns out
   return out
 end
 
-make a function called bm_lower_stmt_list takes stmts, instrs, block_names, blocks_by_name, immut_params returns out
+make a function called bm_lower_stmt_list takes ctx, stmts, instrs, block_names, blocks_by_name, immut_params returns out
   let n = list_len(stmts)
   let i = 0
   while i < n do
     # Issue #156: lower into a fresh fragment and append it inline, rather
     # than handing the growing `instrs` to a callee (which would copy it on
     # every statement: O(n^2) in the body's statement count).
-    let frag = bm_relocate_jumps(bm_lower_stmt(list_get(stmts, i), [], block_names, blocks_by_name, immut_params), list_len(instrs))
+    let frag = bm_relocate_jumps(bm_lower_stmt(ctx, list_get(stmts, i), [], block_names, blocks_by_name, immut_params), list_len(instrs))
     let frag_n = list_len(frag)
     let fi = 0
     while fi < frag_n do
@@ -1652,9 +1653,9 @@ make a function called bm_lower_stmt_list takes stmts, instrs, block_names, bloc
   return instrs
 end
 
-make a function called bm_next_synth_name takes prefix returns name
-  let n = get("__vars", "bm_synth_counter")
-  set_var("bm_synth_counter", n + 1)
+make a function called bm_next_synth_name takes ctx, prefix returns name
+  let n = ctx_read(ctx, "bm_synth_counter")
+  ctx_set(ctx, "bm_synth_counter", n + 1)
   return prefix + "_" + n
 end
 
@@ -1963,11 +1964,11 @@ end
 # names may go unused by the after-block). Tightening this to genuine
 # free-variable precision is real, separate follow-up work, not
 # attempted in this same pass.
-make a function called bm_lower_if_with_nested_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
+make a function called bm_lower_if_with_nested_while takes ctx, stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
   let cond = list_get(stmt, 1)
   let then_stmts = list_get(stmt, 2)
   let else_stmts = list_get(stmt, 3)
-  let after_name = bm_next_synth_name("__if_after")
+  let after_name = bm_next_synth_name(ctx, "__if_after")
   # GitHub #222: `after_known_locals` extends known_locals with every
   # name EITHER then_stmts or else_stmts binds via `let` -- it seeds
   # ONLY the AFTER-block's own known_locals/jump_params (the after
@@ -2013,21 +2014,21 @@ make a function called bm_lower_if_with_nested_while takes stmt, stmts, idx, ins
   let jump_params = list_push(after_known_locals, "__globals")
   let after_k = ["jump", after_name, after_known_locals, jump_params]
 
-  let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
+  let instrs = bm_lower_expr(ctx, cond, instrs, block_names, immut_params)
   let instrs = list_push(instrs, ["JumpIfFalse", 0])
   let jif_pos = list_len(instrs) - 1
 
-  let then_result = bm_lower_top_level_stmt_list(then_stmts, 0, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, [], after_k)
+  let then_result = bm_lower_top_level_stmt_list(ctx, then_stmts, 0, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, [], after_k)
   let instrs = list_get(then_result, 0)
   let pending = list_get(then_result, 1)
 
   let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
 
-  let else_result = bm_lower_top_level_stmt_list(else_stmts, 0, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, [], after_k)
+  let else_result = bm_lower_top_level_stmt_list(ctx, else_stmts, 0, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, [], after_k)
   let instrs = list_get(else_result, 0)
   let pending = list_get(else_result, 1)
 
-  let after_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, after_known_locals, pending, [], k)
+  let after_result = bm_lower_top_level_stmt_list(ctx, stmts, idx + 1, [], block_names, blocks_by_name, immut_params, after_known_locals, pending, [], k)
   let after_instrs = list_get(after_result, 0)
   let pending = list_get(after_result, 1)
   let pending = list_push(pending, ["BlockIR", after_name, jump_params, bm_hash_rewrite_instrs(after_instrs)])
@@ -2065,19 +2066,19 @@ make a function called bm_is_tail_safe_bare_call takes stmt, block_names returns
   return bm_list_contains(block_names, list_get(call, 1))
 end
 
-make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, fresh, k returns out
+make a function called bm_lower_top_level_stmt_list takes ctx, stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, fresh, k returns out
   let n = list_len(stmts)
   let i = start_idx
   while i < n do
     let stmt = list_get(stmts, i)
     let ty = list_get(stmt, 0)
     if ty == "While" then
-      return bm_lower_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
+      return bm_lower_while(ctx, stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
     elif ty == "Let" then
       let val_node = list_get(stmt, 2)
       # Issue #156: lower into a fresh fragment (patched and relocated below)
       # and append it inline -- see bm_relocate_jumps.
-      let frag = bm_lower_stmt(stmt, [], block_names, blocks_by_name, immut_params)
+      let frag = bm_lower_stmt(ctx, stmt, [], block_names, blocks_by_name, immut_params)
       # Issue #156: a set of names, so a rebinding does not grow it.
       if not bm_list_contains(known_locals, list_get(stmt, 1)) then
         let known_locals = list_push(known_locals, list_get(stmt, 1))
@@ -2112,8 +2113,8 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # If. Own dispatch case (not folded into the `else` below) so it's
       # checked BEFORE falling through to the unconditional, ordinary
       # If handling.
-      return bm_lower_if_with_nested_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
-    elif (i == n - 1) and (list_get(k, 0) == "none") and (not bm_lowering_library()) and bm_is_tail_safe_bare_call(stmt, block_names) then
+      return bm_lower_if_with_nested_while(ctx, stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
+    elif (i == n - 1) and (list_get(k, 0) == "none") and (not bm_lowering_library(ctx)) and bm_is_tail_safe_bare_call(stmt, block_names) then
       # Phase 22: a bare statement call to a declared block-model
       # function is a genuinely safe, one-way JumpBlock tail call ONLY
       # here -- truly the LAST statement of this top-level list, with no
@@ -2135,7 +2136,7 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # branch used to return the bare instruction list, so its caller read
       # the first instruction as `instrs` and the second as the synthesized
       # block list -- a regression from #149's fix that no fixture reached.
-      return [bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params), pending]
+      return [bm_lower_jump_call(ctx, call, instrs, block_names, blocks_by_name, immut_params), pending]
     elif ty == "If" then
       # GitHub #222: an ordinary if/else (already excluded from the
       # nested-while case above) that unconditionally binds a name in
@@ -2154,7 +2155,7 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
         end
         let bi2 = bi2 + 1
       end
-      let frag = bm_relocate_jumps(bm_lower_stmt(stmt, [], block_names, blocks_by_name, immut_params), list_len(instrs))
+      let frag = bm_relocate_jumps(bm_lower_stmt(ctx, stmt, [], block_names, blocks_by_name, immut_params), list_len(instrs))
       let frag_n = list_len(frag)
       let fi = 0
       while fi < frag_n do
@@ -2168,7 +2169,7 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # invalidate `fresh` entirely -- this narrow, straight-line-only
       # analysis doesn't reason through any of these (flight_check
       # .patlang's own header).
-      let frag = bm_relocate_jumps(bm_lower_stmt(stmt, [], block_names, blocks_by_name, immut_params), list_len(instrs))
+      let frag = bm_relocate_jumps(bm_lower_stmt(ctx, stmt, [], block_names, blocks_by_name, immut_params), list_len(instrs))
       let frag_n = list_len(frag)
       let fi = 0
       while fi < frag_n do
@@ -2182,11 +2183,11 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
   return bm_apply_continuation(k, instrs, pending, known_locals)
 end
 
-make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
+make a function called bm_lower_while takes ctx, stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
   let cond = list_get(stmt, 1)
   let body_stmts = list_get(stmt, 2)
-  let head_name = bm_next_synth_name("__loop_head")
-  let exit_name = bm_next_synth_name("__loop_exit")
+  let head_name = bm_next_synth_name(ctx, "__loop_head")
+  let exit_name = bm_next_synth_name(ctx, "__loop_exit")
   # Phase 6 (Fork E): real free-variable analysis over the loop body,
   # intersected with known_locals (a name free in the body but not bound
   # anywhere in the enclosing scope is a genuine unbound-variable bug,
@@ -2218,7 +2219,7 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # then `while i < n do ... end` where the body never re-mentions `n`),
   # was missing from the head block's own forwarded params entirely,
   # since body_free only ever scanned body_stmts. A real, confirmed,
-  # pre-existing bug -- found via self_hosting/lib/test.patlang's own
+  # pre-existing bug -- found via self_hosting/lib/gherkin.patlang's own
   # run_feature (`let n = sc_len(h); while i <= n do ... end`, `n` never
   # referenced again inside the loop body) while re-attempting Phase
   # 18's own checkpoint one level further out. Confirmed via a minimal,
@@ -2256,7 +2257,7 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # function returns: a raw word derived from a value (an address, a buffer)
   # is used after the value's last mention, and releasing the value when a
   # loop no longer names it freed what the loop still read.
-  if bm_lowering_library() then
+  if bm_lowering_library(ctx) then
     let captured = bm_union_preserving_order(captured, known_locals)
   end
   let jump_params = list_push(captured, "__globals")
@@ -2282,15 +2283,15 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # fixed as part of this same phase, not merely worked around for the
   # NEW if-with-nested-while case this phase also adds.
   let back_edge_k = ["jump", head_name, captured, jump_params]
-  if get("__vars", "bm_budgeted_depth") > 0 then
+  if ctx_read(ctx, "bm_budgeted_depth") > 0 then
     # Issue #176: lexically inside a budgeted block -- the back-edge yields
     # when the deadline is near (bm_apply_continuation reads the 5th slot).
     let back_edge_k = list_push(back_edge_k, true)
   end
-  let head_instrs = bm_lower_expr(cond, [], block_names, immut_params)
+  let head_instrs = bm_lower_expr(ctx, cond, [], block_names, immut_params)
   let head_instrs = list_push(head_instrs, ["JumpIfFalse", 0])
   let jif_pos = list_len(head_instrs) - 1
-  let body_result = bm_lower_top_level_stmt_list(body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending, [], back_edge_k)
+  let body_result = bm_lower_top_level_stmt_list(ctx, body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending, [], back_edge_k)
   let head_instrs = list_get(body_result, 0)
   let pending = list_get(body_result, 1)
   let head_instrs = list_set(head_instrs, jif_pos, ["JumpIfFalse", list_len(head_instrs)])
@@ -2305,7 +2306,7 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   #    `["none"]`) -- so a while nested inside yet another construct
   #    still correctly reaches whatever THAT construct needs once this
   #    whole while (and everything after it) is finally done.
-  let exit_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [], k)
+  let exit_result = bm_lower_top_level_stmt_list(ctx, stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [], k)
   let exit_instrs = list_get(exit_result, 0)
   let pending = list_get(exit_result, 1)
   let pending = list_push(pending, ["BlockIR", exit_name, jump_params, bm_hash_rewrite_instrs(exit_instrs)])
@@ -2780,25 +2781,28 @@ end
 # f's blocks, which would release the caller's locals before f had used
 # what it was handed from them.
 make a function called bm_lower_library_program takes ast returns prog
-  set_var("bm_lower_library", true)
-  let prog = bm_lower_program(ast)
-  set_var("bm_lower_library", false)
-  return prog
+  return bm_lower_program_as(ast, true)
 end
 
-make a function called bm_lowering_library returns yes
-  return get("__vars", "bm_lower_library") == true
+make a function called bm_lowering_library takes ctx returns yes
+  return ctx_read(ctx, "bm_lower_library") == true
 end
 
 make a function called bm_lower_program takes ast returns prog
+  return bm_lower_program_as(ast, false)
+end
+
+make a function called bm_lower_program_as takes ast, library returns prog
+  let ctx = context_new()
+  ctx_set(ctx, "bm_lower_library", library)
   let ast = bm_inject_closure_entry_helper(ast)
-  set_var("bm_synth_counter", 0)
-  set_var("bm_closure_blocks", [])
-  set_var("bm_budgeted_depth", 0)
-  set_var("bm_fn_bound_names", [])
-  set_var("bm_fn_seen_names", [])
-  set_var("bm_ct_blocks_by_name", [])
-  set_var("bm_uses_box", bm_ast_uses_box(list_get(ast, 1)))
+  ctx_set(ctx, "bm_synth_counter", 0)
+  ctx_set(ctx, "bm_closure_blocks", [])
+  ctx_set(ctx, "bm_budgeted_depth", 0)
+  ctx_set(ctx, "bm_fn_bound_names", [])
+  ctx_set(ctx, "bm_fn_seen_names", [])
+  ctx_set(ctx, "bm_ct_blocks_by_name", [])
+  ctx_set(ctx, "bm_uses_box", bm_ast_uses_box(list_get(ast, 1)))
   let stmts = bm_collect_toplevel_main(bm_expand_classes(bm_dedupe_decls(list_get(ast, 1))))
   let n = list_len(stmts)
 
@@ -2809,7 +2813,7 @@ make a function called bm_lower_program takes ast returns prog
   # declaring `inherits`/methods/traits is rejected here, plainly, before
   # any of its fields are even registered -- see this file's own Phase 13
   # header note for exactly why those three are out of scope.
-  set_var("bm_class_registry", [])
+  ctx_set(ctx, "bm_class_registry", [])
   let i = 0
   while i < n do
     let stmt = list_get(stmts, i)
@@ -2822,7 +2826,7 @@ make a function called bm_lower_program takes ast returns prog
       # Issue #175: inherits, methods and traits are now handled by
       # bm_expand_classes before this pass (see classes.patlang); the registry
       # here still holds each class's OWN fields, for new("Class") objects.
-      set_var("bm_class_registry", bm_class_registry_set(get("__vars", "bm_class_registry"), cname, cfields))
+      ctx_set(ctx, "bm_class_registry", bm_class_registry_set(ctx_read(ctx, "bm_class_registry"), cname, cfields))
     end
     let i = i + 1
   end
@@ -2864,8 +2868,8 @@ make a function called bm_lower_program takes ast returns prog
   # immut_params (its declared params WITHOUT the `mut_` prefix) is
   # recomputed here, per block -- box_set's mut-check only ever looks at
   # THIS block's own parameter list, never a caller's or callee's.
-  set_var("bm_ct_blocks_by_name", blocks_by_name)
-  set_var("bm_declared_fn_names", block_names)
+  ctx_set(ctx, "bm_ct_blocks_by_name", blocks_by_name)
+  ctx_set(ctx, "bm_declared_fn_names", block_names)
   let blocks = []
   let events = []
   # GitHub #199: the entry used to be unconditionally "the first Func
@@ -2909,7 +2913,7 @@ make a function called bm_lower_program takes ast returns prog
       write_file("self_hosting/build/genb_tempdebug.txt", "lowering-fn i=" + i + "/" + n + " name=" + name + " t_ms=" + now_ms())
       let declared_params = list_get(stmt, 2)
       let params = list_push(declared_params, "__globals")
-      let body = bm_expand_activate_list(list_get(stmt, 3))
+      let body = bm_expand_activate_list(ctx, list_get(stmt, 3))
       # GitHub #225: the native x64 PE entry point is invoked by the OS
       # with zero PatLang-level arguments -- a fallback candidate with
       # its own declared parameters can never correctly serve as it (the
@@ -2941,10 +2945,10 @@ make a function called bm_lower_program takes ast returns prog
         end
         let pi = pi + 1
       end
-      set_var("bm_fn_bound_names", bm_bound_names_of(declared_params, body))
-      set_var("bm_fn_seen_names", declared_params)
-      set_var("bm_current_fn", name)
-      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [], ["none"])
+      ctx_set(ctx, "bm_fn_bound_names", bm_bound_names_of(declared_params, body))
+      ctx_set(ctx, "bm_fn_seen_names", declared_params)
+      ctx_set(ctx, "bm_current_fn", name)
+      let top_result = bm_lower_top_level_stmt_list(ctx, body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [], ["none"])
       let instrs = list_get(top_result, 0)
       let synthesized = list_get(top_result, 1)
       let blocks = list_push(blocks, ["BlockIR", name, params, bm_hash_rewrite_instrs(instrs)])
@@ -2960,20 +2964,20 @@ make a function called bm_lower_program takes ast returns prog
       # declared function) and why this handler is never added to the
       # program's own block_names -- it's reachable only through `events`.
       let event_name = list_get(stmt, 1)
-      let body = bm_expand_activate_list(list_get(stmt, 2))
-      let handler_name = bm_next_synth_name("__on_" + event_name)
+      let body = bm_expand_activate_list(ctx, list_get(stmt, 2))
+      let handler_name = bm_next_synth_name(ctx, "__on_" + event_name)
       let handler_params = ["event_name", "event_data", "__globals"]
       let handler_immut_params = ["event_name", "event_data"]
       let handler_known_locals = ["event_name", "event_data"]
-      set_var("bm_fn_bound_names", bm_bound_names_of(["event_name", "event_data"], body))
-      set_var("bm_fn_seen_names", ["event_name", "event_data"])
-      set_var("bm_current_fn", handler_name)
+      ctx_set(ctx, "bm_fn_bound_names", bm_bound_names_of(["event_name", "event_data"], body))
+      ctx_set(ctx, "bm_fn_seen_names", ["event_name", "event_data"])
+      ctx_set(ctx, "bm_current_fn", handler_name)
       # Issue #178: the declared-function tables are passed for real, so a
       # handler can call declared functions. Phase 10 passed empty tables
       # because a handler was run as a single bounded step with no way to
       # follow a jump; Emit has run handlers through bi_run_from since Phase
       # 21 (jumps and value calls both complete before it returns).
-      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, handler_immut_params, handler_known_locals, [], [], ["none"])
+      let top_result = bm_lower_top_level_stmt_list(ctx, body, 0, [], block_names, blocks_by_name, handler_immut_params, handler_known_locals, [], [], ["none"])
       let handler_instrs = list_get(top_result, 0)
       let handler_synth = list_get(top_result, 1)
       let blocks = list_push(blocks, ["BlockIR", handler_name, handler_params, bm_hash_rewrite_instrs(handler_instrs)])
@@ -2988,7 +2992,7 @@ make a function called bm_lower_program takes ast returns prog
     let i = i + 1
   end
   # Issue #182: drain the closure blocks synthesized while lowering expressions.
-  let closure_blocks = get("__vars", "bm_closure_blocks")
+  let closure_blocks = ctx_read(ctx, "bm_closure_blocks")
   let cbi = 0
   while cbi < list_len(closure_blocks) do
     let blocks = list_push(blocks, list_get(closure_blocks, cbi))

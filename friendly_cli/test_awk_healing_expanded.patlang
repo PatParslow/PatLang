@@ -23,7 +23,17 @@
 # Kept as its own small library (not folded directly into patc1_main.patlang)
 # so any self-hosted driver can `include "lib/includes.patlang"` and use it.
 
-# str_trim(s) -> s with leading/trailing space/tab/\r stripped.
+# str_trim(s) -> s with leading/trailing space/tab/\r/\n stripped.
+# GitHub #22: \n was deliberately excluded here originally; audited every
+# call site before changing this shared utility's semantics (per the
+# issue's own explicit request not to "fix" it without checking callers
+# first). Every current caller either trims an already-line-split string
+# (no embedded \n to lose) or explicitly WANTS trailing newlines stripped
+# (the two run_benchmarks.patlang/webcrawler.patlang callers comparing a
+# captured-output blob across execution paths -- the original bug report
+# that surfaced this: str_trim() alone didn't close a trailing-newline
+# difference, needing a separate local helper to finish the job). No
+# caller relies on \n being preserved through a trim call.
 make a function called str_trim takes s returns trimmed
   let n = s.length
   let start = 0
@@ -38,7 +48,7 @@ make a function called str_trim takes s returns trimmed
 end
 
 make a function called is_ws_char takes code returns is_ws
-  return (code == 32) or (code == 9) or (code == 13)
+  return (code == 32) or (code == 9) or (code == 13) or (code == 10)
 end
 
 # str_starts_with(s, prefix) -> bool
@@ -49,25 +59,85 @@ make a function called str_starts_with takes s, prefix returns matches
   return substr(s, 0, prefix.length) == prefix
 end
 
+# str_ends_with(s, suffix) -> bool
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
 # split_lines(s) -> list of lines, split on \n (a trailing \r on each line,
 # from CRLF source files, is stripped too).
+#
+# char_code and substr each check is_ascii() over their WHOLE string
+# argument on every call (hosts.rs and codegen.rs's runtime alike), so a
+# per-character loop over `s` itself is O(n^2). That made assembling one
+# 6 MB function (x64_assemble_chunk splits its whole asm text here) take
+# ~20 minutes. Instead `s` is first cut into pieces of at most 1024
+# characters by repeated halving (each level of halving costs O(n), so
+# O(n log n) overall), and only the short pieces are scanned character by
+# character. A line spanning pieces is carried as a list of segments and
+# joined in a string builder only then (builders are never freed, so one
+# per line would leak; this is at most one per 1024 characters).
+# Checked by self_hosting/tools/split_lines_check.patlang.
 make a function called split_lines takes s returns lines
+  let pieces = split_lines_pieces(s, [])
   let out = []
-  let n = s.length
-  let start = 0
-  let i = 0
-  while i < n do
-    if char_code(s, i) == 10 then
-      let raw = substr(s, start, i - start)
-      let out = list_push(out, strip_trailing_cr(raw))
-      let start = i + 1
+  let carry = []
+  let pi = 0
+  let pn = list_len(pieces)
+  while pi < pn do
+    let piece = list_get(pieces, pi)
+    let m = piece.length
+    let start = 0
+    let i = 0
+    while i < m do
+      if char_code(piece, i) == 10 then
+        let seg = substr(piece, start, i - start)
+        if list_len(carry) > 0 then
+          let seg = split_lines_join(list_push(carry, seg))
+          let carry = []
+        end
+        let out = list_push(out, strip_trailing_cr(seg))
+        let start = i + 1
+      end
+      let i = i + 1
     end
-    let i = i + 1
+    if start < m then
+      let carry = list_push(carry, substr(piece, start, m - start))
+    end
+    let pi = pi + 1
   end
-  if start < n then
-    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  if list_len(carry) > 0 then
+    let out = list_push(out, strip_trailing_cr(split_lines_join(carry)))
   end
   return out
+end
+
+make a function called split_lines_join takes segs returns joined
+  let b = sb_new()
+  let i = 0
+  while i < list_len(segs) do
+    sb_push(b, list_get(segs, i))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Appends `s` to `out` as consecutive pieces of at most 1024 characters,
+# splitting at the largest power-of-two multiple of 1024 below its length.
+make a function called split_lines_pieces takes s, out returns out2
+  let n = s.length
+  if n <= 1024 then
+    return list_push(out, s)
+  end
+  let p = 1024
+  while (p + p) < n do
+    let p = p + p
+  end
+  let out = split_lines_pieces(substr(s, 0, p), out)
+  return split_lines_pieces(substr(s, p, n - p), out)
 end
 
 make a function called strip_trailing_cr takes line returns stripped
@@ -99,6 +169,28 @@ make a function called path_dirname takes path returns dir
     return "."
   end
   return substr(path, 0, last_sep)
+end
+
+# path_basename(path) -> everything after the last '/' or '\', or the
+# whole path if it has no directory component -- the complement of
+# path_dirname above (same separator-scanning loop, opposite half kept).
+make a function called path_basename takes path returns base
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return path
+  end
+  return substr(path, last_sep + 1, n - last_sep - 1)
 end
 
 # path_join(base, rel) -> base + "/" + rel, tolerating a trailing slash on
@@ -152,7 +244,78 @@ make a function called expand_includes takes source, base_dir returns expanded
   return expand_includes_at_depth(source, base_dir, 0)
 end
 
+# expand_includes for a native (--x64) build: an include of a source the
+# runtime already has compiled into x64_runtime.obj (x64_runtime_bundled_
+# source) is dropped, so its functions resolve to the runtime's own copy.
+# A second compiled copy of block_model/heap.patlang ran the same allocator
+# over the same heap and the same lock word: its lock, holding the lock,
+# allocated its own return value through the runtime's bm_alloc, which
+# waited on that lock for ever (the mut_parameters native fixtures).
+make a function called expand_includes_native takes source, base_dir returns expanded
+  return expand_includes_at_depth_opts(source, base_dir, 0, true)
+end
+
+# self_hosting/build_x64_runtime.patlang compiles heap.patlang into the runtime.
+make a function called x64_runtime_bundled_source takes path returns yes
+  let p = path_normalize(path)
+  return (path_basename(p) == "heap.patlang") and (path_basename(path_dirname(p)) == "block_model")
+end
+
+# path with "." segments dropped and each "seg/.." pair removed, "/" between
+# segments ("a/b/../c" -> "a/c"; a leading ".." that has nothing to cancel is
+# kept), so an include reached as "spec_fixtures/../heap.patlang" names its
+# real directory.
+make a function called path_normalize takes path returns out
+  let segs = []
+  let cur = sb_new()
+  let n = path.length
+  let i = 0
+  while i <= n do
+    let c = 47
+    if i < n then
+      let c = char_code(path, i)
+    end
+    if (c == 47) or (c == 92) then
+      let seg = sb_str(cur)
+      let cur = sb_new()
+      if seg == ".." then
+        let k = list_len(segs)
+        if (k > 0) and (segs[k - 1] != "..") and (segs[k - 1] != "") then
+          let kept = []
+          let j = 0
+          while j < k - 1 do
+            let kept = list_push(kept, segs[j])
+            let j = j + 1
+          end
+          let segs = kept
+        else
+          let segs = list_push(segs, seg)
+        end
+      elif (seg != ".") and ((seg != "") or (list_len(segs) == 0)) then
+        let segs = list_push(segs, seg)
+      end
+    else
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  let b = sb_new()
+  let k = 0
+  while k < list_len(segs) do
+    if k > 0 then
+      sb_push(b, "/")
+    end
+    sb_push(b, segs[k])
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
 make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  return expand_includes_at_depth_opts(source, base_dir, depth, false)
+end
+
+make a function called expand_includes_at_depth_opts takes source, base_dir, depth, native returns expanded
   if depth > 16 then
     print("include: nesting deeper than 16 levels (cycle?)")
     return source
@@ -168,10 +331,14 @@ make a function called expand_includes_at_depth takes source, base_dir, depth re
       let rel = str_trim(substr(t, 8, t.length - 8))
       let rel = strip_quotes(rel)
       let path = path_join(base_dir, rel)
-      let inner = read_file(path)
-      let inner_base = path_dirname(path)
-      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
-      sb_push(out, chr(10))
+      if native and x64_runtime_bundled_source(path) then
+        sb_push(out, chr(10))
+      else
+        let inner = read_file(path)
+        let inner_base = path_dirname(path)
+        sb_push(out, expand_includes_at_depth_opts(inner, inner_base, depth + 1, native))
+        sb_push(out, chr(10))
+      end
     else
       sb_push(out, line)
       sb_push(out, chr(10))
@@ -191,21 +358,541 @@ make a function called strip_quotes takes s returns unquoted
   return s
 end
 
-# =============================================================================
-# Test framework (Stage 1 dialect): unit assertions plus a Gherkin-style
-# feature runner. Step definitions are registered in the object store keyed
-# by their text; features are plain text dispatched line by line, so the
-# same framework covers unit, integration, and behaviour tests.
-# =============================================================================
+# Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include "relative/path.patlang"` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of "verified across all three paths."
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include "lib/includes.patlang"` and use it.
 
-make a function called t_init returns done
-  set_var("t_pass", 0)
-  set_var("t_fail", 0)
-  set_var("t_tagfilter", "")
-  set_var("t_pending_tags", "")
-  set_var("t_skipping", 0)
+# str_trim(s) -> s with leading/trailing space/tab/\r/\n stripped.
+# GitHub #22: \n was deliberately excluded here originally; audited every
+# call site before changing this shared utility's semantics (per the
+# issue's own explicit request not to "fix" it without checking callers
+# first). Every current caller either trims an already-line-split string
+# (no embedded \n to lose) or explicitly WANTS trailing newlines stripped
+# (the two run_benchmarks.patlang/webcrawler.patlang callers comparing a
+# captured-output blob across execution paths -- the original bug report
+# that surfaced this: str_trim() alone didn't close a trailing-newline
+# difference, needing a separate local helper to finish the job). No
+# caller relies on \n being preserved through a trim call.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start < n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end > start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13) or (code == 10)
+end
+
+# str_starts_with(s, prefix) -> bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# str_ends_with(s, suffix) -> bool
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
+# split_lines(s) -> list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+#
+# char_code and substr each check is_ascii() over their WHOLE string
+# argument on every call (hosts.rs and codegen.rs's runtime alike), so a
+# per-character loop over `s` itself is O(n^2). That made assembling one
+# 6 MB function (x64_assemble_chunk splits its whole asm text here) take
+# ~20 minutes. Instead `s` is first cut into pieces of at most 1024
+# characters by repeated halving (each level of halving costs O(n), so
+# O(n log n) overall), and only the short pieces are scanned character by
+# character. A line spanning pieces is carried as a list of segments and
+# joined in a string builder only then (builders are never freed, so one
+# per line would leak; this is at most one per 1024 characters).
+# Checked by self_hosting/tools/split_lines_check.patlang.
+make a function called split_lines takes s returns lines
+  let pieces = split_lines_pieces(s, [])
+  let out = []
+  let carry = []
+  let pi = 0
+  let pn = list_len(pieces)
+  while pi < pn do
+    let piece = list_get(pieces, pi)
+    let m = piece.length
+    let start = 0
+    let i = 0
+    while i < m do
+      if char_code(piece, i) == 10 then
+        let seg = substr(piece, start, i - start)
+        if list_len(carry) > 0 then
+          let seg = split_lines_join(list_push(carry, seg))
+          let carry = []
+        end
+        let out = list_push(out, strip_trailing_cr(seg))
+        let start = i + 1
+      end
+      let i = i + 1
+    end
+    if start < m then
+      let carry = list_push(carry, substr(piece, start, m - start))
+    end
+    let pi = pi + 1
+  end
+  if list_len(carry) > 0 then
+    let out = list_push(out, strip_trailing_cr(split_lines_join(carry)))
+  end
+  return out
+end
+
+make a function called split_lines_join takes segs returns joined
+  let b = sb_new()
+  let i = 0
+  while i < list_len(segs) do
+    sb_push(b, list_get(segs, i))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Appends `s` to `out` as consecutive pieces of at most 1024 characters,
+# splitting at the largest power-of-two multiple of 1024 below its length.
+make a function called split_lines_pieces takes s, out returns out2
+  let n = s.length
+  if n <= 1024 then
+    return list_push(out, s)
+  end
+  let p = 1024
+  while (p + p) < n do
+    let p = p + p
+  end
+  let out = split_lines_pieces(substr(s, 0, p), out)
+  return split_lines_pieces(substr(s, p, n - p), out)
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n > 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -> everything before the last '/' or '\', or "." if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return "."
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_basename(path) -> everything after the last '/' or '\', or the
+# whole path if it has no directory component -- the complement of
+# path_dirname above (same separator-scanning loop, opposite half kept).
+make a function called path_basename takes path returns base
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return path
+  end
+  return substr(path, last_sep + 1, n - last_sep - 1)
+end
+
+# path_join(base, rel) -> base + "/" + rel, tolerating a trailing slash on
+# base and an empty base (meaning "current directory"). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like "C:"), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == "") or (base == ".") then
+    return rel
+  end
+  let n = base.length
+  if (n > 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + "/" + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length >= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -> source with every `include "path"`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+# expand_includes for a native (--x64) build: an include of a source the
+# runtime already has compiled into x64_runtime.obj (x64_runtime_bundled_
+# source) is dropped, so its functions resolve to the runtime's own copy.
+# A second compiled copy of block_model/heap.patlang ran the same allocator
+# over the same heap and the same lock word: its lock, holding the lock,
+# allocated its own return value through the runtime's bm_alloc, which
+# waited on that lock for ever (the mut_parameters native fixtures).
+make a function called expand_includes_native takes source, base_dir returns expanded
+  return expand_includes_at_depth_opts(source, base_dir, 0, true)
+end
+
+# self_hosting/build_x64_runtime.patlang compiles heap.patlang into the runtime.
+make a function called x64_runtime_bundled_source takes path returns yes
+  let p = path_normalize(path)
+  return (path_basename(p) == "heap.patlang") and (path_basename(path_dirname(p)) == "block_model")
+end
+
+# path with "." segments dropped and each "seg/.." pair removed, "/" between
+# segments ("a/b/../c" -> "a/c"; a leading ".." that has nothing to cancel is
+# kept), so an include reached as "spec_fixtures/../heap.patlang" names its
+# real directory.
+make a function called path_normalize takes path returns out
+  let segs = []
+  let cur = sb_new()
+  let n = path.length
+  let i = 0
+  while i <= n do
+    let c = 47
+    if i < n then
+      let c = char_code(path, i)
+    end
+    if (c == 47) or (c == 92) then
+      let seg = sb_str(cur)
+      let cur = sb_new()
+      if seg == ".." then
+        let k = list_len(segs)
+        if (k > 0) and (segs[k - 1] != "..") and (segs[k - 1] != "") then
+          let kept = []
+          let j = 0
+          while j < k - 1 do
+            let kept = list_push(kept, segs[j])
+            let j = j + 1
+          end
+          let segs = kept
+        else
+          let segs = list_push(segs, seg)
+        end
+      elif (seg != ".") and ((seg != "") or (list_len(segs) == 0)) then
+        let segs = list_push(segs, seg)
+      end
+    else
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  let b = sb_new()
+  let k = 0
+  while k < list_len(segs) do
+    if k > 0 then
+      sb_push(b, "/")
+    end
+    sb_push(b, segs[k])
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  return expand_includes_at_depth_opts(source, base_dir, depth, false)
+end
+
+make a function called expand_includes_at_depth_opts takes source, base_dir, depth, native returns expanded
+  if depth > 16 then
+    print("include: nesting deeper than 16 levels (cycle?)")
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, "include ") and (str_starts_with(t, "#") == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      if native and x64_runtime_bundled_source(path) then
+        sb_push(out, chr(10))
+      else
+        let inner = read_file(path)
+        let inner_base = path_dirname(path)
+        sb_push(out, expand_includes_at_depth_opts(inner, inner_base, depth + 1, native))
+        sb_push(out, chr(10))
+      end
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes("\"path\"") -> "path" -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n >= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# A Gherkin runner whose state is one explicit context, with no globals
+# (docs/plans/v2-implementation.md, section 7a). test.patlang is the older
+# runner the other suites still use.
+#
+#   let ctx = ctx_new()
+#   step(ctx, "a fresh till", "st_fresh_till")
+#   run_feature_file(ctx, "spec_library/till.feature")
+#   ctx_report(ctx)
+#
+# A step function takes the context and is called by name. It records what
+# it finds with expect(ctx, label, actual, expected), and keeps what a later
+# step needs with ctx_set(ctx, name, value) and ctx_get(ctx, name).
+#
+# The context is a context (context.patlang), then these slots:
+#   2 checks passed       3 checks failed
+#   4 the tag filter      5 the last @tag line, until a scenario takes it
+#   6 skipping this scenario
+#   7 exact steps, a vec of 512 buckets of [text, function name]
+#   8 pattern steps, [text, function name], first registered wins
+#   9 the captures of the step being run, [name, value]
+#   10 contract clauses deferred until a plan binds their variable
+# A context: a run's named state, held by whoever made it and passed explicitly,
+# so nothing is shared by accident (docs/plans/v2-implementation.md, section 7a).
+#
+#   let ctx = context_new()
+#   ctx_set(ctx, "seen", true)
+#   ctx_get(ctx, "seen")
+#
+# A vec: slot 0 a vec of buckets, each a list of [name, value]; slot 1 how many
+# names it holds. A longer-lived kind of context (lib/gherkin.patlang) starts as
+# one of these and adds slots of its own after them. A vec belongs to the thread
+# that made it, so a parallel_map worker is handed the values it needs as items.
+
+make a function called ctx_buckets_new takes n returns buckets
+  let buckets = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  return buckets
+end
+
+make a function called context_new returns ctx
+  let ctx = vec_new()
+  vec_push(ctx, ctx_buckets_new(64))
+  vec_push(ctx, 0)
+  return ctx
+end
+
+# A name's bucket among n, n a power of two. Keys here are short.
+make a function called ctx_slot takes name, n returns k
+  let h = 5381
+  let len = name.length
+  let i = 0
+  while i < len do
+    let h = (h * 33 + char_code(name, i)) % 1073741823
+    let i = i + 1
+  end
+  return h % n
+end
+
+# Twice the buckets, once the names outnumber them by four to one.
+make a function called ctx_grow takes ctx returns done
+  let old = vec_get(ctx, 0)
+  let n = vec_len(old) * 2
+  let buckets = ctx_buckets_new(n)
+  let b = 0
+  while b < vec_len(old) do
+    let entries = vec_get(old, b)
+    let i = 0
+    while i < list_len(entries) do
+      let k = ctx_slot(entries[i][0], n)
+      vec_set(buckets, k, list_push(vec_get(buckets, k), entries[i]))
+      let i = i + 1
+    end
+    let b = b + 1
+  end
+  vec_set(ctx, 0, buckets)
   return true
 end
+
+make a function called ctx_has takes ctx, name returns yes
+  let buckets = vec_get(ctx, 0)
+  let entries = vec_get(buckets, ctx_slot(name, vec_len(buckets)))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A name's value, false when it has none.
+make a function called ctx_get takes ctx, name returns v
+  let buckets = vec_get(ctx, 0)
+  let entries = vec_get(buckets, ctx_slot(name, vec_len(buckets)))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A name's value, the unit value when it has none: an out-of-range read gives unit.
+make a function called ctx_read takes ctx, name returns v
+  if ctx_has(ctx, name) then
+    return ctx_get(ctx, name)
+  end
+  return list_get([], 0)
+end
+
+# A name's value as a number, 0 when it has none.
+make a function called ctx_num takes ctx, name returns n
+  if ctx_has(ctx, name) then
+    return to_num(ctx_get(ctx, name))
+  end
+  return 0
+end
+
+# A name's value as text, "" when it has none.
+make a function called ctx_text takes ctx, name returns s
+  if ctx_has(ctx, name) then
+    return "" + ctx_get(ctx, name)
+  end
+  return ""
+end
+
+# The next number from a counter of this name, from 1.
+make a function called ctx_counter takes ctx, name returns n
+  let n = ctx_num(ctx, name) + 1
+  ctx_set(ctx, name, n)
+  return n
+end
+
+make a function called ctx_set takes ctx, name, v returns done
+  let buckets = vec_get(ctx, 0)
+  let k = ctx_slot(name, vec_len(buckets))
+  let entries = vec_get(buckets, k)
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      vec_set(buckets, k, list_set(entries, i, [name, v]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(buckets, k, list_push(entries, [name, v]))
+  let count = vec_get(ctx, 1) + 1
+  vec_set(ctx, 1, count)
+  if count > vec_len(buckets) * 4 then
+    ctx_grow(ctx)
+  end
+  return true
+end
+
+# A top-level `when` handler takes no arguments, so a program whose handlers use
+# its context holds it in a named object, which is how a handler reaches anything
+# of the program's.
+class ProgramContext {
+  field held = 0
+}
+
+make a function called context_hold takes ctx returns done
+  new("ProgramContext", "program_context")
+  send("program_context", "set", "held", ctx)
+  return true
+end
+
+make a function called context_held returns ctx
+  return get("program_context", "held")
+end
+
+# Text helpers shared by the Gherkin runners (test.patlang, gherkin.patlang)
+# and the step files that use them.
 
 make a function called contains_text takes hay, needle returns r
   if needle.length > hay.length then
@@ -219,40 +906,6 @@ make a function called contains_text takes hay, needle returns r
     let i = i + 1
   end
   return false
-end
-
-make a function called check takes label, actual, expected returns ok
-  if actual == expected then
-    set_var("t_pass", get("__vars", "t_pass") + 1)
-    print("  ok: " + label)
-    return true
-  else
-    set_var("t_fail", get("__vars", "t_fail") + 1)
-    print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
-    return false
-  end
-end
-
-make a function called t_report returns ok
-  let p = get("__vars", "t_pass")
-  let f = get("__vars", "t_fail")
-  print("tests: " + p + " passed, " + f + " failed")
-  if f == 0 then
-    print("ALL TESTS PASSED")
-    return true
-  else
-    print("TESTS FAILED")
-    return false
-  end
-end
-
-# ---- Gherkin runner ----
-
-# Register a step: step("a fresh till", "st_fresh_till")
-make a function called step takes text, fname returns done
-  new("Step", text)
-  send(text, "set", "fn", fname)
-  return true
 end
 
 make a function called starts_with takes s, prefix returns r
@@ -293,76 +946,649 @@ make a function called step_text takes line returns out
   return ""
 end
 
-# Run only scenarios whose preceding @tag line contains `tag` ("" = all)
-make a function called run_feature_tagged takes feature, tag returns ok
-  set_var("t_tagfilter", tag)
-  return run_feature(feature)
-end
+# Gherkin contract clauses (GitHub issue #12; see gherkin_contracts.patlang's
+# header for the design): parsing `<ident> <op> <literal>`, evaluating it, and
+# checking clauses against a GOAP plan's bindings. No state of their own, so
+# both Gherkin runners (test.patlang, gherkin.patlang) use them.
 
-make a function called run_feature_file takes path returns ok
-  return run_feature(read_file(path))
-end
-
-make a function called run_feature takes feature returns ok
-  let h = str_intern(feature)
-  let n = sc_len(h)
+make a function called gc_split_ws takes s returns parts
+  let parts = []
+  let cur = sb_new()
   let i = 0
-  let line = sb_new()
-  while i <= n do
-    let c = sc_code(h, i)
-    if (c == 10) or (c == -1) then
-      let raw = trim_left(sb_str(line))
-      let line = sb_new()
-      if starts_with(raw, "@") then
-        set_var("t_pending_tags", raw)
+  while i < s.length do
+    let c = char_code(s, i)
+    if c == 32 then
+      if sb_str(cur).length > 0 then
+        let parts = list_push(parts, sb_str(cur))
+        let cur = sb_new()
       end
-      if starts_with(raw, "Feature:") then
-        print(raw)
-      end
-      if starts_with(raw, "Scenario:") then
-        let filter = get("__vars", "t_tagfilter")
-        let tags = get("__vars", "t_pending_tags")
-        set_var("t_pending_tags", "")
-        if filter then
-          if tags then
-            if contains_text(tags, filter) then
-              set_var("t_skipping", 0)
-              print(raw + "  [" + tags + "]")
-            else
-              set_var("t_skipping", 1)
-              print(raw + "  [skipped: needs " + filter + "]")
-            end
-          else
-            set_var("t_skipping", 1)
-            print(raw + "  [skipped: needs " + filter + "]")
-          end
-        else
-          set_var("t_skipping", 0)
-          print(raw)
-        end
-      else
-        let text = step_text(raw)
-        if (text != "") and (get("__vars", "t_skipping") != 1) then
-          let fname = get(text, "fn")
-          if fname then
-            apply(fname)
-          else
-            set_var("t_fail", get("__vars", "t_fail") + 1)
-            print("  FAIL: undefined step: " + text)
-          end
-        end
-      end
-      let i = i + 1
     else
-      if c == 13 then
-        let i = i + 1
-      else
-        sb_push(line, sc_char(h, i))
-        let i = i + 1
-      end
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  if sb_str(cur).length > 0 then
+    let parts = list_push(parts, sb_str(cur))
+  end
+  return parts
+end
+
+# parse_contract_clause("x < 10") -> ["x", "<", "10"]
+# On malformed input (not exactly 3 tokens), returns ["ERR", message].
+make a function called parse_contract_clause takes text returns clause
+  let tokens = gc_split_ws(text)
+  if to_num(list_len(tokens)) != 3 then
+    return ["ERR", "malformed contract clause (expected '<ident> <op> <literal>'): " + text]
+  end
+  return tokens
+end
+
+make a function called eval_cmp takes op, lhs, rhs returns ok
+  if op == "<" then
+    return lhs < rhs
+  end
+  if op == "<=" then
+    return lhs <= rhs
+  end
+  if op == ">" then
+    return lhs > rhs
+  end
+  if op == ">=" then
+    return lhs >= rhs
+  end
+  if op == "==" then
+    return lhs == rhs
+  end
+  if op == "!=" then
+    return lhs != rhs
+  end
+  return false
+end
+
+# GitHub #49: representation/type invariants (e.g. `ensure x_kind == "bigint"`)
+# compare a bound value against a NON-numeric literal, so the ident/op/literal
+# grammar can't blindly to_num() both sides the way the original numeric-only
+# design did. Ordering-only (< <= > >=) still requires numbers -- there's no
+# sensible non-numeric ordering here -- but == and != fall back to raw string
+# comparison whenever either side fails to parse as a number.
+make a function called looks_numeric takes s returns ok
+  return to_num(s) or (s == "0")
+end
+
+make a function called eval_cmp_typed takes op, lhs_raw, rhs_raw returns ok
+  if (op == "==") or (op == "!=") then
+    if looks_numeric(lhs_raw) and looks_numeric(rhs_raw) then
+      return eval_cmp(op, to_num(lhs_raw), to_num(rhs_raw))
+    else
+      return eval_cmp(op, lhs_raw, rhs_raw)
     end
   end
+  return eval_cmp(op, to_num(lhs_raw), to_num(rhs_raw))
+end
+
+make a function called gc_find_substr takes hay, needle returns idx
+  if needle.length == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Extract the bound value of `var_name` from a GOAP plan-step label like
+# "scale(X=5)" or "assemble(X=final,Y=base)" (see action_instance_label,
+# rust-runtime/src/ir/hosts.rs). Returns "" if that label doesn't bind
+# this variable at all.
+make a function called gc_extract_binding takes label, var_name returns value
+  let needle = var_name + "="
+  let idx = gc_find_substr(label, needle)
+  if idx < 0 then
+    return ""
+  end
+  let start = idx + needle.length
+  let i = start
+  let scanning = true
+  while (i < label.length) and scanning do
+    let c = label[i]
+    if (c == ",") or (c == ")") then
+      let scanning = false
+    else
+      let i = i + 1
+    end
+  end
+  return substr(label, start, i - start)
+end
+
+# goap_verify_contracts(clauses, plan_labels) -> ok
+#
+# clauses: a list of ["require"|"ensure", var, op, literal] tuples, e.g.
+# what handle_contract_step stashes onto "t_pending_contracts" while
+# deferred. plan_labels: the list of strings plan() returns.
+#
+# Evaluates each clause against whichever plan step's label actually
+# binds that variable -- the guard is checked once against the concrete
+# value GOAP's search settled on, BEFORE that candidate is accepted or
+# any code is generated for it (see the design note at the top of this
+# file). A clause referencing a variable no step binds at all is treated
+# as a failure (there is nothing real to check it against). Prints an
+# ok/FAIL diagnostic per clause but deliberately does NOT touch t_fail
+# itself -- the caller decides, via its own check(...), whether the
+# returned boolean was the outcome that scenario expected (a deliberately
+# violating candidate being correctly rejected is itself a PASSING test).
+make a function called goap_verify_contracts takes clauses, plan_labels returns ok
+  let all_ok = true
+  let ci = 0
+  let cn = to_num(list_len(clauses))
+  while ci < cn do
+    let clause = list_get(clauses, ci)
+    let kind = list_get(clause, 0)
+    let var_name = list_get(clause, 1)
+    let op = list_get(clause, 2)
+    let literal = to_num(list_get(clause, 3))
+    let found = false
+    let li = 0
+    let ln = to_num(list_len(plan_labels))
+    while (li < ln) and (found == false) do
+      let label = list_get(plan_labels, li)
+      let raw = gc_extract_binding(label, var_name)
+      if raw != "" then
+        let found = true
+        let bound = to_num(raw)
+        let ok = eval_cmp(op, bound, literal)
+        if ok then
+          print("  ok: " + kind + " " + var_name + " " + op + " " + list_get(clause, 3) + " (from " + label + ")")
+        else
+          print("  FAIL: " + kind + " violated by synthesized plan: " + label)
+          let all_ok = false
+        end
+      end
+      let li = li + 1
+    end
+    if found == false then
+      print("  FAIL: " + kind + " references a variable no plan step binds: " + var_name)
+      let all_ok = false
+    end
+    let ci = ci + 1
+  end
+  return all_ok
+end
+
+# =============================================================================
+# step_match: match a line of Gherkin text against a template with {name}
+# placeholders and return what each placeholder captured.
+#
+#   sm_match("\"{member}\" borrows \"{title}\"", "\"A. Diallo\" borrows \"Dune\"")
+#     -> ["ok", [["member", "A. Diallo"], ["title", "Dune"]]]
+#   a line of a different shape -> ["no", []]
+#
+# Matching is leftmost-literal: each placeholder captures up to the first
+# occurrence of the literal text that follows it, and the last placeholder
+# captures up to the end of the line (or up to a trailing literal, which must
+# be the line's suffix). A capture is never empty, and two placeholders need
+# literal text between them. Every scan goes through interned-string handles
+# (sc_len/sc_code/sc_substr), which index in O(1); substr/char_code would
+# re-check the whole string per call.
+# =============================================================================
+
+# Splits a template into [literals, names]; literals has one more element
+# than names, and the template is literal0 {name0} literal1 {name1} ... literalN.
+make a function called sm_parse_template takes template returns parsed
+  let h = str_intern(template)
+  let n = sc_len(h)
+  let literals = []
+  let names = []
+  let cur = sb_new()
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if c == 123 then
+      let j = i + 1
+      let nm = sb_new()
+      while (j < n) and (sc_code(h, j) != 125) do
+        sb_push(nm, sc_char(h, j))
+        let j = j + 1
+      end
+      let literals = list_push(literals, sb_str(cur))
+      let cur = sb_new()
+      let names = list_push(names, sb_str(nm))
+      let i = j + 1
+    else
+      sb_push(cur, sc_char(h, i))
+      let i = i + 1
+    end
+  end
+  let literals = list_push(literals, sb_str(cur))
+  return [literals, names]
+end
+
+# True when literal text `lit` sits in handle `h` (length hn) starting at `at`.
+make a function called sm_at takes h, hn, lit, at returns found
+  let hl = str_intern(lit)
+  let ln = sc_len(hl)
+  if at < 0 then
+    return false
+  end
+  if at + ln > hn then
+    return false
+  end
+  let k = 0
+  while k < ln do
+    if sc_code(h, at + k) != sc_code(hl, k) then
+      return false
+    end
+    let k = k + 1
+  end
   return true
+end
+
+# Index of the first occurrence of `lit` in handle `h` at or after `from`, or -1.
+make a function called sm_find takes h, hn, lit, from returns idx
+  let ln = sc_len(str_intern(lit))
+  let i = from
+  while i + ln <= hn do
+    if sm_at(h, hn, lit, i) then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called sm_match takes template, text returns result
+  let parsed = sm_parse_template(template)
+  let lits = parsed[0]
+  let names = parsed[1]
+  let nn = to_num(list_len(names))
+  let ht = str_intern(text)
+  let tn = sc_len(ht)
+  let lead = lits[0]
+  let lead_len = sc_len(str_intern(lead))
+  if sm_at(ht, tn, lead, 0) == false then
+    return ["no", []]
+  end
+  if nn == 0 then
+    if lead_len == tn then
+      return ["ok", []]
+    end
+    return ["no", []]
+  end
+  let pos = lead_len
+  let caps = []
+  let k = 0
+  while k < nn do
+    let lit = lits[k + 1]
+    let lit_len = sc_len(str_intern(lit))
+    let cap = ""
+    if k == nn - 1 then
+      let stop = tn - lit_len
+      if stop < pos then
+        return ["no", []]
+      end
+      if sm_at(ht, tn, lit, stop) == false then
+        return ["no", []]
+      end
+      let cap = sc_substr(ht, pos, stop - pos)
+      let pos = tn
+    else
+      if lit_len == 0 then
+        return ["no", []]
+      end
+      let idx = sm_find(ht, tn, lit, pos)
+      if idx < 0 then
+        return ["no", []]
+      end
+      let cap = sc_substr(ht, pos, idx - pos)
+      let pos = idx + lit_len
+    end
+    if cap == "" then
+      return ["no", []]
+    end
+    let caps = list_push(caps, [names[k], cap])
+    let k = k + 1
+  end
+  return ["ok", caps]
+end
+
+# The inverse of sm_match: fills a template's {name} placeholders with
+# concrete text, from bindings ([[name, value], ...]). A placeholder with no
+# binding is left as the literal text "{name}", visible rather than silently
+# dropped. Values are written the same way sm_match would have captured them
+# (no quoting), so sm_fill followed by sm_match round-trips.
+make a function called sm_fill takes template, bindings returns text
+  let parsed = sm_parse_template(template)
+  let lits = parsed[0]
+  let names = parsed[1]
+  let out = sb_new()
+  sb_push(out, lits[0])
+  let k = 0
+  let kn = to_num(list_len(names))
+  while k < kn do
+    let found = false
+    let b = 0
+    let bn = to_num(list_len(bindings))
+    while b < bn do
+      if bindings[b][0] == names[k] then
+        sb_push(out, "" + bindings[b][1])
+        let found = true
+      end
+      let b = b + 1
+    end
+    if found == false then
+      sb_push(out, "{" + names[k] + "}")
+    end
+    sb_push(out, lits[k + 1])
+    let k = k + 1
+  end
+  return sb_str(out)
+end
+
+
+make a function called ctx_new returns ctx
+  let buckets = vec_new()
+  let i = 0
+  while i < 512 do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  let ctx = context_new()
+  vec_push(ctx, 0)
+  vec_push(ctx, 0)
+  vec_push(ctx, "")
+  vec_push(ctx, "")
+  vec_push(ctx, false)
+  vec_push(ctx, buckets)
+  vec_push(ctx, [])
+  vec_push(ctx, [])
+  vec_push(ctx, [])
+  return ctx
+end
+
+make a function called ctx_failed takes ctx returns n
+  return vec_get(ctx, 3)
+end
+
+make a function called ctx_passed takes ctx returns n
+  return vec_get(ctx, 2)
+end
+
+make a function called ctx_set_failed takes ctx, n returns done
+  vec_set(ctx, 3, n)
+  return true
+end
+
+make a function called ctx_set_passed takes ctx, n returns done
+  vec_set(ctx, 2, n)
+  return true
+end
+
+make a function called ctx_count_failure takes ctx returns done
+  vec_set(ctx, 3, vec_get(ctx, 3) + 1)
+  return true
+end
+
+make a function called expect takes ctx, label, actual, expected returns ok
+  if actual == expected then
+    vec_set(ctx, 2, vec_get(ctx, 2) + 1)
+    print("  ok: " + label)
+    return true
+  end
+  ctx_count_failure(ctx)
+  print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
+  return false
+end
+
+make a function called ctx_report takes ctx returns ok
+  let f = vec_get(ctx, 3)
+  print("tests: " + vec_get(ctx, 2) + " passed, " + f + " failed")
+  if f == 0 then
+    print("ALL TESTS PASSED")
+    return true
+  end
+  print("TESTS FAILED")
+  return false
+end
+
+make a function called ctx_pending_contracts takes ctx returns clauses
+  return vec_get(ctx, 10)
+end
+
+make a function called ctx_clear_pending_contracts takes ctx returns done
+  vec_set(ctx, 10, [])
+  return true
+end
+
+# ---- registering steps ----
+
+# A step's bucket, from its length and its first and last characters.
+make a function called ctx_bucket takes text returns i
+  let n = text.length
+  if n == 0 then
+    return 0
+  end
+  return (n * 31 + char_code(text, 0) * 7 + char_code(text, n - 1)) % 512
+end
+
+# A text with {name} placeholders is a pattern (step_match.patlang); any other
+# is an exact step, looked up first. Registering a text again replaces it.
+make a function called step takes ctx, text, fname returns done
+  if contains_text(text, "{") then
+    return ctx_register_pattern(ctx, text, fname)
+  end
+  let buckets = vec_get(ctx, 7)
+  let k = ctx_bucket(text)
+  let entries = vec_get(buckets, k)
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == text then
+      vec_set(buckets, k, list_set(entries, i, [text, fname]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(buckets, k, list_push(entries, [text, fname]))
+  return true
+end
+
+make a function called ctx_register_pattern takes ctx, text, fname returns done
+  let pats = vec_get(ctx, 8)
+  let i = 0
+  while i < list_len(pats) do
+    if pats[i][0] == text then
+      vec_set(ctx, 8, list_set(pats, i, [text, fname]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(ctx, 8, list_push(pats, [text, fname]))
+  return true
+end
+
+# The function an exact step names, false when there is none.
+make a function called ctx_exact_step takes ctx, text returns fname
+  let entries = vec_get(vec_get(ctx, 7), ctx_bucket(text))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == text then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The first registered pattern that matches: ["ok", captures, fname] or ["no"].
+make a function called ctx_match_pattern takes ctx, text returns result
+  let pats = vec_get(ctx, 8)
+  let i = 0
+  while i < list_len(pats) do
+    let m = sm_match(pats[i][0], text)
+    if m[0] == "ok" then
+      return ["ok", m[1], pats[i][1]]
+    end
+    let i = i + 1
+  end
+  return ["no"]
+end
+
+# The text captured by {name} in the step being run.
+make a function called step_arg takes ctx, name returns value
+  let caps = vec_get(ctx, 9)
+  let i = 0
+  while i < list_len(caps) do
+    if caps[i][0] == name then
+      return caps[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# ---- contract clauses in a scenario ----
+
+# "And require x < 10" / "And ensure x < 10": checked now against the run's
+# variable x if it has one, else deferred until a plan binds it (see
+# gherkin_contracts.patlang's header). A deferred clause counts nothing: the
+# scenario's own expect decides what its outcome should be.
+make a function called ctx_contract_step takes ctx, kind, clause_text returns done
+  let clause = parse_contract_clause(clause_text)
+  if clause[0] == "ERR" then
+    ctx_count_failure(ctx)
+    print("  FAIL: " + clause[1])
+    return true
+  end
+  let var_name = clause[0]
+  if ctx_has(ctx, var_name) then
+    if eval_cmp_typed(clause[1], ctx_get(ctx, var_name), clause[2]) then
+      print("  ok: " + kind + " " + clause_text)
+    else
+      ctx_count_failure(ctx)
+      print("  FAIL: " + kind + " violated: " + clause_text)
+    end
+    return true
+  end
+  vec_set(ctx, 10, list_push(vec_get(ctx, 10), [kind, var_name, clause[1], clause[2]]))
+  print("  (deferred) " + kind + " " + clause_text)
+  return true
+end
+
+# ---- running features ----
+
+make a function called ctx_run_step takes ctx, text returns done
+  if starts_with(text, "require ") then
+    return ctx_contract_step(ctx, "require", substr(text, 8, text.length - 8))
+  end
+  if starts_with(text, "ensure ") then
+    return ctx_contract_step(ctx, "ensure", substr(text, 7, text.length - 7))
+  end
+  let fname = ctx_exact_step(ctx, text)
+  if fname != false then
+    apply(fname, ctx)
+    return true
+  end
+  let pm = ctx_match_pattern(ctx, text)
+  if pm[0] == "ok" then
+    vec_set(ctx, 9, pm[1])
+    apply(pm[2], ctx)
+    return true
+  end
+  ctx_count_failure(ctx)
+  print("  FAIL: undefined step: " + text)
+  return true
+end
+
+# A scenario line: whether its tags pass the filter decides whether its
+# steps run.
+make a function called ctx_start_scenario takes ctx, raw returns done
+  let filter = vec_get(ctx, 4)
+  let tags = vec_get(ctx, 5)
+  vec_set(ctx, 5, "")
+  if filter == "" then
+    vec_set(ctx, 6, false)
+    print(raw)
+  elif (tags != "") and contains_text(tags, filter) then
+    vec_set(ctx, 6, false)
+    print(raw + "  [" + tags + "]")
+  else
+    vec_set(ctx, 6, true)
+    print(raw + "  [skipped: needs " + filter + "]")
+  end
+  return true
+end
+
+make a function called ctx_run_line takes ctx, raw returns done
+  if starts_with(raw, "@") then
+    vec_set(ctx, 5, raw)
+  end
+  if starts_with(raw, "Feature:") then
+    print(raw)
+  end
+  if starts_with(raw, "Scenario:") then
+    return ctx_start_scenario(ctx, raw)
+  end
+  let text = step_text(raw)
+  if (text != "") and (not vec_get(ctx, 6)) then
+    ctx_run_step(ctx, text)
+  end
+  return true
+end
+
+# A feature file, line by line. Its bytes are read as a list, which is O(1)
+# to index under every engine; each line is built one byte at a time, so a
+# feature's text is ASCII.
+make a function called run_feature_file takes ctx, path returns ok
+  let window = 1048576
+  let offset = 0
+  let line = sb_new()
+  let more = true
+  while more do
+    let part = read_file_bytes(path, offset, window)
+    let i = 0
+    while i < list_len(part) do
+      let c = part[i]
+      if c == 10 then
+        ctx_run_line(ctx, trim_left(sb_str(line)))
+        let line = sb_new()
+      elif c != 13 then
+        sb_push(line, chr(c))
+      end
+      let i = i + 1
+    end
+    let offset = offset + list_len(part)
+    let more = list_len(part) == window
+  end
+  ctx_run_line(ctx, trim_left(sb_str(line)))
+  return true
+end
+
+# A feature's text.
+make a function called run_feature takes ctx, feature returns ok
+  let h = str_intern(feature)
+  let n = sc_len(h)
+  let line = sb_new()
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if c == 10 then
+      ctx_run_line(ctx, trim_left(sb_str(line)))
+      let line = sb_new()
+    elif c != 13 then
+      sb_push(line, chr(c))
+    end
+    let i = i + 1
+  end
+  ctx_run_line(ctx, trim_left(sb_str(line)))
+  return true
+end
+
+# From here on, only scenarios whose @tag line holds this tag run ("" for all).
+make a function called run_feature_tagged takes ctx, feature, tag returns ok
+  vec_set(ctx, 4, tag)
+  return run_feature(ctx, feature)
 end
 
 # =============================================================================
@@ -373,11 +1599,810 @@ end
 #
 # Follows RED-GREEN-REFACTOR:
 #   RED:   Write BDD spec first, verify implementation does not exist yet.
-#   PLAN:  Use GOAP to find existing actions that satisfy the BDD spec.
+#   PLAN:  Try known, LLM-free solutions first -- a pure-PatLang
+#          implementation using functions already known to exist, then a
+#          known shell-command pattern whose input->output contract is
+#          verified directly against the real test data. Only when
+#          NEITHER establishes the contract does this fall back to
+#          asking an LLM -- previously the LLM was consulted unconditionally,
+#          since this step was a bare `# TODO: Integrate GOAP planning
+#          here` with `plan_found` hardcoded false. The LLM is a genuine
+#          last resort now, not the default path, and even its own
+#          suggestion gets the same direct, LLM-free contract check
+#          (probe_shell_command) before any wrapper is written or
+#          compiled around it.
 #   GREEN: Write implementation, compile and run BDD spec, verify it passes.
 # =============================================================================
 
-# --- 1. Query Ollama for Solution ---
+# Opt-in schema-conformance check (implementation plan Phase 3, item 1):
+# green_phase additionally requires a synthesized function to satisfy any
+# schema operation registered against it via schema_register_synthesis_
+# check, on top of its own BDD spec passing. No existing caller currently
+# calls schema_register_synthesis_check for anything, so this include and
+# the check below are a no-op for every function name in use today --
+# schema_lookup_synthesis_check(func_name) is simply falsy and green_phase
+# behaves exactly as before. Include added here (rather than left for each
+# caller to add) because this file's own green_phase now calls into it
+# unconditionally to check whether a hook is registered; PatLang's include
+# mechanism does not deduplicate repeated includes of the same file, so a
+# caller that also wants schema_bdd.patlang's other functions should NOT
+# re-include it once it's already pulled in transitively through this file.
+# =============================================================================
+# schema_bdd: attach a Z-notation-style schema (declared state + a general
+# invariant, plus named operations each with a require/ensure precondition/
+# postcondition) to a BDD feature, and check a concrete Given/When/Then
+# scenario as a WITNESS of that schema -- catching a scenario whose own
+# Given already violates an operation's precondition, before any of the
+# scenario's own Then assertions even run.
+#
+# Design decisions, and why (see the implementation plan this file was
+# built from for the full investigation):
+#
+# - A schema's invariant/require/ensure are ORDINARY, separately-compiled
+#   PatLang functions returning bool, referenced by name string and called
+#   via apply() -- never the literal `require`/`ensure` keywords. Those
+#   keywords lower to contract_check (rust-runtime/src/ir/hosts.rs), which
+#   is FATAL on violation (confirmed directly, and independently documented
+#   in self_hosting/lib/primitive_registry.patlang's own header) -- unusable
+#   for a check that must report a diagnosis and keep running, the same
+#   reason primitive_registry.patlang's own try_ wrappers never use
+#   require/ensure for their real failure path either.
+#
+# - apply() has no argument-spread form (confirmed in
+#   rust-runtime/src/ir/interpreter.rs): a function written once, generic
+#   over any schema's own number of state variables, cannot pass one
+#   positional argument per variable. State and inputs are therefore always
+#   bundled as a single list argument: invariant_fn(state_list),
+#   require_fn(state_list, input_list), ensure_fn(before_list, after_list,
+#   input_list).
+#
+# - Binding extends the existing set_var/ctx_get(ctx, ...) convention
+#   every Gherkin step in this codebase already uses (there is no
+#   parametrized step-matching mechanism anywhere to extend instead --
+#   step() dispatch is exact-literal-text, zero-argument, confirmed across
+#   every existing _bdd_demo.patlang file). A scenario's own Given/Then step
+#   functions call schema_bind_state/schema_bind_input directly.
+#
+# HARD RULE: self_hosting/lib/gherkin.patlang's run_feature never resets bound
+# vars between scenarios (only t_skipping/t_pending_tags are per-scenario).
+# Every scenario's Given/Then must explicitly rebind every declared state
+# variable and input itself, every time -- including restating an unchanged
+# variable in Then. Do not rely on a value surviving from a previous
+# scenario, and do not assume an unmentioned variable defaults to its
+# "before" value in Then -- an omitted rebind reads back as the not-yet-
+# bound sentinel (see schema_state_values below), which will correctly
+# fail the check rather than silently pass, but the failure will look like
+# a real violation unless this rule is followed.
+# =============================================================================
+
+# A context: a run's named state, held by whoever made it and passed explicitly,
+# so nothing is shared by accident (docs/plans/v2-implementation.md, section 7a).
+#
+#   let ctx = context_new()
+#   ctx_set(ctx, "seen", true)
+#   ctx_get(ctx, "seen")
+#
+# A vec: slot 0 a vec of buckets, each a list of [name, value]; slot 1 how many
+# names it holds. A longer-lived kind of context (lib/gherkin.patlang) starts as
+# one of these and adds slots of its own after them. A vec belongs to the thread
+# that made it, so a parallel_map worker is handed the values it needs as items.
+
+make a function called ctx_buckets_new takes n returns buckets
+  let buckets = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  return buckets
+end
+
+make a function called context_new returns ctx
+  let ctx = vec_new()
+  vec_push(ctx, ctx_buckets_new(64))
+  vec_push(ctx, 0)
+  return ctx
+end
+
+# A name's bucket among n, n a power of two. Keys here are short.
+make a function called ctx_slot takes name, n returns k
+  let h = 5381
+  let len = name.length
+  let i = 0
+  while i < len do
+    let h = (h * 33 + char_code(name, i)) % 1073741823
+    let i = i + 1
+  end
+  return h % n
+end
+
+# Twice the buckets, once the names outnumber them by four to one.
+make a function called ctx_grow takes ctx returns done
+  let old = vec_get(ctx, 0)
+  let n = vec_len(old) * 2
+  let buckets = ctx_buckets_new(n)
+  let b = 0
+  while b < vec_len(old) do
+    let entries = vec_get(old, b)
+    let i = 0
+    while i < list_len(entries) do
+      let k = ctx_slot(entries[i][0], n)
+      vec_set(buckets, k, list_push(vec_get(buckets, k), entries[i]))
+      let i = i + 1
+    end
+    let b = b + 1
+  end
+  vec_set(ctx, 0, buckets)
+  return true
+end
+
+make a function called ctx_has takes ctx, name returns yes
+  let buckets = vec_get(ctx, 0)
+  let entries = vec_get(buckets, ctx_slot(name, vec_len(buckets)))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A name's value, false when it has none.
+make a function called ctx_get takes ctx, name returns v
+  let buckets = vec_get(ctx, 0)
+  let entries = vec_get(buckets, ctx_slot(name, vec_len(buckets)))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A name's value, the unit value when it has none: an out-of-range read gives unit.
+make a function called ctx_read takes ctx, name returns v
+  if ctx_has(ctx, name) then
+    return ctx_get(ctx, name)
+  end
+  return list_get([], 0)
+end
+
+# A name's value as a number, 0 when it has none.
+make a function called ctx_num takes ctx, name returns n
+  if ctx_has(ctx, name) then
+    return to_num(ctx_get(ctx, name))
+  end
+  return 0
+end
+
+# A name's value as text, "" when it has none.
+make a function called ctx_text takes ctx, name returns s
+  if ctx_has(ctx, name) then
+    return "" + ctx_get(ctx, name)
+  end
+  return ""
+end
+
+# The next number from a counter of this name, from 1.
+make a function called ctx_counter takes ctx, name returns n
+  let n = ctx_num(ctx, name) + 1
+  ctx_set(ctx, name, n)
+  return n
+end
+
+make a function called ctx_set takes ctx, name, v returns done
+  let buckets = vec_get(ctx, 0)
+  let k = ctx_slot(name, vec_len(buckets))
+  let entries = vec_get(buckets, k)
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      vec_set(buckets, k, list_set(entries, i, [name, v]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(buckets, k, list_push(entries, [name, v]))
+  let count = vec_get(ctx, 1) + 1
+  vec_set(ctx, 1, count)
+  if count > vec_len(buckets) * 4 then
+    ctx_grow(ctx)
+  end
+  return true
+end
+
+# A top-level `when` handler takes no arguments, so a program whose handlers use
+# its context holds it in a named object, which is how a handler reaches anything
+# of the program's.
+class ProgramContext {
+  field held = 0
+}
+
+make a function called context_hold takes ctx returns done
+  new("ProgramContext", "program_context")
+  send("program_context", "set", "held", ctx)
+  return true
+end
+
+make a function called context_held returns ctx
+  return get("program_context", "held")
+end
+
+# =============================================================================
+# pmap: a minimal Map<K,V> as an association list of [key, value] pairs with
+# linear-scan lookup -- the exact same idiom already proven in
+# self_hosting/lib/depgraph.patlang's depgraph_map_get/depgraph_map_append
+# (a file->list-of-files map), generalised here to an arbitrary value type
+# and given a full put/get/has/remove/keys surface. PatLang has no native
+# Map/Dict type usable from self-hosted code at this scale.
+#
+# Functional / return-new-collection style throughout, for the same reason
+# as pset.patlang: schema_bdd needs an independent before/after snapshot of
+# state, which an in-place-mutating map wouldn't give for free.
+#
+# pmap_get returns [] (an empty list) for a missing key -- the same
+# not-found sentinel depgraph_map_get already uses, not a distinct "Unit"
+# literal (PatLang's dialect has no source-level Unit/nil literal to write
+# directly). This is INHERENTLY AMBIGUOUS if a real stored value could
+# itself be an empty list: pmap_has is the only call that actually
+# distinguishes "absent" from "present but happens to look like the
+# sentinel" -- never infer presence from pmap_get's return value alone.
+# =============================================================================
+
+# =============================================================================
+# list_copy: appending to a list without touching the list it came from.
+#
+# The interpreter's list_push copies a list that something else still refers
+# to, so pushing onto a shared list is safe there. The native x64 backend's
+# list_push grows a list in place whenever the block has spare capacity and
+# keeps the length in the shared block header (see rt_list_push in
+# x64_runtime.patlang; the choice is deliberate and documented). Pushing onto a
+# list this function did not build itself can therefore change every other
+# reference to it. Code that treats lists as values (sets, maps, environments,
+# states) extends them with list_appended, which builds a new list, and only
+# pushes with list_push onto a list it has just created.
+# =============================================================================
+
+make a function called list_copy takes l returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(l))
+  while i < n do
+    let out = list_push(out, l[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# A new list holding the elements of l followed by v; l is unchanged.
+make a function called list_appended takes l, v returns out
+  let out = list_copy(l)
+  return list_push(out, v)
+end
+
+
+make a function called pmap_new returns m
+  return []
+end
+
+make a function called pmap_has takes m, key returns found
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] == key then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# See the module-level warning above: [] means "not found" here, which is
+# indistinguishable from a genuinely stored empty-list value. Call
+# pmap_has first whenever that distinction matters.
+make a function called pmap_get takes m, key returns value
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] == key then
+      return m[i][1]
+    end
+    let i = i + 1
+  end
+  return []
+end
+
+# Builds a new list either way. Replacing an entry with list_set on m would be
+# copy-on-write in the interpreter but changed m in place in the native x64
+# build, so a map that another value still held (a stored state, say) changed
+# underneath it.
+make a function called pmap_put takes m, key, value returns m2
+  let out = []
+  let found = false
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] == key then
+      let out = list_push(out, [key, value])
+      let found = true
+    else
+      let out = list_push(out, m[i])
+    end
+    let i = i + 1
+  end
+  if found == false then
+    let out = list_push(out, [key, value])
+  end
+  return out
+end
+
+make a function called pmap_remove takes m, key returns m2
+  let out = []
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] != key then
+      let out = list_push(out, m[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called pmap_keys takes m returns keys
+  let out = []
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    let out = list_push(out, m[i][0])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called pmap_size takes m returns n
+  return to_num(list_len(m))
+end
+
+# A small table of [name, ref]: handler_new, handler_lookup, handler_register.
+#
+# Mirrors self_hosting/block_model/interp.patlang's own bm_rt_assoc_get/
+# bm_rt_assoc_set exactly (an ordinary assoc-list, rebuilt via list_push
+# only on write -- never list_set, for the same issue #145 native x64
+# aliasing reason that file's own header already documents) -- not a
+# new design, a real-function twin of an already-proven one.
+make a function called handler_new returns h
+  return []
+end
+
+make a function called handler_lookup takes h, name returns v
+  let n = list_len(h)
+  let i = 0
+  while i < n do
+    let entry = list_get(h, i)
+    if list_get(entry, 0) == name then
+      return list_get(entry, 1)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called handler_register takes h, name, ref returns out
+  let n = list_len(h)
+  let out = []
+  let replaced = false
+  let i = 0
+  while i < n do
+    let entry = list_get(h, i)
+    if list_get(entry, 0) == name then
+      let out = list_push(out, [name, ref])
+      let replaced = true
+    else
+      let out = list_push(out, entry)
+    end
+    let i = i + 1
+  end
+  if replaced then
+    return out
+  end
+  return list_push(out, [name, ref])
+end
+
+
+# Single, process-wide registry (like Step's own new("Step", text)
+# convention -- schemas and operations are inherently global, not
+# per-instance, so one lazily-created Dict is simpler than
+# primitive_registry.patlang's counter-named multi-registry support, which
+# this doesn't need).
+#
+# Was new("Dict", ...) + ambient set_var/get -- the same "ephemeral
+# majority" pattern zs_registry() (self_hosting/lib/zs_schema.patlang)
+# already had, ported the same way and for the same reason: the Block
+# Ownership Model's own Fork B redesign (docs/plans/block-ownership-
+# model.md section 6) has no `new(...)` support for this form at all, so
+# this genuinely could not lower under it unmodified. get_global/
+# set_global/handler_new/handler_register/handler_lookup are real,
+# ordinary functions (self_hosting/lib/block_model_compat.patlang's
+# own, included above since this file is also consumed standalone
+# elsewhere, without zs_schema.patlang) -- block-model's own lowerer
+# always intercepts these exact names earlier, by a hardcoded match,
+# before any declared-function lookup runs, so
+# this file's own body is transparent there while the REAL engine gets a
+# working implementation. `existing` is checked by TYPE, not truthiness,
+# for the same reason zs_registry() checks it that way -- an empty list
+# is falsy in PatLang, confirmed directly, which `if existing then`
+# would have silently broken on first use.
+make a function called schema_registry takes ctx returns registry
+  let existing = ctx_get(ctx, "schema_bdd_registry_obj")
+  if type_of(existing) == "list" then
+    return existing
+  end
+  let registry = handler_new()
+  ctx_set(ctx, "schema_bdd_registry_obj", registry)
+  return registry
+end
+
+# Was send(schema_registry(), "set", key, val) -- see zs_registry_set's
+# own comment (zs_schema.patlang) for why the write must go through
+# get_global/set_global directly rather than through schema_registry()'s
+# own return value, which is a snapshot, not a live handle, once it's an
+# ordinary Handler value instead of a real Dict object.
+make a function called schema_registry_set takes ctx, key, entry returns done
+  ctx_set(ctx, "schema_bdd_registry_obj", handler_register(schema_registry(ctx), key, entry))
+  return true
+end
+
+# state_var_names: list of strings naming the schema's declared state.
+# invariant_fn: name of a function taking ONE argument (the state values,
+# in the same order as state_var_names) and returning bool.
+make a function called schema_define takes ctx, name, state_var_names, invariant_fn returns done
+  schema_registry_set(ctx, name + "__schema", [state_var_names, invariant_fn])
+  return true
+end
+
+make a function called schema_lookup takes ctx, name returns entry
+  return handler_lookup(schema_registry(ctx), name + "__schema")
+end
+
+# input_names: list of strings naming the operation's declared inputs.
+# require_fn: name of a function taking (state_values, input_values),
+# returning bool -- the operation's precondition.
+# ensure_fn: name of a function taking (before_values, after_values,
+# input_values), returning bool -- the operation's postcondition.
+make a function called schema_operation takes ctx, schema_name, op_name, input_names, require_fn, ensure_fn returns done
+  schema_registry_set(ctx, schema_name + "::" + op_name + "__op", [schema_name, input_names, require_fn, ensure_fn])
+  return true
+end
+
+make a function called schema_lookup_operation takes ctx, schema_name, op_name returns entry
+  return handler_lookup(schema_registry(ctx), schema_name + "::" + op_name + "__op")
+end
+
+# ---- binding: a scenario's own step functions call these ----
+#
+# Ordinary keyed ambient state (no Dict/registry object involved at
+# all) -- a straight set_var/get(__vars,...) -> set_global/get_global
+# rename, same as zs_expr.patlang's own scalar state (ze_rt_error, etc.)
+# needed. Dynamic, runtime-computed key names work identically under
+# both get_global (block-model's own GlobalGet has no compile-time-
+# literal-key restriction) and the real engine's own get/set_var.
+
+make a function called schema_bind_state takes ctx, schema, var_name, phase, value returns done
+  ctx_set(ctx, schema + "__" + var_name + "__" + phase, value)
+  return true
+end
+
+make a function called schema_bind_input takes ctx, schema, op, param_name, value returns done
+  ctx_set(ctx, schema + "__" + op + "__in__" + param_name, value)
+  return true
+end
+
+# Not-yet-bound sentinel: get_global(...) on an unset key -- same
+# absence convention already relied on throughout this codebase (e.g.
+# gherkin_contracts.patlang's `already_bound` check), now normalized to
+# `false` for an absent key under BOTH engines (get_global's own header,
+# zs_schema.patlang) rather than the real engine's own raw Unit. Never
+# distinguishes "never bound" from "bound to this same falsy value";
+# low risk for the LibraryLoans-shaped schemas this was designed against
+# (string/list-typed state), a documented hard limit for anything
+# boolean- or zero-valued.
+make a function called schema_state_values takes ctx, schema, state_var_names returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(state_var_names))
+  while i < n do
+    let out = list_push(out, ctx_get(ctx, schema + "__" + state_var_names[i] + "__before"))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called schema_state_values_after takes ctx, schema, state_var_names returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(state_var_names))
+  while i < n do
+    let out = list_push(out, ctx_get(ctx, schema + "__" + state_var_names[i] + "__after"))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called schema_input_values takes ctx, schema, op, input_names returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(input_names))
+  while i < n do
+    let out = list_push(out, ctx_get(ctx, schema + "__" + op + "__in__" + input_names[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- the witness check ----
+#
+# Four-stage check, each stage its own diagnosis tag, checked in the order
+# a Z schema's own reasoning goes: is the state even valid to start from,
+# does this operation's precondition actually hold for it, does the
+# claimed resulting state stay valid, and does the operation's own
+# postcondition connect before to after correctly. Returns [tag, payload],
+# the same 2-element diagnosis shape as synth5_induce
+# (self_hosting/lib/synthesis_lgg.patlang) -- deliberately, so
+# schema_format_diagnosis below can mirror synth5_format_diagnosis's own
+# real structure rather than inventing a new diagnosis style.
+# The value-based core: takes state_before/inputs/state_after directly
+# rather than reading them out of the __vars binding store. schema_check
+# below is the BDD-scenario-shaped wrapper around this; this function is
+# what any OTHER caller (a synthesis harness, a future GOAP or ILP hook --
+# see the implementation plan's Phase 3) should call directly instead of
+# faking a scenario's Given/When/Then bindings just to reach schema_check.
+make a function called schema_check_values takes ctx, schema_name, op_name, state_before, inputs, state_after returns diagnosis
+  let schema_entry = schema_lookup(ctx, schema_name)
+  let invariant_fn = schema_entry[1]
+
+  let op_entry = schema_lookup_operation(ctx, schema_name, op_name)
+  let require_fn = op_entry[2]
+  let ensure_fn = op_entry[3]
+
+  if apply(invariant_fn, state_before) == false then
+    return ["invariant_violated_before", [schema_name, state_before]]
+  end
+
+  if apply(require_fn, state_before, inputs) == false then
+    return ["precondition_violated", [op_name, state_before, inputs]]
+  end
+
+  if apply(invariant_fn, state_after) == false then
+    return ["invariant_violated_after", [schema_name, state_after]]
+  end
+
+  if apply(ensure_fn, state_before, state_after, inputs) == false then
+    return ["postcondition_violated", [op_name, state_before, state_after, inputs]]
+  end
+
+  return ["ok", [op_name, state_before, state_after, inputs]]
+end
+
+make a function called schema_check takes ctx, schema_name, op_name returns diagnosis
+  let schema_entry = schema_lookup(ctx, schema_name)
+  let state_var_names = schema_entry[0]
+
+  let op_entry = schema_lookup_operation(ctx, schema_name, op_name)
+  let input_names = op_entry[1]
+
+  let state_before = schema_state_values(ctx, schema_name, state_var_names)
+  let inputs = schema_input_values(ctx, schema_name, op_name, input_names)
+  let state_after = schema_state_values_after(ctx, schema_name, state_var_names)
+  return schema_check_values(ctx, schema_name, op_name, state_before, inputs, state_after)
+end
+
+# Mirrors synth5_format_diagnosis's real structure (synthesis_lgg.patlang):
+# switch on diagnosis[0], build a human-readable question per case. Returns
+# a plain list of question strings (empty for "ok"), same shape as
+# synth5_induce_and_ask's own return convention.
+make a function called schema_format_diagnosis takes schema_name, op_name, diagnosis returns questions
+  let tag = diagnosis[0]
+  let payload = diagnosis[1]
+
+  if tag == "invariant_violated_before" then
+    return ["This scenario's Given already leaves " + schema_name + " in a state that violates its own invariant, before " + op_name + " is even checked. Is the Given wrong, or is the invariant too strict?"]
+  end
+
+  if tag == "precondition_violated" then
+    return ["Scenario claims " + op_name + " can run from this Given, but " + op_name + "'s own precondition returned false for these inputs. Is the Given wrong, or is " + op_name + "'s precondition too strict -- or is this scenario meant to test a rejection path, which needs its own operation schema rather than " + op_name + "'s?"]
+  end
+
+  if tag == "invariant_violated_after" then
+    return ["Applying " + op_name + " produces a state that violates " + schema_name + "'s invariant. Is the Then clause's claimed resulting state wrong, or does " + op_name + " need a stronger precondition to rule this case out?"]
+  end
+
+  if tag == "postcondition_violated" then
+    return ["The before/after state this scenario claims for " + op_name + " does not satisfy its own postcondition. Is the Then clause's claimed resulting state wrong, or is " + op_name + "'s postcondition wrong?"]
+  end
+
+  return []
+end
+
+# ---- synthesis integration (implementation plan Phase 3) ----
+#
+# Opt-in registration linking a SYNTHESIZED function's name to a schema
+# operation it's meant to satisfy, plus a "harness" function name that
+# knows how to actually exercise it: harness_fn takes (func_name) and
+# returns [state_before, inputs, state_after] by calling the synthesized
+# function itself (via apply) on some concrete test input and observing
+# what it does. This is necessarily domain-specific -- there is no way to
+# derive it generically -- so it must be supplied by whoever registers the
+# hook, not synthesized here.
+#
+# Deliberately separate from schema_operation itself: a schema operation
+# describes the CONTRACT; a synthesis hook additionally says "and here's
+# how to actually run a candidate implementation against it," which only
+# matters once there's a synthesized candidate to check, not for the
+# scenario-witnessing use in schema_check above.
+make a function called schema_register_synthesis_check takes ctx, func_name, schema_name, op_name, harness_fn returns done
+  schema_registry_set(ctx, func_name + "__synthesis_check", [schema_name, op_name, harness_fn])
+  return true
+end
+
+make a function called schema_lookup_synthesis_check takes ctx, func_name returns entry
+  return handler_lookup(schema_registry(ctx), func_name + "__synthesis_check")
+end
+
+# Runs a registered synthesis hook for func_name and returns its
+# schema_check_values diagnosis directly. Callers with no hook registered
+# for func_name should skip calling this entirely (schema_lookup_
+# synthesis_check(func_name) is falsy) rather than call it and inspect the
+# result -- there is no "no hook registered" diagnosis tag, since this
+# function assumes a hook exists.
+make a function called schema_run_synthesis_check takes ctx, func_name returns diagnosis
+  let hook = schema_lookup_synthesis_check(ctx, func_name)
+  let schema_name = hook[0]
+  let op_name = hook[1]
+  let harness_fn = hook[2]
+  let triple = apply(harness_fn, func_name)
+  return schema_check_values(ctx, schema_name, op_name, triple[0], triple[1], triple[2])
+end
+
+
+# --- 0. Establishing contracts/conditions without the LLM, where feasible ---
+
+# Exact whitespace set the generated shell-wrapper's own trim loop uses
+# (space/tab/CR/LF) -- kept as its own function, rather than reusing
+# self_hosting/lib/includes.patlang's str_trim, because str_trim does NOT
+# strip a trailing \n (only space/tab/\r), and PowerShell output is
+# CRLF-terminated. Probing here has to trim EXACTLY the way the eventual
+# compiled wrapper will, or a probe that "passes" could still disagree
+# with what the compiled function actually returns.
+make a function called trim_shell_output takes raw_out returns trimmed
+  let a = 0
+  while (a < raw_out.length) and ((char_code(raw_out, a) == 32) or (char_code(raw_out, a) == 9) or (char_code(raw_out, a) == 13) or (char_code(raw_out, a) == 10)) do
+    let a = a + 1
+  end
+  let z = raw_out.length
+  while (z > a) and ((char_code(raw_out, z - 1) == 32) or (char_code(raw_out, z - 1) == 9) or (char_code(raw_out, z - 1) == 13) or (char_code(raw_out, z - 1) == 10)) do
+    let z = z - 1
+  end
+  return substr(raw_out, a, z - a)
+end
+
+# Splices a literal path into a `{FILE}`-templated command RIGHT NOW, for
+# direct probing -- as opposed to splice_file_placeholder_for_codegen
+# below, which splices in a PatLang expression (`" + file_path + "`) to
+# be embedded in GENERATED source text evaluated later, at a call the
+# compiled wrapper hasn't made yet. Two different substitution targets,
+# so two different functions -- conflating them was the source of a real
+# bug once already (see green_phase's history below).
+make a function called splice_file_placeholder_literal takes template, literal_path returns cmd
+  if not contains_text(template, "{FILE}") then
+    return template
+  end
+  let idx = 0
+  let found = -1
+  while (idx <= template.length - 6) and (found == -1) do
+    if substr(template, idx, 6) == "{FILE}" then
+      let found = idx
+    end
+    let idx = idx + 1
+  end
+  if found < 0 then
+    return template
+  end
+  let left = substr(template, 0, found)
+  let right = substr(template, found + 6, template.length - (found + 6))
+  return left + literal_path + right
+end
+
+# Splices `{FILE}` into a PatLang string-concatenation expression instead
+# of a literal path -- for embedding a command template into GENERATED
+# wrapper source, where the real path is only known once the compiled
+# function actually runs (as its own `file_path` parameter), not at
+# generation time. Shared by both the known-shell-solution path and the
+# LLM path, so a fix here (like the quoting bug in the history below)
+# only has to be made once.
+make a function called splice_file_placeholder_for_codegen takes template returns spliced
+  if not contains_text(template, "{FILE}") then
+    return template
+  end
+  let idx = 0
+  let found = -1
+  while (idx <= template.length - 6) and (found == -1) do
+    if substr(template, idx, 6) == "{FILE}" then
+      let found = idx
+    end
+    let idx = idx + 1
+  end
+  if found < 0 then
+    return template
+  end
+  let left = substr(template, 0, found)
+  let right = substr(template, found + 6, template.length - (found + 6))
+  return left + "\" + file_path + \"" + right
+end
+
+# Establishes a candidate shell command's real input->output contract
+# EMPIRICALLY -- runs it directly, right now, against the actual test
+# file, and compares its trimmed output to the expected result. This is
+# the mechanism that lets both a known command pattern and an LLM's own
+# suggestion be verified without trusting either one's description of
+# itself -- "finding the data on input->output contract" by actually
+# producing the data, not by asking anyone (human, LLM, or a docstring)
+# what the contract is supposed to be. Cheap relative to a full
+# write-wrapper/compile/run BDD cycle, so it's worth doing BEFORE
+# committing to that heavier path.
+make a function called probe_shell_command takes cmd_template, test_file, expected_result returns matches
+  let cmd = splice_file_placeholder_literal(cmd_template, test_file)
+  print("[PLAN PHASE] Probing candidate command directly (no LLM): " + cmd)
+  let raw_out = exec_capture("powershell", "-Command", cmd)
+  let trimmed = trim_shell_output(raw_out)
+  print("[PLAN PHASE] Candidate produced '" + trimmed + "' (expected '" + expected_result + "')")
+  return trimmed == expected_result
+end
+
+# A small table of ALREADY-KNOWN, deterministic PatLang implementations
+# for common capability names -- pure PatLang, built entirely from
+# functions this codebase already has (read_file/split_lines/list_len
+# come from self_hosting/lib/includes.patlang, already `include`d by
+# every driver that includes this engine). Tried before anything
+# shell-based or LLM-based: if a capability can be built entirely from
+# functions already known to exist, there is nothing left to establish
+# empirically OR ask an LLM about -- the contract IS the composition of
+# those functions' own known behavior. Returns "" when func_name isn't
+# in the table.
+make a function called known_patlang_solution takes func_name returns impl_code
+  if func_name == "line_count" then
+    let code = "make a function called line_count takes file_path returns result\n"
+    let code = code + "  let content = read_file(file_path)\n"
+    let code = code + "  let lines = split_lines(content)\n"
+    let code = code + "  return \"\" + list_len(lines)\n"
+    let code = code + "end\n"
+    return code
+  end
+  return ""
+end
+
+# A small table of ALREADY-KNOWN, deterministic shell command patterns
+# for common capability names one PatLang doesn't have a native
+# equivalent for -- these are well-known, unambiguous idioms (not an
+# LLM's guess), so their CORRECTNESS still gets verified empirically via
+# probe_shell_command before being trusted, but their CONTENT never
+# needs an LLM to produce. Returns "" (with {FILE} as the substitution
+# placeholder) when func_name isn't in the table.
+make a function called known_shell_solution takes func_name returns cmd_template
+  if func_name == "file_size" then
+    return "(Get-Item '{FILE}').Length"
+  end
+  if func_name == "get_file_extension" then
+    return "[System.IO.Path]::GetExtension('{FILE}')"
+  end
+  return ""
+end
+
+# --- 1. Query Ollama for Solution (genuine last resort -- see PLAN phase) ---
 
 make a function called ask_llm_for_solution takes missing_func_name, engine_type, model_name returns solution
   let prompt = "You are a Windows PowerShell expert. Given a missing host function named '" + missing_func_name + "', provide ONLY the raw Windows PowerShell expression needed to implement it. No explanations, no code blocks, no markdown. Use {FILE} as placeholder for file paths, {OLD} for old text, {NEW} for new text. Example output: (Get-Item '{FILE}').Length"
@@ -403,26 +2428,25 @@ make a function called synthesize_bdd_spec_code takes func_name, test_file, test
   sb_push(sb, "# Auto-Generated BDD Verification Spec for Synthesized Function: " + func_name + "\n")
   sb_push(sb, "# =============================================================================\n\n")
   sb_push(sb, "include \"../self_hosting/lib/includes.patlang\"\n")
-  sb_push(sb, "include \"../self_hosting/lib/test.patlang\"\n")
+  sb_push(sb, "include \"../self_hosting/lib/gherkin.patlang\"\n")
   sb_push(sb, "include \"lib/synthesized_tools.patlang\"\n\n")
-  sb_push(sb, "make a function called st_given_file returns ok\n")
-  sb_push(sb, "  return check(\"target file exists\", file_exists(\"" + test_file + "\"), \"1\")\n")
+  sb_push(sb, "make a function called st_given_file takes ctx returns ok\n")
+  sb_push(sb, "  return expect(ctx, \"target file exists\", file_exists(\"" + test_file + "\"), \"1\")\n")
   sb_push(sb, "end\n\n")
-  sb_push(sb, "make a function called st_when_synthesized_invoked returns ok\n")
+  sb_push(sb, "make a function called st_when_synthesized_invoked takes ctx returns ok\n")
   sb_push(sb, "  let res = " + func_name + "(\"" + test_arg + "\")\n")
-  sb_push(sb, "  set_var(\"synthesized_res\", res)\n")
-  sb_push(sb, "  return check(\"synthesized function returned result\", true, true)\n")
+  sb_push(sb, "  ctx_set(ctx, \"synthesized_res\", res)\n")
+  sb_push(sb, "  return expect(ctx, \"synthesized function returned result\", true, true)\n")
   sb_push(sb, "end\n\n")
-  sb_push(sb, "make a function called st_then_contract_verified returns ok\n")
+  sb_push(sb, "make a function called st_then_contract_verified takes ctx returns ok\n")
   # REAL BUG FIXED HERE: `get_var` is not a real host/PatLang function
-  # (self_hosting/lib/test.patlang's own set_var/get pair -- see
-  # t_pass's own `get("__vars", "t_pass")` -- uses `get`, not
+  # (the store is the context's ctx_set/ctx_get pair, not
   # `get_var`). The generated spec crashed at runtime with "IR runtime
   # error: host fn 'get_var' not found" every time it reached this line
   # -- invisible before the vacuous-check fix above, since green_phase
   # never distinguished "produced some output, including a crash
   # message" from "the inner BDD suite genuinely completed and passed".
-  sb_push(sb, "  let res = get(\"__vars\", \"synthesized_res\")\n")
+  sb_push(sb, "  let res = ctx_get(ctx, \"synthesized_res\")\n")
   # REAL BUG FIXED HERE: `res` holds a NUMBER (synthesized functions
   # always `return size_num` / `to_num(raw_out)`), but expected_result
   # is embedded as a STRING LITERAL -- `res == "70"` compares a number
@@ -434,15 +2458,15 @@ make a function called synthesize_bdd_spec_code takes func_name, test_file, test
   # via concatenation (`"" + res`, the same idiom already used
   # elsewhere in this file, e.g. the synthesized function's own
   # "returned: " + size_num) before comparing.
-  sb_push(sb, "  return check(\"postcondition verified\", (\"\" + res) == \"" + expected_result + "\", true)\n")
+  sb_push(sb, "  return expect(ctx, \"postcondition verified\", (\"\" + res) == \"" + expected_result + "\", true)\n")
   sb_push(sb, "end\n\n")
-  sb_push(sb, "step(\"a target test file on disk\", \"st_given_file\")\n")
-  sb_push(sb, "step(\"the synthesized function is executed\", \"st_when_synthesized_invoked\")\n")
-  sb_push(sb, "step(\"the contract and output are verified\", \"st_then_contract_verified\")\n\n")
-  sb_push(sb, "t_init()\n")
+  sb_push(sb, "let ctx = ctx_new()\n")
+  sb_push(sb, "step(ctx, \"a target test file on disk\", \"st_given_file\")\n")
+  sb_push(sb, "step(ctx, \"the synthesized function is executed\", \"st_when_synthesized_invoked\")\n")
+  sb_push(sb, "step(ctx, \"the contract and output are verified\", \"st_then_contract_verified\")\n\n")
   sb_push(sb, "let feature_text = \"Feature: Synthesized Function Verification\\nScenario: Validate synthesized tool\\nGiven a target test file on disk\\nWhen the synthesized function is executed\\nThen the contract and output are verified\\n\"\n")
-  sb_push(sb, "run_feature(feature_text)\n")
-  sb_push(sb, "t_report()\n")
+  sb_push(sb, "run_feature(ctx, feature_text)\n")
+  sb_push(sb, "ctx_report(ctx)\n")
   return sb_str(sb)
 end
 
@@ -523,19 +2547,19 @@ make a function called unregister_synthesized takes func_name returns done
   return true
 end
 
-make a function called red_phase takes func_name, test_file, test_arg, expected_result returns ok
+make a function called red_phase takes ctx, func_name, test_file, test_arg, expected_result returns ok
   print("[RED PHASE] Writing BDD specification for '" + func_name + "'...")
 
   let spec_code = synthesize_bdd_spec_code(func_name, test_file, test_arg, expected_result)
   write_file("friendly_cli/test_healing_spec.patlang", spec_code)
   print("[SELF-HEALING ENGINE] BDD specification written to 'friendly_cli/test_healing_spec.patlang'.")
 
-  let impl_exists_before = file_exists(synthesized_func_file(func_name)) == true
+  let impl_exists_before = file_exists(synthesized_func_file(func_name)) == "1"
   if impl_exists_before then
     print("[RED PHASE] WARNING: Implementation already exists -- overwriting for clean red-green cycle.")
-    check("RED PHASE: BDD spec written before implementation (ordering verified)", true, true)
+    expect(ctx, "RED PHASE: BDD spec written before implementation (ordering verified)", true, true)
   else
-    check("RED PHASE: Implementation does not exist before synthesis", true, true)
+    expect(ctx, "RED PHASE: Implementation does not exist before synthesis", true, true)
   end
   print("[RED PHASE] BDD spec written. Implementation absent or overwritten. Test would fail (RED confirmed).")
 
@@ -544,7 +2568,7 @@ end
 
 # --- 4. GREEN Phase: Write implementation, compile and run BDD spec ---
 
-make a function called green_phase takes func_name, impl_code returns ok
+make a function called green_phase takes ctx, func_name, impl_code returns ok
   print("[GREEN PHASE] Writing implementation for '" + func_name + "'...")
 
   let func_file = synthesized_func_file(func_name)
@@ -558,7 +2582,7 @@ make a function called green_phase takes func_name, impl_code returns ok
   register_synthesized(func_name)
 
   let impl_exists_after = file_exists(func_file) == true
-  check("GREEN PHASE: Implementation file exists after writing", impl_exists_after, true)
+  expect(ctx, "GREEN PHASE: Implementation file exists after writing", impl_exists_after, true)
 
   let bdd_src = read_file("friendly_cli/test_healing_spec.patlang")
   let expanded = expand_includes(bdd_src, "friendly_cli")
@@ -567,7 +2591,7 @@ make a function called green_phase takes func_name, impl_code returns ok
 
   let compile_out = exec_capture("./patc1.exe", "friendly_cli/test_healing_expanded.patlang", "friendly_cli/test_healing_expanded.exe")
   let compiled = file_exists("friendly_cli/test_healing_expanded.exe") == true
-  check("GREEN PHASE: BDD spec compiled successfully with patc1.exe", compiled, true)
+  expect(ctx, "GREEN PHASE: BDD spec compiled successfully with patc1.exe", compiled, true)
   if not compiled then
     unregister_synthesized(func_name)
     return false
@@ -575,11 +2599,11 @@ make a function called green_phase takes func_name, impl_code returns ok
 
   let run_out = exec_capture("./friendly_cli/test_healing_expanded.exe")
   let has_output = run_out.length > 0
-  check("GREEN PHASE: Compiled BDD spec produces output", has_output, true)
+  expect(ctx, "GREEN PHASE: Compiled BDD spec produces output", has_output, true)
 
-  # REAL correctness check: the inner BDD spec's own t_report() prints
+  # REAL correctness check: the inner BDD spec's own ctx_report() prints
   # EXACTLY "ALL TESTS PASSED" or "TESTS FAILED" (self_hosting/lib/
-  # test.patlang's t_report, mutually exclusive). Previously this
+  # gherkin.patlang's ctx_report, mutually exclusive). Previously this
   # checked contains_text(run_out, "CONTRACT PASS") instead -- but that
   # string is printed UNCONDITIONALLY by the synthesized function's own
   # generated code, before st_then_contract_verified's real `res ==
@@ -593,15 +2617,35 @@ make a function called green_phase takes func_name, impl_code returns ok
   # the postcondition -- actually passed.
   let inner_suite_passed = contains_text(run_out, "ALL TESTS PASSED")
   let inner_suite_failed = contains_text(run_out, "TESTS FAILED")
-  check("GREEN PHASE: Synthesized function contract verified (inner BDD suite passed)", inner_suite_passed, true)
-  check("GREEN PHASE: inner BDD suite did not report failure", inner_suite_failed, false)
+  expect(ctx, "GREEN PHASE: Synthesized function contract verified (inner BDD suite passed)", inner_suite_passed, true)
+  expect(ctx, "GREEN PHASE: inner BDD suite did not report failure", inner_suite_failed, false)
+
+  # Second, independent oracle on top of the BDD spec above -- opt-in, see
+  # the module-level comment on the schema_bdd.patlang include. A
+  # scenario's own Then can pass while still under-specifying what the
+  # function must hold in general (exactly the class of false-positive
+  # this file's own history already records above); a registered schema
+  # operation checks the synthesized function's actual behaviour against a
+  # general precondition/postcondition instead of one example's assertion.
+  let schema_hook = schema_lookup_synthesis_check(ctx, func_name)
+  let schema_ok = true
+  if schema_hook then
+    let schema_diagnosis = schema_run_synthesis_check(ctx, func_name)
+    let schema_ok = schema_diagnosis[0] == "ok"
+    expect(ctx, "GREEN PHASE: synthesized function satisfies its registered schema operation", schema_ok, true)
+    if not schema_ok then
+      print("[GREEN PHASE] Schema check failed: " + schema_diagnosis[0])
+    end
+  end
 
   if inner_suite_passed then
     if not inner_suite_failed then
-      # Already registered before compiling, above -- verification
-      # passed, so the registration stands.
-      print("[GREEN PHASE] BDD verification complete. Contract verified.")
-      return true
+      if schema_ok then
+        # Already registered before compiling, above -- verification
+        # passed, so the registration stands.
+        print("[GREEN PHASE] BDD verification complete. Contract verified.")
+        return true
+      end
     end
   end
   # Verification failed -- roll back the pre-compile registration so
@@ -614,9 +2658,61 @@ make a function called green_phase takes func_name, impl_code returns ok
   return false
 end
 
+# Generates the wrapper function body for a `{FILE}`-templated shell
+# command -- shared by the known-shell-solution path and the LLM path,
+# so a fix here only has to be made once.
+#
+# REAL BUG FOUND AND FIXED HERE (LLM path history, now applies equally
+# to the known-solution path since both share this function): the
+# LLM's prompt documents {FILE} as already appearing INSIDE quotes in
+# its own suggestion (example output: `(Get-Item '{FILE}').Length` --
+# note the surrounding single quotes are the LLM's own). Splicing used
+# to ALSO wrap the interpolated file_path in a fresh pair of single
+# quotes, producing DOUBLED quotes end to end (`''` + path + `''`),
+# which PowerShell parses as an EMPTY string literal immediately
+# followed by garbage -- Get-Item then fails with "Cannot bind argument
+# ... because it is an empty string", and to_num() of that error text
+# silently becomes 0. Confirmed via a direct repro (heal_missing_
+# function("file_size", ...) expecting "70" for a genuinely-70-byte
+# file returned 0, not 70). Fixed by NOT adding extra quotes --
+# {FILE}'s surrounding quotes in the template are relied on as-is.
+#
+# REAL GENERALIZABILITY GAP FIXED HERE: this used to unconditionally
+# `to_num(raw_out)` the captured output, assuming every synthesized
+# function's real result is numeric (true for file_size/word-count,
+# false for e.g. "get file extension" -- to_num() on a non-numeric
+# string silently returns something wrong rather than an error, so a
+# string-result target would corrupt silently). Trims raw_out's
+# surrounding whitespace/CRLF and returns/compares it as a plain STRING
+# throughout instead -- a numeric-looking result ("70") compares equal
+# to a numeric-looking expected_result string exactly as before, but a
+# genuinely string-shaped result (".md") now works too.
+make a function called build_shell_wrapper_code takes func_name, cmd_template returns impl_code
+  let formatted_cmd = splice_file_placeholder_for_codegen(cmd_template)
+  let code = "# =============================================================================\n"
+  let code = code + "# Auto-Synthesized PatLang Host Function Wrapper: " + func_name + "\n"
+  let code = code + "# =============================================================================\n\n"
+  let code = code + "make a function called " + func_name + " takes file_path returns result\n"
+  let code = code + "  print(\"  [SYNTHESIZED EXEC] " + func_name + "...\")\n"
+  let code = code + "  let raw_out = exec_capture(\"powershell\", \"-Command\", \"" + formatted_cmd + "\")\n"
+  let code = code + "  let a = 0\n"
+  let code = code + "  while (a < raw_out.length) and ((char_code(raw_out, a) == 32) or (char_code(raw_out, a) == 9) or (char_code(raw_out, a) == 13) or (char_code(raw_out, a) == 10)) do\n"
+  let code = code + "    let a = a + 1\n"
+  let code = code + "  end\n"
+  let code = code + "  let z = raw_out.length\n"
+  let code = code + "  while (z > a) and ((char_code(raw_out, z - 1) == 32) or (char_code(raw_out, z - 1) == 9) or (char_code(raw_out, z - 1) == 13) or (char_code(raw_out, z - 1) == 10)) do\n"
+  let code = code + "    let z = z - 1\n"
+  let code = code + "  end\n"
+  let code = code + "  let trimmed = substr(raw_out, a, z - a)\n"
+  let code = code + "  print(\"[CONTRACT PASS] Synthesized function " + func_name + " returned: \" + trimmed)\n"
+  let code = code + "  return trimmed\n"
+  let code = code + "end\n"
+  return code
+end
+
 # --- 5. Main Self-Healing Workflow Entry Point (RED-GREEN-REFACTOR) ---
 
-make a function called heal_missing_function takes func_name, engine_type, model_name, test_file, test_arg, expected_result returns success
+make a function called heal_missing_function takes ctx, func_name, engine_type, model_name, test_file, test_arg, expected_result returns success
   print("[SELF-HEALING ENGINE] Initiating auto-synthesis for missing function: '" + func_name + "'...")
 
   # Step Pre-check: has this specific function already been synthesized?
@@ -626,153 +2722,116 @@ make a function called heal_missing_function takes func_name, engine_type, model
   # ever having been verified, and such an attempt must be retried, not
   # silently treated as already handled.
   if is_registered(func_name) then
-    print("[SELF-HEALING ENGINE] Function '" + func_name + "' already verified and registered in synthesized_tools.patlang. Skipping LLM query.")
+    print("[SELF-HEALING ENGINE] Function '" + func_name + "' already verified and registered in synthesized_tools.patlang. Skipping synthesis entirely.")
     return true
   end
 
   # Step A: RED Phase - Write BDD spec, verify implementation doesn't exist
-  red_phase(func_name, test_file, test_arg, expected_result)
+  red_phase(ctx, func_name, test_file, test_arg, expected_result)
 
-  # Step B: PLAN - Try GOAP planning with existing actions
-  print("[PLAN PHASE] Checking if existing actions can satisfy BDD spec...")
-  let plan_found = false
-  # TODO: Integrate GOAP planning here
-
-  # Step C: If no GOAP plan, consult LLM
-  if not plan_found then
-    print("[PLAN PHASE] No GOAP plan found. Consulting LLM...")
-    let solution = ask_llm_for_solution(func_name, engine_type, model_name)
-
-    # Step D: Generate implementation using LLM solution
-    # Translate {FILE} to PatLang concatenation syntax for file_path
-    # Example: (Get-Item '{FILE}').Length -> (Get-Item '\" + file_path + \"').Length
-    #
-    # REAL BUG FOUND AND FIXED HERE: the LLM's prompt (ask_llm_for_
-    # solution) documents {FILE} as already appearing INSIDE quotes in
-    # its own suggestion (example output: `(Get-Item '{FILE}').Length`
-    # -- note the surrounding single quotes are the LLM's own). This
-    # substitution used to ALSO wrap the interpolated file_path in a
-    # fresh pair of single quotes, producing DOUBLED quotes end to end
-    # (`''` + path + `''`), which PowerShell parses as an EMPTY string
-    # literal immediately followed by garbage -- Get-Item then fails
-    # with "Cannot bind argument ... because it is an empty string",
-    # and to_num() of that error text silently becomes 0. Confirmed via
-    # a direct repro (heal_missing_function("file_size", ...) expecting
-    # "70" for a genuinely-70-byte file returned 0, not 70) -- this bug
-    # was invisible before the vacuous-check fix above, since the old
-    # "CONTRACT PASS" substring check couldn't tell 0 from 70. Fixed by
-    # NOT adding extra quotes here -- {FILE}'s surrounding quotes in the
-    # LLM's own suggestion are relied on as-is.
-    let formatted_solution = solution
-    if contains_text(solution, "{FILE}") then
-      # Manual split and join to emulate text replace in pure PatLang
-      let idx = 0
-      let found = -1
-      while (idx <= solution.length - 6) and (found == -1) do
-        if substr(solution, idx, 6) == "{FILE}" then
-          let found = idx
-        end
-        let idx = idx + 1
-      end
-      if found >= 0 then
-        let left = substr(solution, 0, found)
-        let right = substr(solution, found + 6, solution.length - (found + 6))
-        let formatted_solution = left + "\" + file_path + \"" + right
-      end
-    end
-
-    # Build PowerShell command with file_path variable properly interpolated
-    #
-    # REAL GENERALIZABILITY GAP FIXED HERE: this used to unconditionally
-    # `to_num(raw_out)` the captured output, assuming every synthesized
-    # function's real result is numeric (true for file_size/word-count,
-    # false for e.g. "get file extension" -- to_num() on a non-numeric
-    # string silently returns something wrong rather than an error, so
-    # a string-result target would corrupt silently, invisible before
-    # the vacuous-check fix). Switched to trimming raw_out's surrounding
-    # whitespace/CRLF and returning/comparing it as a plain STRING
-    # throughout -- a numeric-looking result ("70") compares equal to a
-    # numeric-looking expected_result string exactly as before, but a
-    # genuinely string-shaped result (".md") now works too, with no
-    # separate numeric/string code path needed.
-    let code = "# =============================================================================\n"
-    let code = code + "# Auto-Synthesized PatLang Host Function Wrapper: " + func_name + "\n"
-    let code = code + "# =============================================================================\n\n"
-    let code = code + "make a function called " + func_name + " takes file_path returns result\n"
-    let code = code + "  print(\"  [SYNTHESIZED EXEC] " + func_name + "...\")\n"
-    let code = code + "  let raw_out = exec_capture(\"powershell\", \"-Command\", \"" + formatted_solution + "\")\n"
-    let code = code + "  let a = 0\n"
-    let code = code + "  while (a < raw_out.length) and ((char_code(raw_out, a) == 32) or (char_code(raw_out, a) == 9) or (char_code(raw_out, a) == 13) or (char_code(raw_out, a) == 10)) do\n"
-    let code = code + "    let a = a + 1\n"
-    let code = code + "  end\n"
-    let code = code + "  let z = raw_out.length\n"
-    let code = code + "  while (z > a) and ((char_code(raw_out, z - 1) == 32) or (char_code(raw_out, z - 1) == 9) or (char_code(raw_out, z - 1) == 13) or (char_code(raw_out, z - 1) == 10)) do\n"
-    let code = code + "    let z = z - 1\n"
-    let code = code + "  end\n"
-    let code = code + "  let trimmed = substr(raw_out, a, z - a)\n"
-    let code = code + "  print(\"[CONTRACT PASS] Synthesized function " + func_name + " returned: \" + trimmed)\n"
-    let code = code + "  return trimmed\n"
-    let code = code + "end\n"
-    let impl_code = code
-
-    # Step E: GREEN Phase - Write implementation, compile, run BDD spec.
-    # REAL BUG FIXED HERE: this used to be a bare `green_phase(...)`
-    # call with the result discarded, followed by an unconditional
-    # `return true` below -- so heal_missing_function could NEVER
-    # report failure, no matter what green_phase's own checks found.
-    # Confirmed via a direct repro: a deliberately wrong expected_result
-    # still came back `healed = true`. Now the real pass/fail result
-    # propagates all the way out.
-    let green_ok = green_phase(func_name, impl_code)
+  # Step B1: PLAN - a pure-PatLang solution built entirely from functions
+  # already known to exist needs no empirical probe at all: the contract
+  # IS the composition of those functions' own already-known behavior,
+  # so there's nothing left to establish and nothing to ask an LLM about.
+  print("[PLAN PHASE] Checking for a known, pure-PatLang solution (no LLM, no shell)...")
+  let known_impl = known_patlang_solution(func_name)
+  if known_impl != "" then
+    print("[PLAN PHASE] Found a known PatLang-native implementation for '" + func_name + "'.")
+    let green_ok = green_phase(ctx, func_name, known_impl)
     return green_ok
   end
 
-  return true
+  # Step B2: PLAN - a known shell-command pattern (a well-known,
+  # deterministic idiom, not a guess) still gets its actual input->output
+  # contract established empirically, by running it directly against the
+  # real test data, before any wrapper is written or compiled around it.
+  print("[PLAN PHASE] Checking for a known shell-command solution...")
+  let known_cmd = known_shell_solution(func_name)
+  if known_cmd != "" then
+    if probe_shell_command(known_cmd, test_file, expected_result) then
+      print("[PLAN PHASE] Known command's output matches the expected contract -- proceeding without the LLM.")
+      let impl_code = build_shell_wrapper_code(func_name, known_cmd)
+      let green_ok = green_phase(ctx, func_name, impl_code)
+      return green_ok
+    else
+      print("[PLAN PHASE] Known command pattern did not satisfy the contract for this input -- falling back to the LLM.")
+    end
+  end
+
+  # Step C: Neither a known PatLang solution nor a known shell pattern
+  # established the contract -- consult the LLM as a genuine last
+  # resort, not the default path. Its suggestion gets the exact same
+  # empirical, LLM-free contract check (probe_shell_command) any known
+  # pattern would, before a wrapper is ever written or compiled around
+  # it -- the LLM proposes a candidate; it does not get to also decide
+  # whether that candidate is correct.
+  print("[PLAN PHASE] No known solution satisfies the contract. Consulting LLM as a last resort...")
+  let solution = ask_llm_for_solution(func_name, engine_type, model_name)
+
+  if not probe_shell_command(solution, test_file, expected_result) then
+    print("[PLAN PHASE] LLM's suggestion did not satisfy the expected contract when probed directly.")
+    return false
+  end
+  print("[PLAN PHASE] LLM's suggestion matches the expected contract -- proceeding to GREEN phase.")
+
+  let impl_code = build_shell_wrapper_code(func_name, solution)
+
+  # Step E: GREEN Phase - Write implementation, compile, run BDD spec.
+  # REAL BUG FIXED HERE: this used to be a bare `green_phase(...)` call
+  # with the result discarded, followed by an unconditional `return
+  # true` below -- so heal_missing_function could NEVER report failure,
+  # no matter what green_phase's own checks found. Confirmed via a
+  # direct repro: a deliberately wrong expected_result still came back
+  # `healed = true`. Now the real pass/fail result propagates all the
+  # way out.
+  let green_ok = green_phase(ctx, func_name, impl_code)
+  return green_ok
 end
 
 
 # --- Step Definitions ---
 
-make a function called st_given_missing_word_count_function returns ok
+make a function called st_given_missing_word_count_function takes ctx returns ok
   print("[BDD TEST] Simulating runtime missing function: count_words_awk...")
-  return check("missing function trigger initialized", true, true)
+  return expect(ctx, "missing function trigger initialized", true, true)
 end
 
-make a function called st_when_awk_healing_triggered returns ok
+make a function called st_when_awk_healing_triggered takes ctx returns ok
   # Verify the test file exists
   let file_ok = file_exists("friendly_cli/test_src/doc1.md") == true
-  check("test file doc1.md exists", file_ok, true)
+  expect(ctx, "test file doc1.md exists", file_ok, true)
   
   # Run the self-healing engine to generate count_words_awk. 
   # Note: expected output for doc1.md ("# Dummy test file 1 \n Markdown sample document...") is 9 words.
-  let healed = heal_missing_function("count_words_awk", "hermes", "", "friendly_cli/test_src/doc1.md", "friendly_cli/test_src/doc1.md", "9")
-  return check("self-healing engine synthesized awk wrapper (RED-GREEN complete)", healed, true)
+  let healed = heal_missing_function(ctx, "count_words_awk", "hermes", "", "friendly_cli/test_src/doc1.md", "friendly_cli/test_src/doc1.md", "9")
+  return expect(ctx, "self-healing engine synthesized awk wrapper (RED-GREEN complete)", healed, true)
 end
 
-make a function called st_then_awk_function_exists returns ok
+make a function called st_then_awk_function_exists takes ctx returns ok
   # Verify the synthesized function exists
   let file_ok = file_exists("friendly_cli/lib/synthesized_tools.patlang") == true
-  check("synthesized_tools.patlang written to disk", file_ok, true)
+  expect(ctx, "synthesized_tools.patlang written to disk", file_ok, true)
   
   let spec_ok = file_exists("friendly_cli/test_healing_spec.patlang") == true
-  check("test_healing_spec.patlang written to disk", spec_ok, true)
+  expect(ctx, "test_healing_spec.patlang written to disk", spec_ok, true)
   
   let expanded_ok = file_exists("friendly_cli/test_healing_expanded.patlang") == true
-  check("test_healing_expanded.patlang exists", expanded_ok, true)
+  expect(ctx, "test_healing_expanded.patlang exists", expanded_ok, true)
   
   let exe_ok = file_exists("friendly_cli/test_healing_expanded.exe") == true
-  check("test_healing_expanded.exe compiled successfully", exe_ok, true)
+  expect(ctx, "test_healing_expanded.exe compiled successfully", exe_ok, true)
   
   return true
 end
 
 # --- Step Registration ---
 
-step("a missing word count function", "st_given_missing_word_count_function")
-step("the self-healing engine synthesizes the word count function using awk", "st_when_awk_healing_triggered")
-step("the synthesized awk tool, spec, and compiled binary are saved and verified", "st_then_awk_function_exists")
+let ctx = ctx_new()
+step(ctx, "a missing word count function", "st_given_missing_word_count_function")
+step(ctx, "the self-healing engine synthesizes the word count function using awk", "st_when_awk_healing_triggered")
+step(ctx, "the synthesized awk tool, spec, and compiled binary are saved and verified", "st_then_awk_function_exists")
 
-t_init()
+
 
 let line1 = "Feature: Awk Word Count Self-Healing" + chr(10)
 let line2 = "Scenario: Synthesize word count function using awk" + chr(10)
@@ -782,5 +2841,5 @@ let line5 = "Then the synthesized awk tool, spec, and compiled binary are saved 
 
 let feature_text = line1 + line2 + line3 + line4 + line5
 
-run_feature(feature_text)
-t_report()
+run_feature(ctx, feature_text)
+ctx_report(ctx)

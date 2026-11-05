@@ -1,0 +1,156 @@
+# A context: a run's named state, held by whoever made it and passed explicitly,
+# so nothing is shared by accident (docs/plans/v2-implementation.md, section 7a).
+#
+#   let ctx = context_new()
+#   ctx_set(ctx, "seen", true)
+#   ctx_get(ctx, "seen")
+#
+# A vec: slot 0 a vec of buckets, each a list of [name, value]; slot 1 how many
+# names it holds. A longer-lived kind of context (lib/gherkin.patlang) starts as
+# one of these and adds slots of its own after them. A vec belongs to the thread
+# that made it, so a parallel_map worker is handed the values it needs as items.
+
+make a function called ctx_buckets_new takes n returns buckets
+  let buckets = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  return buckets
+end
+
+make a function called context_new returns ctx
+  let ctx = vec_new()
+  vec_push(ctx, ctx_buckets_new(64))
+  vec_push(ctx, 0)
+  return ctx
+end
+
+# A name's bucket among n, n a power of two. Keys here are short.
+make a function called ctx_slot takes name, n returns k
+  let h = 5381
+  let len = name.length
+  let i = 0
+  while i < len do
+    let h = (h * 33 + char_code(name, i)) % 1073741823
+    let i = i + 1
+  end
+  return h % n
+end
+
+# Twice the buckets, once the names outnumber them by four to one.
+make a function called ctx_grow takes ctx returns done
+  let old = vec_get(ctx, 0)
+  let n = vec_len(old) * 2
+  let buckets = ctx_buckets_new(n)
+  let b = 0
+  while b < vec_len(old) do
+    let entries = vec_get(old, b)
+    let i = 0
+    while i < list_len(entries) do
+      let k = ctx_slot(entries[i][0], n)
+      vec_set(buckets, k, list_push(vec_get(buckets, k), entries[i]))
+      let i = i + 1
+    end
+    let b = b + 1
+  end
+  vec_set(ctx, 0, buckets)
+  return true
+end
+
+make a function called ctx_has takes ctx, name returns yes
+  let buckets = vec_get(ctx, 0)
+  let entries = vec_get(buckets, ctx_slot(name, vec_len(buckets)))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A name's value, false when it has none.
+make a function called ctx_get takes ctx, name returns v
+  let buckets = vec_get(ctx, 0)
+  let entries = vec_get(buckets, ctx_slot(name, vec_len(buckets)))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A name's value, the unit value when it has none: an out-of-range read gives unit.
+make a function called ctx_read takes ctx, name returns v
+  if ctx_has(ctx, name) then
+    return ctx_get(ctx, name)
+  end
+  return list_get([], 0)
+end
+
+# A name's value as a number, 0 when it has none.
+make a function called ctx_num takes ctx, name returns n
+  if ctx_has(ctx, name) then
+    return to_num(ctx_get(ctx, name))
+  end
+  return 0
+end
+
+# A name's value as text, "" when it has none.
+make a function called ctx_text takes ctx, name returns s
+  if ctx_has(ctx, name) then
+    return "" + ctx_get(ctx, name)
+  end
+  return ""
+end
+
+# The next number from a counter of this name, from 1.
+make a function called ctx_counter takes ctx, name returns n
+  let n = ctx_num(ctx, name) + 1
+  ctx_set(ctx, name, n)
+  return n
+end
+
+make a function called ctx_set takes ctx, name, v returns done
+  let buckets = vec_get(ctx, 0)
+  let k = ctx_slot(name, vec_len(buckets))
+  let entries = vec_get(buckets, k)
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      vec_set(buckets, k, list_set(entries, i, [name, v]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(buckets, k, list_push(entries, [name, v]))
+  let count = vec_get(ctx, 1) + 1
+  vec_set(ctx, 1, count)
+  if count > vec_len(buckets) * 4 then
+    ctx_grow(ctx)
+  end
+  return true
+end
+
+# A top-level `when` handler takes no arguments, so a program whose handlers use
+# its context holds it in a named object, which is how a handler reaches anything
+# of the program's.
+class ProgramContext {
+  field held = 0
+}
+
+make a function called context_hold takes ctx returns done
+  new("ProgramContext", "program_context")
+  send("program_context", "set", "held", ctx)
+  return true
+end
+
+make a function called context_held returns ctx
+  return get("program_context", "held")
+end

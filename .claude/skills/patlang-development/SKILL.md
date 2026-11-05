@@ -32,9 +32,9 @@ diagnostic files were written first and Gherkin formalized only after
 something worked. That's the failure mode this rule exists to close.
 
 Formal feature work lives in `spec_library/**/*.feature`, wired through
-`self_hosting/lib/test.patlang`'s Gherkin runner and (for language-level
+`self_hosting/lib/gherkin.patlang`'s Gherkin runner and (for language-level
 semantics) `self_hosting/lib/spec_steps_language.patlang`'s `step()`
-registrations, or `gherkin_contracts.patlang`'s `ensure` steps for
+registrations, or `gherkin.patlang`'s `ensure` steps for
 representation/type invariants. Run the whole language gate with:
 
 ```
@@ -283,7 +283,7 @@ rust-runtime/target/release/pat --ir-run self_hosting/build_patc1.patlang
 ./patc1.exe <src>.patlang <out>.wasm wasm32-wasip1
 wasmtime run <out>.wasm
 
-# Full language spec gate (Gherkin-backed, 37/37 .feature files)
+# Full language spec gate (Gherkin-backed, every language .feature but match_pattern)
 rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_language_spec_suite.patlang
 
 # Rust<->self-host mirror parity check (see the mirror-check skill for the full workflow)

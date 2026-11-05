@@ -244,6 +244,9 @@ make a function called lw_expr takes fb, e returns s
     end
     return lw_closure(fb, e[1], e[2], raises)
   end
+  if kind == "Budgeted" then
+    return lw_budgeted(fb, e)
+  end
   if kind == "List" then
     let slots = []
     let i = 0
@@ -399,6 +402,28 @@ make a function called lw_extern takes fb, args, kind returns d
   return d
 end
 
+# budgeted(ms, existing) { body }: the body as a closure, which a fiber runs
+# (runtime/fibers.patlang). A loop lexically in the body checks the budget at
+# its back-edge, in closures inside it too, so the closure's builder says so.
+make a function called lw_budgeted takes fb, e returns d
+  let ms = lw_expr(fb, e[1])
+  let inner = list_set(fb, 7, list_set(fb[7], 5, true))
+  let f = lw_closure(inner, ["__budget_arg"], e[3], [])
+  let existing = lw_expr(fb, e[2])
+  let d = lw_new_slot(fb)
+  lw_emit(fb, ["call", d, "rt_budgeted", [ms, f, existing]])
+  return d
+end
+
+# A loop's back-edge, in a budgeted body.
+make a function called lw_back_edge takes fb, l_test returns done
+  if fb[7][5] then
+    lw_call(fb, "budget_check", [])
+  end
+  lw_emit(fb, ["jump", l_test])
+  return true
+end
+
 # A closure literal: its body is lifted to a function of its own, named
 # from this declaration, taking the closure itself first and then its
 # parameters. The closure holds the values of the variables its body reads
@@ -526,6 +551,9 @@ make a function called lw_stmt_value takes fb, st returns slot
     lw_emit(fb, ["label", l_end])
     return d
   end
+  if kind == "Match" then
+    return lw_match(fb, st, true)
+  end
   if kind == "While" then
     let d = lw_new_slot(fb)
     lw_emit(fb, ["copy", d, lw_const(fb, "unit", "")])
@@ -538,7 +566,7 @@ make a function called lw_stmt_value takes fb, st returns slot
     lw_emit(fb, ["branch", c, l_body, l_end])
     lw_emit(fb, ["label", l_body])
     lw_emit(fb, ["copy", d, lw_block_value(fb, st[2])])
-    lw_emit(fb, ["jump", l_test])
+    lw_back_edge(fb, l_test)
     lw_emit(fb, ["label", l_end])
     return d
   end
@@ -645,8 +673,12 @@ make a function called lw_stmt takes fb, st returns done
     lw_emit(fb, ["branch", c, l_body, l_end])
     lw_emit(fb, ["label", l_body])
     lw_stmts(fb, st[2])
-    lw_emit(fb, ["jump", l_test])
+    lw_back_edge(fb, l_test)
     lw_emit(fb, ["label", l_end])
+    return true
+  end
+  if kind == "Match" then
+    lw_match(fb, st, false)
     return true
   end
   if kind == "Assert" then
@@ -658,6 +690,92 @@ make a function called lw_stmt takes fb, st returns done
   end
   lw_error(fb, "unsupported statement " + kind)
   return false
+end
+
+# ---- match ----
+
+# A pattern as ordinary expressions over subject: [test, the lets to run once
+# the test has passed].
+make a function called lw_pattern takes pat, subject returns r
+  let tag = pat[0]
+  if tag == "PWild" then
+    return [["Bool", "true"], []]
+  elif tag == "PBind" then
+    return [["Bool", "true"], [["Let", pat[1], subject, false, false]]]
+  elif tag == "PLit" then
+    return [["Bin", "==", subject, pat[1]], []]
+  elif tag == "PCmp" then
+    return [["Bin", pat[1], subject, pat[2]], []]
+  elif tag == "PGlob" then
+    return [["Call", "glob_match", [subject, ["Str", pat[1]]]], []]
+  end
+  let subs = pat[1]
+  let test = ["Bin", "and", ["Bin", "==", ["Call", "type_of", [subject]], ["Str", "list"]], ["Bin", "==", ["Member", subject, "length"], ["Num", "" + list_len(subs)]]]
+  let lets = []
+  let i = 0
+  while i < list_len(subs) do
+    let sub = lw_pattern(subs[i], ["Index", subject, ["Num", "" + i]])
+    let test = ["Bin", "and", test, sub[0]]
+    let j = 0
+    while j < list_len(sub[1]) do
+      let lets = list_push(lets, sub[1][j])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return [test, lets]
+end
+
+# A match: the scrutinee once, then each arm's test, its bindings, its guard
+# (which may read those bindings) and its block. A value no case takes stops
+# the program, whether or not contracts are checked. Gives the slot holding the
+# taken block's value when wanted.
+make a function called lw_match takes fb, st, wanted returns d
+  let d = 0 - 1
+  if wanted then
+    let d = lw_new_slot(fb)
+  end
+  let v = lw_expr(fb, st[1])
+  let tmp = "__match_" + lw_new_label(fb)
+  lw_emit(fb, ["copy", lw_bind(fb, tmp), v])
+  let subject = ["Var", tmp]
+  let l_end = lw_new_label(fb)
+  let i = 0
+  while i < list_len(st[2]) do
+    let arm = st[2][i]
+    let comp = lw_pattern(arm[0], subject)
+    let c = lw_expr(fb, comp[0])
+    let l_bind = lw_new_label(fb)
+    let l_next = lw_new_label(fb)
+    lw_emit(fb, ["branch", c, l_bind, l_next])
+    lw_emit(fb, ["label", l_bind])
+    lw_stmts(fb, comp[1])
+    if arm[1] != false then
+      let g = lw_expr(fb, arm[1])
+      let l_body = lw_new_label(fb)
+      lw_emit(fb, ["branch", g, l_body, l_next])
+      lw_emit(fb, ["label", l_body])
+    end
+    if wanted then
+      lw_emit(fb, ["copy", d, lw_block_value(fb, arm[2])])
+    else
+      lw_stmts(fb, arm[2])
+    end
+    lw_emit(fb, ["jump", l_end])
+    lw_emit(fb, ["label", l_next])
+    let i = i + 1
+  end
+  let w = lw_const(fb, "str", "assertion")
+  let t = lw_const(fb, "str", "match: no case matched the scrutinee value")
+  let n = lw_const(fb, "str", fb[5])
+  let failed = lw_new_slot(fb)
+  lw_emit(fb, ["call", failed, "rt_contract_failed", [w, t, n]])
+  if wanted then
+    lw_emit(fb, ["copy", d, lw_const(fb, "unit", "")])
+  end
+  lw_emit(fb, ["jump", l_end])
+  lw_emit(fb, ["label", l_end])
+  return d
 end
 
 # require/ensure/assert COND: when contracts are checked
@@ -813,6 +931,24 @@ make a function called lw_let_giving takes fb, name, rhs returns done
   return true
 end
 
+# Whether a pattern binds name, at any depth.
+make a function called lw_pattern_binds takes pat, name returns yes
+  if pat[0] == "PBind" then
+    return pat[1] == name
+  end
+  if pat[0] != "PList" then
+    return false
+  end
+  let i = 0
+  while i < list_len(pat[1]) do
+    if lw_pattern_binds(pat[1][i], name) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
 # Whether a statement list assigns name anywhere (with let), at any depth.
 make a function called lw_assigns takes stmts, name returns yes
   let i = 0
@@ -831,6 +967,15 @@ make a function called lw_assigns takes stmts, name returns yes
         return true
       end
     end
+    if st[0] == "Match" then
+      let a = 0
+      while a < list_len(st[2]) do
+        if lw_pattern_binds(st[2][a][0], name) or lw_assigns(st[2][a][2], name) then
+          return true
+        end
+        let a = a + 1
+      end
+    end
     let i = i + 1
   end
   return false
@@ -842,6 +987,11 @@ make a function called lw_raise_events takes fb, r returns done
   let raises = fb[8]
   if list_len(raises) == 0 then
     return true
+  end
+  # the payload reads r and so does the return: a variable, under no name
+  if not v2_contains(vec_to_list(fb[2]), r) then
+    vec_push(fb[1], "")
+    vec_push(fb[2], r)
   end
   let first = 0
   if (vec_len(fb[1]) > 0) and (vec_get(fb[1], 0) == "__closure_self") then
@@ -918,7 +1068,10 @@ make a function called lw_function_with takes name, params, body, captured, lift
     let i = i + 1
   end
   if list_len(captured) > 0 then
+    # read once per capture, so a variable, under no name
     let block = lw_new_slot(fb)
+    vec_push(fb[1], "")
+    vec_push(fb[2], block)
     lw_emit(fb, ["prim", block, "value_data", [0]])
     let k = 0
     while k < list_len(captured) do
@@ -935,7 +1088,7 @@ make a function called lw_function_with takes name, params, body, captured, lift
   lw_raise_events(fb, u)
   lw_emit(fb, ["return", u])
   let func = ir_fn(name, list_len(pnames), vec_get(fb[3], 0), vec_to_list(fb[0]), vec_to_list(fb[2]))
-  ensure ir_well_formed(func, false)
+  ensure ir_well_formed(func, false) and ir_temps_read_once(func)
   return [func, vec_to_list(fb[4])]
 end
 
@@ -957,7 +1110,7 @@ make a function called lw_program takes files returns result
   let f = 0
   while f < list_len(files) do
     let stmts = files[f][0]
-    let ctx = [files[f][1], symbols, by_name, handled, rules]
+    let ctx = [files[f][1], symbols, by_name, handled, rules, false]
     let i = 0
     while i < list_len(stmts) do
       let st = stmts[i]
@@ -989,11 +1142,11 @@ make a function called lw_program takes files returns result
   # __main registers the functions reached by name first: __register is
   # lowered last, when every by_name call has been seen
   let start = ["Expr", ["Call", "__register", []], 0]
-  let r = lw_function_with("__main", [], v2_concat([start], v2_concat(classes, top)), [], lifted, false, [false, symbols, by_name, handled, rules], [])
+  let r = lw_function_with("__main", [], v2_concat([start], v2_concat(classes, top)), [], lifted, false, [false, symbols, by_name, handled, rules, false], [])
   let fns = list_push(fns, r[0])
   let errors = v2_concat(errors, r[1])
   let registrations = lw_by_name_registrations(files, symbols, vec_to_list(by_name))
-  let r = lw_function_with("__register", [], registrations, [], lifted, false, [false, symbols, by_name, handled, rules], [])
+  let r = lw_function_with("__register", [], registrations, [], lifted, false, [false, symbols, by_name, handled, rules, false], [])
   let fns = list_push(fns, r[0])
   let errors = v2_concat(errors, r[1])
   # the program facts (B2), each recorded where it was declared: the events
@@ -1008,7 +1161,7 @@ end
 # fn 'no_such_host' not found").
 make a function called lw_undeclared_function takes name returns func
   let body = [["Return", ["Call", "rt_undeclared", [["Str", name]]]]]
-  let r = lw_function_with(name, [], body, [], vec_new(), false, [true, [], vec_new(), vec_new(), vec_new()], [])
+  let r = lw_function_with(name, [], body, [], vec_new(), false, [true, [], vec_new(), vec_new(), vec_new(), false], [])
   return r[0]
 end
 

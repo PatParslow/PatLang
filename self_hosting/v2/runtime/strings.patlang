@@ -1,7 +1,14 @@
-# v2 runtime: strings. A string's block payload is [len:8] then its bytes;
-# a literal is data with the same layout and its heap bit clear
-# (x64.patlang, xv_str_data), so length and bytes are always at the same
-# offsets from the data word, and only a heap string is ever counted.
+# v2 runtime: strings. A string is UTF-8: its block payload is [len:8], its bytes;
+# [chars:8], its characters, or -1 until they are first counted; then the bytes.
+# A literal is data with the same layout and its heap bit clear (x64.patlang,
+# xv_str_data), so all three are always at the same offsets from the data word,
+# and only a heap string is ever counted.
+#
+# A program sees characters: length, indexes, substr, char_code and chr
+# (system.patlang). The runtime's own text code works in bytes (str_len,
+# rt_byte_at, rt_byte_substr). A string of only ASCII has as many characters as
+# bytes, so it indexes in O(1); any other walks from its start, and a scan of one
+# goes through the cursor (hosts.patlang, str_intern).
 quiet_operators()
 
 make a function called rt_string_class returns c
@@ -26,16 +33,96 @@ end
 
 make a function called rt_str_bytes takes s returns addr
   require (value_class(s) == 8)
-  let addr = value_data(s) + 24
-  ensure addr == value_data(s) + 24
+  let addr = value_data(s) + 32
+  ensure addr == value_data(s) + 32
   return addr
+end
+
+# How many characters a string has, counted once.
+make a function called rt_str_chars takes s returns n
+  require value_class(s) == 8
+  let block = value_data(s)
+  let n = mem_load(block, 24)
+  if n < 0 then
+    let at = block + 32
+    let len = mem_load(block, 16)
+    let n = 0
+    let i = 0
+    while i < len do
+      if word_and(mem_load_byte(at, i), 192) != 128 then
+        let n = n + 1
+      end
+      let i = i + 1
+    end
+    mem_store(block, 24, n)
+  end
+  ensure n >= 0
+  return n
+end
+
+# Where a string's character i starts, in bytes from its first byte; i may be
+# its character count.
+make a function called rt_char_offset takes s, i returns at
+  require (value_class(s) == 8) and (i >= 0)
+  let len = str_len(s)
+  if rt_str_chars(s) == len then
+    let at = i
+    ensure at >= 0
+    return at
+  end
+  let bytes = rt_str_bytes(s)
+  let at = 0
+  let k = 0
+  while (k < i) and (at < len) do
+    let at = at + rt_utf8_width(mem_load_byte(bytes, at))
+    let k = k + 1
+  end
+  ensure at >= 0
+  return at
+end
+
+# A character's length in bytes, from its first byte.
+make a function called rt_utf8_width takes lead returns w
+  require value_class(lead) == 2
+  if lead < 128 then
+    let w = 1
+  elif lead < 224 then
+    let w = 2
+  elif lead < 240 then
+    let w = 3
+  else
+    let w = 4
+  end
+  ensure (w >= 1) and (w <= 4)
+  return w
+end
+
+# The character starting at a byte address.
+make a function called rt_utf8_decode takes at returns code
+  require at != 0
+  let lead = mem_load_byte(at, 0)
+  let w = rt_utf8_width(lead)
+  if w == 1 then
+    let code = lead
+    ensure code >= 0
+    return code
+  end
+  let code = word_and(lead, word_shr(127, w))
+  let k = 1
+  while k < w do
+    let code = word_or(word_shl(code, 6), word_and(mem_load_byte(at, k), 63))
+    let k = k + 1
+  end
+  ensure code >= 0
+  return code
 end
 
 # A new string of len bytes, its bytes not yet written.
 make a function called rt_str_alloc takes len returns block
   require (value_class(len) == 2) and (len >= 0)
-  let block = rt_alloc(8 + len)
+  let block = rt_alloc(16 + len)
   mem_store(block, 16, len)
+  mem_store(block, 24, 0 - 1)
   ensure mem_load(block, 16) == len
   return block
 end
@@ -57,8 +144,8 @@ make a function called str_concat takes a, b returns s
   let la = str_len(a)
   let lb = str_len(b)
   let block = rt_str_alloc(la + lb)
-  rt_copy_bytes(block + 24, rt_str_bytes(a), la)
-  rt_copy_bytes(block + 24 + la, rt_str_bytes(b), lb)
+  rt_copy_bytes(block + 32, rt_str_bytes(a), la)
+  rt_copy_bytes(block + 32 + la, rt_str_bytes(b), lb)
   let s = value_make(rt_string_heap_type(), block)
   ensure (value_class(s) == 8) and (str_len(s) == str_len(a) + str_len(b))
   return s
@@ -114,8 +201,8 @@ make a function called str_eq takes a, b returns yes
     ensure value_class(yes) == 1
     return yes
   end
-  let pa = ba + 24
-  let pb = bb + 24
+  let pa = ba + 32
+  let pb = bb + 32
   let i = 0
   while i + 8 <= n do
     if mem_load(pa, i) != mem_load(pb, i) then
@@ -155,7 +242,7 @@ make a function called rt_int_to_s takes n returns s
     let len = len + 1
   end
   let block = rt_str_alloc(len)
-  let at = block + 24
+  let at = block + 32
   let pos = len - 1
   let v = n
   if v == 0 then
@@ -229,6 +316,11 @@ make a function called to_s takes v returns s
   end
   if c == 6 then
     let s = rt_complex_to_s(v)
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 7 then
+    let s = rt_interval_to_s(v)
     ensure value_class(s) == 8
     return s
   end
@@ -350,7 +442,7 @@ end
 make a function called dot_length takes v returns n
   require (value_class(v) == 8) or (value_class(v) == 9)
   if value_class(v) == 8 then
-    let n = str_len(v)
+    let n = rt_str_chars(v)
     ensure n >= 0
     return n
   end
@@ -379,7 +471,7 @@ make a function called str_join takes parts, sep returns s
     let total = total + str_len(sep) * (n - 1)
   end
   let block = rt_str_alloc(total)
-  let at = block + 24
+  let at = block + 32
   let k = 0
   while k < n do
     if k > 0 then

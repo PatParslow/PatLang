@@ -47,6 +47,7 @@
 # instead of accidentally breaking Phase 2's suite the moment this file
 # was extended.
 
+include "../lib/context.patlang"
 include "block_ir.patlang"
 include "heap.patlang"
 # Phase 18: reuses self_hosting/lib/interp.patlang's own interp_call_host
@@ -146,11 +147,12 @@ end
 # enclosing __globals, and hand back the body's own value. Its final globals
 # are discarded (documented limit in budgeted.feature).
 make a function called bi_budget_entry takes arg returns value
+  let ctx = context_new()
   let prog = list_get(arg, 0)
   let blk = bi_find_block(prog, list_get(arg, 1))
   let locs = bm_loc_set(bm_loc_new(), list_get(bi_block_params(blk), 0), list_get(arg, 2))
   let locs = bm_loc_set(locs, "__globals", list_get(arg, 3))
-  return list_get(bi_run_from(prog, blk, locs), 0)
+  return list_get(bi_run_from(ctx, prog, blk, locs), 0)
 end
 
 # Issue #176 (threads half): `parallel_map(items, "fn")`. The real host runs
@@ -184,11 +186,12 @@ make a function called bi_parallel_map takes prog, args returns result
 end
 
 make a function called bi_pmap_entry takes arg returns value
+  let ctx = context_new()
   let prog = list_get(arg, 0)
   let blk = bi_find_block(prog, list_get(arg, 1))
   let locs = bm_loc_set(bm_loc_new(), list_get(bi_block_params(blk), 0), list_get(arg, 2))
   let locs = bm_loc_set(locs, "__globals", list_get(arg, 3))
-  return list_get(bi_run_from(prog, blk, locs), 0)
+  return list_get(bi_run_from(ctx, prog, blk, locs), 0)
 end
 
 # Phase 7 (Fork C): a counter of how many times the RUNTIME refcount
@@ -196,19 +199,15 @@ end
 # measurable form of "most mutations should be proven safe before this
 # code ever runs" (design doc section 3.5). Seeded in bi_run, alongside
 # bm_heap_ready.
-make a function called bm_note_runtime_check_performed returns done
-  set_var("bm_runtime_check_count", get("__vars", "bm_runtime_check_count") + 1)
+make a function called bm_note_runtime_check_performed takes ctx returns done
+  ctx_set(ctx, "bm_runtime_check_count", ctx_num(ctx, "bm_runtime_check_count") + 1)
   return true
 end
 
-make a function called bm_get_runtime_check_count returns n
-  return get("__vars", "bm_runtime_check_count")
-end
-
-make a function called bm_ensure_heap_ready returns done
-  if get("__vars", "bm_heap_ready") == false then
+make a function called bm_ensure_heap_ready takes ctx returns done
+  if ctx_read(ctx, "bm_heap_ready") == false then
     bm_heap_init()
-    set_var("bm_heap_ready", true)
+    ctx_set(ctx, "bm_heap_ready", true)
   end
   return true
 end
@@ -472,7 +471,7 @@ end
 # Each branch below is commented with the string its hash represents;
 # see block_ir.patlang's own header on bm_op_hash and hash_check.patlang
 # for how these literals were derived and collision-checked.
-make a function called bi_run_block takes prog, blk, locs returns outcome
+make a function called bi_run_block takes ctx, prog, blk, locs returns outcome
   let instrs = bi_block_instrs(blk)
   let n = list_len(instrs)
   let pc = 0
@@ -534,7 +533,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       print(list_get(popped, 0))
       let pc = pc + 1
     elif op == 258931 then # "BoxNew"
-      bm_ensure_heap_ready()
+      bm_ensure_heap_ready(ctx)
       let popped = bm_st_pop(stack)
       let ptr = bm_alloc(8)
       bm_box_write(ptr, list_get(popped, 0))
@@ -558,7 +557,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let popped_p = bm_st_pop(list_get(popped_v, 1))
       let ptr = list_get(popped_p, 0)
       let stack = list_get(popped_p, 1)
-      bm_note_runtime_check_performed()
+      bm_note_runtime_check_performed(ctx)
       if bm_rc_touch_for_mutation(ptr) == 1 then
         bm_box_write(ptr, v)
         let stack = bm_st_push(stack, ptr)
@@ -735,7 +734,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         # than trusting it: this exact call used to be a single bare
         # bi_run_block, which errored on that first "jump" outcome. Fixed
         # here, at the source, rather than special-cased around.
-        let handler_outcome = bi_run_from(prog, handler_blk, handler_locs)
+        let handler_outcome = bi_run_from(ctx, prog, handler_blk, handler_locs)
         let final_handler_locs = list_get(handler_outcome, 1)
         let cur_globals = bm_loc_get(final_handler_locs, "__globals")
         let hi = hi + 1
@@ -798,7 +797,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         # Issue #176 (threads half): same reason -- see bi_parallel_map.
         let call_result = ["Ok", bi_parallel_map(prog, list_get(popped, 0))]
       else
-        let call_result = interp_call_host(list_get(instr, 1), list_get(popped, 0))
+        let call_result = interp_call_host(ctx, list_get(instr, 1), list_get(popped, 0))
       end
       if list_get(call_result, 0) == "Err" then
         # Issue #159: the shared dispatcher (lib/interp.patlang, protected
@@ -868,7 +867,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         let callee_locs = bm_loc_set(callee_locs, list_get(param_names, pi), list_get(args, pi))
         let pi = pi + 1
       end
-      let call_outcome = bi_run_from(prog, callee_blk, callee_locs)
+      let call_outcome = bi_run_from(ctx, prog, callee_blk, callee_locs)
       let stack = bm_st_push(stack, list_get(call_outcome, 0))
       let locs = bm_loc_set(locs, "__globals", bm_loc_get(list_get(call_outcome, 1), "__globals"))
       let pc = pc + 1
@@ -909,7 +908,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         let callee_locs = bm_loc_set(callee_locs, list_get(callee_params, bi), list_get(call_args, bi))
         let bi = bi + 1
       end
-      let call_outcome = bi_run_from(prog, callee_blk, callee_locs)
+      let call_outcome = bi_run_from(ctx, prog, callee_blk, callee_locs)
       let stack = bm_st_push(stack, list_get(call_outcome, 0))
       let locs = bm_loc_set(locs, "__globals", bm_loc_get(list_get(call_outcome, 1), "__globals"))
       let pc = pc + 1
@@ -964,11 +963,11 @@ end
 # This function fixes that (see bi_run/Emit's own rewiring onto it
 # below) by doing what bi_run's own loop always did -- follow "jump"
 # outcomes to completion -- rather than assuming one call suffices.
-make a function called bi_run_from takes prog, block, locs returns pair
+make a function called bi_run_from takes ctx, prog, block, locs returns pair
   let cur = block
   let locs = locs
   while true do
-    let outcome = bi_run_block(prog, cur, locs)
+    let outcome = bi_run_block(ctx, prog, cur, locs)
     if list_get(outcome, 0) == "halt" then
       return [list_get(outcome, 1), list_get(outcome, 2)]
     end
@@ -986,7 +985,13 @@ end
 # needed the final locs bi_run_from also returns, so it simply discards
 # them.
 make a function called bi_run takes prog returns result
-  bi_init_run_state()
+  return list_get(bi_run_counting(prog), 0)
+end
+
+# What a run gives and how many times its runtime refcount check fired.
+make a function called bi_run_counting takes prog returns result
+  let ctx = context_new()
+  bi_init_run_state(ctx)
   let cur = bi_find_block(prog, bi_program_entry(prog))
   # The entry block never has anything jumped INTO it, so the very first
   # pointer's own globals-view section (section 3.2/3.3) is seeded here,
@@ -994,13 +999,13 @@ make a function called bi_run takes prog returns result
   # it purely by JumpBlock forwarding (lower.patlang's own doing), never
   # by re-seeding.
   let locs = bm_loc_set(bm_loc_new(), "__globals", [])
-  let outcome = bi_run_from(prog, cur, locs)
-  return list_get(outcome, 0)
+  let outcome = bi_run_from(ctx, prog, cur, locs)
+  return [list_get(outcome, 0), ctx_read(ctx, "bm_runtime_check_count")]
 end
 
-make a function called bi_init_run_state returns done
-  set_var("bm_heap_ready", false)
-  set_var("bm_runtime_check_count", 0)
+make a function called bi_init_run_state takes ctx returns done
+  ctx_set(ctx, "bm_heap_ready", false)
+  ctx_set(ctx, "bm_runtime_check_count", 0)
   return true
 end
 
@@ -1044,14 +1049,15 @@ end
 # second, parallel entry point rather than a flag on bi_run itself,
 # since fiber_new needs a plain top-level function name to spawn.
 make a function called bi_debug_run takes prog returns result
-  bi_init_run_state()
+  let ctx = context_new()
+  bi_init_run_state(ctx)
   let cur = bi_find_block(prog, bi_program_entry(prog))
   let locs = bm_loc_set(bm_loc_new(), "__globals", [])
   let trail = []
   while true do
     let trail = bm_trail_push(trail, bi_block_name(cur))
     fiber_yield(trail)
-    let outcome = bi_run_block(prog, cur, locs)
+    let outcome = bi_run_block(ctx, prog, cur, locs)
     if list_get(outcome, 0) == "halt" then
       return list_get(outcome, 1)
     end

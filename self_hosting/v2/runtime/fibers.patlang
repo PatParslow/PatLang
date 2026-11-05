@@ -1,0 +1,347 @@
+# v2 runtime: fibers, budgeted blocks, and threads started one at a time.
+#
+# A fiber is a Windows fiber: its own stack, on whichever thread resumes it,
+# using that thread's memory context. A program holds an id, an int; the list
+# at runtime_state() + 4112 pairs each unfinished one with its job, under the
+# ticket lock at 4416 and 4424, 4432 being the last id given. A fiber's entry
+# stays until it finishes and a thread's until thread_result takes its result,
+# so an id is live as long as the program can still use it.
+#
+# A job (threads.patlang) is an uncounted block: 16 the function, 32 the value
+# handed across a switch (a thread's arguments), 48 a thread's result, 64 a
+# thread's context, 0 for a fiber, 72 its handle, 80 the fiber that resumed it,
+# 88 1 once it has finished; for a fiber, 96 its deadline in ms or -1, 104 the
+# last budget check or -1, 112 how many durations are held, 120 up to 16 of them.
+#
+# A thread context holds the job of the fiber it is running at 2592, 0 for
+# none, and at 2600 the thread's own fiber once it has resumed one.
+quiet_operators()
+
+make a function called rt_fibers_init returns r
+  let st = runtime_state()
+  mem_store(st, 4416, 0)
+  mem_store(st, 4424, 0)
+  mem_store(st, 4432, 0)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_jobs_lock returns r
+  let st = runtime_state()
+  let mine = atomic_add(st + 4416, 1)
+  while mem_load(st, 4424) != mine do
+    let spin = 0
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_jobs_unlock returns r
+  let st = runtime_state()
+  mem_store(st, 4424, mem_load(st, 4424) + 1)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# Gives a job an id.
+make a function called rt_job_add takes job returns id
+  require job != 0
+  rt_jobs_lock()
+  let st = runtime_state()
+  let id = mem_load(st, 4432) + 1
+  mem_store(st, 4432, id)
+  rt_global_set(4112, list_push(rt_global_get(4112), [id, job]))
+  rt_jobs_unlock()
+  ensure id > 0
+  return id
+end
+
+# The job of an id, or 0.
+make a function called rt_job_of takes id returns job
+  rt_jobs_lock()
+  let jobs = rt_global_get(4112)
+  rt_jobs_unlock()
+  let job = 0
+  if value_class(id) == 2 then
+    let n = list_len(jobs)
+    let k = 0
+    while k < n do
+      let row = jobs[k]
+      if row[0] == id then
+        let job = row[1]
+        let k = n
+      end
+      let k = k + 1
+    end
+  end
+  ensure value_class(job) == 2
+  return job
+end
+
+make a function called rt_job_remove takes id returns r
+  require value_class(id) == 2
+  rt_jobs_lock()
+  let jobs = rt_global_get(4112)
+  let kept = []
+  let n = list_len(jobs)
+  let k = 0
+  while k < n do
+    let row = jobs[k]
+    if row[0] != id then
+      let kept = list_push(kept, row)
+    end
+    let k = k + 1
+  end
+  rt_global_set(4112, kept)
+  rt_jobs_unlock()
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- fibers ----
+
+make a function called rt_fiber_job takes id returns job
+  let job = rt_job_of(id)
+  if job != 0 then
+    if mem_load(job, 64) != 0 then
+      let job = 0
+    end
+  end
+  ensure value_class(job) == 2
+  return job
+end
+
+make a function called rt_fiber_start takes f returns id
+  require value_class(f) == 10
+  let job = rt_job_new(248)
+  mem_init_value(job, 16, f)
+  mem_store(job, 96, 0 - 1)
+  mem_store(job, 104, 0 - 1)
+  let h = extern_call("KERNEL32.DLL", "CreateFiber", 0, thread_entry_address(), job)
+  if h == 0 then
+    rt_fail_memory()
+  end
+  mem_store(job, 72, h)
+  let id = rt_job_add(job)
+  ensure id > 0
+  return id
+end
+
+# A function by name, on a fiber that has not started.
+make a function called fiber_new takes by_name returns id
+  require value_class(by_name) == 8
+  let id = rt_fiber_start(rt_function_named(by_name))
+  ensure id > 0
+  return id
+end
+
+# Runs the fiber until it yields or ends, giving what it yielded or returned.
+make a function called fiber_resume takes id, arg returns value
+  require rt_fiber_job(id) != 0
+  let job = rt_fiber_job(id)
+  let ctx = rt_context()
+  if mem_load(ctx, 2600) == 0 then
+    mem_store(ctx, 2600, extern_call("KERNEL32.DLL", "ConvertThreadToFiber", 0))
+  end
+  let running = mem_load(ctx, 2592)
+  if running == 0 then
+    mem_store(job, 80, mem_load(ctx, 2600))
+  else
+    mem_store(job, 80, mem_load(running, 72))
+  end
+  mem_init_value(job, 32, arg)
+  mem_store(ctx, 2592, job)
+  extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(job, 72))
+  # this fiber may have been resumed on another thread since
+  mem_store(rt_context(), 2592, running)
+  let value = mem_take_value(job, 32)
+  if mem_load(job, 88) == 1 then
+    extern_call("KERNEL32.DLL", "DeleteFiber", mem_load(job, 72))
+    rt_job_remove(id)
+    rt_release_value_at(job, 16)
+    rt_free(job)
+  end
+  ensure value_live(value)
+  return value
+end
+
+# Back to whoever resumed this fiber, with a value; gives what the next
+# resume hands it.
+make a function called fiber_yield takes value returns delivered
+  require mem_load(rt_context(), 2592) != 0
+  let job = mem_load(rt_context(), 2592)
+  mem_init_value(job, 32, value)
+  extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(job, 80))
+  let delivered = mem_take_value(job, 32)
+  ensure value_live(delivered)
+  return delivered
+end
+
+make a function called fiber_alive takes id returns yes
+  let yes = rt_fiber_job(id) != 0
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A fiber's first PatLang code, from rt_thread_main. Its frame holds no
+# counted value at the last switch, since nothing returns from there.
+make a function called rt_fiber_main takes job returns r
+  require job != 0
+  rt_fiber_run(job)
+  mem_store(job, 88, 1)
+  extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(job, 80))
+  # a finished fiber is never resumed
+  let r = 0
+  ensure false
+  return r
+end
+
+make a function called rt_fiber_run takes job returns r
+  require job != 0
+  let f = mem_load_value(job, 16)
+  let arg = mem_take_value(job, 32)
+  mem_init_value(job, 32, f(arg))
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- budgeted ----
+
+# What `budgeted(ms, existing) { body }` lowers to, f being the body: runs a new
+# fiber, or the paused one existing names, until ms have passed. ["done", value]
+# or ["paused", id].
+make a function called rt_budgeted takes ms, f, existing returns out
+  require (value_class(ms) == 2) and (value_class(f) == 10)
+  let id = existing
+  if value_class(existing) != 2 then
+    let id = rt_fiber_start(f)
+  end
+  let job = rt_fiber_job(id)
+  if job == 0 then
+    print("budgeted: fiber " + id + " has already finished")
+    exit_with(94)
+  end
+  mem_store(job, 96, now_ms() + ms)
+  mem_store(job, 104, 0 - 1)
+  mem_store(job, 112, 0)
+  let value = fiber_resume(id, value_make(0, 0))
+  if fiber_alive(id) then
+    let out = ["paused", id]
+  else
+    let out = ["done", value]
+  end
+  ensure list_len(out) == 2
+  return out
+end
+
+# A line fitted through the job's recent durations, carried one step on, and
+# never below the longest of them.
+make a function called rt_budget_predict takes job returns ms
+  require job != 0
+  let n = mem_load(job, 112)
+  let ms = 0
+  let sum_x = 0
+  let sum_y = 0
+  let sum_xy = 0
+  let sum_xx = 0
+  let k = 0
+  while k < n do
+    let y = mem_load(job, 120 + 8 * k)
+    if y > ms then
+      let ms = y
+    end
+    let sum_x = sum_x + k
+    let sum_y = sum_y + y
+    let sum_xy = sum_xy + k * y
+    let sum_xx = sum_xx + k * k
+    let k = k + 1
+  end
+  if n >= 2 then
+    let denom = n * sum_xx - sum_x * sum_x
+    let estimate = word_div(sum_y, n) + word_div((n * sum_xy - sum_x * sum_y) * (n + 1), 2 * denom)
+    if estimate > ms then
+      let ms = estimate
+    end
+  end
+  ensure ms >= 0
+  return ms
+end
+
+# At every loop's back-edge inside a budgeted block: yields once the next
+# iteration, judged by the recent ones, would pass the deadline.
+make a function called budget_check returns r
+  let r = 0
+  let job = mem_load(rt_context(), 2592)
+  if job != 0 then
+    let now = now_ms()
+    let last = mem_load(job, 104)
+    if last >= 0 then
+      let n = mem_load(job, 112)
+      if n == 16 then
+        let k = 1
+        while k < 16 do
+          mem_store(job, 112 + 8 * k, mem_load(job, 120 + 8 * k))
+          let k = k + 1
+        end
+        let n = 15
+      end
+      let took = now - last
+      if took < 0 then
+        let took = 0
+      end
+      mem_store(job, 120 + 8 * n, took)
+      mem_store(job, 112, n + 1)
+    end
+    mem_store(job, 104, now)
+    let deadline = mem_load(job, 96)
+    if deadline >= 0 then
+      if now + rt_budget_predict(job) >= deadline then
+        fiber_yield(value_make(0, 0))
+      end
+    end
+  end
+  ensure r == 0
+  return r
+end
+
+# ---- threads started one at a time ----
+
+# A closure on a thread of its own, called with no arguments.
+make a function called thread_spawn takes f returns id
+  require value_class(f) == 10
+  let id = rt_job_add(rt_thread_start(f, []))
+  ensure id > 0
+  return id
+end
+
+make a function called rt_thread_job takes id returns job
+  let job = rt_job_of(id)
+  if job == 0 then
+    print("no thread " + id + ": never started, or its result has been taken")
+    exit_with(95)
+  end
+  ensure job != 0
+  return job
+end
+
+# Whether the thread has finished. Never waits.
+make a function called thread_poll takes id returns done
+  let done = mem_load(rt_thread_job(id), 88) == 1
+  ensure value_class(done) == 1
+  return done
+end
+
+# What the thread returned, waiting for it if need be. This gives its result
+# and everything the thread held back, so it is taken once.
+make a function called thread_result takes id returns value
+  let job = rt_thread_job(id)
+  rt_job_remove(id)
+  let value = rt_thread_finish(job)
+  ensure value_live(value)
+  return value
+end

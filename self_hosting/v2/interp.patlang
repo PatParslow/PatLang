@@ -103,7 +103,7 @@ make a function called iv_translate takes func returns code
       let t = [1, ins[1], iv_slot(vars, ins[2])]
     elif op == "call" then
       # the function itself is found at the first call; slot 4 keeps it
-      let t = [2, ins[1], ins[2], iv_slots(vars, ins[3]), vec_new()]
+      let t = [2, ins[1], ins[2], iv_slots(vars, ins[3]), iv_cell_new()]
     elif op == "op" then
       let t = [3, ins[1], iv_op_code(ins[2]), iv_slot(vars, ins[3]), iv_slot(vars, ins[4])]
     elif op == "un" then
@@ -136,8 +136,34 @@ end
 
 # ---- the program ----
 
-# The program's functions, the runtime's being compiled: a vec of 1024 buckets of
-# [name, func, a vec holding its translated code once it has any].
+# A cell keeps what is worked out on first use, for every thread of the program: a
+# list of three slots, the first's data word counting claims on it, the second its
+# value, the third's data word 1 once that value is there. The first to claim it
+# stores; a thread that finds it not ready works the value out itself, the same
+# value, and uses its own. A vec would not do: pushing moves its list out.
+make a function called iv_cell_new returns cell
+  return rt_list_alloc(3)
+end
+
+make a function called iv_cell_ready takes cell returns yes
+  return mem_load(value_data(cell), 72) == 1
+end
+
+make a function called iv_cell_value takes cell returns v
+  return mem_load_value(value_data(cell), 48)
+end
+
+make a function called iv_cell_fill takes cell, v returns r
+  let block = value_data(cell)
+  if atomic_add(block + 40, 1) == 0 then
+    mem_store_value(block, 48, v)
+    mem_store(block, 72, 1)
+  end
+  return v
+end
+
+# The program's functions, the runtime's being compiled: a list, only read once
+# made, of 1024 buckets of [name, func, a cell for its translated code].
 make a function called iv_table takes fns, runtime_names returns table
   let table = vec_new()
   let i = 0
@@ -149,11 +175,11 @@ make a function called iv_table takes fns, runtime_names returns table
   while i < list_len(fns) do
     if not v2_contains(runtime_names, ir_fn_name(fns[i])) then
       let k = iv_bucket(ir_fn_name(fns[i]))
-      vec_set(table, k, list_push(vec_get(table, k), [ir_fn_name(fns[i]), fns[i], vec_new()]))
+      vec_set(table, k, list_push(vec_get(table, k), [ir_fn_name(fns[i]), fns[i], iv_cell_new()]))
     end
     let i = i + 1
   end
-  return table
+  return vec_to_list(table)
 end
 
 make a function called iv_bucket takes name returns k
@@ -168,7 +194,7 @@ end
 
 # A name's entry in the program, false when it is not the program's.
 make a function called iv_find takes table, name returns entry
-  let entries = vec_get(table, iv_bucket(name))
+  let entries = table[iv_bucket(name)]
   let i = 0
   while i < list_len(entries) do
     if entries[i][0] == name then
@@ -182,10 +208,10 @@ end
 # A function's translated code, made on its first call. Two threads doing that
 # at once make the same code.
 make a function called iv_code_of takes entry returns code
-  if vec_len(entry[2]) == 0 then
-    vec_push(entry[2], iv_translate(entry[1]))
+  if iv_cell_ready(entry[2]) then
+    return iv_cell_value(entry[2])
   end
-  return vec_get(entry[2], 0)
+  return iv_cell_fill(entry[2], iv_translate(entry[1]))
 end
 
 # ---- frames ----
@@ -334,22 +360,27 @@ make a function called iv_op takes code, a, b returns r
 end
 
 # A call: of a function of the program, or a runtime function through its
-# closure. ins[4] keeps what the name means after the first call: [entry] or
-# [false, closure].
+# closure. The cell ins[4] keeps what the name means after the first call: the
+# program's entry, a list, or the closure.
 make a function called iv_call takes table, ins, block returns r
-  let cache = ins[4]
-  if vec_len(cache) == 0 then
-    let entry = iv_find(table, ins[2])
-    vec_push(cache, entry)
-    if entry == false then
-      vec_push(cache, iv_runtime_function(ins[2]))
-    end
+  let target = false
+  if iv_cell_ready(ins[4]) then
+    let target = iv_cell_value(ins[4])
+  else
+    let target = iv_cell_fill(ins[4], iv_call_target(table, ins[2]))
   end
-  let entry = vec_get(cache, 0)
-  if entry != false then
-    return iv_run(table, entry, iv_read_all(block, ins[3]))
+  if value_class(target) == 9 then
+    return iv_run(table, target, iv_read_all(block, ins[3]))
   end
-  return iv_call_native(vec_get(cache, 1), block, ins[3])
+  return iv_call_native(target, block, ins[3])
+end
+
+make a function called iv_call_target takes table, name returns target
+  let entry = iv_find(table, name)
+  if entry == false then
+    return iv_runtime_function(name)
+  end
+  return entry
 end
 
 # A runtime function's closure, or one that stops the program as a compiled call
@@ -532,6 +563,16 @@ end
 
 # ---- the program's run ----
 
+# The repository the interpreter belongs to, ending in a separator: the executable
+# is at self_hosting/build/ under it, wherever the program is started.
+make a function called iv_repo_root returns root
+  let buf = rt_alloc(1024)
+  let n = extern_call("KERNEL32.DLL", "GetModuleFileNameA", 0, buf + 16, 1024)
+  let exe = rt_str_from_bytes(buf + 16, n)
+  rt_free(buf)
+  return path_dirname(path_dirname(path_dirname(exe))) + "/"
+end
+
 make a function called iv_main returns code
   let args = argv()
   if list_len(args) < 1 then
@@ -540,7 +581,7 @@ make a function called iv_main returns code
   end
   # the program's argv() starts after its own path
   mem_store(runtime_state(), 4408, 2)
-  let lowered = v2_front_end(args[0])
+  let lowered = v2_front_end(args[0], iv_repo_root())
   if lowered[0] == "error" then
     let i = 0
     while i < list_len(lowered[1]) do

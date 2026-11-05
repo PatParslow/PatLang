@@ -1,4 +1,4 @@
-Feature: closed-form solving for periodic (trig) equations as a parametric solution family (sym_solve_for, sym_pi, self_hosting/lib/symbolic.patlang -- NOT YET IMPLEMENTED, this is the pre-implementation RED spec)
+Feature: closed-form solving for periodic (trig) equations as a parametric solution family (sym_solve_for, sym_pi, self_hosting/lib/symbolic.patlang)
 
   Scenario: sin(x) = 0 returns a parametric family, not a finite list
     Given sym_solve_for is called on sym_sin(sym_var("x")) for variable "x" with no bounded range

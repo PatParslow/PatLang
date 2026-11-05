@@ -6,13 +6,13 @@ Feature: real library selftests run under block-model with the real engine's own
   standing gate over every ported library that has a selftest, each driven
   through the SAME generic driver
   (spec_fixtures/selftest_under_block_model.patlang): real `include`
-  expansion, `bm_lower_program`, `bi_run_from`, and the pass/fail counts
-  read out of the run's own returned `__globals` -- never a vacuous 0/0.
+  expansion, `bm_lower_program`, `bi_run_from`, and the pass/fail counts the
+  program prints from its own context -- never a vacuous 0/0.
 
-  "Passes" here is a strong claim, checked three ways per selftest: every
+  "Passes" here is a strong claim, checked per selftest: every
   line the real engine prints (each `ok:`, the totals) appears identically,
-  in order, at the start of block-model's own output; the run's own
-  `t_fail` is 0; and its `t_pass` equals the real engine's own count.
+  in order, at the start of block-model's own output; and its totals line
+  reports no failures and the real engine's own count of passes.
 
   Each selftest is a script-style program (top-level `t_init()`, `let`,
   `check(...)`), so this gate is what proves top-level statement support

@@ -16,6 +16,7 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
       | a total past 2^63, so a bigint             |
       | i / 7, a rational                          |
       | sqrt(0 - 4) * i, a complex number          |
+      | interval_make(i, i + 1) + 1, an interval   |
       | a new Widget object, unnamed               |
       | a string builder with 10 pushes, read back |
       | a vec with 10 pushes, read back            |

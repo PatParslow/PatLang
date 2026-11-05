@@ -1,4 +1,4 @@
-Feature: structural symbolic differentiation and interval-based monotonicity (sym_derivative, sym_is_monotonic, self_hosting/lib/symbolic.patlang -- NOT YET IMPLEMENTED, this is the pre-implementation RED spec)
+Feature: structural symbolic differentiation and interval-based monotonicity (sym_derivative, sym_is_monotonic, self_hosting/lib/symbolic.patlang)
 
   Scenario: derivative of a sum is the sum of derivatives
     Given sym_add(sym_pow(sym_var("x"), sym_const(2)), sym_const(5)) -- x^2 + 5

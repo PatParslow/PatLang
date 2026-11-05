@@ -1,3 +1,4 @@
+include "context.patlang"
 # =============================================================================
 # Self-hosted PatLang -> x64 NASM (win64) backend -- SLICE 1.
 #
@@ -1846,7 +1847,7 @@ make a function called x64_analyze_float_consts takes instrs, final_map, float_i
   return out
 end
 
-make a function called x64_instr_is_call_boundary takes instr, idx returns is_call
+make a function called x64_instr_is_call_boundary takes ctx, instr, idx returns is_call
   let ty = instr[0]
   if ty == "Call" then
     return true
@@ -1883,7 +1884,7 @@ make a function called x64_instr_is_call_boundary takes instr, idx returns is_ca
     end
   end
   if ty == "Bin" then
-    if get("__vars", "x64_dbi_hm__" + idx) == true then
+    if ctx_read(ctx, "x64_dbi_hm__" + idx) == true then
       return true
     end
     # REAL BUG FOUND AND FIXED HERE (2026-07-20, same session as the
@@ -2012,22 +2013,23 @@ end
 # necessary regardless) and removing it just reintroduces the 20-30
 # minute regex_match_node stall without fixing the real bug.
 make a function called x64_build_regmap takes locals, instrs, dyn_bin_indices returns names
+  let ctx = context_new()
   let pool = x64_reg_pool()
   let cap = to_num(list_len(pool))
   let n = to_num(list_len(locals))
   let total_instrs = to_num(list_len(instrs))
   let li = 0
   while li < n do
-    set_var("x64brm_last__" + locals[li], 0 - 1)
+    ctx_set(ctx, "x64brm_last__" + locals[li], 0 - 1)
     let li = li + 1
   end
   let ii = 0
   while ii < total_instrs do
     let instr = instrs[ii]
     if instr[0] == "Load" then
-      set_var("x64brm_last__" + instr[1], ii)
+      ctx_set(ctx, "x64brm_last__" + instr[1], ii)
     elif instr[0] == "Store" then
-      set_var("x64brm_last__" + instr[1], ii)
+      ctx_set(ctx, "x64brm_last__" + instr[1], ii)
     end
     let ii = ii + 1
   end
@@ -2045,21 +2047,21 @@ make a function called x64_build_regmap takes locals, instrs, dyn_bin_indices re
   end
   let dbihm_i = 0
   while dbihm_i < to_num(list_len(dyn_bin_indices)) do
-    set_var("x64_dbi_hm__" + list_get(dyn_bin_indices, dbihm_i), true)
+    ctx_set(ctx, "x64_dbi_hm__" + list_get(dyn_bin_indices, dbihm_i), true)
     let dbihm_i = dbihm_i + 1
   end
   let has_cb_so_far = false
   let cbi = 0
   while cbi < total_instrs do
-    if x64_instr_is_call_boundary(instrs[cbi], cbi) then
+    if x64_instr_is_call_boundary(ctx, instrs[cbi], cbi) then
       let has_cb_so_far = true
     end
-    set_var("x64brm_cb__" + cbi, has_cb_so_far)
+    ctx_set(ctx, "x64brm_cb__" + cbi, has_cb_so_far)
     let cbi = cbi + 1
   end
   let dbihm_ci = 0
   while dbihm_ci < to_num(list_len(dyn_bin_indices)) do
-    set_var("x64_dbi_hm__" + list_get(dyn_bin_indices, dbihm_ci), false)
+    ctx_set(ctx, "x64_dbi_hm__" + list_get(dyn_bin_indices, dbihm_ci), false)
     let dbihm_ci = dbihm_ci + 1
   end
   let out = []
@@ -2067,11 +2069,14 @@ make a function called x64_build_regmap takes locals, instrs, dyn_bin_indices re
   while i < n do
     if to_num(list_len(out)) < cap then
       let name = locals[i]
-      let last = get("__vars", "x64brm_last__" + name)
+      let last = ctx_read(ctx, "x64brm_last__" + name)
+      if last == false then
+        let last = 0 - 1
+      end
       let ok = true
       if last >= 0 then
         let effective = x64_extend_across_loops_fast(back_edges, last)
-        if get("__vars", "x64brm_cb__" + effective) == true then
+        if ctx_read(ctx, "x64brm_cb__" + effective) == true then
           let ok = false
         end
       end
@@ -2083,12 +2088,12 @@ make a function called x64_build_regmap takes locals, instrs, dyn_bin_indices re
   end
   let cli = 0
   while cli < n do
-    set_var("x64brm_last__" + locals[cli], false)
+    ctx_set(ctx, "x64brm_last__" + locals[cli], false)
     let cli = cli + 1
   end
   let cci = 0
   while cci < total_instrs do
-    set_var("x64brm_cb__" + cci, false)
+    ctx_set(ctx, "x64brm_cb__" + cci, false)
     let cci = cci + 1
   end
   return out
@@ -4574,7 +4579,7 @@ end
 #
 # apply(fname) invokes a PatLang function by NAME (a runtime string),
 # with zero explicit args -- used throughout self_hosting/lib/
-# console.patlang and self_hosting/lib/test.patlang's own step()
+# console.patlang and self_hosting/lib/gherkin.patlang's own step()
 # dispatcher for exactly this "look up a handler by name, call it"
 # pattern. No whole-program flow analysis exists to know in advance
 # which names any given apply() call site might be asked to resolve at
@@ -4613,6 +4618,7 @@ end
 # the string-family tag bit, no copying needed.
 
 make a function called x64_emit_apply_table_asm takes funcs returns asm
+  let ctx = context_new()
   # labels[i] is the code label; shown[i] is the name apply() and fiber_new
   # match against. Block-model functions are emitted as bm_fn_<name>, and the
   # program refers to them as <name>, so each one gets a second entry under
@@ -4632,7 +4638,7 @@ make a function called x64_emit_apply_table_asm takes funcs returns asm
     let fname = funcs[fi][1]
     if (fname.length > dyn_prefix.length) and (substr(fname, 0, dyn_prefix.length) == dyn_prefix) then
       let target = substr(fname, dyn_prefix.length, fname.length - dyn_prefix.length)
-      set_var("x64_apply_adapted__" + target, true)
+      ctx_set(ctx, "x64_apply_adapted__" + target, true)
       let adapted = list_push(adapted, target)
     end
     let fi = fi + 1
@@ -4648,7 +4654,7 @@ make a function called x64_emit_apply_table_asm takes funcs returns asm
         let labels = list_push(labels, fname)
         let shown = list_push(shown, substr(fname, dyn_prefix.length, fname.length - dyn_prefix.length))
       elif substr(fname, 0, 6) == "bm_fn_" then
-        if get("__vars", "x64_apply_adapted__" + substr(fname, 6, fname.length - 6)) != true then
+        if ctx_read(ctx, "x64_apply_adapted__" + substr(fname, 6, fname.length - 6)) != true then
           let labels = list_push(labels, fname)
           let shown = list_push(shown, substr(fname, 6, fname.length - 6))
         end
@@ -4658,7 +4664,7 @@ make a function called x64_emit_apply_table_asm takes funcs returns asm
   end
   let ai = 0
   while ai < adapted.length do
-    set_var("x64_apply_adapted__" + adapted[ai], false)
+    ctx_set(ctx, "x64_apply_adapted__" + adapted[ai], false)
     let ai = ai + 1
   end
   let n = labels.length
@@ -11080,6 +11086,7 @@ make a function called x64_fused_const_binop_asm takes const_text, op returns as
 end
 
 make a function called x64_emit_func takes func, float_mode, dynamic_mode, float_func_names returns asm
+  let ctx = context_new()
   let func_name = func[1]
   let params = func[2]
   let instrs = func[3]
@@ -11181,7 +11188,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let jump_targets = x64_collect_jump_targets(instrs)
   let xef_jt_i = 0
   while xef_jt_i < to_num(list_len(jump_targets)) do
-    set_var("xef_jt__" + list_get(jump_targets, xef_jt_i), true)
+    ctx_set(ctx, "xef_jt__" + list_get(jump_targets, xef_jt_i), true)
     let xef_jt_i = xef_jt_i + 1
   end
   # GitHub #37: per-INSTRUCTION float classification replaces the old
@@ -11234,53 +11241,53 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   # runs once per function in the whole program).
   let xef_dbi_i = 0
   while xef_dbi_i < to_num(list_len(dyn_bin_indices)) do
-    set_var("xef_dbi__" + list_get(dyn_bin_indices, xef_dbi_i), true)
+    ctx_set(ctx, "xef_dbi__" + list_get(dyn_bin_indices, xef_dbi_i), true)
     let xef_dbi_i = xef_dbi_i + 1
   end
   let xef_fii_i = 0
   while xef_fii_i < to_num(list_len(float_instr_indices)) do
-    set_var("xef_fii__" + list_get(float_instr_indices, xef_fii_i), true)
+    ctx_set(ctx, "xef_fii__" + list_get(float_instr_indices, xef_fii_i), true)
     let xef_fii_i = xef_fii_i + 1
   end
   let xef_fci_i = 0
   while xef_fci_i < to_num(list_len(float_const_indices)) do
-    set_var("xef_fci__" + list_get(float_const_indices, xef_fci_i), true)
+    ctx_set(ctx, "xef_fci__" + list_get(float_const_indices, xef_fci_i), true)
     let xef_fci_i = xef_fci_i + 1
   end
   let xef_bpo_i = 0
   while xef_bpo_i < to_num(list_len(bool_print_overrides)) do
-    set_var("xef_bpo__" + list_get(bool_print_overrides, xef_bpo_i), true)
+    ctx_set(ctx, "xef_bpo__" + list_get(bool_print_overrides, xef_bpo_i), true)
     let xef_bpo_i = xef_bpo_i + 1
   end
   let xef_tca_i = 0
   while xef_tca_i < to_num(list_len(tower_ctor_arg_indices)) do
-    set_var("xef_tca__" + list_get(tower_ctor_arg_indices, xef_tca_i), true)
+    ctx_set(ctx, "xef_tca__" + list_get(tower_ctor_arg_indices, xef_tca_i), true)
     let xef_tca_i = xef_tca_i + 1
   end
   let xef_fbs_i = 0
   while xef_fbs_i < to_num(list_len(float_box_single_indices)) do
-    set_var("xef_fbs__" + list_get(float_box_single_indices, xef_fbs_i), true)
+    ctx_set(ctx, "xef_fbs__" + list_get(float_box_single_indices, xef_fbs_i), true)
     let xef_fbs_i = xef_fbs_i + 1
   end
   let xef_fbr_i = 0
   while xef_fbr_i < to_num(list_len(float_box_receiver_indices)) do
-    set_var("xef_fbr__" + list_get(float_box_receiver_indices, xef_fbr_i), true)
+    ctx_set(ctx, "xef_fbr__" + list_get(float_box_receiver_indices, xef_fbr_i), true)
     let xef_fbr_i = xef_fbr_i + 1
   end
   let xef_mli_i = 0
   while xef_mli_i < to_num(list_len(mixed_left_int_indices)) do
-    set_var("xef_mli__" + list_get(mixed_left_int_indices, xef_mli_i), true)
+    ctx_set(ctx, "xef_mli__" + list_get(mixed_left_int_indices, xef_mli_i), true)
     let xef_mli_i = xef_mli_i + 1
   end
   let xef_mri_i = 0
   while xef_mri_i < to_num(list_len(mixed_right_int_indices)) do
-    set_var("xef_mri__" + list_get(mixed_right_int_indices, xef_mri_i), true)
+    ctx_set(ctx, "xef_mri__" + list_get(mixed_right_int_indices, xef_mri_i), true)
     let xef_mri_i = xef_mri_i + 1
   end
   let xef_fdb_i = 0
   while xef_fdb_i < to_num(list_len(float_dyn_bins)) do
     let fdb = list_get(float_dyn_bins, xef_fdb_i)
-    set_var("xef_fdb__" + list_get(fdb, 0), [list_get(fdb, 1), list_get(fdb, 2)])
+    ctx_set(ctx, "xef_fdb__" + list_get(fdb, 0), [list_get(fdb, 1), list_get(fdb, 2)])
     let xef_fdb_i = xef_fdb_i + 1
   end
   let i = 0
@@ -11294,16 +11301,16 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     # -- only safe when NEITHER the current Const nor the upcoming Bin
     # is dynamic OR float per their own per-instruction analyses (a
     # mixed function can still fuse its provably-plain-int Bin ops).
-    if get("__vars", "xef_dbi__" + (i + 1)) != true then
-    if (get("__vars", "xef_fii__" + (i + 1)) != true) and (type_of(get("__vars", "xef_fdb__" + (i + 1))) != "list") then
-    if get("__vars", "xef_fci__" + i) != true then
+    if ctx_read(ctx, "xef_dbi__" + (i + 1)) != true then
+    if (ctx_read(ctx, "xef_fii__" + (i + 1)) != true) and (type_of(ctx_read(ctx, "xef_fdb__" + (i + 1))) != "list") then
+    if ctx_read(ctx, "xef_fci__" + i) != true then
     if i + 1 < n then
       let next = instrs[i + 1]
       if instr[0] == "Const" then
         if instr[1] == "num" then
           if next[0] == "Bin" then
             if x64_fusable_binop(next[1]) then
-              if get("__vars", "xef_jt__" + (i + 1)) != true then
+              if ctx_read(ctx, "xef_jt__" + (i + 1)) != true then
                 let fused = true
               end
             end
@@ -11321,7 +11328,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let i = i + 2
     else
       let label = "L_" + func_name + "_" + i
-      let is_bool_print = get("__vars", "xef_bpo__" + i) == true
+      let is_bool_print = ctx_read(ctx, "xef_bpo__" + i) == true
       let is_float_print = false
       # REAL BUG found and fixed here (GitHub #89 follow-up, 2026-09-06,
       # found via the patc2->patc3 self-hosting fixpoint): `produces_float`
@@ -11361,14 +11368,14 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
           end
         end
       end
-      let is_dynamic_bin = get("__vars", "xef_dbi__" + i) == true
-      let is_float_bin = get("__vars", "xef_fii__" + i) == true
-      let is_float_const = get("__vars", "xef_fci__" + i) == true
-      let is_tower_ctor_arg = get("__vars", "xef_tca__" + i) == true
-      let is_float_box_single = get("__vars", "xef_fbs__" + i) == true
-      let is_float_box_receiver = get("__vars", "xef_fbr__" + i) == true
-      let is_mixed_left_int = get("__vars", "xef_mli__" + i) == true
-      let is_mixed_right_int = get("__vars", "xef_mri__" + i) == true
+      let is_dynamic_bin = ctx_read(ctx, "xef_dbi__" + i) == true
+      let is_float_bin = ctx_read(ctx, "xef_fii__" + i) == true
+      let is_float_const = ctx_read(ctx, "xef_fci__" + i) == true
+      let is_tower_ctor_arg = ctx_read(ctx, "xef_tca__" + i) == true
+      let is_float_box_single = ctx_read(ctx, "xef_fbs__" + i) == true
+      let is_float_box_receiver = ctx_read(ctx, "xef_fbr__" + i) == true
+      let is_mixed_left_int = ctx_read(ctx, "xef_mli__" + i) == true
+      let is_mixed_right_int = ctx_read(ctx, "xef_mri__" + i) == true
       let call_box_positions_here = x64_call_box_positions_at(call_box_entries, i)
       # GitHub #229: whether a math CallHost here has a proven raw-float
       # argument (else it takes the tagged runtime path), and for a
@@ -11377,7 +11384,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       if i < to_num(list_len(produces_float)) then
         let raw_math = list_get(produces_float, i) == true
       end
-      let float_dyn_sides = get("__vars", "xef_fdb__" + i)
+      let float_dyn_sides = ctx_read(ctx, "xef_fdb__" + i)
       sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int, call_box_positions_here, raw_math, float_dyn_sides))
       # the boxes made for a call's arguments are the caller's to release
       # (list_push and list_set take their own reference to the element,
@@ -11395,57 +11402,57 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   end
   let xef_dbi_ci = 0
   while xef_dbi_ci < to_num(list_len(dyn_bin_indices)) do
-    set_var("xef_dbi__" + list_get(dyn_bin_indices, xef_dbi_ci), false)
+    ctx_set(ctx, "xef_dbi__" + list_get(dyn_bin_indices, xef_dbi_ci), false)
     let xef_dbi_ci = xef_dbi_ci + 1
   end
   let xef_fii_ci = 0
   while xef_fii_ci < to_num(list_len(float_instr_indices)) do
-    set_var("xef_fii__" + list_get(float_instr_indices, xef_fii_ci), false)
+    ctx_set(ctx, "xef_fii__" + list_get(float_instr_indices, xef_fii_ci), false)
     let xef_fii_ci = xef_fii_ci + 1
   end
   let xef_fci_ci = 0
   while xef_fci_ci < to_num(list_len(float_const_indices)) do
-    set_var("xef_fci__" + list_get(float_const_indices, xef_fci_ci), false)
+    ctx_set(ctx, "xef_fci__" + list_get(float_const_indices, xef_fci_ci), false)
     let xef_fci_ci = xef_fci_ci + 1
   end
   let xef_bpo_ci = 0
   while xef_bpo_ci < to_num(list_len(bool_print_overrides)) do
-    set_var("xef_bpo__" + list_get(bool_print_overrides, xef_bpo_ci), false)
+    ctx_set(ctx, "xef_bpo__" + list_get(bool_print_overrides, xef_bpo_ci), false)
     let xef_bpo_ci = xef_bpo_ci + 1
   end
   let xef_tca_ci = 0
   while xef_tca_ci < to_num(list_len(tower_ctor_arg_indices)) do
-    set_var("xef_tca__" + list_get(tower_ctor_arg_indices, xef_tca_ci), false)
+    ctx_set(ctx, "xef_tca__" + list_get(tower_ctor_arg_indices, xef_tca_ci), false)
     let xef_tca_ci = xef_tca_ci + 1
   end
   let xef_fbs_ci = 0
   while xef_fbs_ci < to_num(list_len(float_box_single_indices)) do
-    set_var("xef_fbs__" + list_get(float_box_single_indices, xef_fbs_ci), false)
+    ctx_set(ctx, "xef_fbs__" + list_get(float_box_single_indices, xef_fbs_ci), false)
     let xef_fbs_ci = xef_fbs_ci + 1
   end
   let xef_fbr_ci = 0
   while xef_fbr_ci < to_num(list_len(float_box_receiver_indices)) do
-    set_var("xef_fbr__" + list_get(float_box_receiver_indices, xef_fbr_ci), false)
+    ctx_set(ctx, "xef_fbr__" + list_get(float_box_receiver_indices, xef_fbr_ci), false)
     let xef_fbr_ci = xef_fbr_ci + 1
   end
   let xef_mli_ci = 0
   while xef_mli_ci < to_num(list_len(mixed_left_int_indices)) do
-    set_var("xef_mli__" + list_get(mixed_left_int_indices, xef_mli_ci), false)
+    ctx_set(ctx, "xef_mli__" + list_get(mixed_left_int_indices, xef_mli_ci), false)
     let xef_mli_ci = xef_mli_ci + 1
   end
   let xef_mri_ci = 0
   while xef_mri_ci < to_num(list_len(mixed_right_int_indices)) do
-    set_var("xef_mri__" + list_get(mixed_right_int_indices, xef_mri_ci), false)
+    ctx_set(ctx, "xef_mri__" + list_get(mixed_right_int_indices, xef_mri_ci), false)
     let xef_mri_ci = xef_mri_ci + 1
   end
   let xef_fdb_ci = 0
   while xef_fdb_ci < to_num(list_len(float_dyn_bins)) do
-    set_var("xef_fdb__" + list_get(list_get(float_dyn_bins, xef_fdb_ci), 0), false)
+    ctx_set(ctx, "xef_fdb__" + list_get(list_get(float_dyn_bins, xef_fdb_ci), 0), false)
     let xef_fdb_ci = xef_fdb_ci + 1
   end
   let xef_jt_ci = 0
   while xef_jt_ci < to_num(list_len(jump_targets)) do
-    set_var("xef_jt__" + list_get(jump_targets, xef_jt_ci), false)
+    ctx_set(ctx, "xef_jt__" + list_get(jump_targets, xef_jt_ci), false)
     let xef_jt_ci = xef_jt_ci + 1
   end
   return sb_str(sb)
@@ -11520,8 +11527,7 @@ end
 # FUNCTION NAMES in one program (low thousands at the very worst), not
 # with file size in KB/MB the way the O(n^2) content-hash bug (fixed
 # separately) did, so this stays acceptable without the same fix.
-make a function called x64_extra_float_func_names returns names
-  let raw = "" + get("__vars", "__x64_extra_float_func_names")
+make a function called x64_extra_float_func_names takes raw returns names
   if raw == "" then
     return []
   end
@@ -12537,6 +12543,12 @@ make a function called x64_func_names_of takes funcs returns names
 end
 
 make a function called emit_program_x64 takes ir, owns_globals, extern_names returns asm
+  return emit_program_x64_floats(ir, owns_globals, extern_names, "")
+end
+
+# float_names: functions outside this program unit known to return floats, one
+# per line (x64_unit_env, x64_compile_unit.patlang).
+make a function called emit_program_x64_floats takes ir, owns_globals, extern_names, float_names returns asm
   let funcs = ir[2]
   let sb = sb_new()
   sb_push(sb, "default rel" + x64_nl_char())
@@ -12877,7 +12889,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   let n = to_num(list_len(funcs))
   let float_func_names = x64_collect_float_func_names(funcs)
-  let extra_float_func_names = x64_extra_float_func_names()
+  let extra_float_func_names = x64_extra_float_func_names(float_names)
   let efi = 0
   while efi < to_num(list_len(extra_float_func_names)) do
     if not x64_str_in_list(float_func_names, extra_float_func_names[efi]) then

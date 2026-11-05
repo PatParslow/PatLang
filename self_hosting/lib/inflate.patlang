@@ -26,49 +26,50 @@
 # front and a growable buffer would be unneeded complexity for this
 # codebase's only real caller.
 
+include "context.patlang"
 include "includes.patlang"
 
 # ---- bit-level reader (global state -- one inflate run at a time) ----
 
-make a function called infl_reset takes bytes, start_offset returns done
-  set_var("infl_bytes", bytes)
-  set_var("infl_pos", start_offset)
-  set_var("infl_bitbuf", 0)
-  set_var("infl_bitcnt", 0)
+make a function called infl_reset takes ctx, bytes, start_offset returns done
+  ctx_set(ctx, "infl_bytes", bytes)
+  ctx_set(ctx, "infl_pos", start_offset)
+  ctx_set(ctx, "infl_bitbuf", 0)
+  ctx_set(ctx, "infl_bitcnt", 0)
   return true
 end
 
-make a function called infl_getbyte returns b
-  let bytes = get("__vars", "infl_bytes")
-  let pos = get("__vars", "infl_pos")
+make a function called infl_getbyte takes ctx returns b
+  let bytes = ctx_get(ctx, "infl_bytes")
+  let pos = ctx_get(ctx, "infl_pos")
   if pos >= bytes.length then
-    set_var("infl_pos", pos + 1)
+    ctx_set(ctx, "infl_pos", pos + 1)
     return 0
   end
-  set_var("infl_pos", pos + 1)
+  ctx_set(ctx, "infl_pos", pos + 1)
   return char_code(bytes, pos)
 end
 
-make a function called infl_getbit returns bit
-  let cnt = get("__vars", "infl_bitcnt")
+make a function called infl_getbit takes ctx returns bit
+  let cnt = ctx_get(ctx, "infl_bitcnt")
   if cnt == 0 then
-    set_var("infl_bitbuf", infl_getbyte())
-    set_var("infl_bitcnt", 8)
+    ctx_set(ctx, "infl_bitbuf", infl_getbyte(ctx))
+    ctx_set(ctx, "infl_bitcnt", 8)
   end
-  let buf = get("__vars", "infl_bitbuf")
+  let buf = ctx_get(ctx, "infl_bitbuf")
   let bit = buf band 1
-  set_var("infl_bitbuf", buf shr 1)
-  set_var("infl_bitcnt", get("__vars", "infl_bitcnt") - 1)
+  ctx_set(ctx, "infl_bitbuf", buf shr 1)
+  ctx_set(ctx, "infl_bitcnt", ctx_num(ctx, "infl_bitcnt") - 1)
   return bit
 end
 
 # infl_getbits(n) -> an n-bit value, LSB-first (block header fields,
 # stored-block LEN/NLEN, HLIT/HDIST/HCLEN, length/distance extra bits).
-make a function called infl_getbits takes n returns v
+make a function called infl_getbits takes ctx, n returns v
   let val = 0
   let i = 0
   while i < n do
-    let val = val bor (infl_getbit() shl i)
+    let val = val bor (infl_getbit(ctx) shl i)
     let i = i + 1
   end
   return val
@@ -76,9 +77,9 @@ end
 
 # Discards any partial byte in the bit buffer -- needed before a
 # stored (uncompressed) block, which is always byte-aligned.
-make a function called infl_align_byte returns done
-  set_var("infl_bitbuf", 0)
-  set_var("infl_bitcnt", 0)
+make a function called infl_align_byte takes ctx returns done
+  ctx_set(ctx, "infl_bitbuf", 0)
+  ctx_set(ctx, "infl_bitcnt", 0)
   return true
 end
 
@@ -134,7 +135,7 @@ end
 # DEFLATE packs bits MSB-first: each new bit read becomes the new LOW
 # bit of `code` (code = (code << 1) | bit), which is the standard
 # canonical-Huffman decode loop (puff.c's own `decode()`).
-make a function called infl_decode takes huff returns symbol_val
+make a function called infl_decode takes ctx, huff returns symbol_val
   let count = huff[0]
   let symtab = huff[1]
   let code = 0
@@ -142,7 +143,7 @@ make a function called infl_decode takes huff returns symbol_val
   let index = 0
   let len = 1
   while len <= 15 do
-    let code = code bor infl_getbit()
+    let code = code bor infl_getbit(ctx)
     let cnt = count[len]
     if (code - cnt) < first then
       return symtab[index + (code - first)]
@@ -212,10 +213,10 @@ end
 
 # ---- dynamic Huffman tree header (RFC 1951 section 3.2.7) ----
 
-make a function called infl_dynamic_trees returns huffs
-  let hlit = infl_getbits(5) + 257
-  let hdist = infl_getbits(5) + 1
-  let hclen = infl_getbits(4) + 4
+make a function called infl_dynamic_trees takes ctx returns huffs
+  let hlit = infl_getbits(ctx, 5) + 257
+  let hdist = infl_getbits(ctx, 5) + 1
+  let hclen = infl_getbits(ctx, 4) + 4
   let order = infl_clcidx()
   let cl_lengths = rt_list_new(19)
   let i = 0
@@ -225,7 +226,7 @@ make a function called infl_dynamic_trees returns huffs
   end
   let j = 0
   while j < hclen do
-    rt_list_set(cl_lengths, order[j], infl_getbits(3))
+    rt_list_set(cl_lengths, order[j], infl_getbits(ctx, 3))
     let j = j + 1
   end
   let cl_huff = infl_construct(cl_lengths, 19)
@@ -239,13 +240,13 @@ make a function called infl_dynamic_trees returns huffs
   end
   let n = 0
   while n < total do
-    let sym = infl_decode(cl_huff)
+    let sym = infl_decode(ctx, cl_huff)
     if sym < 16 then
       rt_list_set(lengths, n, sym)
       let n = n + 1
     elif sym == 16 then
       let prev = lengths[n - 1]
-      let rep = infl_getbits(2) + 3
+      let rep = infl_getbits(ctx, 2) + 3
       let r = 0
       while r < rep do
         rt_list_set(lengths, n, prev)
@@ -253,7 +254,7 @@ make a function called infl_dynamic_trees returns huffs
         let r = r + 1
       end
     elif sym == 17 then
-      let rep2 = infl_getbits(3) + 3
+      let rep2 = infl_getbits(ctx, 3) + 3
       let r2 = 0
       while r2 < rep2 do
         rt_list_set(lengths, n, 0)
@@ -261,7 +262,7 @@ make a function called infl_dynamic_trees returns huffs
         let r2 = r2 + 1
       end
     else
-      let rep3 = infl_getbits(7) + 11
+      let rep3 = infl_getbits(ctx, 7) + 11
       let r3 = 0
       while r3 < rep3 do
         rt_list_set(lengths, n, 0)
@@ -292,7 +293,7 @@ end
 # malformed/unsupported symbol -- checked so a corrupt/truncated PNG
 # fails cleanly (image_png.patlang reports [] like every other decoder
 # here) instead of writing past out_buf's real allocation.
-make a function called infl_decode_block takes litlen_huff, dist_huff, out_buf, out_pos, out_size returns new_pos
+make a function called infl_decode_block takes ctx, litlen_huff, dist_huff, out_buf, out_pos, out_size returns new_pos
   let pos = out_pos
   let lbase = infl_lbase()
   let lext = infl_lext()
@@ -300,7 +301,7 @@ make a function called infl_decode_block takes litlen_huff, dist_huff, out_buf, 
   let dext = infl_dext()
   let running = true
   while running do
-    let sym = infl_decode(litlen_huff)
+    let sym = infl_decode(ctx, litlen_huff)
     if sym < 0 then
       return 0 - 1
     elif sym < 256 then
@@ -316,12 +317,12 @@ make a function called infl_decode_block takes litlen_huff, dist_huff, out_buf, 
       if li >= 29 then
         return 0 - 1
       end
-      let length = lbase[li] + infl_getbits(lext[li])
-      let dsym = infl_decode(dist_huff)
+      let length = lbase[li] + infl_getbits(ctx, lext[li])
+      let dsym = infl_decode(ctx, dist_huff)
       if (dsym < 0) or (dsym >= 30) then
         return 0 - 1
       end
-      let distance = dbase[dsym] + infl_getbits(dext[dsym])
+      let distance = dbase[dsym] + infl_getbits(ctx, dext[dsym])
       if distance > pos then
         return 0 - 1
       end
@@ -340,19 +341,19 @@ make a function called infl_decode_block takes litlen_huff, dist_huff, out_buf, 
   return pos
 end
 
-make a function called infl_stored_block takes out_buf, out_pos, out_size returns new_pos
-  infl_align_byte()
-  let len_lo = infl_getbyte()
-  let len_hi = infl_getbyte()
+make a function called infl_stored_block takes ctx, out_buf, out_pos, out_size returns new_pos
+  infl_align_byte(ctx)
+  let len_lo = infl_getbyte(ctx)
+  let len_hi = infl_getbyte(ctx)
   let len = len_lo + (len_hi * 256)
-  infl_getbyte()
-  infl_getbyte()
+  infl_getbyte(ctx)
+  infl_getbyte(ctx)
   if (out_pos + len) > out_size then
     return 0 - 1
   end
   let i = 0
   while i < len do
-    mem_poke_byte(out_buf, out_pos + i, infl_getbyte())
+    mem_poke_byte(out_buf, out_pos + i, infl_getbyte(ctx))
     let i = i + 1
   end
   return out_pos + len
@@ -363,23 +364,23 @@ end
 # stream (no zlib header/trailer -- see zlib_inflate_to_buffer for
 # that): a sequence of blocks, each starting with a 3-bit header
 # (BFINAL, BTYPE), continuing until a BFINAL=1 block is fully decoded.
-make a function called infl_run takes bytes, start_offset, out_buf, out_size returns total
-  infl_reset(bytes, start_offset)
+make a function called infl_run takes ctx, bytes, start_offset, out_buf, out_size returns total
+  infl_reset(ctx, bytes, start_offset)
   let pos = 0
   let final = false
   while final == false do
-    let bfinal = infl_getbits(1)
+    let bfinal = infl_getbits(ctx, 1)
     if bfinal == 1 then
       let final = true
     end
-    let btype = infl_getbits(2)
+    let btype = infl_getbits(ctx, 2)
     if btype == 0 then
-      let pos = infl_stored_block(out_buf, pos, out_size)
+      let pos = infl_stored_block(ctx, out_buf, pos, out_size)
     elif btype == 1 then
-      let pos = infl_decode_block(infl_fixed_litlen_huff(), infl_fixed_dist_huff(), out_buf, pos, out_size)
+      let pos = infl_decode_block(ctx, infl_fixed_litlen_huff(), infl_fixed_dist_huff(), out_buf, pos, out_size)
     elif btype == 2 then
-      let trees = infl_dynamic_trees()
-      let pos = infl_decode_block(trees[0], trees[1], out_buf, pos, out_size)
+      let trees = infl_dynamic_trees(ctx)
+      let pos = infl_decode_block(ctx, trees[0], trees[1], out_buf, pos, out_size)
     else
       return 0 - 1
     end
@@ -398,9 +399,9 @@ end
 # same class of risk as any other decoder here with a malformed file;
 # adding Adler-32 verification is straightforward to add later if a
 # real corrupt-but-structurally-valid file is ever actually seen).
-make a function called zlib_inflate_to_buffer takes bytes, out_buf, out_size returns total
+make a function called zlib_inflate_to_buffer takes ctx, bytes, out_buf, out_size returns total
   if bytes.length < 6 then
     return 0 - 1
   end
-  return infl_run(bytes, 2, out_buf, out_size)
+  return infl_run(ctx, bytes, 2, out_buf, out_size)
 end

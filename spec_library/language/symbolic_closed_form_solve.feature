@@ -1,4 +1,4 @@
-Feature: closed-form solving for recognized polynomial forms (sym_solve_for, self_hosting/lib/symbolic.patlang -- NOT YET IMPLEMENTED, this is the pre-implementation RED spec)
+Feature: closed-form solving for recognized polynomial forms (sym_solve_for, self_hosting/lib/symbolic.patlang)
 
   Scenario: a linear equation returns exactly one exact solution
     Given sym_solve_for is called on 2*x + 4 = 0 for variable "x"

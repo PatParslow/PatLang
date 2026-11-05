@@ -190,15 +190,15 @@ fn given_selftest_suite(world: &mut PatWorld, name: String) {
     };
     world.source = match name.as_str() {
         // pos_tests.patlang's own header comment documents this exact
-        // concatenation order: lib/test.patlang (the assertion/Gherkin-style
+        // concatenation order: lib/gherkin.patlang (the assertion/Gherkin-style
         // feature-runner framework) + lib/pos.patlang (the library under
         // test) + examples/pos_tests.patlang (the suite itself).
-        // test.patlang `include`s gherkin_contracts.patlang, so it cannot be
+        // gherkin.patlang `include`s other files, so it cannot be
         // spliced in as text (an include inside spliced text resolves against
         // this file's directory, not lib/). The scenario source is written
         // beside lib/, so give it real include lines instead.
         "pos" => {
-            "include \"lib/test.patlang\"\ninclude \"lib/pos.patlang\"\n".to_string()
+            "include \"lib/includes.patlang\"\ninclude \"lib/gherkin.patlang\"\ninclude \"lib/pos.patlang\"\n".to_string()
                 + &read("self_hosting/examples/pos_tests.patlang")
         }
         // regex_dsl_selftest.patlang and syntax_dsl_selftest.patlang are

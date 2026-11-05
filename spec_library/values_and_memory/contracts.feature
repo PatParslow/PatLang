@@ -12,8 +12,8 @@ Feature: the runtime and compiler state their contracts (spec 2.4)
     Then the program stops at that call, naming the broken ensure clause, before anything is released twice
 
   Scenario: a broken representation contract stops where it was broken
-    Given a value built with an int type word and a pointer in its data word
-    When it is passed to a function requiring an int
+    Given a value built with a type word naming no class, or with a heap type word and a freed block in its data word
+    When it is passed to a function requiring a live value
     Then the program stops at that call, naming the require clause
 
   Scenario: contracts are checked in every build
@@ -30,3 +30,8 @@ Feature: the runtime and compiler state their contracts (spec 2.4)
     Given each compiler stage's job function
     When its declaration is read
     Then it requires well-formed input artefacts and ensures a well-formed output artefact
+
+  Scenario: a match no case takes stops the program
+    Given a match no case takes
+    When the program is built and run
+    Then it stops at the match, naming the function, with a non-zero exit code

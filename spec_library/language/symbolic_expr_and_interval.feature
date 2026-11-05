@@ -1,4 +1,4 @@
-Feature: symbolic expression construction and interval evaluation (sym_const/sym_var/sym_add/sym_sub/sym_mul/sym_div/sym_pow/sym_sqrt, sym_eval_interval, sym_interval_add/sub/mul/div, self_hosting/lib/symbolic.patlang -- NOT YET IMPLEMENTED, this is the pre-implementation RED spec)
+Feature: symbolic expression construction and interval evaluation (sym_const/sym_var/sym_add/sym_sub/sym_mul/sym_div/sym_pow/sym_sqrt, sym_eval_interval, sym_interval_add/sub/mul/div, self_hosting/lib/symbolic.patlang)
 
   Scenario: A constant expression evaluates to a zero-width interval
     Given sym_const(2)

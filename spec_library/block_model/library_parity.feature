@@ -191,15 +191,13 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   worked example, driven through the real Gherkin runner and the
   `zs_schema`/`schema_bdd` libraries) is lowered through `bm_lower_program`
   with real `include` expansion applied and run to completion via
-  `bi_run_from`. Its pass and fail counts are read out of the RETURNED
-  `__globals` (not via `get_global` from the driver's own scope, which is a
-  separate store and produced an earlier vacuous 0/0), so 5 passed / 0
-  failed is a real result and not the absence of one.
+  `bi_run_from`. It prints its pass and fail counts from its own context, so 5
+  passed / 0 failed is a real result and not the absence of one.
 
   Scenario: the real schema_bdd_selftest.patlang runs end to end under block-model with the same results as the real engine
     Given self_hosting/schema_bdd_selftest.patlang, real and unmodified, with its includes expanded
     When it is lowered through bm_lower_program and run to completion
-    Then all five of its checks pass, its Gherkin output has no stray tag suffix, and its counts are read from the run's own final globals
+    Then all five of its checks pass, its Gherkin output has no stray tag suffix, and it prints its own counts
 
   A ninth finding (GitHub issue #159), from running the real `step_match` and
   `zs_schema` selftests: `CallHost` dispatches through

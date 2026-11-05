@@ -54,3 +54,28 @@ Feature: match / case pattern matching (issue #44, self-hosted toolchain only)
     Given a match where the matching arm has no `return`, with more arms and code after it
     When the match is evaluated
     Then a matched arm with no `return` correctly jumps past the remaining arms, not back into the match
+
+  Scenario: A match that ends a function gives the function its value
+    Given a function whose last statement is a match, each arm ending in a value
+    When the match is evaluated
+    Then the function returns the taken arm's value
+
+  Scenario: An arm's let assigns the function's named result
+    Given a function returning r, each arm of its match assigning r from the pattern's bindings
+    When the match is evaluated
+    Then the function returns what the taken arm assigned
+
+  Scenario: A closure's match sees what the closure captured
+    Given a closure whose match compares against and guards with a captured variable
+    When the match is evaluated
+    Then the captured value decides the arm
+
+  Scenario: The scrutinee is evaluated once
+    Given a match whose scrutinee calls a function that counts its calls, with several arms tested
+    When the match is evaluated
+    Then the function was called once
+
+  Scenario: A value of another type does not match a literal or a list pattern
+    Given a match over a number with string and list cases first, and over a string with number and list cases first
+    When the match is evaluated
+    Then each falls through to its wildcard arm

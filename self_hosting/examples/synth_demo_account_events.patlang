@@ -20,17 +20,19 @@
 # instead of within one pure expression.
 
 include "../lib/bidi_synthesis.patlang"
-include "../lib/test.patlang"
+include "../lib/includes.patlang"
+include "../lib/gherkin.patlang"
 
-t_init()
+let ctx = ctx_new()
+context_hold(ctx)
 
-make a function called account_examples takes pairs returns examples
+make a function called account_examples takes ctx, pairs returns examples
   let out = []
   let i = 0
   let n = to_num(list_len(pairs))
   while i < n do
     let p = pairs[i]
-    let b = new("Dict", "ae_ex_" + pr_next_id())
+    let b = new("Dict", "ae_ex_" + pr_next_id(ctx))
     send(b, "set", "balance", p[0])
     send(b, "set", "amount", p[1])
     let out = list_push(out, [b, p[2]])
@@ -40,26 +42,27 @@ make a function called account_examples takes pairs returns examples
 end
 
 when insufficient_funds do
-  let log = get("__vars", "event_log")
-  set_var("event_log", list_push(log, "insufficient_funds: attempted " + event_data))
+  let ctx = context_held()
+  let log = ctx_get(ctx, "event_log")
+  ctx_set(ctx, "event_log", list_push(log, "insufficient_funds: attempted " + event_data))
 end
 
 class Account {
   field balance = 0
   field id = "acct"
 
-  make a function called withdraw takes self, amount returns done
-    let b = new("Dict", "ae_call_" + pr_next_id())
+  make a function called withdraw takes self, ctx, amount returns done
+    let b = new("Dict", "ae_call_" + pr_next_id(ctx))
     send(b, "set", "balance", get(self, "balance"))
     send(b, "set", "amount", amount)
-    let registry = get("__vars", "account_registry")
+    let registry = ctx_get(ctx, "account_registry")
 
-    let withdraw_ast = get("__vars", "account_withdraw_ast")
-    let new_balance = sbe_eval(withdraw_ast, b, registry)
+    let withdraw_ast = ctx_get(ctx, "account_withdraw_ast")
+    let new_balance = sbe_eval(ctx, withdraw_ast, b, registry)
     send(self, "set", "balance", new_balance[1])
 
-    let insufficient_ast = get("__vars", "account_insufficient_ast")
-    let insufficient = sbe_eval(insufficient_ast, b, registry)
+    let insufficient_ast = ctx_get(ctx, "account_insufficient_ast")
+    let insufficient = sbe_eval(ctx, insufficient_ast, b, registry)
     if insufficient[1] then
       emit("insufficient_funds", amount)
     end
@@ -67,19 +70,19 @@ class Account {
   end
 }
 
-make a function called run_synth_demo_account_events returns ok
-  let registry = pr_standard_registry()
+make a function called run_synth_demo_account_events takes ctx returns ok
+  let registry = pr_standard_registry(ctx)
 
-  let withdraw_examples = account_examples([
+  let withdraw_examples = account_examples(ctx, [
     [100, 30, 70],
     [100, 100, 0],
     [100, 150, 100],
     [50, 20, 30],
     [50, 60, 50]
   ])
-  let withdraw_result = bidi_synthesize_from_examples(withdraw_examples, ["balance", "amount"], [], registry, ["cond", "gt", "sub"], 12)
-  check("withdraw logic derives (cond witness)", withdraw_result[0], "OK")
-  set_var("account_withdraw_ast", withdraw_result[1])
+  let withdraw_result = bidi_synthesize_from_examples(ctx, withdraw_examples, ["balance", "amount"], [], registry, ["cond", "gt", "sub"], 12)
+  expect(ctx, "withdraw logic derives (cond witness)", withdraw_result[0], "OK")
+  ctx_set(ctx, "account_withdraw_ast", withdraw_result[1])
 
   let b1 = new("Dict", "ae_i1")
   send(b1, "set", "balance", 100)
@@ -97,33 +100,33 @@ make a function called run_synth_demo_account_events returns ok
   send(b5, "set", "balance", 30)
   send(b5, "set", "amount", 10)
   let insufficient_examples = [[b1, true], [b2, false], [b3, false], [b4, true], [b5, false]]
-  let insufficient_result = bidi_synthesize_from_examples(insufficient_examples, ["balance", "amount"], [], registry, ["gt"], 6)
-  check("is_insufficient predicate derives (gt witness)", insufficient_result[0], "OK")
-  set_var("account_insufficient_ast", insufficient_result[1])
-  set_var("account_registry", registry)
+  let insufficient_result = bidi_synthesize_from_examples(ctx, insufficient_examples, ["balance", "amount"], [], registry, ["gt"], 6)
+  expect(ctx, "is_insufficient predicate derives (gt witness)", insufficient_result[0], "OK")
+  ctx_set(ctx, "account_insufficient_ast", insufficient_result[1])
+  ctx_set(ctx, "account_registry", registry)
 
   print("derived withdraw AST: " + withdraw_result[1])
   print("derived is_insufficient AST: " + insufficient_result[1])
 
   # ---- real end-to-end object + event behaviour, via BOTH derived pieces ----
-  set_var("event_log", [])
+  ctx_set(ctx, "event_log", [])
   let acc = new("Account", "acc1")
   send(acc, "set", "balance", 100)
 
-  send(acc, "withdraw", 30)
-  check("withdraw(30) on balance 100 -> 70, no event", get(acc, "balance"), 70)
-  check("no insufficient_funds event fired for a fulfillable withdrawal", to_num(list_len(get("__vars", "event_log"))), 0)
+  send(acc, "withdraw", ctx, 30)
+  expect(ctx, "withdraw(30) on balance 100 -> 70, no event", get(acc, "balance"), 70)
+  expect(ctx, "no insufficient_funds event fired for a fulfillable withdrawal", to_num(list_len(ctx_get(ctx, "event_log"))), 0)
 
-  send(acc, "withdraw", 500)
-  check("withdraw(500) on balance 70, insufficient -> unchanged (70)", get(acc, "balance"), 70)
-  check("insufficient_funds event DID fire, driven by the derived predicate", to_num(list_len(get("__vars", "event_log"))), 1)
+  send(acc, "withdraw", ctx, 500)
+  expect(ctx, "withdraw(500) on balance 70, insufficient -> unchanged (70)", get(acc, "balance"), 70)
+  expect(ctx, "insufficient_funds event DID fire, driven by the derived predicate", to_num(list_len(ctx_get(ctx, "event_log"))), 1)
 
-  send(acc, "withdraw", 70)
-  check("withdraw(70) on balance 70, exact boundary -> 0, no event (not insufficient)", get(acc, "balance"), 0)
-  check("event log still has exactly 1 entry after an exact-boundary (non-insufficient) withdrawal", to_num(list_len(get("__vars", "event_log"))), 1)
+  send(acc, "withdraw", ctx, 70)
+  expect(ctx, "withdraw(70) on balance 70, exact boundary -> 0, no event (not insufficient)", get(acc, "balance"), 0)
+  expect(ctx, "event log still has exactly 1 entry after an exact-boundary (non-insufficient) withdrawal", to_num(list_len(ctx_get(ctx, "event_log"))), 1)
 
-  t_report()
-  return get("__vars", "t_fail") == 0
+  ctx_report(ctx)
+  return ctx_failed(ctx) == 0
 end
 
-run_synth_demo_account_events()
+run_synth_demo_account_events(ctx)

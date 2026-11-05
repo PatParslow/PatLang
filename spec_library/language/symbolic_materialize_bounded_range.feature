@@ -1,4 +1,4 @@
-Feature: materializing a solution set within a bounded range, and the numeric fallback for equations with no closed form (sym_materialize, sym_solve_for, self_hosting/lib/symbolic.patlang -- NOT YET IMPLEMENTED, this is the pre-implementation RED spec)
+Feature: materializing a solution set within a bounded range, and the numeric fallback for equations with no closed form (sym_materialize, sym_solve_for, self_hosting/lib/symbolic.patlang)
 
   Scenario: materializing a finite Solutions set filters to the requested range
     Given the quadratic Solutions([-1.41..., 1.41...]) from x^2-2=0

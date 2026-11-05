@@ -8,8 +8,7 @@
 # parallel_map runs a function on every item on threads of their own. Each
 # thread gets its own memory context (memory.patlang), made by the thread
 # that starts it, and given back to the pool when it has finished. A job is
-# an uncounted block: 16 the function, 32 the item, 48 the result,
-# 64 the thread's context, 72 its handle.
+# an uncounted block: fibers.patlang gives its layout.
 quiet_operators()
 
 make a function called rt_threads_init returns r
@@ -52,6 +51,49 @@ make a function called apply takes by_name, rest returns r
   return r
 end
 
+# A zeroed job with this many bytes after the block's header.
+make a function called rt_job_new takes bytes returns job
+  require bytes >= 80
+  let job = rt_alloc(bytes)
+  let k = 0
+  while k < bytes do
+    mem_store(job, 16 + k, 0)
+    let k = k + 8
+  end
+  ensure job != 0
+  return job
+end
+
+# A thread calling f with these arguments: its job.
+make a function called rt_thread_start takes f, args returns job
+  require (value_class(f) == 10) and (value_class(args) == 9)
+  let job = rt_job_new(80)
+  mem_init_value(job, 16, f)
+  mem_init_value(job, 32, args)
+  let ctx = rt_alloc(rt_context_bytes())
+  rt_context_clear(ctx + 16)
+  mem_store(job, 64, ctx + 16)
+  mem_store(job, 72, extern_call("KERNEL32.DLL", "CreateThread", 0, 0, thread_entry_address(), job, 0, 0))
+  ensure job != 0
+  return job
+end
+
+# Waits for a job's thread, gives back all it held, and gives its result.
+make a function called rt_thread_finish takes job returns result
+  require job != 0
+  extern_call("KERNEL32.DLL", "WaitForSingleObject", mem_load(job, 72), 4294967295)
+  extern_call("KERNEL32.DLL", "CloseHandle", mem_load(job, 72))
+  let result = mem_take_value(job, 48)
+  rt_release_value_at(job, 16)
+  rt_release_value_at(job, 32)
+  let ctx = mem_load(job, 64)
+  rt_context_retire(ctx)
+  rt_free(ctx - 16)
+  rt_free(job)
+  ensure value_live(result)
+  return result
+end
+
 make a function called parallel_map takes items, by_name returns results
   require (value_class(items) == 9) and (value_class(by_name) == 8)
   let f = rt_function_named(by_name)
@@ -59,51 +101,42 @@ make a function called parallel_map takes items, by_name returns results
   let jobs = []
   let k = 0
   while k < n do
-    let job = rt_alloc(64)
-    mem_store(job, 16, 0)
-    mem_store(job, 24, 0)
-    mem_store(job, 32, 0)
-    mem_store(job, 40, 0)
-    mem_store(job, 48, 0)
-    mem_store(job, 56, 0)
-    mem_init_value(job, 16, f)
-    mem_init_value(job, 32, items[k])
-    let ctx = rt_alloc(rt_context_bytes())
-    rt_context_clear(ctx + 16)
-    mem_store(job, 64, ctx + 16)
-    let h = extern_call("KERNEL32.DLL", "CreateThread", 0, 0, thread_entry_address(), job, 0, 0)
-    mem_store(job, 72, h)
-    let jobs = list_push(jobs, job)
+    let jobs = list_push(jobs, rt_thread_start(f, [items[k]]))
     let k = k + 1
   end
   let results = []
   let k = 0
   while k < n do
-    let job = jobs[k]
-    extern_call("KERNEL32.DLL", "WaitForSingleObject", mem_load(job, 72), 4294967295)
-    extern_call("KERNEL32.DLL", "CloseHandle", mem_load(job, 72))
-    let results = list_push(results, mem_load_value(job, 48))
-    rt_release_value_at(job, 16)
-    rt_release_value_at(job, 32)
-    rt_release_value_at(job, 48)
-    let ctx = mem_load(job, 64)
-    rt_context_retire(ctx)
-    rt_free(ctx - 16)
-    rt_free(job)
+    let results = list_push(results, rt_thread_finish(jobs[k]))
     let k = k + 1
   end
   ensure list_len(results) == list_len(items)
   return results
 end
 
-# A thread's first PatLang code (x64.patlang, v2_thread_entry): its memory
-# context, then the job's function on its item.
+# A thread's or a fiber's first PatLang code (x64.patlang, v2_thread_entry).
+# A thread: its memory context, then the job's function on its arguments. A
+# fiber has no context of its own and does not come back from rt_fiber_main.
 make a function called rt_thread_main takes job returns r
   require job != 0
+  if mem_load(job, 64) == 0 then
+    rt_fiber_main(job)
+  end
   extern_call("KERNEL32.DLL", "TlsSetValue", mem_load(runtime_state(), 200), mem_load(job, 64))
-  let f = mem_load_value(job, 16)
-  let item = mem_load_value(job, 32)
-  mem_init_value(job, 48, f(item))
+  rt_thread_run(job)
+  # the job's owner may free it from here on
+  if mem_load(mem_load(job, 64), 2600) != 0 then
+    extern_call("KERNEL32.DLL", "ConvertFiberToThread")
+  end
+  mem_store(job, 88, 1)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_thread_run takes job returns r
+  require job != 0
+  mem_init_value(job, 48, rt_apply(mem_load_value(job, 16), mem_load_value(job, 32)))
   let r = 0
   ensure r == 0
   return r

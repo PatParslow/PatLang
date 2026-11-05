@@ -3,19 +3,21 @@
 include "../lib/lexer.patlang"
 include "../lib/parser.patlang"
 include "../lib/includes.patlang"
+include "../lib/regex_dsl.patlang"
+include "../lib/syntax_dsl.patlang"
 include "ir.patlang"
 include "lower.patlang"
 include "contracts.patlang"
 
 make a function called v2_runtime_files returns files
-  return ["self_hosting/v2/runtime/core.patlang", "self_hosting/v2/runtime/memory.patlang", "self_hosting/v2/runtime/strings.patlang", "self_hosting/v2/runtime/lists.patlang", "self_hosting/v2/runtime/integers.patlang", "self_hosting/v2/runtime/rationals.patlang", "self_hosting/v2/runtime/floats.patlang", "self_hosting/v2/runtime/numbers.patlang", "self_hosting/v2/runtime/closures.patlang", "self_hosting/v2/runtime/objects.patlang", "self_hosting/v2/runtime/logic.patlang", "self_hosting/v2/runtime/vfs.patlang", "self_hosting/v2/runtime/net.patlang", "self_hosting/v2/runtime/hosts.patlang", "self_hosting/v2/runtime/cells.patlang", "self_hosting/v2/runtime/system.patlang", "self_hosting/v2/runtime/threads.patlang"]
+  return ["self_hosting/v2/runtime/core.patlang", "self_hosting/v2/runtime/memory.patlang", "self_hosting/v2/runtime/strings.patlang", "self_hosting/v2/runtime/lists.patlang", "self_hosting/v2/runtime/integers.patlang", "self_hosting/v2/runtime/rationals.patlang", "self_hosting/v2/runtime/floats.patlang", "self_hosting/v2/runtime/numbers.patlang", "self_hosting/v2/runtime/closures.patlang", "self_hosting/v2/runtime/objects.patlang", "self_hosting/v2/runtime/logic.patlang", "self_hosting/v2/runtime/vfs.patlang", "self_hosting/v2/runtime/net.patlang", "self_hosting/v2/runtime/hosts.patlang", "self_hosting/v2/runtime/cells.patlang", "self_hosting/v2/runtime/system.patlang", "self_hosting/v2/runtime/threads.patlang", "self_hosting/v2/runtime/fibers.patlang", "self_hosting/v2/runtime/math.patlang"]
 end
 
 # A program's files, each once however many files include it, each before
 # the files that include it: pushes [path, text] onto `files`. An include
 # line is blank in the text, so line numbers stay the file's own; its path
-# resolves against the including file.
-make a function called v2_collect_files takes path, seen, files returns done
+# resolves against the including file. A file that cannot be read goes on `errors`.
+make a function called v2_collect_files takes path, seen, files, errors returns done
   let key = path_normalize(path)
   let k = 0
   while k < vec_len(seen) do
@@ -25,13 +27,17 @@ make a function called v2_collect_files takes path, seen, files returns done
     let k = k + 1
   end
   vec_push(seen, key)
+  if not file_exists(path) then
+    vec_push(errors, "cannot read " + path)
+    return false
+  end
   let lines = split_lines(read_file(path))
   let text = sb_new()
   let i = 0
   while i < list_len(lines) do
     let t = str_trim(lines[i])
     if str_starts_with(t, "include ") then
-      v2_collect_files(path_join(path_dirname(path), strip_quotes(str_trim(substr(t, 8, t.length - 8)))), seen, files)
+      v2_collect_files(path_join(path_dirname(path), strip_quotes(str_trim(substr(t, 8, t.length - 8)))), seen, files, errors)
     else
       sb_push(text, lines[i])
     end
@@ -40,6 +46,37 @@ make a function called v2_collect_files takes path, seen, files returns done
   end
   vec_push(files, [path, sb_str(text)])
   return true
+end
+
+# Whether a line of this text starts a `syntax` definition.
+make a function called v2_defines_syntax takes text returns yes
+  let lines = split_lines(text)
+  let i = 0
+  while i < list_len(lines) do
+    if str_starts_with(str_trim(lines[i]), "syntax ") then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Expands `syntax` definitions in a program's files, in the order they are
+# collected: a definition holds in its own file and the files after it. The
+# scan is only for files that can need it.
+make a function called v2_expand_syntax takes files, first returns defs
+  let defs = []
+  let i = first
+  while i < vec_len(files) do
+    let f = vec_get(files, i)
+    if (list_len(defs) > 0) or v2_defines_syntax(f[1]) then
+      let r = expand_syntax_dsls_with(f[1], defs)
+      vec_set(files, i, [f[0], r[0]])
+      let defs = r[1]
+    end
+    let i = i + 1
+  end
+  return defs
 end
 
 # A file's statements, and any parse errors in it: [stmts, errors].
@@ -99,17 +136,24 @@ make a function called v2_declares takes stmts, name returns yes
   return false
 end
 
-# ["ok", lw_program's result], or ["error", messages].
-make a function called v2_front_end takes src_path returns result
+# ["ok", lw_program's result], or ["error", messages]. The runtime's files are
+# found under runtime_root, "" being the current directory.
+make a function called v2_front_end takes src_path, runtime_root returns result
   let collected = vec_new()
   let seen = vec_new()
+  let unread = vec_new()
   let runtime_files = v2_runtime_files()
   let i = 0
   while i < list_len(runtime_files) do
-    v2_collect_files(runtime_files[i], seen, collected)
+    v2_collect_files(runtime_root + runtime_files[i], seen, collected, unread)
     let i = i + 1
   end
-  v2_collect_files(src_path, seen, collected)
+  let runtime_count = vec_len(collected)
+  v2_collect_files(src_path, seen, collected, unread)
+  if vec_len(unread) > 0 then
+    return ["error", vec_to_list(unread)]
+  end
+  v2_expand_syntax(collected, runtime_count)
   let files = vec_to_list(collected)
   let parsed_files = []
   let errors = []
