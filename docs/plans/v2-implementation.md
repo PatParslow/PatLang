@@ -215,15 +215,16 @@ artefact shorter than that is built again rather than used, whether an interrupt
 another build writing it at that moment cut it short. No rename is needed, since a job's
 artefacts are the same bytes whoever writes them.
 
-Not done: artefacts are never evicted.
+Not done: artefacts are never evicted (GitHub #234).
+
+Three behaviours the project owner decided to keep on 2026-11-05, now in spec 1.13 and
+`programs.feature`: a function without `return` gives its last statement's value, `exec_capture`
+gives both outputs, and a file is included once. With these in, Part 1 is 69/69 on v2 and on the
+interpreter and `engines_agree.feature` 50/50. No compiler or runtime source changed, so the other
+gates were not rerun.
 
 Questions found on the way, for the project owner:
 
-- Three differences recorded here were against the older interpreter, `pat --ir-run`. One
-  probe of each on 2026-11-04 found v2 and the v2 interpreter agree: a function that ends
-  without `return` gives its last statement's value (`let y = x + 1` gave 2); `exec_capture`
-  includes the error stream; `include` takes a file once. Spec 1.7 is met for these two engines,
-  but no scenario holds them to it, and whether those are the behaviours wanted is still open.
 - Some `@runtime` scenarios do not fit two-word values as written:
   `contracts.feature`'s "an int type word and a pointer in its data word"
   is simply an int, and returning a borrowed argument without a reference

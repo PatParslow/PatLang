@@ -155,6 +155,15 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - Two intervals are equal when both ends are, and a real number equals the interval from
   itself to itself. `<` and its relatives do not apply to intervals.
 
+### 1.13 Functions, commands and includes
+
+- A function that ends without `return` gives the value of its last statement. An
+  expression gives its value and a `let` the value it bound. An `if` or a `while` gives the
+  value of the last statement it ran, or `unit` if it ran none, and a function with no
+  statements gives `unit`.
+- `exec_capture` gives what the command wrote to standard output and to standard error.
+- A file reached by several includes is included once, before the files that include it.
+
 ## Part 2: the new version's runtime and compiler
 
 ### 2.1 Representation
