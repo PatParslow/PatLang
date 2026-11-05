@@ -210,10 +210,12 @@ artefacts back (15 s).
   its gates pass with the change (native 126/126, block model 224/224,
   language 184/184, a Gen B self-compile whose output runs).
 
-Not done: artefacts are never evicted, and two builds writing the same
-key at once can see a partly written artefact (a write to a temporary
-name and a rename would close it; `rename_file` exists now, but exits the program if the
-rename fails, so a race between two builds could fail a build. No spec scenario requires it).
+A job's record now gives the length of each of its artefacts and ends in a marker line; an
+artefact shorter than that is built again rather than used, whether an interrupted build or
+another build writing it at that moment cut it short. No rename is needed, since a job's
+artefacts are the same bytes whoever writes them.
+
+Not done: artefacts are never evicted.
 
 Questions found on the way, for the project owner:
 
@@ -363,10 +365,13 @@ sources described under "Removing the globals".
   interpreter now finds the runtime from its own executable's path, so it must stay at
   `self_hosting/build/` in the repository, and the front end reports a file it cannot read on both
   engines. The compiler itself still runs from the repository's root.
-- **v2 gates, rerun one at a time on 2026-11-04 with intervals and that fix in:** Part 1 65/65 on
-  v2 and on the interpreter; `engines_agree.feature` 47/47; Part 2 67/67; the language suite 242/242
-  and the match suite 26/26, each on v2 and on the interpreter; the block-model suite 211/211 on v2
-  and on the interpreter; the language suite 242/242 on `pat --ir-run`. The old compiler's gates
+- **v2 gates, rerun one at a time on 2026-11-05 with intervals and the artefact check in:** Part 1
+  65/65 on v2 and on the interpreter; `engines_agree.feature` 47/47; Part 2 75/75; the language suite
+  242/242 and the match suite 26/26, each on v2 and on the interpreter; the block-model suite 211/211
+  on v2 and on the interpreter; the language suite 242/242 on `pat --ir-run`; the second and third
+  generations of the compiler byte identical. Two cold builds of one program at once, sharing the
+  artefact store, at 100, 200, 400 and 800 new functions: both exit 0, both print the right total,
+  and the executables are byte identical. The old compiler's gates
   were not rerun. Earlier results, before intervals, were: Part 1 59/59 on v2 and on the interpreter; `engines_agree.feature` 35/35;
   Part 2 67/67; the language
   suite 242/242 on `pat --ir-run`, v2 and the interpreter. Part 1 and `engines_agree` ran

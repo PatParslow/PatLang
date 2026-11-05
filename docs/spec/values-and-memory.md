@@ -241,6 +241,8 @@ summary (2.5) and stated as the function's contract (2.4).
   - the program facts.
 - Per-function ownership summaries are artefacts. A caller is compiled
   against its callee's summary, never its body.
+- An artefact is used only when it is complete. One cut short, by an interrupted
+  build or by another build writing it at the same moment, is built again.
 - Registrations (`when` handlers, rules, functions reached only by name)
   are recorded in the program facts, never rediscovered by scanning.
 - Synthesized names are the declaration's identity plus a counter local

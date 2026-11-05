@@ -534,6 +534,55 @@ make a function called st_rr_summary_reuse takes ctx returns ok
   return a and b and c
 end
 
+# Where a function's artefacts are stored: their common path, found by the label
+# its assembly defines, or "" if none has it.
+make a function called rr_artefact_stem takes name returns stem
+  let out = exec_capture("cmd", "/c", "findstr /m /l " + name + ": self_hosting" + chr(92) + "build" + chr(92) + "v2_artefacts" + chr(92) + "*.asm")
+  let lines = split_lines(rr_clean(out))
+  if list_len(lines) == 0 then
+    return ""
+  end
+  let first = lines[0]
+  if not str_ends_with(first, ".asm") then
+    return ""
+  end
+  return substr(first, 0, first.length - 4)
+end
+
+make a function called rr_cut_in_half takes path returns done
+  let bytes = read_file_bytes(path, 0, 67108864)
+  let half = read_file_bytes(path, 0, floor(list_len(bytes) / 2))
+  write_file_bytes(path, half)
+  return true
+end
+
+# The function's name and constant are new each run, so its artefacts are this run's.
+make a function called st_rr_partial_rebuilt takes ctx returns ok
+  let k = now_ms() % 1000000
+  let name = "rr_part_" + k
+  let src = "self_hosting/build/v2_rt_partial.patlang"
+  let exe = "self_hosting/build/v2_rt_partial.exe"
+  write_file(src, "make a function called " + name + " takes n returns r" + nl() + "  return n + " + k + nl() + "end" + nl() + "print(" + name + "(1))" + nl())
+  rr_compile(src, exe, [])
+  let wanted = "" + (1 + k)
+  let all = expect(ctx, "the first build runs", rr_clean(exec_capture(exe)), wanted)
+  let stem = rr_artefact_stem(name)
+  if not expect(ctx, "the function's artefacts are found", stem != "", true) then
+    return false
+  end
+  let exts = [".text", ".asm", ".chunk"]
+  let i = 0
+  while i < list_len(exts) do
+    rr_cut_in_half(stem + exts[i])
+    rr_compile(src, exe, [])
+    let a = expect(ctx, exts[i] + " cut short: the function is built again", rr_ledger_has(exe, "built " + name), true)
+    let b = expect(ctx, exts[i] + " cut short: the program runs", rr_clean(exec_capture(exe)), wanted)
+    let all = all and a and b
+    let i = i + 1
+  end
+  return all
+end
+
 # The program facts are an artefact of the build (OUT.facts), one per line,
 # recorded by the lowering where each registration is declared.
 make a function called st_rr_facts takes ctx returns ok
@@ -623,6 +672,9 @@ make a function called register_runtime_steps takes ctx returns done
   step(ctx, "its code is searched for set_global, get_global, set_var and reads of __vars", "st_rr_noop")
   step(ctx, "there are none", "st_rr_no_globals")
   step(ctx, "f's compiled artefact is reused unchanged", "st_rr_summary_reuse")
+  step(ctx, "a built program whose function's stored code, assembly or record is then cut short", "st_rr_noop")
+  step(ctx, "the program is built again", "st_rr_noop")
+  step(ctx, "that function is built again, and the program runs", "st_rr_partial_rebuilt")
   step(ctx, "the program facts list all three, and no stage scans for them", "st_rr_facts")
   step(ctx, "they are byte-identical", "st_rr_parallel_build")
   step(ctx, "each synthesized name is its declaration's name plus a counter local to it", "st_rr_names")
@@ -640,9 +692,16 @@ end
 let ctx = ctx_new()
 register_runtime_steps(ctx)
 let features = ["runtime_representation", "ownership", "memory_manager", "contracts", "compiler_structure"]
+# A feature file named on the command line runs alone.
+let only = argv()
 let i = 0
 while i < list_len(features) do
-  run_feature_file(ctx, "spec_library/values_and_memory/" + features[i] + ".feature")
+  if list_len(only) == 0 then
+    run_feature_file(ctx, "spec_library/values_and_memory/" + features[i] + ".feature")
+  end
   let i = i + 1
+end
+if list_len(only) > 0 then
+  run_feature_file(ctx, only[0])
 end
 ctx_report(ctx)

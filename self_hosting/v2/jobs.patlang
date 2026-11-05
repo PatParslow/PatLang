@@ -268,14 +268,26 @@ end
 
 # A stored chunk back: its records' bytes (KEY.chunk), each line's fields
 # read byte by byte, then its sections from KEY.text and KEY.data.
-make a function called jb_chunk_from_bytes takes bytes, stem returns chunk
+#
+# Gives [chunk, assembly text], or false unless every artefact is complete: the
+# record ends in its "z" line and each file has the length the record gives. An
+# artefact being written, by this build or another, is shorter than that, and a
+# job's artefacts are the same bytes whoever writes them.
+make a function called jb_chunk_from_bytes takes bytes, stem returns stored
+  let n = list_len(bytes)
+  if n < 3 then
+    return false
+  end
+  if (bytes[n - 1] != 10) or (bytes[n - 2] != 122) or (bytes[n - 3] != 10) then
+    return false
+  end
+  let asm_text = ""
   let text_bytes = []
   let data_bytes = []
   let bss = 0
   let syms = []
   let relocs = []
   let ext = []
-  let n = list_len(bytes)
   let i = 0
   while i < n do
     let fields = []
@@ -296,8 +308,19 @@ make a function called jb_chunk_from_bytes takes bytes, stem returns chunk
     let tag = fields[0]
     if tag == "t" then
       let text_bytes = read_file_bytes(stem + ".text", 0, to_num(fields[1]))
+      if list_len(text_bytes) != to_num(fields[1]) then
+        return false
+      end
     elif tag == "d" then
       let data_bytes = read_file_bytes(stem + ".data", 0, to_num(fields[1]))
+      if list_len(data_bytes) != to_num(fields[1]) then
+        return false
+      end
+    elif tag == "a" then
+      let asm_text = read_file(stem + ".asm")
+      if byte_length(asm_text) != to_num(fields[1]) then
+        return false
+      end
     elif tag == "b" then
       let bss = to_num(fields[1])
     elif tag == "s" then
@@ -308,7 +331,7 @@ make a function called jb_chunk_from_bytes takes bytes, stem returns chunk
       let ext = list_push(ext, fields[1])
     end
   end
-  return ["ChunkImage", text_bytes, data_bytes, bss, syms, relocs, ext]
+  return [["ChunkImage", text_bytes, data_bytes, bss, syms, relocs, ext], asm_text]
 end
 
 # ---- running the jobs ----
@@ -329,8 +352,10 @@ make a function called jb_run_job takes job returns result
   let asm_path = jb_artefact_path(dir, job[4], ".asm")
   let t0 = now_ms()
   if (dir != "") and file_exists(chunk_path) and file_exists(asm_path) then
-    let chunk = jb_chunk_from_bytes(jb_read_bytes(chunk_path), jb_artefact_path(dir, job[4], ""))
-    return [job[0], chunk, read_file(asm_path), "reused", [now_ms() - t0, 0, 0]]
+    let stored = jb_chunk_from_bytes(jb_read_bytes(chunk_path), jb_artefact_path(dir, job[4], ""))
+    if stored != false then
+      return [job[0], stored[0], stored[1], "reused", [now_ms() - t0, 0, 0]]
+    end
   end
   let asm = job[2]
   if job[1] == "fn" then
@@ -345,8 +370,8 @@ make a function called jb_run_job takes job returns result
       write_file(asm_path, asm)
       write_file_bytes(jb_artefact_path(dir, job[4], ".text"), chunk[1])
       write_file_bytes(jb_artefact_path(dir, job[4], ".data"), chunk[2])
-      # written last: a job's artefacts are complete once this exists
-      write_file(chunk_path, text)
+      # written last, and checked against the others when read
+      write_file(chunk_path, text + "a " + byte_length(asm) + chr(10) + "z" + chr(10))
     end
   end
   return [job[0], chunk, asm, "built", [t1 - t0, t2 - t1, now_ms() - t2]]

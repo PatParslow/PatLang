@@ -26,6 +26,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When g's body changes without changing its ownership summary
     Then f's compiled artefact is reused unchanged
 
+  Scenario: a partly written artefact is rebuilt, never used
+    Given a built program whose function's stored code, assembly or record is then cut short
+    When the program is built again
+    Then that function is built again, and the program runs
+
   Scenario: registrations are recorded, not rediscovered
     Given a program with a when handler, a rule, and a function reached only through apply
     When it is compiled
