@@ -393,6 +393,13 @@ sources described under "Removing the globals".
   `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the interpreter and
   compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the interpreter; the
   three compiler generations byte identical.
+- **The assembler's byte encoding (GitHub #239).** `xa_int_to_bytes_le` found each byte of a
+  value by repeated subtraction from a list of powers, so a large displacement cost thousands of
+  operations. It now takes the bytes from the top down, each bit by bit against the byte's
+  weight, and a byte above the value costs one comparison. The compiler's link of itself went
+  from 73-75 s to 48-53 s and its jobs from 279 s to 235-239 s; `rt_facts` links in 25 s, where
+  it took 38 s. These were measured while other builds ran. The gates passed as listed above,
+  rerun after the change, and the three generations stayed byte identical.
 - **v2 gates on 2026-11-06, after that fix:** Part 1 87/87 on v2 and on the interpreter;
   `engines_agree.feature` 61/61; Part 2 83/83; the language suite 242/242 on the interpreter and
   compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the interpreter; the

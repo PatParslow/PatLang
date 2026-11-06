@@ -161,7 +161,7 @@ an include path that doesn't exist; the one checked, `family_tree_main`, fails o
   81 s of it linking ([#239](https://github.com/PatParslow/PatLang/issues/239)). Half of the link
   was `let xs = list_push(xs, f(xs))` copying the list on each push; with that fixed, the
   compiler's link of itself takes 73 s, where it took 151 s, and its self-compile 369 s, where it
-  took 456 s.
+  took 456 s. Encoding the assembler's bytes from the top down took the link to about 50 s.
 - **Named objects** took quadratic time: 814 ms at 1,000 objects and 49.7 s at 8,000, where `pat` goes
   from 57 ms to 84 ms ([#236](https://github.com/PatParslow/PatLang/issues/236)). Now 0.63 s at 8,000,
   growing about linearly.

@@ -73,19 +73,12 @@ end
 # rather than trying to track which specific range each operator does
 # or doesn't handle correctly.
 #
-# Algorithm: bias a negative value into the equivalent non-negative
-# two's-complement bit pattern first (via `+`, never `shl`, since `1
-# shl 64` is itself out of range for n=8), then peel off each of the
-# resulting value's bits from the TOP (bit 63) down via comparison and
-# subtraction against a shrinking power of two, placing each set bit
-# into the correct output byte. Must go top-down, not byte-by-byte from
-# the bottom up: testing a low bit against the ORIGINAL, still-large
-# remaining value before any higher bit has been subtracted out is
-# meaningless (it compares the whole value against a tiny power of
-# two, which is trivially true and proves nothing about that specific
-# bit) -- confirmed as a real bug this way, on a value as simple as
-# exactly 2^63, which came back as 2^63-1 (every low bit falsely "set")
-# before this was restructured as a single top-down pass.
+# Algorithm: a negative value encodes its magnitude less one, each byte
+# then inverted (two's complement without 2^64 as a value). A non-negative
+# one is taken from the top byte down: each byte's digit is found bit by
+# bit, comparing what remains against the byte's weight times the bit and
+# subtracting it when it fits. Top-down matters: a low bit can only be
+# tested once every higher bit is out of what remains.
 make a function called xa_int_to_bytes_le takes v, n returns bytes
   # Real bug found (session 8, native-toolchain cutover): the old
   # negative-value handling below computed `uv = v + 2^bits` directly,
@@ -125,56 +118,41 @@ make a function called xa_int_to_bytes_le takes v, n returns bytes
     end
     return out
   end
-  let powers = [1]
-  let k = 0
-  while k < 63 do
-    let powers = list_push(powers, powers[k] * 2)
-    let k = k + 1
+  # Each byte from the top, as a digit 0-255 found bit by bit against
+  # that byte's weight; a byte whose weight exceeds what remains is zero
+  # after one comparison, so a small value costs little.
+  let weights = [1]
+  let i = 1
+  while i < 8 do
+    let weights = list_push(weights, weights[i - 1] * 256)
+    let i = i + 1
   end
-  let uv = v
-  let out = []
-  let bi = 0
-  while bi < n do
-    let out = list_push(out, 0)
-    let bi = bi + 1
-  end
-  # `bit_pos`/`byte_idx`/`bit_in_byte` below are always plain machine
-  # ints (0-63/0-7), never BigInt, so ordinary `/`/`%` on THEM (never
-  # on `uv`/`remaining` themselves) is safe.
-  let remaining = uv
-  let bit_pos = 63
-  while bit_pos >= 0 do
-    let p = powers[bit_pos]
+  let bits = [128, 64, 32, 16, 8, 4, 2, 1]
+  let digits = [0, 0, 0, 0, 0, 0, 0, 0]
+  let remaining = v
+  let i = 7
+  while i >= 0 do
+    let p = weights[i]
     if remaining >= p then
-      let remaining = remaining - p
-      # byte_idx/bit_in_byte via `/`/`%` looked safe (bit_pos is always a
-      # plain small int, 0-63, matching this function's own "safe on
-      # small plain ints" convention above) but ISN'T: PatLang's `/` is
-      # EXACT/mathematical division, promoting to a genuine Rational the
-      # moment the division isn't even (e.g. `4 / 8` is the rational
-      # `1/2`, not truncating int division) -- confirmed harmless under
-      # the INTERPRETER (which apparently truncates `/` for two plain
-      # ints) but NOT under the current bootstrap compiler (codegen.
-      # patlang, used to compile patc1.exe itself, separate from
-      # codegen_x64.patlang): there, `list_set`'s index
-      # argument silently falls through its Value::Rational-unhandled
-      # case to `usize::MAX`, corrupting every non-multiple-of-8 bit
-      # position -- found via `patc1.exe`'s own crash compiling this
-      # very file into its own body for the first time (Phase 5 native-
-      # toolchain wiring). Fixed by computing both via repeated
-      # subtraction instead, staying within this function's own
-      # established `+`/`-`/comparisons-only safe set.
-      let byte_idx = 0
-      let bit_in_byte = bit_pos
-      while bit_in_byte >= 8 do
-        let bit_in_byte = bit_in_byte - 8
-        let byte_idx = byte_idx + 1
+      let d = 0
+      let b = 0
+      while b < 8 do
+        let w = p * bits[b]
+        if remaining >= w then
+          let remaining = remaining - w
+          let d = d + bits[b]
+        end
+        let b = b + 1
       end
-      if byte_idx < n then
-        let out = list_set(out, byte_idx, out[byte_idx] + powers[bit_in_byte])
-      end
+      let digits = list_set(digits, i, d)
     end
-    let bit_pos = bit_pos - 1
+    let i = i - 1
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, digits[i])
+    let i = i + 1
   end
   return out
 end
