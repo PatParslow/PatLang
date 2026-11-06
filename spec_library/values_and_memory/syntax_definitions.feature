@@ -11,3 +11,8 @@ Feature: a syntax definition extends the language for the program (spec 1.9)
     Given a file with a syntax definition, and a program that includes it and uses the syntax
     When the program runs
     Then the included file's definition expands the program's block
+
+  Scenario: AST.Name(args) gives a node
+    Given rules and ordinary code using AST.Name(args), nested, in a closure, and with a variable named AST
+    When the program runs
+    Then each gives a list of the name and its arguments, a function can take it, and the variable keeps its meaning

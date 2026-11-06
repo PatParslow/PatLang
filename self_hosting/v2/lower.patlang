@@ -22,6 +22,120 @@ end
 # The symbol index: every declared function's name and parameter names,
 # made before any declaration is lowered (the one program-wide input
 # lowering needs).
+# ---- a program's functions with a name the runtime has ----
+#
+# Such a function gets the name lw_user_name gives it, and a call from the
+# program's code reaches it by that name. The runtime's code keeps the runtime's
+# function: a runtime file is a quiet one.
+
+make a function called lw_user_name takes name returns out
+  return "user__" + name
+end
+
+make a function called lw_name_bucket takes name returns i
+  let n = name.length
+  if n == 0 then
+    return 0
+  end
+  return (n + 31 * char_code(name, 0) + 7 * char_code(name, n - 1)) % 1024
+end
+
+# The names of the program's functions that the runtime also has, or that are
+# primitives. The runtime's names are kept in buckets, since a program as large as
+# the compiler has thousands of functions.
+make a function called lw_shadowing takes files returns shadows
+  let buckets = vec_new()
+  let i = 0
+  while i < 1024 do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  let f = 0
+  while f < list_len(files) do
+    if files[f][1] then
+      let stmts = files[f][0]
+      let i = 0
+      while i < list_len(stmts) do
+        if stmts[i][0] == "Func" then
+          let b = lw_name_bucket(stmts[i][1])
+          vec_set(buckets, b, list_push(vec_get(buckets, b), stmts[i][1]))
+        end
+        let i = i + 1
+      end
+    end
+    let f = f + 1
+  end
+  let shadows = []
+  let f = 0
+  while f < list_len(files) do
+    if not files[f][1] then
+      let stmts = files[f][0]
+      let i = 0
+      while i < list_len(stmts) do
+        if stmts[i][0] == "Func" then
+          let name = stmts[i][1]
+          if v2_contains(vec_get(buckets, lw_name_bucket(name)), name) or ir_is_prim(name) then
+            if not v2_contains(shadows, name) then
+              let shadows = list_push(shadows, name)
+            end
+          end
+        end
+        let i = i + 1
+      end
+    end
+    let f = f + 1
+  end
+  return shadows
+end
+
+# The files with those functions under their new names.
+make a function called lw_rename_shadowing takes files, shadows returns out
+  if list_len(shadows) == 0 then
+    return files
+  end
+  let out = []
+  let f = 0
+  while f < list_len(files) do
+    let file = files[f]
+    if not file[1] then
+      let renamed = []
+      let i = 0
+      while i < list_len(file[0]) do
+        let st = file[0][i]
+        if (st[0] == "Func") and v2_contains(shadows, st[1]) then
+          let st = list_set(st, 1, lw_user_name(st[1]))
+        end
+        let renamed = list_push(renamed, st)
+        let i = i + 1
+      end
+      let file = list_set(file, 0, renamed)
+    end
+    let out = list_push(out, file)
+    let f = f + 1
+  end
+  return out
+end
+
+# A function's name as its source has it.
+make a function called lw_source_name takes name returns out
+  let prefix = lw_user_name("")
+  if str_starts_with(name, prefix) then
+    return substr(name, prefix.length, name.length - prefix.length)
+  end
+  return name
+end
+
+# The name a call in this code reaches.
+make a function called lw_call_target takes fb, name returns target
+  if fb[7][0] then
+    return name
+  end
+  if v2_contains(fb[7][1][2], name) then
+    return lw_user_name(name)
+  end
+  return name
+end
+
 make a function called lw_symbols takes files returns symbols
   let names = []
   let params = []
@@ -232,6 +346,10 @@ make a function called lw_expr takes fb, e returns s
     return lw_call(fb, "rt_member", [e[1], ["Str", e[2]]])
   end
   if kind == "MethodCall" then
+    # AST.Name(args): the node ["Name", args...] (spec 1.9), unless a variable has the name
+    if (e[1][0] == "Var") and (e[1][1] == "AST") and (lw_var_slot(fb, "AST") < 0) then
+      return lw_expr(fb, ["List", v2_concat([["Str", e[2]]], e[3])])
+    end
     return lw_call(fb, "send", v2_concat([e[1], ["Str", e[2]]], e[3]))
   end
   if kind == "Index" then
@@ -302,6 +420,7 @@ make a function called lw_call takes fb, name, args returns d
     lw_emit(fb, ["callv", d, slots])
     return d
   end
+  let name = lw_call_target(fb, name)
   if name == "extern_call" then
     return lw_extern(fb, args, "extern")
   end
@@ -606,6 +725,9 @@ make a function called lw_stmt takes fb, st returns done
     if lw_gives_var(st[1], st[2]) then
       return lw_let_giving(fb, st[1], st[2])
     end
+    if lw_adds_to_var(fb, st[1], st[2]) then
+      return lw_let_adding(fb, st[1], st[2])
+    end
     let v = lw_expr(fb, st[2])
     let s = lw_bind(fb, st[1])
     if s != v then
@@ -800,15 +922,15 @@ make a function called lw_contract takes fb, which, cond, line returns done
   end
   let w = lw_const(fb, "str", kind)
   let t = lw_const(fb, "str", lw_text(cond))
-  let n = lw_const(fb, "str", fb[5])
+  let n = lw_const(fb, "str", lw_source_name(fb[5]))
   let d = lw_new_slot(fb)
   lw_emit(fb, ["call", d, "rt_contract_failed", [w, t, n]])
   lw_emit(fb, ["jump", l_ok])
   lw_emit(fb, ["label", l_ok])
   # a clause that held is a fact (runtime/logic.patlang); a quiet file's raise
-  # nothing
-  if not fb[7][0] then
-    let held_name = lw_const(fb, "str", fb[5])
+  # nothing, and nor do an engine's
+  if (not fb[7][0]) and (not fb[7][1][3]) then
+    let held_name = lw_const(fb, "str", lw_source_name(fb[5]))
     let held_kind = lw_const(fb, "str", which)
     let held_text = lw_const(fb, "str", lw_text(cond))
     let held = lw_new_slot(fb)
@@ -833,10 +955,10 @@ make a function called lw_text takes e returns text
     return lw_text(e[2]) + " " + e[1] + " " + lw_text(e[3])
   end
   if kind == "Un" then
-    if e[1] == "not" then
-      return "not " + lw_text(e[2])
+    if e[1] == "-" then
+      return "-" + lw_text(e[2])
     end
-    return e[1] + lw_text(e[2])
+    return e[1] + " " + lw_text(e[2])
   end
   if kind == "Member" then
     return lw_text(e[1]) + "." + e[2]
@@ -884,6 +1006,35 @@ make a function called lw_gives_var takes name, rhs returns yes
     let i = i + 1
   end
   return whole == 1
+end
+
+# Whether `let name = rhs` adds to name's own value: rhs is name + e, and e does
+# not mention it. Nothing reads the old value after the addition.
+make a function called lw_adds_to_var takes fb, name, rhs returns yes
+  if fb[7][0] or (rhs[0] != "Bin") or (rhs[1] != "+") then
+    return false
+  end
+  let left = rhs[2]
+  if (left[0] != "Var") or (left[1] != name) or (list_len(left) != 2) then
+    return false
+  end
+  if lw_mentions(rhs[3], name) then
+    return false
+  end
+  return lw_var_slot(fb, name) >= 0
+end
+
+# The value is moved out of the variable, so that op_add_taken, seeing nothing
+# else holds a string, can add to it in place.
+make a function called lw_let_adding takes fb, name, rhs returns done
+  let s = lw_var_slot(fb, name)
+  let b = lw_expr(fb, rhs[3])
+  let t = lw_new_slot(fb)
+  lw_emit(fb, ["take", t, s])
+  let d = lw_new_slot(fb)
+  lw_emit(fb, ["op", d, "a+", t, b])
+  lw_emit(fb, ["copy", s, d])
+  return true
 end
 
 make a function called lw_mentions takes e, name returns yes
@@ -1097,7 +1248,20 @@ end
 # [stmts, quiet]. [fns, errors, facts]: facts are the program facts code
 # generation needs, [the event names some `when` handles].
 make a function called lw_program takes files returns result
-  let symbols = lw_symbols(files)
+  let shadows = lw_shadowing(files)
+  let files = lw_rename_shadowing(files, shadows)
+  let symbols = list_push(lw_symbols(files), shadows)
+  # an engine's own contracts are not facts of the program it runs: the file
+  # that asks for the runtime by name is the interpreter
+  let engine = false
+  let f = 0
+  while f < list_len(files) do
+    if files[f][2] then
+      let engine = true
+    end
+    let f = f + 1
+  end
+  let symbols = list_push(symbols, engine)
   let by_name = vec_new()
   let handled = vec_new()
   let rules = vec_new()
@@ -1266,19 +1430,28 @@ make a function called lw_by_name_registrations takes files, symbols, names retu
     end
   end
   let out = []
+  let prefix = lw_user_name("")
   let i = 0
   while i < list_len(wanted) do
+    # a name the program has given a function of its own reaches that function
+    let key = wanted[i]
+    let target = key
+    if v2_contains(symbols[2], key) then
+      let target = lw_user_name(key)
+    elif str_starts_with(key, prefix) then
+      let key = substr(key, prefix.length, key.length - prefix.length)
+    end
     let params = false
     let k = 0
     while k < list_len(symbols[0]) do
-      if symbols[0][k] == wanted[i] then
+      if symbols[0][k] == target then
         let params = symbols[1][k]
       end
       let k = k + 1
     end
     if params != false then
-      let wrapper = ["Closure", params, [["Return", ["CallThrough", wanted[i], params], 0]]]
-      let out = list_push(out, ["Expr", ["Call", "rt_register_function", [["Str", wanted[i]], wrapper]], 0])
+      let wrapper = ["Closure", params, [["Return", ["CallThrough", target, params], 0]]]
+      let out = list_push(out, ["Expr", ["Call", "rt_register_function", [["Str", key], wrapper]], 0])
     end
     let i = i + 1
   end

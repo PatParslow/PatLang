@@ -8,8 +8,9 @@ quiet_operators()
 #        are each thread's: memory.patlang's thread context, rt_active_events)
 #   4128 which classes' methods raise which events: [class id, event]
 #   4144 the classes: a list of class records (rt_class_*)
-#   4160 named objects: a list of [name, object]
+#   4160 named objects: the address of their table (rt_named_*), not a value
 #   4176 the next class id for a declared class
+#   4192, 4200 the named table's ticket lock: next ticket, ticket being served
 # (4208 is threads.patlang's functions by name, 4224 logic.patlang's rules)
 # and, at 2048 + 8 * class id (ids below 256), each class's event flag:
 # nonzero once a handler is registered for an event its methods raise.
@@ -38,12 +39,15 @@ end
 make a function called rt_objects_init returns r
   let st = runtime_state()
   let off = 4096
-  while off <= 4160 do
+  while off <= 4144 do
     mem_store(st, off, 0)
     mem_store(st, word_add(off, 8), 0)
     mem_init_value(st, off, [])
     let off = word_add(off, 16)
   end
+  mem_store(st, 4192, 0)
+  mem_store(st, 4200, 0)
+  mem_store(st, 4160, rt_named_table_new(64))
   mem_store(st, 4176, 0)
   mem_store(st, 4184, 0)
   mem_init_value(st, 4176, 64)
@@ -233,8 +237,160 @@ end
 # new(class) makes an object of that class, its fields its defaults;
 # new(class, name) also names it, findable by that name until
 # object_delete. A class never declared is declared here, with no fields.
-make a function called new takes cls, name returns o
+# ---- named objects ----
+
+# A table is an uncounted block: its count at 16, its capacity, a power of two,
+# at 24, and from 32 a value slot per bucket, each a list of [name, object] with
+# the earliest object of a name first. The lock lets any thread find or add one.
+
+make a function called rt_named_lock returns r
+  let st = runtime_state()
+  let mine = atomic_add(st + 4192, 1)
+  while mem_load(st, 4200) != mine do
+    let spin = 0
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_named_unlock returns r
+  atomic_add(runtime_state() + 4200, 1)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_named_table_new takes cap returns block
+  require (cap > 0) and (word_and(cap, cap - 1) == 0)
+  let block = rt_alloc(16 + 16 * cap)
+  mem_store(block, 16, 0)
+  mem_store(block, 24, cap)
+  let i = 0
+  while i < cap do
+    let off = 32 + 16 * i
+    mem_store(block, off, 0)
+    mem_store(block, off + 8, 0)
+    mem_init_value(block, off, [])
+    let i = i + 1
+  end
+  ensure block != 0
+  return block
+end
+
+# Where a name's bucket is in a table: FNV-1a over the name's bytes.
+make a function called rt_named_slot takes block, name returns off
+  require (block != 0) and (value_class(name) == 8)
+  let addr = rt_str_bytes(name)
+  let n = str_len(name)
+  let h = word_add(word_mul(3421674724, 4294967296), 2216829733)
+  let i = 0
+  while i < n do
+    let h = word_mul(word_xor(h, mem_load_byte(addr, i)), 1099511628211)
+    let i = i + 1
+  end
+  let off = 32 + 16 * word_and(h, mem_load(block, 24) - 1)
+  ensure off >= 32
+  return off
+end
+
+make a function called rt_named_insert takes block, pair returns r
+  require (block != 0) and (value_class(pair) == 9)
+  let off = rt_named_slot(block, pair[0])
+  mem_store_value(block, off, list_push(mem_load_value(block, off), pair))
+  mem_store(block, 16, mem_load(block, 16) + 1)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The table moved to twice the capacity, each name's objects in their order. The
+# caller holds the lock, so nothing is reading the old table when it is freed.
+make a function called rt_named_grow returns r
+  let st = runtime_state()
+  let old = mem_load(st, 4160)
+  let cap = mem_load(old, 24)
+  let block = rt_named_table_new(2 * cap)
+  let i = 0
+  while i < cap do
+    let off = 32 + 16 * i
+    let bucket = mem_load_value(old, off)
+    let k = 0
+    while k < list_len(bucket) do
+      rt_named_insert(block, bucket[k])
+      let k = k + 1
+    end
+    mem_store_value(old, off, false)
+    let i = i + 1
+  end
+  mem_store(st, 4160, block)
+  rt_free(old)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_named_add takes name, o returns r
+  require (value_class(name) == 8) and value_live(o)
+  rt_named_lock()
+  let block = mem_load(runtime_state(), 4160)
+  if mem_load(block, 16) >= mem_load(block, 24) then
+    rt_named_grow()
+    let block = mem_load(runtime_state(), 4160)
+  end
+  rt_named_insert(block, [name, o])
+  rt_named_unlock()
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The earliest object still alive with this name, else false.
+make a function called rt_named_find takes name returns o
+  require value_class(name) == 8
+  rt_named_lock()
+  let block = mem_load(runtime_state(), 4160)
+  let bucket = mem_load_value(block, rt_named_slot(block, name))
+  let i = rt_pairs_index(bucket, name)
+  let o = false
+  if i >= 0 then
+    let o = bucket[i][1]
+  end
+  rt_named_unlock()
+  ensure value_live(o)
+  return o
+end
+
+make a function called rt_named_remove takes name, o returns r
+  require (value_class(name) == 8) and value_live(o)
+  rt_named_lock()
+  let block = mem_load(runtime_state(), 4160)
+  let off = rt_named_slot(block, name)
+  let bucket = mem_load_value(block, off)
+  let kept = []
+  let k = 0
+  while k < list_len(bucket) do
+    if bucket[k][1] != o then
+      let kept = list_push(kept, bucket[k])
+    end
+    let k = k + 1
+  end
+  mem_store(block, 16, mem_load(block, 16) - (list_len(bucket) - list_len(kept)))
+  mem_store_value(block, off, kept)
+  rt_named_unlock()
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called new takes cls, name, rest returns o
   require (value_class(cls) == 8) and ((value_class(name) == 8) or (value_class(name) == 0))
+  if list_len(rest) > 0 then
+    print("new takes a class and a name; a class declaration says what it inherits")
+    let o = extern_call("KERNEL32.DLL", "ExitProcess", 75)
+    ensure rt_is_object(o) and (type_of(o) == cls)
+    return o
+  end
   let rec = rt_class_by_name(cls)
   if rec == false then
     class_define(cls, "", [], [], [], [])
@@ -247,7 +403,7 @@ make a function called new takes cls, name returns o
   end
   let o = rt_object_alloc(rec[1], name, fields)
   if value_class(name) == 8 then
-    rt_global_set(4160, list_push(rt_global_get(4160), [name, o]))
+    rt_named_add(name, o)
   end
   ensure rt_is_object(o) and (type_of(o) == cls)
   return o
@@ -258,10 +414,9 @@ end
 make a function called rt_resolve takes v returns o
   require value_live(v)
   if value_class(v) == 8 then
-    let named = rt_global_get(4160)
-    let i = rt_pairs_index(named, v)
-    if i >= 0 then
-      let o = named[i][1]
+    let found = rt_named_find(v)
+    if found != false then
+      let o = found
       ensure value_live(o)
       return o
     end
@@ -279,16 +434,10 @@ make a function called object_delete takes v returns r
     ensure value_class(r) == 1
     return r
   end
-  let named = rt_global_get(4160)
-  let kept = []
-  let k = 0
-  while k < list_len(named) do
-    if named[k][1] != o then
-      let kept = list_push(kept, named[k])
-    end
-    let k = word_add(k, 1)
+  let name = mem_load_value(value_data(o), 24)
+  if value_class(name) == 8 then
+    rt_named_remove(name, o)
   end
-  rt_global_set(4160, kept)
   let r = true
   ensure value_class(r) == 1
   return r
@@ -331,7 +480,8 @@ make a function called rt_field_set takes v, key, x returns r
 end
 
 # o.name: a field when the object has one, else the method called with no
-# arguments.
+# arguments. A string holding an object's name reaches that object, as it does
+# for rt_field_set and send.
 make a function called rt_member takes v, m returns r
   require value_live(v) and (value_class(m) == 8)
   # the one member read in nearly every loop, not through the method's closure
@@ -340,8 +490,9 @@ make a function called rt_member takes v, m returns r
     ensure value_live(r)
     return r
   end
-  if rt_is_object(v) then
-    let fields = rt_fields(v)
+  let o = rt_resolve(v)
+  if rt_is_object(o) then
+    let fields = rt_fields(o)
     let i = rt_pairs_index(fields, m)
     if i >= 0 then
       let r = fields[i][1]
@@ -536,6 +687,23 @@ make a function called emit takes event, data returns r
   let r = true
   ensure value_class(r) == 1
   return r
+end
+
+# The last pair with this key, or -1.
+make a function called rt_pairs_last_index takes pairs, key returns i
+  require (value_class(pairs) == 9)
+  let k = list_len(pairs) - 1
+  while k >= 0 do
+    if pairs[k][0] == key then
+      let i = k
+      ensure (i >= 0 - 1) and (i < list_len(pairs))
+      return i
+    end
+    let k = k - 1
+  end
+  let i = 0 - 1
+  ensure (i >= 0 - 1) and (i < list_len(pairs))
+  return i
 end
 
 make a function called rt_pairs_index_name takes names, x returns i

@@ -215,7 +215,12 @@ artefact shorter than that is built again rather than used, whether an interrupt
 another build writing it at that moment cut it short. No rename is needed, since a job's
 artefacts are the same bytes whoever writes them.
 
-Not done: artefacts are never evicted (GitHub #234).
+Eviction is explicit (GitHub #234): `compile.patlang --evict KEEP_MB` removes whole jobs, least
+recently used first. A build marks each job it reuses by rewriting its record.
+
+Existing programs on v2 were surveyed on 2026-11-05. The results, the gaps they showed and the work
+that follows are in `docs/plans/removing-rust.md`. The `friendly_cli` results under "Removing the
+globals" below are from `pat --ir-run` and the old route, so they say nothing about v2.
 
 Three behaviours the project owner decided to keep on 2026-11-05, now in spec 1.13 and
 `programs.feature`: a function without `return` gives its last statement's value, `exec_capture`
@@ -366,6 +371,20 @@ sources described under "Removing the globals".
   interpreter now finds the runtime from its own executable's path, so it must stay at
   `self_hosting/build/` in the repository, and the front end reports a file it cannot read on both
   engines. The compiler itself still runs from the repository's root.
+- **Threads calling the system together (GitHub #249).** Every thread wrote the counts from
+  `ReadFile`, `WriteFile`, `GetExitCodeProcess` and `PeekNamedPipe` to one word, and formatted
+  numbers in one 64-byte buffer, so one thread could read another's count. The native compiler,
+  run with `--workers 8`, failed at random on 4 of 21 compiles: `read_file_bytes` returned more
+  bytes than asked for. Each thread's context now holds its own word and buffer (`rt_out_word`,
+  `rt_scratch` in `memory.patlang`). `concurrency.feature` has the scenario: 8 threads each read
+  their own length of one file 400 times and print a number of seven copies of their own digit.
+  Before the fix it failed on the contract, with 197 to 236 of each worker's 400 lines printed.
+  After it, 16 of 16 pass on both engines.
+- **v2 gates on 2026-11-06, after that fix:** Part 1 87/87 on v2 and on the interpreter;
+  `engines_agree.feature` 61/61; Part 2 83/83; the language suite 242/242 on the interpreter and
+  compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the interpreter; the
+  compiler built by `pat --ir-run`, its build of itself and that build's build of itself byte
+  identical. A cold self-compile on 8 workers takes about 7.8 minutes.
 - **v2 gates, rerun one at a time on 2026-11-05 with intervals and the artefact check in:** Part 1
   65/65 on v2 and on the interpreter; `engines_agree.feature` 47/47; Part 2 75/75; the language suite
   242/242 and the match suite 26/26, each on v2 and on the interpreter; the block-model suite 211/211

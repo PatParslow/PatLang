@@ -583,6 +583,86 @@ make a function called st_rr_partial_rebuilt takes ctx returns ok
   return all
 end
 
+# What comes after a path's last backslash.
+make a function called rr_file_name takes path returns name
+  let i = path.length - 1
+  while (i >= 0) and (char_code(path, i) != 92) do
+    let i = i - 1
+  end
+  return substr(path, i + 1, path.length - i - 1)
+end
+
+# Which of two stored records is older, by the store's own order.
+make a function called rr_older_record takes a, b returns first
+  let lines = split_lines(rr_clean(exec_capture("cmd", "/c", "dir /b /o:d /t:w " + a + ".chunk " + b + ".chunk")))
+  return lines[0]
+end
+
+make a function called rr_stored_fn takes name, k returns stem
+  let src = "self_hosting/build/v2_rt_" + name + ".patlang"
+  write_file(src, "make a function called " + name + " takes n returns r" + nl() + "  return n + " + k + nl() + "end" + nl() + "print(" + name + "(1))" + nl())
+  rr_compile(src, "self_hosting/build/v2_rt_" + name + ".exe", [])
+  return rr_artefact_stem(name)
+end
+
+make a function called st_rr_reuse_marks_used takes ctx returns ok
+  let k = now_ms() % 1000000
+  let first = rr_stored_fn("rr_used_a_" + k, k)
+  let second = rr_stored_fn("rr_used_b_" + k, k + 1)
+  let found = expect(ctx, "both functions' artefacts are found", (first != "") and (second != ""), true)
+  if not found then
+    return false
+  end
+  let name_second = rr_file_name(second) + ".chunk"
+  let name_first = rr_file_name(first) + ".chunk"
+  let a = expect(ctx, "the first is the older at first", rr_older_record(first, second), name_first)
+  rr_compile("self_hosting/build/v2_rt_rr_used_a_" + k + ".patlang", "self_hosting/build/v2_rt_rr_used_a_" + k + ".exe", [])
+  let b = expect(ctx, "after its reuse the second is the older", rr_older_record(first, second), name_second)
+  return a and b
+end
+
+# A job of about 1.2 MB: a record and an assembly of 600 KB each.
+make a function called rr_fake_job takes dir, stem returns done
+  let line = sb_new()
+  let i = 0
+  while i < 1000 do
+    sb_push(line, "0123456789")
+    let i = i + 1
+  end
+  let piece = sb_str(line)
+  let b = sb_new()
+  let i = 0
+  while i < 60 do
+    sb_push(b, piece)
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  write_file(dir + "/" + stem + ".asm", text)
+  write_file(dir + "/" + stem + ".chunk", text)
+  return true
+end
+
+make a function called rr_evict takes keep_mb, dir returns out
+  return rr_clean(exec_capture(rr_pat(), "--ir-run", "self_hosting/v2/compile.patlang", "--evict", "" + keep_mb, dir))
+end
+
+make a function called st_rr_evict takes ctx returns ok
+  let dir = "self_hosting/build/v2_rt_evict"
+  exec_capture("cmd", "/c", "rmdir /s /q self_hosting" + chr(92) + "build" + chr(92) + "v2_rt_evict")
+  rr_fake_job(dir, "1_1")
+  rr_fake_job(dir, "2_2")
+  rr_fake_job(dir, "3_3")
+  # used most recently
+  write_file(dir + "/1_1.chunk", read_file(dir + "/1_1.chunk"))
+  let a = expect(ctx, "a size it fits removes nothing", contains_text(rr_evict(100, dir), "evicted 0 jobs"), true)
+  let b = expect(ctx, "and all three remain", file_exists(dir + "/2_2.chunk") and file_exists(dir + "/3_3.asm") and file_exists(dir + "/1_1.chunk"), true)
+  let out = rr_evict(2, dir)
+  let c = expect(ctx, "2 MB removes two of the three jobs", contains_text(out, "evicted 2 jobs"), true)
+  let d = expect(ctx, "the least recently used, whole", file_exists(dir + "/2_2.chunk") or file_exists(dir + "/2_2.asm") or file_exists(dir + "/3_3.chunk") or file_exists(dir + "/3_3.asm"), false)
+  let e = expect(ctx, "the most recently used remains, whole", file_exists(dir + "/1_1.chunk") and file_exists(dir + "/1_1.asm"), true)
+  return a and b and c and d and e
+end
+
 # The program facts are an artefact of the build (OUT.facts), one per line,
 # recorded by the lowering where each registration is declared.
 make a function called st_rr_facts takes ctx returns ok
@@ -672,6 +752,12 @@ make a function called register_runtime_steps takes ctx returns done
   step(ctx, "its code is searched for set_global, get_global, set_var and reads of __vars", "st_rr_noop")
   step(ctx, "there are none", "st_rr_no_globals")
   step(ctx, "f's compiled artefact is reused unchanged", "st_rr_summary_reuse")
+  step(ctx, "two functions' artefacts, the first stored before the second", "st_rr_noop")
+  step(ctx, "the first is reused by a later build", "st_rr_noop")
+  step(ctx, "the second is now the less recently used", "st_rr_reuse_marks_used")
+  step(ctx, "a store of three jobs, the first used most recently, of more than the size asked for", "st_rr_noop")
+  step(ctx, "eviction is asked for with that size", "st_rr_noop")
+  step(ctx, "whole jobs go, least recently used first, until the store fits, and a larger size removes nothing", "st_rr_evict")
   step(ctx, "a built program whose function's stored code, assembly or record is then cut short", "st_rr_noop")
   step(ctx, "the program is built again", "st_rr_noop")
   step(ctx, "that function is built again, and the program runs", "st_rr_partial_rebuilt")

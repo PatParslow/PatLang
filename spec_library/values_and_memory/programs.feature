@@ -15,3 +15,13 @@ Feature: what functions, commands and includes give (spec 1.13)
     Given a program whose two included files both include a third
     When it runs
     Then the third file's statements run once, before the files that include it
+
+  Scenario: a program's function may have a name the runtime has
+    Given a program defining to_s, list_len and emit
+    When it calls them directly, from a closure and by name
+    Then each call reaches the program's function, and the runtime goes on using its own
+
+  Scenario: two of a program's files defining one name is an error
+    Given a program and a file it includes that define one function name
+    When the program is given
+    Then both engines report that the name is declared twice, and nothing runs

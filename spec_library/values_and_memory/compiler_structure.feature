@@ -26,6 +26,16 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When g's body changes without changing its ownership summary
     Then f's compiled artefact is reused unchanged
 
+  Scenario: a reused artefact counts as just used
+    Given two functions' artefacts, the first stored before the second
+    When the first is reused by a later build
+    Then the second is now the less recently used
+
+  Scenario: artefacts are evicted only when asked, least recently used first
+    Given a store of three jobs, the first used most recently, of more than the size asked for
+    When eviction is asked for with that size
+    Then whole jobs go, least recently used first, until the store fits, and a larger size removes nothing
+
   Scenario: a partly written artefact is rebuilt, never used
     Given a built program whose function's stored code, assembly or record is then cut short
     When the program is built again

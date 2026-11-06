@@ -20,3 +20,13 @@ Feature: every value is an object of a class, and answers methods through it (sp
     Given 3.to_s, 3.14.to_s, [1, 2, 3].length, and n.to_s where n is 42
     When each is evaluated
     Then they are "3", "3.14", 3 and "42"
+
+  Scenario: an object's name finds the same field as the object does
+    Given an object named a1 with a field, and a string holding that name
+    When a program reads and assigns the field through the string
+    Then it sees the same field the object has, and the string still answers length
+
+  Scenario: new takes a class and a name, and nothing more
+    Given a call of new with further arguments after the name
+    When the program runs
+    Then it stops there, saying that a class declaration is how to inherit

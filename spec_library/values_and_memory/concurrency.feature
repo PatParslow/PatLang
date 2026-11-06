@@ -45,3 +45,8 @@ Feature: fibers, budgeted blocks and threads (spec 1.8)
       | a thread whose result is then taken |
     When each runs for N and for 10N iterations
     Then no concurrent loop's peak memory grows
+
+  Scenario: threads read files and print numbers together
+    Given 8 threads, each reading its own length of one file 400 times and printing a number of seven copies of its own digit each time
+    When parallel_map runs them
+    Then every read gives the length asked for, and every number is printed whole

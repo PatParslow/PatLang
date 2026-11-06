@@ -24,7 +24,10 @@ value's class without producing a new value.
 `new("Widget", "w1")` returns the object, whose class is `Widget`. This
 changes today's behaviour: `new` returns the object's name, the string
 `"w1"`, and `get`, `send` and `object_delete` look the object up by that
-name. The name stays a way to find a named object (1.6).
+name. The name stays a way to find a named object (1.6): `s.field` and
+`s.field = x`, where `s` is a string holding the name, reach the object's field.
+`new` takes a class and a name and nothing more: further arguments stop the program,
+since inheritance and traits belong to a `class` declaration.
 
 ### 1.2 Methods on every value
 
@@ -86,7 +89,9 @@ any event is (`emit`, `when`), with nothing specific to operators.
   replaces a value each iteration does not grow memory with the number of
   iterations.
 - **Named objects** (`new` with a name) are the one exception: they live
-  until `object_delete`, which frees them and releases what they hold.
+  until `object_delete`, which frees them and releases what they hold. Finding
+  one by its name takes about the same time however many there are. A repeated
+  name finds the earliest of its objects still alive.
 - The bound is checked from outside the program, by the process's memory
   use. A program has no primitive for reading it.
 
@@ -95,7 +100,9 @@ any event is (`emit`, `when`), with nothing specific to operators.
 The interpreter and native code are two routes to one language. Every
 scenario in Part 1 must give the same observable result on both, whichever
 directory the program is started in. A program file or an included file that
-cannot be read is an error on both, naming the file, and nothing of the program runs.
+cannot be read is an error on both, naming the file, and nothing of the program runs. What a
+program can read, its logic state and contract facts among them, holds nothing of the engine
+running it.
 
 ### 1.8 Fibers, budgeted blocks and threads
 
@@ -123,6 +130,9 @@ cannot be read is an error on both, naming the file, and nothing of the program 
 
 - `syntax NAME { ... }` defines a trigger keyword, tokens and rules. Each block
   `trigger { ... }` is replaced by what its rules give, before the program is parsed.
+- `AST.Name(args)` gives a node, the list `["Name", args...]`, in a rule or in any other
+  code, and nodes nest. A rule can pass one to a function:
+  `return handle(AST.Route(verb, path));`. A variable named `AST` keeps its meaning.
 - A definition starts a line, and holds in its own file and the files collected after
   it, each file coming after the files it includes.
 
@@ -134,12 +144,18 @@ A string holds characters, whatever bytes they take. `.length`, indexes, `substr
 An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
 the cursor.
 
+`let s = s + x` gives a new value, as `+` always does; whatever else holds the old string keeps
+it. When nothing else holds it, the time an append takes does not depend on the string's length.
+
 ### 1.11 Numbers and bits as functions
 
 `pow` of an exact base to a whole power is exact, and otherwise a float. `sin`, `cos`,
 `tan`, `asin`, `acos`, `atan`, `atan2`, `log` and `exp` give floats. `ceil`, `trunc` and
 `round` are exact for exact numbers; `round` takes a half away from zero. `abs` of a
 complex number is its modulus. `to_fixed` rounds the float's exact value, a tie to even.
+`max(a, b)` and `min(a, b)` give the larger and the smaller of two real numbers, keeping its kind.
+`bnot` of an int is its bitwise complement, so `bnot n` is `-1 - n`; of anything else it stops the
+program, as the other bit operators do.
 
 ### 1.12 Intervals
 
@@ -163,6 +179,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   statements gives `unit`.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
 - A file reached by several includes is included once, before the files that include it.
+- A program may define a function with a name the runtime has. The program's calls reach its
+  function, directly, from a closure or by name, and the runtime goes on using its own. Two of a
+  program's files defining one name is an error, naming it, and nothing of the program runs.
 
 ## Part 2: the new version's runtime and compiler
 
@@ -252,6 +271,9 @@ summary (2.5) and stated as the function's contract (2.4).
   against its callee's summary, never its body.
 - An artefact is used only when it is complete. One cut short, by an interrupted
   build or by another build writing it at the same moment, is built again.
+- A build leaves artefacts in place, and marks those it reuses as just used.
+  `compile.patlang --evict KEEP_MB` removes whole jobs, least recently used first,
+  until the store is no larger than that. An evicted job is built again when next needed.
 - Registrations (`when` handlers, rules, functions reached only by name)
   are recorded in the program facts, never rediscovered by scanning.
 - Synthesized names are the declaration's identity plus a counter local

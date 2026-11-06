@@ -20,3 +20,8 @@ Feature: the interpreter and native code are one language (spec 1.7)
     Given a program that includes a path with no file at it
     When that program is given
     Then both engines report that the include cannot be read, and nothing of the program runs
+
+  Scenario: the logic state holds nothing of the engine running the program
+    Given a program with one contract, one rule and one action
+    When it reads its state and the contract facts
+    Then both engines give the program's own facts alone

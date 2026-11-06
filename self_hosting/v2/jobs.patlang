@@ -336,6 +336,216 @@ end
 
 # ---- running the jobs ----
 
+# ---- eviction ----
+
+# A line's words, split on spaces.
+make a function called jb_words takes line returns words
+  let words = []
+  let cur = sb_new()
+  let any = false
+  let i = 0
+  let n = line.length
+  while i < n do
+    let c = char_code(line, i)
+    if c == 32 then
+      if any then
+        let words = list_push(words, sb_str(cur))
+        let cur = sb_new()
+        let any = false
+      end
+    else
+      sb_push(cur, chr(c))
+      let any = true
+    end
+    let i = i + 1
+  end
+  if any then
+    let words = list_push(words, sb_str(cur))
+  end
+  return words
+end
+
+make a function called jb_all_digits takes s returns yes
+  let n = s.length
+  if n == 0 then
+    return false
+  end
+  let i = 0
+  while i < n do
+    let c = char_code(s, i)
+    if (c < 48) or (c > 57) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Where the name's extension starts, or -1.
+make a function called jb_last_dot takes name returns at
+  let i = name.length - 1
+  while i >= 0 do
+    if char_code(name, i) == 46 then
+      return i
+    end
+    let i = i - 1
+  end
+  return 0 - 1
+end
+
+make a function called jb_stem_bucket takes stem returns b
+  let h = 0
+  let i = 0
+  let n = stem.length
+  while i < n do
+    let h = (h * 31 + char_code(stem, i)) % 4096
+    let i = i + 1
+  end
+  return h
+end
+
+# The store's files, least recently written first: a list of [name, bytes]. Each
+# line of `dir` that names a file ends in its size and its name.
+make a function called jb_store_files takes dir returns files
+  let win = sb_new()
+  let i = 0
+  while i < dir.length do
+    if char_code(dir, i) == 47 then
+      sb_push(win, chr(92))
+    else
+      sb_push(win, chr(char_code(dir, i)))
+    end
+    let i = i + 1
+  end
+  let lines = split_lines(exec_capture("cmd", "/c", "dir /a-d /o:d /t:w /-c " + sb_str(win)))
+  let files = []
+  let k = 0
+  while k < list_len(lines) do
+    let words = jb_words(lines[k])
+    let n = list_len(words)
+    if n >= 4 then
+      if jb_all_digits(words[n - 2]) and (jb_last_dot(words[n - 1]) > 0) then
+        let files = list_push(files, [words[n - 1], to_num(words[n - 2])])
+      end
+    end
+    let k = k + 1
+  end
+  return files
+end
+
+# Removes whole jobs, least recently used first, until the store is no more than
+# keep_bytes: [jobs removed, bytes removed, bytes left]. A job's use is its record's
+# time, so a job with no record, left by an interrupted build, goes first. The record
+# goes first too: without it the job no longer counts as stored.
+make a function called jb_evict takes dir, keep_bytes returns result
+  let files = jb_store_files(dir)
+  let buckets = vec_new()
+  let i = 0
+  while i < 4096 do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  let total = 0
+  let order = []
+  let stems = []
+  let i = 0
+  while i < list_len(files) do
+    let name = files[i][0]
+    let dot = jb_last_dot(name)
+    let stem = substr(name, 0, dot)
+    let ext = substr(name, dot, name.length - dot)
+    let total = total + files[i][1]
+    let b = jb_stem_bucket(stem)
+    let entries = vec_get(buckets, b)
+    let found = 0 - 1
+    let k = 0
+    while k < list_len(entries) do
+      if entries[k][0] == stem then
+        let found = k
+      end
+      let k = k + 1
+    end
+    if found < 0 then
+      let stems = list_push(stems, stem)
+      vec_set(buckets, b, list_push(entries, [stem, [files[i]], ext == ".chunk"]))
+    else
+      let e = entries[found]
+      let e = [stem, list_push(e[1], files[i]), e[2] or (ext == ".chunk")]
+      vec_set(buckets, b, list_set(entries, found, e))
+    end
+    if ext == ".chunk" then
+      let order = list_push(order, stem)
+    end
+    let i = i + 1
+  end
+  let by_age = []
+  let i = 0
+  while i < list_len(stems) do
+    let entries = vec_get(buckets, jb_stem_bucket(stems[i]))
+    let k = 0
+    while k < list_len(entries) do
+      if (entries[k][0] == stems[i]) and (not entries[k][2]) then
+        let by_age = list_push(by_age, stems[i])
+      end
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(order) do
+    let by_age = list_push(by_age, order[i])
+    let i = i + 1
+  end
+  let jobs = 0
+  let removed = 0
+  let i = 0
+  while (total > keep_bytes) and (i < list_len(by_age)) do
+    let stem = by_age[i]
+    let entries = vec_get(buckets, jb_stem_bucket(stem))
+    let k = 0
+    while k < list_len(entries) do
+      if entries[k][0] == stem then
+        let got = jb_remove_job(dir, stem, entries[k][1])
+        let total = total - got
+        let removed = removed + got
+        let jobs = jobs + 1
+      end
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  return [jobs, removed, total]
+end
+
+# The bytes removed: a file another build holds stays.
+make a function called jb_remove_job takes dir, stem, files returns bytes
+  let got = 0
+  let chunk = dir + "/" + stem + ".chunk"
+  let i = 0
+  while i < list_len(files) do
+    let path = dir + "/" + files[i][0]
+    if path == chunk then
+      remove_file(path)
+      if not file_exists(path) then
+        let got = got + files[i][1]
+      end
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(files) do
+    let path = dir + "/" + files[i][0]
+    if path != chunk then
+      remove_file(path)
+      if not file_exists(path) then
+        let got = got + files[i][1]
+      end
+    end
+    let i = i + 1
+  end
+  return got
+end
+
 make a function called jb_artefact_path takes dir, key, ext returns path
   return dir + "/" + key + ext
 end
@@ -352,8 +562,12 @@ make a function called jb_run_job takes job returns result
   let asm_path = jb_artefact_path(dir, job[4], ".asm")
   let t0 = now_ms()
   if (dir != "") and file_exists(chunk_path) and file_exists(asm_path) then
-    let stored = jb_chunk_from_bytes(jb_read_bytes(chunk_path), jb_artefact_path(dir, job[4], ""))
+    let record = jb_read_bytes(chunk_path)
+    let stored = jb_chunk_from_bytes(record, jb_artefact_path(dir, job[4], ""))
     if stored != false then
+      # marks the job as just used, for eviction. The same bytes, so another
+      # build reading it finds it whole or short, and a short one is built again.
+      write_file_bytes(chunk_path, record)
       return [job[0], stored[0], stored[1], "reused", [now_ms() - t0, 0, 0]]
     end
   end

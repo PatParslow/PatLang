@@ -36,3 +36,13 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
     Given a loop that makes new("Widget", "w" + i) without object_delete, then reads get of the first
     When it runs
     Then the first object's fields are still readable after the loop
+
+  Scenario: many named objects are each found by their name
+    Given thousands of named objects, and two objects with one name
+    When a program reads each by its name and then deletes them
+    Then each read finds its own object, a repeated name finds the first until it is deleted, and a deleted name can be used again
+
+  Scenario: finding a named object does not depend on how many there are
+    Given the same lookups at 1,000 and at 16,000 named objects
+    When a program times them
+    Then the larger takes no more than about three times as long
