@@ -11,6 +11,11 @@ Feature: values and objects with identity (spec 1.5)
     When all three are read
     Then a has 10 elements, b ends in 99, and c ends in 77
 
+  Scenario: pushing onto a list nothing else holds does not copy all of it each time
+    Given a loop of let out = list_push(out, e), where e reads out, at 20,000 and at 40,000 pushes
+    When a program times them
+    Then twice the pushes take no more than about three times as long
+
   Scenario: equal lists built different ways are equal
     Given ["x", "y"] and list_push(list_push([], "x"), "y")
     When they are compared with ==

@@ -129,6 +129,13 @@ Since the survey, by the project owner's decisions below, with the gates passing
   `pat`. In those demos the `AST` route builds nodes and then drops them.
 - **#245.** Bare undefined names stay an error, and the programs using them were changed, apart from
   the four in `rust-runtime/examples`.
+- **#244.** The name `unit` is the unit value unless a program binds it (spec 1.13), as on `pat`.
+  The 16 programs that stopped on it now compile on v2. The 15 that use the `world`
+  libraries, and `interp_budget_probe`, then stop on `set_var`, which is gone, and they fail on `pat` too.
+  `build_portfolio` read two top-level `let`s inside functions, and these are functions now. It
+  defined `q` and `nl` three times, through `codegen`, `html` and `transpile_ruby`, which now
+  share them from `lib/chars.patlang`. It compiles on v2; it has not been run, as it writes the
+  site and calls `patc1` and `rustc`.
 
 The first two rows count every program with that failure, whether or not it was run, so not all of
 them were seen working on `pat`. `friendly_cli` compiled with 3 failures on the old route and has 26
@@ -151,7 +158,10 @@ an include path that doesn't exist; the one checked, `family_tree_main`, fails o
 - **The v2 interpreter** is 37-50 times slower than `pat`
   ([#238](https://github.com/PatParslow/PatLang/issues/238)). This is the main obstacle to step 2.
 - **The native compiler** takes 103 s on a tiny program where the same compiler on `pat` takes 30 s,
-  81 s of it linking ([#239](https://github.com/PatParslow/PatLang/issues/239)).
+  81 s of it linking ([#239](https://github.com/PatParslow/PatLang/issues/239)). Half of the link
+  was `let xs = list_push(xs, f(xs))` copying the list on each push; with that fixed, the
+  compiler's link of itself takes 73 s, where it took 151 s, and its self-compile 369 s, where it
+  took 456 s.
 - **Named objects** took quadratic time: 814 ms at 1,000 objects and 49.7 s at 8,000, where `pat` goes
   from 57 ms to 84 ms ([#236](https://github.com/PatParslow/PatLang/issues/236)). Now 0.63 s at 8,000,
   growing about linearly.

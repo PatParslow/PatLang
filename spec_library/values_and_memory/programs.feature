@@ -6,6 +6,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When each is called
     Then each gives what spec 1.13 says, and an if or while that ran nothing gives unit
 
+  Scenario: the name unit is the unit value, unless the program binds it
+    Given a program that writes unit, and binds unit as a parameter and as a variable
+    When it runs
+    Then unit is the value a function with no statements gives, and a bound unit is the program's own
+
   Scenario: exec_capture gives what a command wrote to both of its outputs
     Given a command that writes to standard error and to standard output
     When exec_capture runs it

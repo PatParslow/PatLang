@@ -380,6 +380,19 @@ sources described under "Removing the globals".
   their own length of one file 400 times and print a number of seven copies of their own digit.
   Before the fix it failed on the contract, with 197 to 236 of each worker's 400 lines printed.
   After it, 16 of 16 pass on both engines.
+- **The name `unit` (GitHub #244).** Spec 1.13: `unit` is the unit value unless the program binds
+  it, as a parameter or with `let`. The lowerer gives the constant when the name has no slot.
+  `vi_unit` checks both cases on both engines.
+- **`let xs = list_push(xs, f(xs))` copied the list (GitHub #239).** The lowerer gave `xs` to the
+  call only when no other argument mentioned it, so a push whose value read the list copied all of
+  it each time. Every argument is evaluated before the value is given, so the other arguments may
+  read it. 16,000 such pushes took 2,574 ms and now take 3 ms; `bm_push_scale` checks that twice
+  the pushes take at most about three times as long. The native compiler's own link went from
+  151 s to 73 s.
+- **v2 gates on 2026-11-06, after those two:** Part 1 89/89 on v2 and on the interpreter;
+  `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the interpreter and
+  compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the interpreter; the
+  three compiler generations byte identical.
 - **v2 gates on 2026-11-06, after that fix:** Part 1 87/87 on v2 and on the interpreter;
   `engines_agree.feature` 61/61; Part 2 83/83; the language suite 242/242 on the interpreter and
   compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the interpreter; the

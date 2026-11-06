@@ -72,7 +72,9 @@ any event is (`emit`, `when`), with nothing specific to operators.
 - **Values:** numbers, booleans, unit, strings, lists and closures. An
   operation that "changes" one produces a new value. Every other holder
   of the old value keeps seeing the old value: `list_set` and `list_push`
-  leave the list they were given unchanged. Two numbers, strings or
+  leave the list they were given unchanged. When nothing else holds the old list,
+  `let xs = list_push(xs, e)` takes the same time however long `xs` is, also when `e`
+  reads `xs`. Two numbers, strings or
   lists are equal when their contents are. Closure equality is not
   specified here.
 - **Objects with identity:** class instances, objects made by `new`,
@@ -177,6 +179,8 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   expression gives its value and a `let` the value it bound. An `if` or a `while` gives the
   value of the last statement it ran, or `unit` if it ran none, and a function with no
   statements gives `unit`.
+- The name `unit` in a program is that value, unless the program binds `unit` itself, as a
+  parameter or with `let`.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
 - A file reached by several includes is included once, before the files that include it.
 - A program may define a function with a name the runtime has. The program's calls reach its
