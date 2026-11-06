@@ -155,8 +155,13 @@ an include path that doesn't exist; the one checked, `family_tree_main`, fails o
 | `bench_strconcat` | 1,951 ms | 266,366 ms | 273,249 ms |
 
 - **v2 native** is 17-21 times faster than `pat` on the first three.
-- **The v2 interpreter** is 37-50 times slower than `pat`
-  ([#238](https://github.com/PatParslow/PatLang/issues/238)). This is the main obstacle to step 2.
+- **The v2 interpreter** was 37-50 times slower than `pat`
+  ([#238](https://github.com/PatParslow/PatLang/issues/238)), the main obstacle to step 2. Its
+  translated code is now one list of ints, its frames come from one block, and two ints add
+  directly: `bench_fib` 14.8 s, `bench_manycalls` 26.1 s, `bench_sumloop` 32.1 s and
+  `bench_strconcat` 3.2 s, measured while other programs were running, so 1.6-10 times
+  slower than `pat`. Most of what remains is the compiled code itself: every temporary goes to
+  the stack, every reference count is an atomic add, and contracts are checked as it runs.
 - **The native compiler** takes 103 s on a tiny program where the same compiler on `pat` takes 30 s,
   81 s of it linking ([#239](https://github.com/PatParslow/PatLang/issues/239)). Half of the link
   was `let xs = list_push(xs, f(xs))` copying the list on each push; with that fixed, the

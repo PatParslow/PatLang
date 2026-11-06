@@ -389,6 +389,23 @@ sources described under "Removing the globals".
   read it. 16,000 such pushes took 2,574 ms and now take 3 ms; `bm_push_scale` checks that twice
   the pushes take at most about three times as long. The native compiler's own link went from
   151 s to 73 s.
+- **The interpreter's speed (GitHub #238).** Each function is translated once into one list of
+  ints, read word by word, with its constants in a second list; frames come from one block the
+  interpreter allocates, not a list per call; the rarely run kinds sit in a function of their own
+  so that the loop's frame on the machine's stack stays small; and `op_add` adds two ints
+  directly when no handler is registered. `bench_fib` runs in 14.8 s, where it took 104.9 s,
+  measured on the same loaded machine. Taking the string into a local before `op_add_taken`
+  kept a second reference, so every `s = s + x` copied the string; `bm_append_scale` now appends
+  16 characters at a time, so that a copy costs more than the loop, and fails on that mistake.
+  400,000 appends take 887 ms, where they took 3,326 ms.
+- **The signals scenarios claimed fixed ports.** A claim of 9601 failed once because another
+  program held the port for a moment. They now claim port 0, so the system picks a free one,
+  and the second claim takes the port the first one got; the language suite passes 242/242 on
+  `pat`, on the interpreter and compiled by v2.
+- **v2 gates on 2026-11-06, after the new interpreter:** Part 1 89/89 on v2 and on the
+  interpreter; `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the
+  interpreter and compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the
+  interpreter; the three compiler generations byte identical.
 - **v2 gates on 2026-11-06, after those two:** Part 1 89/89 on v2 and on the interpreter;
   `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the interpreter and
   compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the interpreter; the

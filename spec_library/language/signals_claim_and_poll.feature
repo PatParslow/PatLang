@@ -1,13 +1,13 @@
 Feature: signals (signal_claim/signal_poll -- port ownership + idle polling)
 
   Scenario: The first claimant of a port becomes its primary
-    Given signal_claim(9601) called for the first time
+    Given signal_claim(0) called for the first time, so the system picks a port no one holds
     When the result is checked
     Then it is >= 0 (a real port_id)
 
   Scenario: A second claim on the same port is rejected
     Given the same process still holds the port from the first claim
-    When signal_claim(9601) is called again
+    When signal_claim is called again on the port the first claim got
     Then it returns -1 -- the free single-instance-detection this subsystem relies on
 
   Scenario: Polling an idle port times out to empty, not an error
