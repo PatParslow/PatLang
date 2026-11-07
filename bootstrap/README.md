@@ -1,3 +1,22 @@
+# Bootstrapping v2 from its IR (GitHub #247)
+
+`ir_reader.py` builds a Windows x64 executable from v2's IR
+(`docs/spec/ir.md`), using only Python's standard library.
+`v2_compiler.ir` is the compiler's own IR, so a machine with Python and
+nothing of PatLang's builds the compiler with:
+
+```
+py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe
+```
+
+`self_hosting/v2/tools/gates.sh` does this when there is no `v2.exe`. On every
+run it also rewrites `v2_compiler.ir` with `v2.exe ... --ir`, builds a compiler
+from it with the reader, and checks that this compiler builds the compiler
+byte for byte as `v2.exe` does.
+
+The rest of this directory is the earlier bootstrap of the old compiler,
+described below.
+
 # PatLang IR bootstrap (GitHub #25, Piece 2 + #196)
 
 `bootstrap_interp.py` is a standalone Python interpreter for PatLang's own

@@ -44,6 +44,18 @@ Made by the project owner on 2026-11-05:
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical.
+
+   Progress, 2026-11-07:
+   - The IR is specified in `docs/spec/ir.md`, and `compile.patlang ... --ir` writes it. The
+     compiler's own IR is 4.1 MB.
+   - The first reader, `bootstrap/ir_reader.py`, is written in Python, as the project owner chose.
+     It builds a compiler from the compiler's IR in about 3 seconds.
+   - That compiler built the compiler with `--no-cache` in 6 minutes. Its build is byte identical
+     to v2's own build of the compiler, and to the build it then made of itself.
+   - `gates.sh` builds its first `v2.exe` this way, from `bootstrap/v2_compiler.ir`, and checks the
+     chain on every run. Only the block-model suite's steps, which test the old engine, still start `pat`.
+   - The `compiler_structure.feature` scenario builds a program reaching every kind of
+     instruction from its IR, and checks that it gives the same output as v2's own build.
 4. **Build the browser WASM backend and host**
    ([#248](https://github.com/PatParslow/PatLang/issues/248)). This can run alongside steps 2 and 3.
    The old compiler can't retire until it is done, being the only WASM route.

@@ -301,3 +301,16 @@ summary (2.5) and stated as the function's contract (2.4).
 - Synthesized names are the declaration's identity plus a counter local
   to it. A sequential build and a parallel build of the same input
   produce identical bytes.
+
+### 2.6 The IR and the bootstrap
+
+- `compile.patlang SRC OUT.ir --ir` writes the program's IR. That is every
+  function the program can reach, the runtime's included, after the
+  ownership stage, and the one program fact that code generation reads.
+  `docs/spec/ir.md` gives the text form and what each instruction means.
+- A reader builds an executable from that IR, and it behaves as v2's own
+  build of the program does.
+- The first reader, `bootstrap/ir_reader.py`, is written in Python with
+  only its standard library, and builds for Windows x64. It builds the
+  compiler from the compiler's own IR. That compiler builds the compiler,
+  the result builds it again, and the last two are byte identical.

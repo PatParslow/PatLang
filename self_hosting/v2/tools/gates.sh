@@ -3,10 +3,11 @@
 #
 #   self_hosting/v2/tools/gates.sh
 #
-# pat --ir-run is used once, to build the first self_hosting/build/v2.exe
-# when there is none, until the IR reader (GitHub #247) takes its place.
-# The language and match suites run their programs on these two engines;
-# the block-model suite's steps still start pat (GitHub #246).
+# When there is no self_hosting/build/v2.exe, the first is built from the
+# compiler's IR, bootstrap/v2_compiler.ir, by the IR reader
+# (bootstrap/ir_reader.py, docs/spec/ir.md), which needs only Python. The
+# language and match suites run their programs on these two engines; the
+# block-model suite's steps still start pat, the old engine they test.
 #
 # Each step's result goes to self_hosting/build/v2_gates/status as it
 # finishes, and its output to a log beside it.
@@ -22,9 +23,8 @@ tests() { tr -d '\000' < "$1" | grep -a '^tests:'; }
 # The compiler. v2.exe builds a, a builds b; a and b must be byte identical,
 # and b becomes v2.exe.
 if [ ! -f $B/v2.exe ]; then
-  PATLANG_MAX_MEM_MB=16000 rust-runtime/target/release/pat.exe --ir-run self_hosting/v2/compile.patlang \
-    self_hosting/v2/compile.patlang $B/v2.exe --workers 8 > "$D/boot.log" 2>&1
-  st "first compiler, on pat: exit $?"
+  py -3 -I bootstrap/ir_reader.py bootstrap/v2_compiler.ir $B/v2.exe > "$D/boot.log" 2>&1
+  st "first compiler, from the IR: exit $?"
 fi
 $B/v2.exe self_hosting/v2/compile.patlang $B/v2_gen_a.exe --no-cache --workers 8 > "$D/gen_a.log" 2>&1
 st "compiler a: exit $?"
@@ -37,6 +37,22 @@ else
   st "fixpoint: a and b differ"
   st "stopped"
   exit 1
+fi
+
+# The bootstrap (spec 2.6): the compiler's IR, written again, and the
+# compiler the reader builds from it, which must build the compiler byte for
+# byte as v2.exe does. v2.exe builds itself unchanged, so the chain from the
+# reader is a fixpoint too.
+$B/v2.exe self_hosting/v2/compile.patlang bootstrap/v2_compiler.ir --ir > "$D/ir.log" 2>&1
+st "compiler IR: exit $?"
+py -3 -I bootstrap/ir_reader.py bootstrap/v2_compiler.ir $B/v2_read.exe >> "$D/ir.log" 2>&1
+st "reader: exit $?"
+$B/v2_read.exe self_hosting/v2/compile.patlang $B/v2_read_a.exe --no-cache --workers 8 > "$D/read_a.log" 2>&1
+st "reader's compiler builds the compiler: exit $?"
+if cmp -s $B/v2_read_a.exe $B/v2.exe; then
+  st "bootstrap: identical to v2.exe"
+else
+  st "bootstrap: differs from v2.exe"
 fi
 
 # The interpreter, built by that compiler.
