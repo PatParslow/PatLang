@@ -402,6 +402,15 @@ sources described under "Removing the globals".
   program held the port for a moment. They now claim port 0, so the system picks a free one,
   and the second claim takes the port the first one got; the language suite passes 242/242 on
   `pat`, on the interpreter and compiled by v2.
+- **The linker's name index (GitHub #239).** `xpl_build_index` gave every index 4096 buckets,
+  and the link builds one for each chunk's own local names as well as the whole symbol table,
+  hundreds in all, so making and freeing empty buckets took about a quarter of the link. The
+  bucket count now doubles up to the number of names. The compiler's link of itself went from
+  47.8 s to 30.4 s, and `rt_facts` links in 12.5 s, where it took 20.9 s.
+- **v2 gates on 2026-11-07, after the name index:** Part 1 89/89 on v2 and on the interpreter;
+  `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the interpreter
+  and compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the
+  interpreter; the three compiler generations byte identical.
 - **v2 gates on 2026-11-06, after the new interpreter:** Part 1 89/89 on v2 and on the
   interpreter; `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the
   interpreter and compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the
