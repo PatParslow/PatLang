@@ -8,7 +8,7 @@ Feature: string builders and vecs are values (docs/plans/general-refcounting.md,
 
   Scenario: a string builder and a vec have their own type and identity, under both backends
     Given a builder pushed to through two names, a vec pushed to through two names, identity comparisons, and a vec_to_list snapshot taken before a vec_set
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same nine lines: the shared contents, "string_builder" and "vec" from type_of, true for a copy and false for another builder, and the snapshot unchanged
 
   `str_intern(s)` returns `s` itself: the string, not an integer handle into a
@@ -17,5 +17,5 @@ Feature: string builders and vecs are values (docs/plans/general-refcounting.md,
 
   Scenario: an interned string is a string, under both backends
     Given a string built by + and interned, then compared, concatenated, and read with sc_len and sc_char
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same six lines, starting with "string" from type_of

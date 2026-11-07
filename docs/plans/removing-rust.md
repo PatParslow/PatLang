@@ -22,6 +22,25 @@ Made by the project owner on 2026-11-05:
 2. **Move tooling off `pat --ir-run`** ([#246](https://github.com/PatParslow/PatLang/issues/246)).
    The compiler, suite runners and portfolio build run on the native v2 compiler and the v2
    interpreter.
+
+   Progress, 2026-11-07:
+   - The language and match suites start their programs on v2 (`self_hosting/lib/v2_engines.patlang`),
+     and `gates.sh` runs every suite on the v2 interpreter. In the run of 2026-11-07 the fixpoint
+     was byte identical, and the counts were:
+     - Part 1: 99/99 on both engines;
+     - `engines_agree`: 62/62;
+     - Part 2: 83/83;
+     - language: 245/245 on the interpreter and compiled by v2;
+     - match: 26/26;
+     - block model: 211/211.
+   - v2 gained what the scenarios needed: `sed`, the stage-0 shims, `progress_report` and
+     `progress_status`, `plan_incremental`, and `action_clear` (spec 1.10 and 1.13).
+   - Spec 1.10 now says `chr` of anything but an int stops the program. The old engine truncated,
+     and `self_hosting/lib/utf8.patlang`'s `utf8_encode` still relies on that.
+   - `build_daemon_demo` announces itself once it has claimed its port, and the suite waits for
+     that announcement.
+   - Still on `pat`: the first `v2.exe` when there is none, the block-model suite's own steps
+     (they test the old engine), and the portfolio build.
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical.

@@ -15,3 +15,13 @@ Feature: a program sees characters, whatever bytes they take
     Given a loop of let s = s + x, at 100,000 and at 200,000 appends
     When a program times them
     Then twice the appends take no more than about three times as long
+
+  Scenario: chr of anything but an int stops the program
+    Given chr of a float
+    When the program runs
+    Then it stops at chr, naming the require clause
+
+  Scenario: sed replaces literal matches of its pattern
+    Given sed commands with and without g and i, with no match, an empty pattern, no replacement, an empty replacement, flags after a slash, characters of two bytes and an int as input
+    When each is applied
+    Then each gives what spec 1.10 says

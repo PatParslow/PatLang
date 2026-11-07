@@ -1,6 +1,6 @@
 # v2 runtime: the string cursor, kinds of number, sorting, files, the clock and
 # child processes. Children spawned are a list of [pid, process handle] at
-# runtime_state() + 4304.
+# runtime_state() + 4304, and progress_report's latest status is at 4448.
 quiet_operators()
 
 make a function called rt_hosts_init returns r
@@ -8,6 +8,9 @@ make a function called rt_hosts_init returns r
   mem_store(st, 4304, 0)
   mem_store(st, 4312, 0)
   mem_init_value(st, 4304, [])
+  mem_store(st, 4448, 0)
+  mem_store(st, 4456, 0)
+  mem_init_value(st, 4448, "")
   let r = 0
   ensure r == 0
   return r
@@ -62,6 +65,117 @@ make a function called sc_code takes h, i returns c
   end
   ensure c >= 0 - 1
   return c
+end
+
+# sed(command, input): command is s/pattern/replacement/flags, a literal
+# substitution, the first match or, with g in the flags, every one; with i
+# letters match whatever their ASCII case. Any other command, an empty
+# pattern or a missing replacement gives the input (spec 1.10). The scan
+# uses the cursor, so it is O(n) on any string.
+make a function called sed takes command, input returns out
+  require value_live(command) and value_live(input)
+  let text = to_s(input)
+  let cmd = to_s(command)
+  let n = str_len(cmd)
+  if (n == 0) or (char_code(cmd, 0) != 115) then
+    ensure value_class(text) == 8
+    return text
+  end
+  let slashes = []
+  let i = 0
+  while (i < n) and (list_len(slashes) < 3) do
+    if char_code(cmd, i) == 47 then
+      let slashes = list_push(slashes, i)
+    end
+    let i = i + 1
+  end
+  if list_len(slashes) < 2 then
+    ensure value_class(text) == 8
+    return text
+  end
+  let pat = substr(cmd, slashes[0] + 1, slashes[1] - slashes[0] - 1)
+  let flags = ""
+  let rep = ""
+  if list_len(slashes) == 3 then
+    let rep = substr(cmd, slashes[1] + 1, slashes[2] - slashes[1] - 1)
+    let flags = substr(cmd, slashes[2] + 1, n - slashes[2] - 1)
+  else
+    let rep = substr(cmd, slashes[1] + 1, n - slashes[1] - 1)
+  end
+  if str_len(pat) == 0 then
+    ensure value_class(text) == 8
+    return text
+  end
+  let out = rt_sed_replace(str_intern(text), str_intern(pat), rep, rt_has_code(flags, 103), rt_has_code(flags, 105))
+  ensure value_class(out) == 8
+  return out
+end
+
+# Whether s holds the character code c.
+make a function called rt_has_code takes s, c returns yes
+  require (value_class(s) == 8) and (value_class(c) == 2)
+  let yes = false
+  let i = 0
+  while (i < str_len(s)) and (not yes) do
+    let yes = char_code(s, i) == c
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# hay with pat replaced by rep, both given as cursors.
+make a function called rt_sed_replace takes hay, pat, rep, global, ci returns out
+  require value_live(hay) and value_live(pat) and (value_class(rep) == 8)
+  let n = sc_len(hay)
+  let m = sc_len(pat)
+  let b = sb_new()
+  let start = 0
+  let k = 0
+  let going = true
+  while going and (k + m <= n) do
+    if rt_sed_match_at(hay, k, pat, m, ci) then
+      sb_push(b, sc_substr(hay, start, k - start))
+      sb_push(b, rep)
+      let k = k + m
+      let start = k
+      let going = global
+    else
+      let k = k + 1
+    end
+  end
+  sb_push(b, sc_substr(hay, start, n - start))
+  let out = sb_str(b)
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called rt_sed_match_at takes hay, k, pat, m, ci returns yes
+  require (value_class(k) == 2) and (value_class(m) == 2)
+  let yes = true
+  let j = 0
+  while yes and (j < m) do
+    let a = sc_code(hay, k + j)
+    let c = sc_code(pat, j)
+    if ci then
+      let a = rt_ascii_lower(a)
+      let c = rt_ascii_lower(c)
+    end
+    let yes = a == c
+    let j = j + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_ascii_lower takes c returns l
+  require value_class(c) == 2
+  let l = c
+  if (c >= 65) and (c <= 90) then
+    let l = c + 32
+  end
+  ensure value_class(l) == 2
+  return l
 end
 
 make a function called sc_char takes h, i returns s
@@ -325,6 +439,22 @@ end
 
 # ---- the clock ----
 
+# progress_report(text) keeps text as the latest status; progress_status()
+# gives it, "" before any report (spec 1.13).
+make a function called progress_report takes text returns r
+  require value_live(text)
+  rt_global_set(4448, to_s(text))
+  let r = unit
+  ensure value_class(r) == 0
+  return r
+end
+
+make a function called progress_status returns s
+  let s = rt_global_get(4448)
+  ensure value_class(s) == 8
+  return s
+end
+
 # Milliseconds since 1970: FILETIME counts 100 ns from 1601.
 make a function called now_ms returns ms
   let buf = rt_alloc(8)
@@ -571,6 +701,50 @@ end
 # error text says so. The pipes are polled, so neither filling can stop it.
 make a function called exec_capture_io takes program, args, stdin_text, timeout_ms returns result
   require value_live(program) and value_live(stdin_text) and (value_class(args) == 9)
+  let run = rt_run_process(program, args, stdin_text, timeout_ms)
+  let result = [run[0], run[1], run[2]]
+  ensure (list_len(result) == 3) and (value_class(result[2]) == 1)
+  return result
+end
+
+# Runs a program with a list of arguments: [what it wrote to standard
+# output, followed by standard error if it exited non-zero, its peak
+# working set in bytes, or -1 where the system gives none] (spec 1.13).
+make a function called exec_peak_memory takes program, args returns result
+  require value_live(program) and (value_class(args) == 9)
+  let run = rt_run_process(program, args, "", 0)
+  let text = run[0]
+  if (not run[2]) and rt_has_non_space(run[1]) then
+    let n = str_len(text)
+    if (n > 0) and (char_code(text, n - 1) != 10) then
+      let text = text + chr(10)
+    end
+    let text = text + run[1]
+  end
+  let result = [text, run[3]]
+  ensure (list_len(result) == 2) and (value_class(result[1]) == 2)
+  return result
+end
+
+# Whether s holds anything but spaces, tabs and line ends.
+make a function called rt_has_non_space takes s returns yes
+  require value_class(s) == 8
+  let n = str_len(s)
+  let yes = false
+  let i = 0
+  while (i < n) and (not yes) do
+    let c = char_code(s, i)
+    let yes = (c != 32) and (c != 9) and (c != 10) and (c != 13)
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# exec_capture_io's work: [stdout, stderr, whether it succeeded, the peak
+# working set in bytes or -1].
+make a function called rt_run_process takes program, args, stdin_text, timeout_ms returns result
+  require value_live(program) and value_live(stdin_text) and (value_class(args) == 9)
   let in_pipe = rt_pipe(true)
   let out_pipe = rt_pipe(false)
   let err_pipe = rt_pipe(false)
@@ -581,7 +755,7 @@ make a function called exec_capture_io takes program, args, stdin_text, timeout_
   if pi == 0 then
     print("exec_capture_io: " + program + ": could not start")
     let result = extern_call("KERNEL32.DLL", "ExitProcess", 93)
-    ensure (list_len(result) == 3) and (value_class(result[2]) == 1)
+    ensure (list_len(result) == 4) and (value_class(result[2]) == 1)
     return result
   end
   let text = to_s(stdin_text)
@@ -614,6 +788,14 @@ make a function called exec_capture_io takes program, args, stdin_text, timeout_
   rt_drain_pipe(out_pipe[0], out_text)
   rt_drain_pipe(err_pipe[0], err_text)
   let ok = (rt_exit_code(h) == 0) and (not timed_out)
+  # PROCESS_MEMORY_COUNTERS, 80 bytes: cb, then PeakWorkingSetSize at 8
+  let counters = rt_alloc(80)
+  mem_store(counters, 16, 80)
+  let peak = 0 - 1
+  if rt_i32(extern_call("KERNEL32.DLL", "K32GetProcessMemoryInfo", h, counters + 16, 80)) != 0 then
+    let peak = mem_load(counters, 24)
+  end
+  rt_free(counters)
   extern_call("KERNEL32.DLL", "CloseHandle", out_pipe[0])
   extern_call("KERNEL32.DLL", "CloseHandle", err_pipe[0])
   extern_call("KERNEL32.DLL", "CloseHandle", h)
@@ -625,7 +807,7 @@ make a function called exec_capture_io takes program, args, stdin_text, timeout_
     end
     sb_push(err_text, "timeout after " + timeout_ms + " ms")
   end
-  let result = [sb_str(out_text), sb_str(err_text), ok]
-  ensure (list_len(result) == 3) and (value_class(result[2]) == 1)
+  let result = [sb_str(out_text), sb_str(err_text), ok, peak]
+  ensure (list_len(result) == 4) and (value_class(result[2]) == 1) and (value_class(result[3]) == 2)
   return result
 end

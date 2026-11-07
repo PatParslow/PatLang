@@ -2,7 +2,7 @@ Feature: x64 tag-collision PREVENTION sweep (GitHub #49's core ask, #48's fix)
 
   Scenario: A plain int cannot coincidentally collide with a reserved family tag at zero payload
     Given a plain int bit-identical to each of the 8 reserved x64 family tags (String/List/Closure/Object/BigInt/Rational/Complex/Interval), each with a ZERO payload
-    When type_of() classifies each one, compiled and run via --x64
+    When type_of() classifies each one, compiled and run by v2
     Then a plain int bit-identical to any of the 8 reserved family tags (String/List/Closure/Object/BigInt/Rational/Complex/Interval) with a ZERO payload is still classified as "int", never coincidentally misread as that family (GitHub #48's fix, swept across all 8 tags at once)
 
   Note: this is a PREVENTION invariant over the values themselves, not a

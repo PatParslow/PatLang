@@ -4,7 +4,7 @@ Feature: x64_bitwise_selftest uses print(), not an x64-only primitive (GitHub #4
     Given self_hosting/examples/x64_bitwise_selftest.patlang uses print()
       (available under every backend) instead of rt_print_i64 (only defined
       inside self_hosting/lib/x64_runtime.patlang, in scope for --x64 alone)
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both show: 8, 15, 6, 1152921504606846976, 1
     And the two outputs match exactly
 

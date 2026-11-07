@@ -2,9 +2,10 @@ Feature: a block-model program talks to a separate OS process over real signals 
 
   The acceptance test #178 named: `spawn` plus `signal_query`, through the block
   engine, matching `pat --ir-run`. self_hosting/tools/spec_fixtures/signal_secondary.patlang
-  spawns signal_primary.patlang (a real detached child that claims port 9701 with
-  `signal_claim`, answers `status` through a `when` handler calling `signal_reply`,
-  and stops on `quit`), sleeps while the child claims its port, sends the query over
+  spawns signal_primary.patlang (a real detached child that claims a port the system
+  picks with `signal_claim(0)` and writes it to its log, answers `status` through a
+  `when` handler calling `signal_reply`, and stops on `quit`), reads the port from the
+  child's log once the child has written it, sends the query over
   real loopback TCP, prints the reply, sends `quit`, waits for the child to exit and
   prints what the child logged about how it stopped.
 

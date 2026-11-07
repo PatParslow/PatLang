@@ -319,9 +319,9 @@ sources described under "Removing the globals".
 - **A loop's peak memory** settles over its first iterations, so a comparison has to
   start past that. Threads settle by 2000: 13.8 MB, flat to 32000. The check runs from
   2000.
-- **Not built in v2:** `goal`, `action_add_numeric`, `action_clear`, `plan_incremental`,
-  `plan_numeric`, `fluent_set`, `class_def`, `tcp_try_connect`, `tls_counter_next`,
-  `progress_report`, `exec_peak_memory`, `world_run`, and the functions tied to the Rust
+- **Not built in v2:** `goal`, `action_add_numeric`, `plan_numeric`, `fluent_set`,
+  `class_def`, `tcp_try_connect`, `tls_counter_next`, `world_run`,
+  and the functions tied to the Rust
   engine (`run_ir`, `compile_ir`, `compile_shape`, `rustc_build*`, `codegen_prelude*`). A
   call to one stops the program when reached, with the interpreter's message. No
   language scenario reaches them.

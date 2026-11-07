@@ -144,7 +144,15 @@ A string holds characters, whatever bytes they take. `.length`, indexes, `substr
 `char_code`, `chr` and the string cursor (`str_intern`, `sc_len`, `sc_code`, `sc_char`,
 `sc_substr`) all count characters; `byte_length` and `hash_string` see the UTF-8 bytes.
 An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
-the cursor.
+the cursor. `chr(n)` gives the character whose code is the int `n`; anything else stops the
+program.
+
+`sed(command, input)` takes a command `s/pattern/replacement/flags` and replaces the first
+literal match of the pattern in the input, or every match, left to right and not overlapping,
+when the flags hold `g`. With `i` in the flags, letters match whatever their ASCII case.
+Everything after the third slash is flags. A command that does not start with `s`, an empty
+pattern or a missing replacement gives the input unchanged; an empty replacement deletes the
+match. The command and the input are read as text.
 
 `let s = s + x` gives a new value, as `+` always does; whatever else holds the old string keeps
 it. When nothing else holds it, the time an append takes does not depend on the string's length.
@@ -182,7 +190,17 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - The name `unit` in a program is that value, unless the program binds `unit` itself, as a
   parameter or with `let`.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
+- `exec_peak_memory(program, args)` runs the program with the list of arguments and gives two
+  things: what it wrote to standard output, followed by what it wrote to standard error if it
+  exited non-zero, and its peak working set in bytes, or -1 where the system gives none.
 - A file reached by several includes is included once, before the files that include it.
+- The runtime has the stage-0 shims: `add(a, b)`, `multiply(a, b)` and `subtract(a, b)` give
+  `a + b`, `a * b` and `a - b`; `calculate`, `calculate_result` and `get_value` of anything give
+  0, and `process` and `validate` of anything give `true`.
+- `progress_report(text)` keeps `text` as the program's latest status, and `progress_status()`
+  gives it, `""` before any report.
+- `action_clear()` forgets every action `action_add` added, and `plan_incremental(goals)` gives
+  what `plan(goals)` gives.
 - A program may define a function with a name the runtime has. The program's calls reach its
   function, directly, from a closure or by name, and the runtime goes on using its own. Two of a
   program's files defining one name is an error, naming it, and nothing of the program runs.

@@ -1,16 +1,17 @@
 # Runs spec_library/values_and_memory's @language features
 # (docs/spec/values-and-memory.md, Part 1) against one engine:
 #
-#   pat --ir-run self_hosting/v2/spec/run_values_and_memory.patlang [interp|v2|both|rust]
+#   self_hosting/build/v2_interp.exe self_hosting/v2/spec/run_values_and_memory.patlang [interp|v2|both|rust]
 #
 # interp runs each fixture with the v2 interpreter (self_hosting/v2/interp.patlang,
-# itself built by v2); v2 compiles it with the new compiler
-# (self_hosting/v2/compile.patlang) and runs the executable; both compares them;
-# rust runs it with pat --ir-run, the interpreter this replaces. Each
+# itself built by v2); v2 compiles it with the native v2 compiler
+# (self_hosting/lib/v2_engines.patlang) and runs the executable; both compares
+# them; rust runs it with pat --ir-run, the interpreter this replaces. Each
 # scenario's fixture is in self_hosting/v2/spec/fixtures/, its expected
 # output here. engines_agree.feature runs every fixture on both engines.
 include "../../lib/includes.patlang"
 include "../../lib/gherkin.patlang"
+include "../../lib/v2_engines.patlang"
 
 make a function called vm_engine returns e
   let a = argv()
@@ -73,7 +74,7 @@ make a function called vm_v2_build takes ctx, name returns err
 end
 
 make a function called vm_v2_build_now takes name returns err
-  let out = exec_capture(vm_pat(), "--ir-run", "self_hosting/v2/compile.patlang", vm_fixture(name), vm_exe(name))
+  let out = v2_compile([vm_fixture(name), vm_exe(name)])[0]
   # the compiler prints "v2: OUT" when it wrote the executable
   if contains_text(out, "v2: " + vm_exe(name)) then
     return ""
@@ -81,23 +82,17 @@ make a function called vm_v2_build_now takes name returns err
   return "v2 build failed: " + vm_clean(out)
 end
 
-# The v2 interpreter, built once per run.
+# The v2 interpreter. The runner runs on it, and Windows won't replace a
+# running executable, so self_hosting/v2/tools/gates.sh builds it first.
 make a function called vm_interp_exe returns path
-  return "self_hosting/build/v2_interp.exe"
+  return v2_interpreter()
 end
 
 make a function called vm_interp_build takes ctx returns err
-  let done = ctx_get(ctx, "vm_built_interp")
-  if type_of(done) == "string" then
-    return done
+  if file_exists(vm_interp_exe()) then
+    return ""
   end
-  let out = exec_capture(vm_pat(), "--ir-run", "self_hosting/v2/compile.patlang", "self_hosting/v2/interp.patlang", vm_interp_exe())
-  let err = ""
-  if not contains_text(out, "v2: " + vm_interp_exe()) then
-    let err = "interpreter build failed: " + vm_clean(out)
-  end
-  ctx_set(ctx, "vm_built_interp", err)
-  return err
+  return "no interpreter at " + vm_interp_exe() + ": build it with self_hosting/v2/tools/gates.sh"
 end
 
 # A fixture run on an engine: [its output, its peak working set], or the build's
@@ -473,6 +468,32 @@ make a function called st_pg_exec_stderr takes ctx returns ok
   return a and b
 end
 
+make a function called st_pg_exec_peak takes ctx returns ok
+  let out = vm_run(ctx, "vi_exec_peak")
+  let a = expect(ctx, "standard output when it exits 0", contains_text(out, "ok:to out"), true)
+  let b = expect(ctx, "no standard error when it exits 0", contains_text(out, "quiet"), false)
+  let c = expect(ctx, "standard output when it fails", contains_text(out, "failed:to out"), true)
+  let d = expect(ctx, "standard error when it fails", contains_text(out, "to err"), true)
+  let e = expect(ctx, "a peak above 0 both times", contains_text(out, "false"), false)
+  return a and b and c and d and e
+end
+
+make a function called st_tx_sed takes ctx returns ok
+  return vm_expect(ctx, "each gives what spec 1.10 says", "vi_sed", "heLLo" + nl() + "heLlo" + nl() + "hexlo" + nl() + "hexxo worxd" + nl() + "hello" + nl() + "hello" + nl() + "hello" + nl() + "hello" + nl() + "helo" + nl() + "f00 b00" + nl() + "XXX" + nl() + "cafe e" + nl() + "1two")
+end
+
+make a function called st_pg_shims takes ctx returns ok
+  return vm_expect(ctx, "the sum, product and difference, then 0 or true", "vi_shims", "5" + nl() + "6" + nl() + "2" + nl() + "5/6" + nl() + "0" + nl() + "0" + nl() + "0" + nl() + "true" + nl() + "true")
+end
+
+make a function called st_pg_progress_plan takes ctx returns ok
+  return vm_expect(ctx, "the status, then the second report, the plans and no plan", "vi_progress_plan", "true" + nl() + "second" + nl() + "[go]" + nl() + "true" + nl() + "0")
+end
+
+make a function called st_tx_chr_float takes ctx returns ok
+  return vm_stops(ctx, "chr of a float", "rt_chr_float", "contract violation: precondition failed in chr()")
+end
+
 make a function called st_pg_include_once takes ctx returns ok
   return vm_expect(ctx, "base runs once, then both includers' functions see it", "rt_include", "base runs" + nl() + "42" + nl() + "40")
 end
@@ -668,6 +689,14 @@ make a function called register_values_and_memory_steps takes ctx returns done
   vm_noops(ctx, ["a program that writes unit, and binds unit as a parameter and as a variable", "it runs"])
   step(ctx, "unit is the value a function with no statements gives, and a bound unit is the program's own", "st_pg_unit")
   step(ctx, "it gives both", "st_pg_exec_stderr")
+  vm_noops(ctx, ["a command that writes to both outputs, once exiting 0 and once exiting 3", "exec_peak_memory runs each"])
+  vm_noops(ctx, ["sed commands with and without g and i, with no match, an empty pattern, no replacement, an empty replacement, flags after a slash, characters of two bytes and an int as input", "each is applied", "add, multiply and subtract of ints and of rationals, and calculate, calculate_result, get_value, process and validate of an int, a string and a list"])
+  step(ctx, "each gives what spec 1.10 says", "st_tx_sed")
+  vm_noops(ctx, ["a status read before any report and after two, and a one-action plan found with plan and with plan_incremental, then the actions cleared", "chr of a float"])
+  step(ctx, "the status is empty, then the second report; both plans are the action, and after action_clear there is no plan", "st_pg_progress_plan")
+  step(ctx, "it stops at chr, naming the require clause", "st_tx_chr_float")
+  step(ctx, "add, multiply and subtract give the sum, product and difference, and the others give 0 or true", "st_pg_shims")
+  step(ctx, "it gives standard output, standard error only from the failure, and a peak above 0", "st_pg_exec_peak")
   step(ctx, "the third file's statements run once, before the files that include it", "st_pg_include_once")
   step(ctx, "both engines print what those calls give", "st_ea_anywhere")
   step(ctx, "both engines report that it cannot be read", "st_ea_no_program")

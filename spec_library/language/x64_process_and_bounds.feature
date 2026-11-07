@@ -35,15 +35,15 @@ Feature: Native x64 process spawning, timeouts and out-of-range access agree wit
 
   Scenario: out-of-range list and string access, and list_len of a non-list, match the interpreter
     Given an empty list, a three-element list, and out-of-range and negative indexes into them
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same nine lines, with Unit for the list reads and 0 for list_len of Unit
 
   Scenario: a program path with a directory separator but no ./ prefix launches on both exec forms
-    Given exec_capture and exec_capture_io called with "rust-runtime/target/release/pat.exe"
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Given exec_capture and exec_capture_io called with "self_hosting/build/v2_interp.exe"
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same four lines, with the child's output captured
 
   Scenario: exec_capture_io kills a child that outlives timeout_ms and leaves a quick child alone
     Given an infinite-loop child with a 400 ms timeout and a quick child with a 30000 ms timeout
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same seven lines: the infinite child reports failure and "timeout after 400 ms" well inside the guard, the quick child succeeds untimed

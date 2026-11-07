@@ -19,7 +19,7 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: BigInt modulo, mixed signs and a BigInt divisor, matches the interpreter
     Given a value that overflows into BigInt, reduced by a small positive divisor, a small negative divisor, a negated dividend, and by another BigInt (including an exact multiple)
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same nine lines
 
   A second, related class of gap (GitHub #187), found chasing a real crash in
@@ -41,12 +41,14 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   `chr()` on a Float had the same gap: native code used the boxed Float's
   tagged word as the byte, where the interpreter truncates (`chr(66.9)` is
-  `"B"`).
+  `"B"`). v2 follows spec 1.10 instead: `chr` takes an int, so the fixture
+  floors its quotient before `chr`, and `chr(66.9)` stops the program on
+  both engines.
 
-  Scenario: v.to_s on primitives, chr() on a Rational, and Rational %, match the interpreter
-    Given int, Rational, Bool and List values stringified with .to_s, a byte built via chr() on a Rational produced by / and on a Float, and several Rational % combinations including negative operands
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
-    Then both print the same fourteen lines
+  Scenario: v.to_s on primitives, chr() of a floored quotient, and Rational %, match the interpreter
+    Given int, Rational, Bool and List values stringified with .to_s, a byte built via chr() on a quotient floored to an int, several Rational % combinations including negative operands, and chr() of a Float
+    When the file is run on the v2 interpreter and compiled and run by v2
+    Then both print the same twelve lines, then stop at chr of the Float
 
   A third, unrelated gap (GitHub #188), found writing a fixture for the second:
   the self-hosted lexer (used only by `patc1 --x64`, not the interpreter) reads
@@ -59,7 +61,7 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: an int literal immediately followed by .member parses and runs, matching the interpreter
     Given 233.to_s, 4.to_s, [1, 2, 3].length, and n.to_s through a variable
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same five lines
 
   A fourth gap (GitHub #186), found once the previous three were fixed: an
@@ -77,7 +79,7 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: an exact Rational result demotes to int, an inexact one stays Rational, matching the interpreter
     Given exact and inexact sums, an exact and inexact product, an exact subtraction, exact and inexact division, and an exact modulo, all built from Rationals
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same twelve lines
 
   A fifth gap (GitHub #189), found testing #187's own .to_s fix against a
@@ -99,7 +101,7 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: type_of and .to_s recognize a genuine unboxed float, whether from a bare literal or sqrt()'s direct result
     Given a bare float literal and the direct, un-promoted result of sqrt()
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print the same six lines: float, its string form, float again, the sqrt result's string form, the literal's own correct print, and "after"
 
   A sixth gap (GitHub #50/#102), found reviewing #50's own scheduled
@@ -124,7 +126,7 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: an ordinary int local mixed with a float literal in one Bin converts correctly on either side
     Given `x + 2.5` where x is an int local, and `a + x` where a is a float local and x an int local
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print true for both comparisons against 7.5
 
   A seventh gap (GitHub #194, a follow-up to #50's own scheduled design
@@ -149,12 +151,14 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   boxing at the call site, which remains real, separate follow-up work
   (see GitHub #195 for the precise reason it isn't done yet -- a
   block-model calling-convention detail found but not yet root-caused
-  while investigating it).
+  while investigating it). v2 has no separate boxing step to call: the
+  float is read from a list, so nothing at the call shows it is a float,
+  and both engines run it.
 
-  Scenario: a boxed float reaching a non-float-mode function's dynamic arithmetic computes and reports its type correctly
-    Given plus(a, b) with no float literal in its own body, called with an explicitly boxed 1.5 and a plain int 2
-    When the file is compiled and run via --x64 only (rt_box_float has no interpreter equivalent)
-    Then it prints 3.5 and then float, not a segfault
+  Scenario: a float the call cannot see reaching a non-float-mode function's dynamic arithmetic computes and reports its type correctly
+    Given plus(a, b) with no float literal in its own body, called with 1.5 read from a list and a plain int 2
+    When the file is run on the v2 interpreter and compiled and run by v2
+    Then both print 3.5 and then float, not a segfault
 
   An eighth gap (GitHub #195, the cross-compilation-unit half of #50's
   own design review): a float-returning function, compiled as its own
@@ -178,7 +182,7 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: a float-returning function proves float across the per-unit compilation boundary
     Given make_half() returning 1.0/2.0, with no caller-side float evidence of its own
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both report type_of "float" and both confirm the value equals 0.5
 
   A ninth gap, closing #194's own remaining half (the first half, the
@@ -198,10 +202,10 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
 
   Scenario: a float literal argument at an ordinary call site is auto-boxed, no manual boxing needed
     Given plus(a, b) with no float literal in its own body, called directly as plus(1.5, 2)
-    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the file is run on the v2 interpreter and compiled and run by v2
     Then both print 3.5, with no manual rt_box_float call anywhere in the source
 
   Scenario: an integral float prints as the integer it is, however large (GitHub #230)
     Given 2^1023, -2^1000, 2^70, 2^62 and 3 * 2^64 as floats (pow(2.0, n)), 4.0, and "" + 2^66
-    When the integral float file is run under `pat --ir-run` and compiled+run via `--x64`
+    When the integral float file is run on the v2 interpreter and compiled and run by v2
     Then both print each value's exact integer text, never the saturated 9223372036854775807
