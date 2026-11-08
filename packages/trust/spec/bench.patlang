@@ -1,0 +1,165 @@
+# Times the trust checks at doubling sizes, from the repository root:
+#
+#   ./self_hosting/build/v2.exe packages/trust/spec/bench.patlang packages/trust/build/bench.exe --workers 2
+#   ./packages/trust/build/bench.exe
+#
+# 1. A transition log of N rekeys (100, 200, 400, 800), each revoking the
+#    old key, in a three-member group: writing it, then trust_check_log
+#    over its files, then the revocation check of a release against the N
+#    revocations it collected.
+# 2. A certificate over a view of M members, all signing (32 to 256).
+#
+# The verifier closure accepts every signature, so the times are the
+# PatLang reading and checking alone, not the oracle's. Each size's line
+# is printed as it finishes.
+include "../trust.patlang"
+
+make a function called bn_key takes text returns k
+  require value_class(text) == 8
+  let k = sha256_string_hex(text)
+  ensure k.length == 64
+  return k
+end
+
+make a function called bn_sig returns s
+  require true
+  let b = sb_new()
+  let i = 0
+  while i < 128 do
+    sb_push(b, "5")
+    let i = i + 1
+  end
+  let s = sb_str(b)
+  ensure s.length == 128
+  return s
+end
+
+make a function called bn_ok takes w returns bytes
+  require value_class(w) == 9
+  let bytes = []
+  if w[0] == "ok" then
+    let bytes = w[1]
+  else
+    print("bench setup refused: " + w[1] + " " + w[2] + " " + w[3])
+  end
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+# Writes a log of n rekeys under dir (made beforehand); gives the pin.
+make a function called bn_write_log takes dir, n returns pin
+  require (value_class(dir) == 8) and (n >= 0)
+  let sig = bn_sig()
+  let members = [[0, "ed25519", bn_key("m0")], [1, "ed25519", bn_key("m1")], [2, "ed25519", bn_key("m2")]]
+  let vb = bn_ok(trust_write_view("", 0, "majority", members))
+  let vhash = sha256_hex(vb)
+  let gb = bn_ok(trust_write_genesis("bench", vhash, "2026-11-08"))
+  let group = sha256_hex(gb)
+  write_file_bytes(tr_entry_path(dir, 0, "-view.rec"), vb)
+  write_file_bytes(tr_entry_path(dir, 0, "-genesis.rec"), gb)
+  write_file_bytes(tr_entry_path(dir, 0, "-genesis.sig"), bn_ok(trust_write_sigs([[0, sig], [1, sig], [2, sig]])))
+  let i = 1
+  while i <= n do
+    let members = [[0, "ed25519", bn_key("rekey " + i)], members[1], members[2]]
+    let nb = bn_ok(trust_write_view(group, i, "majority", members))
+    let nhash = sha256_hex(nb)
+    let tb = bn_ok(trust_write_transition(group, i - 1, vhash, i, nhash, "rekey", 0, "", "2026-01-01"))
+    write_file_bytes(tr_entry_path(dir, i, "-view.rec"), nb)
+    write_file_bytes(tr_entry_path(dir, i, "-transition.rec"), tb)
+    write_file_bytes(tr_entry_path(dir, i, "-transition.sig"), bn_ok(trust_write_sigs([[0, sig], [1, sig]])))
+    let vhash = nhash
+    let i = i + 1
+  end
+  let pin = group
+  ensure pin.length == 64
+  return pin
+end
+
+make a function called bn_log takes n returns ok
+  require n > 0
+  let dir = "packages/trust/build/bench_log_" + n + "/"
+  exec_capture("py", "-3", "-I", "packages/trust/spec/oracle.py", "clean", dir)
+  exec_capture("py", "-3", "-I", "packages/trust/spec/oracle.py", "mkdir", dir)
+  let accept = |alg, pub, msg, sig| {
+    return true
+  }
+  let t0 = now_ms()
+  let pin = bn_write_log(dir, n)
+  let t1 = now_ms()
+  let r = trust_check_log(dir, pin, accept)
+  let t2 = now_ms()
+  let ok = r[0] == "ok"
+  let rev_ms = 0
+  if ok then
+    let s = r[1]
+    let view = trust_state_view(s, n)
+    let rb = bn_ok(trust_write_release(pin, n, view[1], "bench", "0.1.0", bn_key("manifest"), "2026-11-08"))
+    let rel = trust_read_release(rb)[1]
+    let t3 = now_ms()
+    # slot 0's every key was revoked from 2026-01-01, but its current key
+    # is not, so slots 0 and 1 both still count.
+    let rv = trust_check_revocations(s, rel, [0, 1])
+    let rev_ms = now_ms() - t3
+    let ok = (rv[0] == "ok") and (trust_state_epoch(s) == n) and (list_len(trust_state_revocations(s)) == n)
+  else
+    print("  check failed: " + r[1] + " " + r[2] + " " + r[3])
+  end
+  print("log " + n + " rekeys: write " + (t1 - t0) + " ms, check_log " + (t2 - t1) + " ms, revocations " + rev_ms + " ms, ok " + ok)
+  return ok
+end
+
+make a function called bn_cert takes m returns ok
+  require (m > 0) and (m <= trust_max_members())
+  let accept = |alg, pub, msg, sig| {
+    return true
+  }
+  let sig = bn_sig()
+  let members = []
+  let sigs = []
+  let i = 0
+  while i < m do
+    let members = list_push(members, [i, "ed25519", bn_key("member " + i)])
+    # Signatures in reverse slot order, so the slot lookups are not in order.
+    let sigs = list_push(sigs, [m - 1 - i, sig])
+    let i = i + 1
+  end
+  let vb = bn_ok(trust_write_view("", 0, "majority", members))
+  let sb = bn_ok(trust_write_sigs(sigs))
+  let rounds = 20
+  let t0 = now_ms()
+  let ok = true
+  let k = 0
+  while k < rounds do
+    let view = trust_read_view(vb)[1]
+    let cr = trust_check_cert(view, bn_key("statement"), trust_read_sigs(sb)[1], accept, 0 - 1, "bench")
+    let ok = ok and (cr[0] == "ok") and (list_len(cr[1]) == m)
+    let k = k + 1
+  end
+  let ms = now_ms() - t0
+  print("cert over " + m + " members, " + rounds + " rounds: " + ms + " ms, ok " + ok)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called bn_main returns ok
+  require true
+  let ok = true
+  let sizes = [100, 200, 400, 800]
+  let i = 0
+  while i < list_len(sizes) do
+    let ok = bn_log(sizes[i]) and ok
+    let i = i + 1
+  end
+  let ms = [32, 64, 128, 256]
+  let i = 0
+  while i < list_len(ms) do
+    let ok = bn_cert(ms[i]) and ok
+    let i = i + 1
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+if not bn_main() then
+  exit_with(1)
+end

@@ -1,0 +1,267 @@
+# Verifying a package directory (docs/plans/package-trust.md, "Verifying a
+# package", steps 1, 2, 3, 5 and 6; step 4, the trust store's rollback
+# check, is the caller's, from the epoch the result gives):
+#
+#   <dir>/manifest.pkg                 the manifest (packages/README.md)
+#   <dir>/<file>                       each file its `file` lines name
+#   <dir>/trust/log/                   the group's log (trust_check_log)
+#   <dir>/trust/release/<version>.rec  the release statement, and .sig
+#   <dir>/trust/withdraw/<version>.rec a withdrawal, when there is one, and .sig
+
+make a function called trust_max_manifest_bytes returns n
+  require true
+  let n = 1048576
+  ensure n > 0
+  return n
+end
+
+# A manifest's lines (LF ends; a CR before one is dropped), from its bytes.
+make a function called tr_manifest_lines takes bytes returns lines
+  require value_class(bytes) == 9
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    let c = bytes[i]
+    if c == 10 then
+      let out = list_push(out, sb_str(cur))
+      let cur = sb_new()
+    elif c != 13 then
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  if sb_len(cur) > 0 then
+    let out = list_push(out, sb_str(cur))
+  end
+  let lines = out
+  ensure value_class(lines) == 9
+  return lines
+end
+
+# A manifest line's words (runs of spaces and tabs separate them).
+make a function called tr_manifest_words takes line returns words
+  require value_class(line) == 8
+  let h = str_intern(line)
+  let n = sc_len(h)
+  let out = []
+  let start = 0
+  let i = 0
+  while i <= n do
+    let sep = i == n
+    if not sep then
+      let c = sc_code(h, i)
+      let sep = (c == 32) or (c == 9)
+    end
+    if sep then
+      if i > start then
+        let out = list_push(out, sc_substr(h, start, i - start))
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let words = out
+  ensure value_class(words) == 9
+  return words
+end
+
+# Hex of either case, as lowercase; "" when the text is not 64 hex digits.
+make a function called tr_lower_hash takes text returns low
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let b = sb_new()
+  let good = n == 64
+  let i = 0
+  while good and (i < n) do
+    let c = sc_code(h, i)
+    if (c >= 65) and (c <= 70) then
+      let c = c + 32
+    end
+    let good = ((c >= 48) and (c <= 57)) or ((c >= 97) and (c <= 102))
+    sb_push(b, chr(c))
+    let i = i + 1
+  end
+  let low = ""
+  if good then
+    let low = sb_str(b)
+  end
+  ensure (low == "") or (low.length == 64)
+  return low
+end
+
+# A path a manifest may name: relative, `/`-separated, with no empty, `.`
+# or `..` part, no `\` and no `:`, so it stays inside the package.
+make a function called tr_safe_path takes path returns yes
+  require value_class(path) == 8
+  let h = str_intern(path)
+  let n = sc_len(h)
+  let yes = n > 0
+  let start = 0
+  let i = 0
+  while yes and (i <= n) do
+    if (i == n) or (sc_code(h, i) == 47) then
+      let part = sc_substr(h, start, i - start)
+      let yes = (part != "") and (part != ".") and (part != "..")
+      let start = i + 1
+    else
+      let c = sc_code(h, i)
+      let yes = (c != 92) and (c != 58)
+    end
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A manifest's package, version and files: ["ok", [package, version,
+# [[path, hash]]]] or a "malformed" failure (stage "manifest").
+make a function called trust_manifest_names takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "manifest"
+  let lines = tr_manifest_lines(bytes)
+  let packages = []
+  let versions = []
+  let files = []
+  let i = 0
+  while i < list_len(lines) do
+    let w = tr_manifest_words(lines[i])
+    if (list_len(w) > 0) and (sc_code(str_intern(w[0]), 0) != 35) then
+      if w[0] == "package" then
+        let packages = list_push(packages, w)
+      elif w[0] == "version" then
+        let versions = list_push(versions, w)
+      elif w[0] == "file" then
+        if (list_len(w) != 4) or (w[2] != "sha256") or (tr_lower_hash(w[3]) == "") or (not tr_safe_path(w[1])) then
+          let r = tr_malformed(stage, "line " + (i + 1) + " is not `file <path> sha256 <64 hex digits>` with a path inside the package")
+          ensure r[0] == "err"
+          return r
+        end
+        let files = list_push(files, [w[1], tr_lower_hash(w[3])])
+      end
+    end
+    let i = i + 1
+  end
+  let r = ["ok", []]
+  if (list_len(packages) != 1) or (list_len(packages[0]) != 2) or (not tr_is_name(packages[0][1])) then
+    let r = tr_malformed(stage, "not exactly one `package <name>` line")
+  elif (list_len(versions) != 1) or (list_len(versions[0]) != 2) or (not tr_is_version(versions[0][1])) then
+    let r = tr_malformed(stage, "not exactly one `version MAJOR.MINOR.PATCH` line")
+  elif list_len(files) == 0 then
+    let r = tr_malformed(stage, "no `file` lines")
+  else
+    let r = ["ok", [packages[0][1], versions[0][1], files]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# Step 1: every file the manifest names has the hash it gives.
+make a function called trust_check_files takes base, files returns r
+  require (value_class(base) == 8) and (value_class(files) == 9)
+  let stage = "files"
+  let i = 0
+  while i < list_len(files) do
+    let got = sha256_file_hex(base + files[i][0])
+    if got == "" then
+      let r = trust_err("file-missing", stage, files[i][0])
+      ensure r[0] == "err"
+      return r
+    end
+    if got != files[i][1] then
+      let r = trust_err("file-mismatch", stage, files[i][0] + " has hash " + got + ", the manifest " + files[i][1])
+      ensure r[0] == "err"
+      return r
+    end
+    let i = i + 1
+  end
+  let r = ["ok", list_len(files)]
+  ensure r[0] == "ok"
+  return r
+end
+
+# The bytes of two files that go together: ["ok", [a, b]] or the first failure.
+make a function called tr_read_pair takes a, b, stage returns r
+  require (value_class(a) == 8) and (value_class(b) == 8)
+  let max = trust_max_record_bytes()
+  let ra = trust_read_file(a, max, stage)
+  let rb = trust_read_file(b, max, stage)
+  let r = ra
+  if (ra[0] == "ok") and (rb[0] != "ok") then
+    let r = rb
+  elif ra[0] == "ok" then
+    let r = ["ok", [ra[1], rb[1]]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# Verifies a package directory against the pinned genesis hash, with
+# verify the signature check. ["ok", [package, version, the log's highest
+# epoch, the release's counted signers]] or the first failure.
+make a function called trust_verify_package takes dir, pin, verify returns r
+  require (value_class(dir) == 8) and (value_class(pin) == 8)
+  let base = dir
+  if (dir == "") or (sc_code(str_intern(dir), sc_len(str_intern(dir)) - 1) != 47) then
+    let base = dir + "/"
+  end
+  let mf = trust_read_file(base + "manifest.pkg", trust_max_manifest_bytes(), "manifest")
+  if mf[0] != "ok" then
+    let r = mf
+    ensure r[0] == "err"
+    return r
+  end
+  let mr = trust_manifest_names(mf[1])
+  if mr[0] != "ok" then
+    let r = mr
+    ensure r[0] == "err"
+    return r
+  end
+  let pkg = mr[1][0]
+  let version = mr[1][1]
+  let fr = trust_check_files(base, mr[1][2])
+  if fr[0] != "ok" then
+    let r = fr
+    ensure r[0] == "err"
+    return r
+  end
+  let lr = trust_check_log(base + "trust/log/", pin, verify)
+  if lr[0] != "ok" then
+    let r = lr
+    ensure r[0] == "err"
+    return r
+  end
+  let s = lr[1]
+  let rp = tr_read_pair(base + "trust/release/" + version + ".rec", base + "trust/release/" + version + ".sig", "release")
+  if rp[0] != "ok" then
+    let r = rp
+    ensure r[0] == "err"
+    return r
+  end
+  let rc = trust_check_release(s, mf[1], rp[1][0], rp[1][1], verify)
+  if rc[0] != "ok" then
+    let r = rc
+    ensure r[0] == "err"
+    return r
+  end
+  let rel = rc[1][0]
+  let wrec = base + "trust/withdraw/" + version + ".rec"
+  let wsig = base + "trust/withdraw/" + version + ".sig"
+  if file_exists(wrec) or file_exists(wsig) then
+    let wp = tr_read_pair(wrec, wsig, "withdrawal")
+    let r = wp
+    if wp[0] == "ok" then
+      let r = trust_check_withdrawal(s, rel, wp[1][0], wp[1][1], verify)
+    end
+    ensure r[0] == "err"
+    return r
+  end
+  let rv = trust_check_revocations(s, rel, rc[1][1])
+  let r = rv
+  if rv[0] == "ok" then
+    let r = ["ok", [pkg, version, trust_state_epoch(s), rv[1]]]
+  end
+  ensure value_class(r) == 9
+  return r
+end

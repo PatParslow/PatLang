@@ -1,0 +1,253 @@
+# Versions and constraints for the resolve package.
+#
+# A version is MAJOR.MINOR.PATCH: three runs of decimal digits joined by
+# dots, with no leading zeros, so two texts are the same version exactly when
+# they are the same text. Versions compare numerically field by field; the
+# fields may be any size. A constraint is an operator and a version; the
+# operators are =, >=, >, <= and <, named eq, ge, gt, le and lt in the facts.
+include "text.patlang"
+
+# A version's three fields as numbers, or [] when the text is not a version.
+make a function called rs_version_parse takes text returns fields
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = []
+  let cur = 0
+  let digits = 0
+  let first_zero = false
+  let bad = n == 0
+  let i = 0
+  while (i <= n) and (not bad) do
+    let c = sc_code(h, i)
+    if (i < n) and (c >= 48) and (c <= 57) then
+      if (digits == 1) and first_zero then
+        let bad = true
+      end
+      if digits == 0 then
+        let first_zero = c == 48
+      end
+      let cur = cur * 10 + (c - 48)
+      let digits = digits + 1
+    elif (i == n) or (c == 46) then
+      if digits == 0 then
+        let bad = true
+      else
+        let out = list_push(out, cur)
+      end
+      let cur = 0
+      let digits = 0
+      let first_zero = false
+    else
+      let bad = true
+    end
+    let i = i + 1
+  end
+  let fields = out
+  if bad or (list_len(out) != 3) then
+    let fields = []
+  end
+  ensure (list_len(fields) == 0) or (list_len(fields) == 3)
+  return fields
+end
+
+# "lt", "eq" or "gt": how the version with fields a stands to the one with
+# fields b.
+make a function called rs_fields_order takes a, b returns o
+  require (list_len(a) == 3) and (list_len(b) == 3)
+  let o = "eq"
+  let i = 0
+  while (i < 3) and (o == "eq") do
+    if a[i] < b[i] then
+      let o = "lt"
+    elif a[i] > b[i] then
+      let o = "gt"
+    end
+    let i = i + 1
+  end
+  ensure (o == "lt") or (o == "eq") or (o == "gt")
+  return o
+end
+
+# How version text a stands to version text b: "lt", "eq" or "gt", or
+# "invalid" when either is not a version.
+make a function called rs_version_order takes a, b returns o
+  require (value_class(a) == 8) and (value_class(b) == 8)
+  let fa = rs_version_parse(a)
+  let fb = rs_version_parse(b)
+  let o = "invalid"
+  if (list_len(fa) == 3) and (list_len(fb) == 3) then
+    let o = rs_fields_order(fa, fb)
+  end
+  ensure value_class(o) == 8
+  return o
+end
+
+# An operator's fact name ("ge" for ">="), or "" for any other text.
+make a function called rs_op_name takes text returns name
+  require value_class(text) == 8
+  let name = ""
+  if text == "=" then
+    let name = "eq"
+  elif text == ">=" then
+    let name = "ge"
+  elif text == ">" then
+    let name = "gt"
+  elif text == "<=" then
+    let name = "le"
+  elif text == "<" then
+    let name = "lt"
+  end
+  ensure value_class(name) == 8
+  return name
+end
+
+# An operator's text (">=" for "ge").
+make a function called rs_op_text takes name returns text
+  require (name == "eq") or (name == "ge") or (name == "gt") or (name == "le") or (name == "lt")
+  let text = "="
+  if name == "ge" then
+    let text = ">="
+  elif name == "gt" then
+    let text = ">"
+  elif name == "le" then
+    let text = "<="
+  elif name == "lt" then
+    let text = "<"
+  end
+  ensure value_class(text) == 8
+  return text
+end
+
+# One constraint, its operator a run of <, > and = (spaces after it
+# optional): ["ok", op name, bound] or ["error", message].
+make a function called rs_parse_constraint takes text returns r
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let i = 0
+  while (i < n) and ((sc_code(h, i) == 60) or (sc_code(h, i) == 62) or (sc_code(h, i) == 61)) do
+    let i = i + 1
+  end
+  let op = rs_op_name(sc_substr(h, 0, i))
+  let bound = rs_trim(sc_substr(h, i, n - i))
+  if op == "" then
+    let r = ["error", "constraint '" + text + "' has no operator =, >=, >, <= or <"]
+  elif list_len(rs_version_parse(bound)) != 3 then
+    let r = ["error", "constraint '" + text + "' bound '" + bound + "' is not MAJOR.MINOR.PATCH"]
+  else
+    let r = ["ok", op, bound]
+  end
+  ensure (r[0] == "ok") or (r[0] == "error")
+  return r
+end
+
+# A comma-separated list of constraints, none empty and none twice:
+# ["ok", [[op, bound], ...]] or ["error", message]. `who` begins the
+# messages ("depends 'deflate'", "the request").
+make a function called rs_parse_constraints takes who, text returns r
+  require (value_class(who) == 8) and (value_class(text) == 8)
+  let parts = rs_split_commas(text)
+  let out = []
+  let err = ""
+  let i = 0
+  while (i < list_len(parts)) and (err == "") do
+    if parts[i] == "" then
+      let err = who + " has an empty constraint"
+    else
+      let c = rs_parse_constraint(parts[i])
+      if c[0] == "error" then
+        let err = c[1]
+      else
+        # A constraint given twice would be one fact twice; the line is short,
+        # so a scan of the constraints so far is enough.
+        let k = 0
+        while k < list_len(out) do
+          if (out[k][0] == c[1]) and (out[k][1] == c[2]) then
+            let err = who + " gives '" + rs_op_text(c[1]) + " " + c[2] + "' twice"
+          end
+          let k = k + 1
+        end
+        let out = list_push(out, [c[1], c[2]])
+      end
+    end
+    let i = i + 1
+  end
+  if err != "" then
+    let r = ["error", err]
+  else
+    let r = ["ok", out]
+  end
+  ensure (r[0] == "ok") or (r[0] == "error")
+  return r
+end
+
+# Constraints as text: ">= 0.1.0, < 0.2.0".
+make a function called rs_constraints_text takes cs returns text
+  require value_class(cs) == 9
+  let b = sb_new()
+  let i = 0
+  while i < list_len(cs) do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, rs_op_text(cs[i][0]))
+    sb_push(b, " ")
+    sb_push(b, cs[i][1])
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  ensure value_class(text) == 8
+  return text
+end
+
+# ---- sorting ----
+
+# Whether a comes strictly before b. Modes: "text" (Strings, by bytes),
+# "first" (lists, by their first item, a String) and "version" (lists
+# [fields, text], by version).
+make a function called rs_before takes a, b, mode returns yes
+  require (mode == "text") or (mode == "first") or (mode == "version")
+  if mode == "text" then
+    let yes = str_cmp(a, b) < 0
+  elif mode == "first" then
+    let yes = str_cmp(a[0], b[0]) < 0
+  else
+    let yes = rs_fields_order(a[0], b[0]) == "lt"
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A stable bottom-up merge sort: O(n log n) comparisons.
+make a function called rs_sort takes items, mode returns sorted
+  require (value_class(items) == 9) and ((mode == "text") or (mode == "first") or (mode == "version"))
+  let n = list_len(items)
+  let src = items
+  let w = 1
+  while w < n do
+    let dst = []
+    let lo = 0
+    while lo < n do
+      let mid = min(lo + w, n)
+      let hi = min(lo + 2 * w, n)
+      let i = lo
+      let j = mid
+      while (i < mid) or (j < hi) do
+        if (j >= hi) or ((i < mid) and (not rs_before(src[j], src[i], mode))) then
+          let dst = list_push(dst, src[i])
+          let i = i + 1
+        else
+          let dst = list_push(dst, src[j])
+          let j = j + 1
+        end
+      end
+      let lo = hi
+    end
+    let src = dst
+    let w = w * 2
+  end
+  let sorted = src
+  ensure list_len(sorted) == n
+  return sorted
+end

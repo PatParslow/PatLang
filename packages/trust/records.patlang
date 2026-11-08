@@ -1,0 +1,848 @@
+# The trust records (docs/plans/package-trust.md, "Records"): readers and
+# writers for the view, genesis, transition, release and withdrawal records
+# and for signature files.
+#
+# A record is ASCII: one `key value` field a line, each line ending in LF,
+# printable characters only (32..126), one space between key and value, no
+# leading, trailing or doubled spaces, no blank lines and no comments. Its
+# fields come in the order given below, each as often as given, so a record
+# has exactly one byte form and its hash (SHA-256 of its bytes) names it.
+# Its first line, `record patlang-<kind> 1`, separates the kinds: a
+# signature over one kind's hash is never one over another's.
+#
+# A reader takes a record's bytes and gives ["ok", record] or a failure
+# ["err", code, stage, detail], code "malformed" or "too-large". A writer
+# takes field values and gives ["ok", bytes]; it reads what it wrote back,
+# so it refuses exactly what a reader refuses.
+#
+# Records, as lists (use the accessors in trust.patlang):
+#   view        ["view", hash, group ("" at epoch 0), epoch, quorum (0 for
+#                majority, else a count), members [[slot, alg, key hex]]
+#                in increasing slot order]
+#   genesis     ["genesis", hash, package, view, created (yyyymmdd), created text]
+#   transition  ["transition", hash, group, from-epoch, from-view, to-epoch,
+#                to-view, reason, subject, evidence ("" unless exclude),
+#                revoke-from (yyyymmdd, 0 for none)]
+#   release     ["release", hash, group, epoch, view, package, version,
+#                manifest, created (yyyymmdd)]
+#   withdraw    ["withdraw", hash, group, epoch, view, package, version, reason]
+#   sigs        ["sigs", hash, [[slot, signature hex]]]
+
+# ---- bounds ----
+
+make a function called trust_max_record_bytes returns n
+  require true
+  let n = 65536
+  ensure n > 0
+  return n
+end
+
+make a function called trust_max_members returns n
+  require true
+  let n = 256
+  ensure n > 0
+  return n
+end
+
+make a function called trust_max_sig_lines returns n
+  require true
+  let n = 256
+  ensure n > 0
+  return n
+end
+
+# ---- failures ----
+
+make a function called trust_err takes code, stage, detail returns r
+  require (value_class(code) == 8) and (value_class(stage) == 8) and (value_class(detail) == 8)
+  let r = ["err", code, stage, detail]
+  ensure list_len(r) == 4
+  return r
+end
+
+make a function called tr_malformed takes stage, detail returns r
+  require value_class(detail) == 8
+  let r = trust_err("malformed", stage, detail)
+  ensure r[0] == "err"
+  return r
+end
+
+# ---- lines ----
+
+# A record's lines as [key, value] pairs: ["ok", pairs] or a failure. Bytes
+# beyond max_bytes, or lines beyond max_lines, are "too-large".
+make a function called trust_lines takes bytes, max_bytes, max_lines, stage returns r
+  require (value_class(bytes) == 9) and (max_bytes > 0) and (max_lines > 0)
+  let n = list_len(bytes)
+  if n > max_bytes then
+    let r = trust_err("too-large", stage, "more than " + max_bytes + " bytes")
+    ensure r[0] == "err"
+    return r
+  end
+  if n == 0 then
+    let r = tr_malformed(stage, "empty")
+    ensure r[0] == "err"
+    return r
+  end
+  if bytes[n - 1] != 10 then
+    let r = tr_malformed(stage, "the last line does not end in LF")
+    ensure r[0] == "err"
+    return r
+  end
+  let pairs = []
+  let key = sb_new()
+  let val = sb_new()
+  let in_value = false
+  let prev = 10
+  let line = 1
+  let i = 0
+  while i < n do
+    let c = bytes[i]
+    if c == 10 then
+      if not in_value then
+        let r = tr_malformed(stage, "line " + line + " has no value")
+        ensure r[0] == "err"
+        return r
+      end
+      if prev == 32 then
+        let r = tr_malformed(stage, "line " + line + " ends in a space")
+        ensure r[0] == "err"
+        return r
+      end
+      if list_len(pairs) >= max_lines then
+        let r = trust_err("too-large", stage, "more than " + max_lines + " lines")
+        ensure r[0] == "err"
+        return r
+      end
+      let pairs = list_push(pairs, [sb_str(key), sb_str(val)])
+      let key = sb_new()
+      let val = sb_new()
+      let in_value = false
+      let line = line + 1
+    elif c == 32 then
+      if prev == 32 then
+        let r = tr_malformed(stage, "line " + line + " has two spaces together")
+        ensure r[0] == "err"
+        return r
+      end
+      if prev == 10 then
+        let r = tr_malformed(stage, "line " + line + " starts with a space")
+        ensure r[0] == "err"
+        return r
+      end
+      if in_value then
+        sb_push(val, " ")
+      else
+        let in_value = true
+      end
+    elif (c < 33) or (c > 126) then
+      let r = tr_malformed(stage, "line " + line + " holds the byte " + c + ", not printable ASCII")
+      ensure r[0] == "err"
+      return r
+    elif in_value then
+      sb_push(val, chr(c))
+    else
+      sb_push(key, chr(c))
+    end
+    let prev = c
+    let i = i + 1
+  end
+  let r = ["ok", pairs]
+  ensure list_len(r) == 2
+  return r
+end
+
+# The pairs of the fields after the record line, by schema: schema is a
+# list of [key, least, most], in record order; the result is one list of
+# values per schema entry. Any other key, a repeat beyond most, or a key
+# out of order is malformed.
+make a function called tr_take takes pairs, first, schema, stage returns r
+  require (value_class(pairs) == 9) and (value_class(schema) == 9) and (first >= 0)
+  let groups = []
+  let p = first
+  let j = 0
+  while j < list_len(schema) do
+    let key = schema[j][0]
+    let values = []
+    while (p < list_len(pairs)) and (pairs[p][0] == key) and (list_len(values) < schema[j][2]) do
+      let values = list_push(values, pairs[p][1])
+      let p = p + 1
+    end
+    if (schema[j][2] > 1) and (p < list_len(pairs)) and (pairs[p][0] == key) then
+      let r = trust_err("too-large", stage, "more than " + schema[j][2] + " `" + key + "` fields")
+      ensure r[0] == "err"
+      return r
+    end
+    if list_len(values) < schema[j][1] then
+      let r = tr_malformed(stage, "no `" + key + "` field where line " + (p + 1) + " is")
+      ensure r[0] == "err"
+      return r
+    end
+    let groups = list_push(groups, values)
+    let j = j + 1
+  end
+  if p < list_len(pairs) then
+    let r = tr_malformed(stage, "line " + (p + 1) + ": unexpected field `" + pairs[p][0] + "`")
+    ensure r[0] == "err"
+    return r
+  end
+  let r = ["ok", groups]
+  ensure list_len(r) == 2
+  return r
+end
+
+# A record's fields after its `record patlang-<kind> 1` line, by schema.
+make a function called tr_record_fields takes bytes, kind, schema, max_lines, stage returns r
+  require (value_class(bytes) == 9) and (value_class(kind) == 8)
+  let lr = trust_lines(bytes, trust_max_record_bytes(), max_lines, stage)
+  if lr[0] != "ok" then
+    let r = lr
+    ensure r[0] == "err"
+    return r
+  end
+  let pairs = lr[1]
+  if (pairs[0][0] != "record") or (pairs[0][1] != "patlang-" + kind + " 1") then
+    let r = tr_malformed(stage, "not a `record patlang-" + kind + " 1` record")
+    ensure r[0] == "err"
+    return r
+  end
+  let r = tr_take(pairs, 1, schema, stage)
+  ensure value_class(r) == 9
+  return r
+end
+
+# ---- values ----
+
+# A value's space-separated words.
+make a function called tr_words takes text returns words
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = []
+  let start = 0
+  let i = 0
+  while i < n do
+    if sc_code(h, i) == 32 then
+      let out = list_push(out, sc_substr(h, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let out = list_push(out, sc_substr(h, start, n - start))
+  let words = out
+  ensure list_len(words) >= 1
+  return words
+end
+
+# A natural number written without leading zeros, at most 9 digits; -1 for
+# anything else.
+make a function called tr_nat takes text returns n
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let len = sc_len(h)
+  if (len == 0) or (len > 9) or ((len > 1) and (sc_code(h, 0) == 48)) then
+    let n = 0 - 1
+    ensure n == 0 - 1
+    return n
+  end
+  let v = 0
+  let i = 0
+  while i < len do
+    let c = sc_code(h, i)
+    if (c < 48) or (c > 57) then
+      let n = 0 - 1
+      ensure n == 0 - 1
+      return n
+    end
+    let v = v * 10 + (c - 48)
+    let i = i + 1
+  end
+  let n = v
+  ensure n >= 0
+  return n
+end
+
+# Lowercase hex of exactly nbytes bytes.
+make a function called tr_is_hex takes text, nbytes returns yes
+  require (value_class(text) == 8) and (nbytes > 0)
+  let h = str_intern(text)
+  let len = sc_len(h)
+  let yes = len == 2 * nbytes
+  let i = 0
+  while yes and (i < len) do
+    let c = sc_code(h, i)
+    let yes = ((c >= 48) and (c <= 57)) or ((c >= 97) and (c <= 102))
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A package name: lower case letters, digits and `_`, 1 to 64 of them.
+make a function called tr_is_name takes text returns yes
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let len = sc_len(h)
+  let yes = (len > 0) and (len <= 64)
+  let i = 0
+  while yes and (i < len) do
+    let c = sc_code(h, i)
+    let yes = ((c >= 48) and (c <= 57)) or ((c >= 97) and (c <= 122)) or (c == 95)
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# MAJOR.MINOR.PATCH, each a natural number without leading zeros.
+make a function called tr_is_version takes text returns yes
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let len = sc_len(h)
+  let parts = []
+  let start = 0
+  let i = 0
+  while i <= len do
+    if (i == len) or (sc_code(h, i) == 46) then
+      let parts = list_push(parts, sc_substr(h, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let yes = list_len(parts) == 3
+  let k = 0
+  while yes and (k < list_len(parts)) do
+    let yes = tr_nat(parts[k]) >= 0
+    let k = k + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called tr_leap takes y returns yes
+  require y >= 0
+  let yes = (((y % 4) == 0) and ((y % 100) != 0)) or ((y % 400) == 0)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A calendar date YYYY-MM-DD as the number yyyymmdd; -1 when it is not one.
+make a function called tr_date takes text returns d
+  require value_class(text) == 8
+  let h = str_intern(text)
+  if (sc_len(h) != 10) or (sc_code(h, 4) != 45) or (sc_code(h, 7) != 45) then
+    let d = 0 - 1
+    ensure d == 0 - 1
+    return d
+  end
+  let y = tr_digits(h, 0, 4)
+  let m = tr_digits(h, 5, 2)
+  let day = tr_digits(h, 8, 2)
+  let days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  let d = 0 - 1
+  if (y >= 1) and (m >= 1) and (m <= 12) and (day >= 1) then
+    let most = days[m - 1]
+    if (m == 2) and tr_leap(y) then
+      let most = 29
+    end
+    if day <= most then
+      let d = y * 10000 + m * 100 + day
+    end
+  end
+  ensure (d == 0 - 1) or (d >= 10101)
+  return d
+end
+
+# The number the k digits at i of a string cursor spell; -1 if any is not a digit.
+make a function called tr_digits takes h, i, k returns n
+  require (i >= 0) and (k > 0)
+  let v = 0
+  let j = 0
+  while j < k do
+    let c = sc_code(h, i + j)
+    if (c < 48) or (c > 57) then
+      let n = 0 - 1
+      ensure n == 0 - 1
+      return n
+    end
+    let v = v * 10 + (c - 48)
+    let j = j + 1
+  end
+  let n = v
+  ensure n >= 0
+  return n
+end
+
+# ---- sorting (for the duplicate-key check) ----
+
+# Strings in increasing order (bottom-up merge sort, O(n log n)).
+make a function called tr_sort_strings takes items returns sorted
+  require value_class(items) == 9
+  let n = list_len(items)
+  let a = items
+  let width = 1
+  while width < n do
+    let b = []
+    let lo = 0
+    while lo < n do
+      let mid = lo + width
+      if mid > n then
+        let mid = n
+      end
+      let hi = lo + 2 * width
+      if hi > n then
+        let hi = n
+      end
+      let i = lo
+      let j = mid
+      while (i < mid) or (j < hi) do
+        if (j >= hi) or ((i < mid) and (str_cmp(a[i], a[j]) <= 0)) then
+          let b = list_push(b, a[i])
+          let i = i + 1
+        else
+          let b = list_push(b, a[j])
+          let j = j + 1
+        end
+      end
+      let lo = hi
+    end
+    let a = b
+    let width = width * 2
+  end
+  let sorted = a
+  ensure list_len(sorted) == n
+  return sorted
+end
+
+# ---- readers ----
+
+make a function called trust_read_view takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "view"
+  let schema = [["group", 0, 1], ["epoch", 1, 1], ["quorum", 1, 1], ["member", 1, trust_max_members()]]
+  let fr = tr_record_fields(bytes, "view", schema, trust_max_members() + 4, stage)
+  if fr[0] != "ok" then
+    let r = fr
+    ensure r[0] == "err"
+    return r
+  end
+  let f = fr[1]
+  let epoch = tr_nat(f[1][0])
+  if epoch < 0 then
+    let r = tr_malformed(stage, "epoch `" + f[1][0] + "` is not a number")
+    ensure r[0] == "err"
+    return r
+  end
+  let group = ""
+  if list_len(f[0]) == 1 then
+    let group = f[0][0]
+    if not tr_is_hex(group, 32) then
+      let r = tr_malformed(stage, "group is not a SHA-256 hash in lowercase hex")
+      ensure r[0] == "err"
+      return r
+    end
+  end
+  if (epoch == 0) != (group == "") then
+    let r = tr_malformed(stage, "a view names its group exactly when its epoch is above 0")
+    ensure r[0] == "err"
+    return r
+  end
+  let mr = tr_members(f[3], stage)
+  if mr[0] != "ok" then
+    let r = mr
+    ensure r[0] == "err"
+    return r
+  end
+  let members = mr[1]
+  let quorum = 0
+  if f[2][0] != "majority" then
+    let quorum = tr_nat(f[2][0])
+    if (quorum < 1) or (quorum > list_len(members)) then
+      let r = tr_malformed(stage, "quorum `" + f[2][0] + "` is neither `majority` nor a count from 1 to the members' " + list_len(members))
+      ensure r[0] == "err"
+      return r
+    end
+  end
+  let r = ["ok", ["view", sha256_hex(bytes), group, epoch, quorum, members]]
+  ensure r[0] == "ok"
+  return r
+end
+
+# `member <slot> <alg> <key>` values: slots increasing, keys distinct.
+make a function called tr_members takes values, stage returns r
+  require value_class(values) == 9
+  let members = []
+  let keys = []
+  let last = 0 - 1
+  let i = 0
+  while i < list_len(values) do
+    let w = tr_words(values[i])
+    if list_len(w) != 3 then
+      let r = tr_malformed(stage, "member " + (i + 1) + " is not `<slot> <alg> <key>`")
+      ensure r[0] == "err"
+      return r
+    end
+    let slot = tr_nat(w[0])
+    if slot <= last then
+      let r = tr_malformed(stage, "member slot `" + w[0] + "` is not a number above the one before")
+      ensure r[0] == "err"
+      return r
+    end
+    if w[1] != "ed25519" then
+      let r = tr_malformed(stage, "member " + w[0] + ": algorithm `" + w[1] + "` is not ed25519")
+      ensure r[0] == "err"
+      return r
+    end
+    if not tr_is_hex(w[2], 32) then
+      let r = tr_malformed(stage, "member " + w[0] + ": the key is not 32 bytes of lowercase hex")
+      ensure r[0] == "err"
+      return r
+    end
+    let members = list_push(members, [slot, w[1], w[2]])
+    let keys = list_push(keys, w[2])
+    let last = slot
+    let i = i + 1
+  end
+  let sorted = tr_sort_strings(keys)
+  let k = 1
+  while k < list_len(sorted) do
+    if sorted[k] == sorted[k - 1] then
+      let r = tr_malformed(stage, "two members have the same key")
+      ensure r[0] == "err"
+      return r
+    end
+    let k = k + 1
+  end
+  let r = ["ok", members]
+  ensure r[0] == "ok"
+  return r
+end
+
+make a function called trust_read_genesis takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "genesis"
+  let schema = [["package", 1, 1], ["view", 1, 1], ["created", 1, 1]]
+  let fr = tr_record_fields(bytes, "genesis", schema, 8, stage)
+  if fr[0] != "ok" then
+    let r = fr
+    ensure r[0] == "err"
+    return r
+  end
+  let f = fr[1]
+  let created = tr_date(f[2][0])
+  let r = []
+  if not tr_is_name(f[0][0]) then
+    let r = tr_malformed(stage, "package `" + f[0][0] + "` is not a package name")
+  elif not tr_is_hex(f[1][0], 32) then
+    let r = tr_malformed(stage, "view is not a SHA-256 hash in lowercase hex")
+  elif created < 0 then
+    let r = tr_malformed(stage, "created `" + f[2][0] + "` is not a YYYY-MM-DD date")
+  else
+    let r = ["ok", ["genesis", sha256_hex(bytes), f[0][0], f[1][0], created, f[2][0]]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called trust_read_transition takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "transition"
+  let schema = [["group", 1, 1], ["from-epoch", 1, 1], ["from-view", 1, 1], ["to-epoch", 1, 1], ["to-view", 1, 1], ["reason", 1, 1], ["subject", 1, 1], ["evidence", 0, 1], ["revoke-from", 0, 1]]
+  let fr = tr_record_fields(bytes, "transition", schema, 16, stage)
+  if fr[0] != "ok" then
+    let r = fr
+    ensure r[0] == "err"
+    return r
+  end
+  let f = fr[1]
+  let reason = f[5][0]
+  let from_epoch = tr_nat(f[1][0])
+  let to_epoch = tr_nat(f[3][0])
+  let subject = tr_nat(f[6][0])
+  let evidence = ""
+  if list_len(f[7]) == 1 then
+    let evidence = f[7][0]
+  end
+  let revoke = 0
+  if list_len(f[8]) == 1 then
+    let revoke = tr_date(f[8][0])
+  end
+  let r = []
+  if not tr_is_hex(f[0][0], 32) then
+    let r = tr_malformed(stage, "group is not a SHA-256 hash in lowercase hex")
+  elif (from_epoch < 0) or (to_epoch < 0) then
+    let r = tr_malformed(stage, "an epoch is not a number")
+  elif not (tr_is_hex(f[2][0], 32) and tr_is_hex(f[4][0], 32)) then
+    let r = tr_malformed(stage, "a view is not a SHA-256 hash in lowercase hex")
+  elif (reason != "admit") and (reason != "depart") and (reason != "exclude") and (reason != "rekey") then
+    let r = tr_malformed(stage, "reason `" + reason + "` is not admit, depart, exclude or rekey")
+  elif subject < 0 then
+    let r = tr_malformed(stage, "subject `" + f[6][0] + "` is not a slot")
+  elif (reason == "exclude") != (evidence != "") then
+    let r = tr_malformed(stage, "a transition names evidence exactly when it is an exclusion")
+  elif (evidence != "") and (not tr_is_hex(evidence, 32)) then
+    let r = tr_malformed(stage, "evidence is not a SHA-256 hash in lowercase hex")
+  elif revoke < 0 then
+    let r = tr_malformed(stage, "revoke-from `" + f[8][0] + "` is not a YYYY-MM-DD date")
+  elif (revoke > 0) and (reason == "admit") then
+    let r = tr_malformed(stage, "an admission revokes no key")
+  else
+    let r = ["ok", ["transition", sha256_hex(bytes), f[0][0], from_epoch, f[2][0], to_epoch, f[4][0], reason, subject, evidence, revoke]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called trust_read_release takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "release"
+  let schema = [["group", 1, 1], ["epoch", 1, 1], ["view", 1, 1], ["package", 1, 1], ["version", 1, 1], ["manifest", 1, 1], ["created", 1, 1]]
+  let fr = tr_record_fields(bytes, "release", schema, 12, stage)
+  if fr[0] != "ok" then
+    let r = fr
+    ensure r[0] == "err"
+    return r
+  end
+  let f = fr[1]
+  let epoch = tr_nat(f[1][0])
+  let created = tr_date(f[6][0])
+  let r = []
+  if not (tr_is_hex(f[0][0], 32) and tr_is_hex(f[2][0], 32) and tr_is_hex(f[5][0], 32)) then
+    let r = tr_malformed(stage, "group, view or manifest is not a SHA-256 hash in lowercase hex")
+  elif epoch < 0 then
+    let r = tr_malformed(stage, "epoch `" + f[1][0] + "` is not a number")
+  elif not tr_is_name(f[3][0]) then
+    let r = tr_malformed(stage, "package `" + f[3][0] + "` is not a package name")
+  elif not tr_is_version(f[4][0]) then
+    let r = tr_malformed(stage, "version `" + f[4][0] + "` is not MAJOR.MINOR.PATCH")
+  elif created < 0 then
+    let r = tr_malformed(stage, "created `" + f[6][0] + "` is not a YYYY-MM-DD date")
+  else
+    let r = ["ok", ["release", sha256_hex(bytes), f[0][0], epoch, f[2][0], f[3][0], f[4][0], f[5][0], created]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called trust_read_withdraw takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "withdrawal"
+  let schema = [["group", 1, 1], ["epoch", 1, 1], ["view", 1, 1], ["package", 1, 1], ["version", 1, 1], ["reason", 1, 1]]
+  let fr = tr_record_fields(bytes, "withdraw", schema, 12, stage)
+  if fr[0] != "ok" then
+    let r = fr
+    ensure r[0] == "err"
+    return r
+  end
+  let f = fr[1]
+  let epoch = tr_nat(f[1][0])
+  let r = []
+  if not (tr_is_hex(f[0][0], 32) and tr_is_hex(f[2][0], 32)) then
+    let r = tr_malformed(stage, "group or view is not a SHA-256 hash in lowercase hex")
+  elif epoch < 0 then
+    let r = tr_malformed(stage, "epoch `" + f[1][0] + "` is not a number")
+  elif not tr_is_name(f[3][0]) then
+    let r = tr_malformed(stage, "package `" + f[3][0] + "` is not a package name")
+  elif not tr_is_version(f[4][0]) then
+    let r = tr_malformed(stage, "version `" + f[4][0] + "` is not MAJOR.MINOR.PATCH")
+  else
+    let r = ["ok", ["withdraw", sha256_hex(bytes), f[0][0], epoch, f[2][0], f[3][0], f[4][0], f[5][0]]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# A signature file: `sign <slot> <signature hex>` lines, at least one. Slots
+# may repeat here; a certificate check refuses a repeat.
+make a function called trust_read_sigs takes bytes returns r
+  require value_class(bytes) == 9
+  let stage = "signatures"
+  let lr = trust_lines(bytes, trust_max_record_bytes(), trust_max_sig_lines(), stage)
+  if lr[0] != "ok" then
+    let r = lr
+    ensure r[0] == "err"
+    return r
+  end
+  let pairs = lr[1]
+  let sigs = []
+  let i = 0
+  while i < list_len(pairs) do
+    let w = tr_words(pairs[i][1])
+    if (pairs[i][0] != "sign") or (list_len(w) != 2) then
+      let r = tr_malformed(stage, "line " + (i + 1) + " is not `sign <slot> <signature>`")
+      ensure r[0] == "err"
+      return r
+    end
+    let slot = tr_nat(w[0])
+    if slot < 0 then
+      let r = tr_malformed(stage, "line " + (i + 1) + ": slot `" + w[0] + "` is not a number")
+      ensure r[0] == "err"
+      return r
+    end
+    if not tr_is_hex(w[1], 64) then
+      let r = tr_malformed(stage, "line " + (i + 1) + ": the signature is not 64 bytes of lowercase hex")
+      ensure r[0] == "err"
+      return r
+    end
+    let sigs = list_push(sigs, [slot, w[1]])
+    let i = i + 1
+  end
+  let r = ["ok", ["sigs", sha256_hex(bytes), sigs]]
+  ensure r[0] == "ok"
+  return r
+end
+
+# A record's fields, for tools that edit records: ["ok", [[key, value]]],
+# the record line first.
+make a function called trust_fields takes bytes returns r
+  require value_class(bytes) == 9
+  let r = trust_lines(bytes, trust_max_record_bytes(), trust_max_members() + 16, "record")
+  ensure value_class(r) == 9
+  return r
+end
+
+# Fields back to bytes, each `key value` and LF.
+make a function called trust_fields_bytes takes pairs returns bytes
+  require value_class(pairs) == 9
+  let b = sb_new()
+  let i = 0
+  while i < list_len(pairs) do
+    sb_push(b, pairs[i][0])
+    sb_push(b, " ")
+    sb_push(b, pairs[i][1])
+    sb_push(b, "\n")
+    let i = i + 1
+  end
+  let bytes = utf8_encode(sb_str(b))
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+# ---- writers ----
+
+# The bytes of a text that reader reads (a function name): ["ok", bytes]
+# or the reader's failure.
+make a function called tr_written takes b, reader returns r
+  require value_class(reader) == 8
+  let bytes = utf8_encode(sb_str(b))
+  let rr = apply(reader, bytes)
+  let r = rr
+  if rr[0] == "ok" then
+    let r = ["ok", bytes]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called tr_field takes b, key, value returns done
+  require (value_class(key) == 8)
+  sb_push(b, key)
+  sb_push(b, " ")
+  sb_push(b, to_s(value))
+  sb_push(b, "\n")
+  let done = true
+  ensure done
+  return done
+end
+
+# group "" for an epoch-0 view; quorum "majority" or a count's text;
+# members [[slot, alg, key hex]] in increasing slot order.
+make a function called trust_write_view takes group, epoch, quorum, members returns r
+  require (value_class(group) == 8) and (value_class(members) == 9)
+  let b = sb_new()
+  tr_field(b, "record", "patlang-view 1")
+  if group != "" then
+    tr_field(b, "group", group)
+  end
+  tr_field(b, "epoch", epoch)
+  tr_field(b, "quorum", quorum)
+  let i = 0
+  while i < list_len(members) do
+    let m = members[i]
+    tr_field(b, "member", to_s(m[0]) + " " + m[1] + " " + m[2])
+    let i = i + 1
+  end
+  let r = tr_written(b, "trust_read_view")
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called trust_write_genesis takes package, view, created returns r
+  require value_class(package) == 8
+  let b = sb_new()
+  tr_field(b, "record", "patlang-genesis 1")
+  tr_field(b, "package", package)
+  tr_field(b, "view", view)
+  tr_field(b, "created", created)
+  let r = tr_written(b, "trust_read_genesis")
+  ensure value_class(r) == 9
+  return r
+end
+
+# evidence and revoke "" when the transition has none.
+make a function called trust_write_transition takes group, from_epoch, from_view, to_epoch, to_view, reason, subject, evidence, revoke returns r
+  require (value_class(evidence) == 8) and (value_class(revoke) == 8)
+  let b = sb_new()
+  tr_field(b, "record", "patlang-transition 1")
+  tr_field(b, "group", group)
+  tr_field(b, "from-epoch", from_epoch)
+  tr_field(b, "from-view", from_view)
+  tr_field(b, "to-epoch", to_epoch)
+  tr_field(b, "to-view", to_view)
+  tr_field(b, "reason", reason)
+  tr_field(b, "subject", subject)
+  if evidence != "" then
+    tr_field(b, "evidence", evidence)
+  end
+  if revoke != "" then
+    tr_field(b, "revoke-from", revoke)
+  end
+  let r = tr_written(b, "trust_read_transition")
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called trust_write_release takes group, epoch, view, package, version, manifest, created returns r
+  require value_class(package) == 8
+  let b = sb_new()
+  tr_field(b, "record", "patlang-release 1")
+  tr_field(b, "group", group)
+  tr_field(b, "epoch", epoch)
+  tr_field(b, "view", view)
+  tr_field(b, "package", package)
+  tr_field(b, "version", version)
+  tr_field(b, "manifest", manifest)
+  tr_field(b, "created", created)
+  let r = tr_written(b, "trust_read_release")
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called trust_write_withdraw takes group, epoch, view, package, version, reason returns r
+  require value_class(package) == 8
+  let b = sb_new()
+  tr_field(b, "record", "patlang-withdraw 1")
+  tr_field(b, "group", group)
+  tr_field(b, "epoch", epoch)
+  tr_field(b, "view", view)
+  tr_field(b, "package", package)
+  tr_field(b, "version", version)
+  tr_field(b, "reason", reason)
+  let r = tr_written(b, "trust_read_withdraw")
+  ensure value_class(r) == 9
+  return r
+end
+
+# sigs [[slot, signature hex]].
+make a function called trust_write_sigs takes sigs returns r
+  require value_class(sigs) == 9
+  let b = sb_new()
+  let i = 0
+  while i < list_len(sigs) do
+    tr_field(b, "sign", to_s(sigs[i][0]) + " " + sigs[i][1])
+    let i = i + 1
+  end
+  let r = tr_written(b, "trust_read_sigs")
+  ensure value_class(r) == 9
+  return r
+end

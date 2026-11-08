@@ -1,0 +1,1253 @@
+# Runs packages/trust/spec/*.feature, from the repository root:
+#
+#   ./self_hosting/build/v2.exe packages/trust/spec/run_spec.patlang packages/trust/build/run_spec.exe --workers 2
+#   ./packages/trust/build/run_spec.exe [feature file]
+#
+# Python's `cryptography` (spec/oracle.py, run as `py -3 -I`) makes the test
+# keys and signatures from fixed seeds, and the verifier closure the checks
+# are given calls it. Each scenario that builds a group writes its log and
+# package under packages/trust/build/s<n>/. The exit code is 0 when every
+# check passes, 1 otherwise.
+include "../../../self_hosting/lib/includes.patlang"
+include "../../../self_hosting/lib/gherkin.patlang"
+include "../trust.patlang"
+
+make a function called tt_oracle returns p
+  require true
+  let p = "packages/trust/spec/oracle.py"
+  ensure p.length > 0
+  return p
+end
+
+make a function called tt_build returns p
+  require true
+  let p = "packages/trust/build/"
+  ensure p.length > 0
+  return p
+end
+
+# ---- text helpers ----
+
+# A step's text as bytes: `|` is LF, `<N:X>` N copies of X, `<sp>` a space,
+# `<cr>` CR, `<b:N>` the byte N; every other character is its own code.
+make a function called tt_decode takes text returns bytes
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = []
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if c == 124 then
+      let out = list_push(out, 10)
+      let i = i + 1
+    elif c == 60 then
+      let close = i + 1
+      while (close < n) and (sc_code(h, close) != 62) do
+        let close = close + 1
+      end
+      let tok = sc_substr(h, i + 1, close - i - 1)
+      let out = tt_token(out, tok)
+      let i = close + 1
+    else
+      let out = list_push(out, c)
+      let i = i + 1
+    end
+  end
+  let bytes = out
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+# One <...> token's bytes appended to out.
+make a function called tt_token takes out, tok returns out2
+  require (value_class(out) == 9) and (value_class(tok) == 8)
+  let r = out
+  if tok == "sp" then
+    let r = list_push(r, 32)
+  elif tok == "cr" then
+    let r = list_push(r, 13)
+  else
+    let h = str_intern(tok)
+    let colon = 0
+    while (colon < sc_len(h)) and (sc_code(h, colon) != 58) do
+      let colon = colon + 1
+    end
+    let head = sc_substr(h, 0, colon)
+    let tail = sc_substr(h, colon + 1, sc_len(h) - colon - 1)
+    if head == "b" then
+      let r = list_push(r, to_num(tail))
+    else
+      let k = to_num(head)
+      let th = str_intern(tail)
+      let j = 0
+      while j < k do
+        let m = 0
+        while m < sc_len(th) do
+          let r = list_push(r, sc_code(th, m))
+          let m = m + 1
+        end
+        let j = j + 1
+      end
+    end
+  end
+  let out2 = r
+  ensure value_class(out2) == 9
+  return out2
+end
+
+# Bytes as a String (each byte one character).
+make a function called tt_text takes bytes returns text
+  require value_class(bytes) == 9
+  let b = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    sb_push(b, chr(bytes[i]))
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  ensure value_class(text) == 8
+  return text
+end
+
+# The space-separated words of a step argument.
+make a function called tt_words takes text returns words
+  require value_class(text) == 8
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = []
+  let start = 0
+  let i = 0
+  while i <= n do
+    if (i == n) or (sc_code(h, i) == 32) then
+      if i > start then
+        let out = list_push(out, sc_substr(h, start, i - start))
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let words = out
+  ensure value_class(words) == 9
+  return words
+end
+
+# A word split at its first `c` (a character code): [before, after], or
+# [word, ""] when it has none.
+make a function called tt_split_at takes word, c returns parts
+  require value_class(word) == 8
+  let h = str_intern(word)
+  let n = sc_len(h)
+  let i = 0
+  while (i < n) and (sc_code(h, i) != c) do
+    let i = i + 1
+  end
+  let parts = [word, ""]
+  if i < n then
+    let parts = [sc_substr(h, 0, i), sc_substr(h, i + 1, n - i - 1)]
+  end
+  ensure list_len(parts) == 2
+  return parts
+end
+
+make a function called tt_repeat takes s, k returns out
+  require (value_class(s) == 8) and (k >= 0)
+  let b = sb_new()
+  let i = 0
+  while i < k do
+    sb_push(b, s)
+    let i = i + 1
+  end
+  let out = sb_str(b)
+  ensure out.length == k * s.length
+  return out
+end
+
+make a function called tt_pad4 takes n returns s
+  require n >= 0
+  let s = to_s(n)
+  if s.length < 4 then
+    let s = substr("000", 0, 4 - s.length) + s
+  end
+  ensure s.length >= 4
+  return s
+end
+
+# A failure's "stage code", or "ok".
+make a function called tt_outcome takes r returns s
+  require value_class(r) == 9
+  let s = "ok"
+  if r[0] == "err" then
+    let s = r[2] + " " + r[1]
+  end
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called tt_detail takes r returns s
+  require value_class(r) == 9
+  let s = ""
+  if r[0] == "err" then
+    let s = " [" + r[2] + ": " + r[1] + ": " + r[3] + "]"
+  end
+  ensure value_class(s) == 8
+  return s
+end
+
+# ---- the oracle ----
+
+make a function called tt_py1 takes a returns out
+  require value_class(a) == 8
+  let out = str_trim(exec_capture("py", "-3", "-I", tt_oracle(), a))
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called tt_py2 takes a, b returns out
+  require (value_class(a) == 8) and (value_class(b) == 8)
+  let out = str_trim(exec_capture("py", "-3", "-I", tt_oracle(), a, b))
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called tt_py3 takes a, b, c returns out
+  require (value_class(a) == 8) and (value_class(b) == 8) and (value_class(c) == 8)
+  let out = str_trim(exec_capture("py", "-3", "-I", tt_oracle(), a, b, c))
+  ensure value_class(out) == 8
+  return out
+end
+
+# A name's public key, from the oracle once and then from the context.
+make a function called tt_pub takes ctx, name returns pub
+  require value_class(name) == 8
+  let keys = []
+  if ctx_has(ctx, "keys") then
+    let keys = ctx_get(ctx, "keys")
+  end
+  let i = 0
+  while i < list_len(keys) do
+    if keys[i][0] == name then
+      let pub = keys[i][1]
+      ensure pub.length == 64
+      return pub
+    end
+    let i = i + 1
+  end
+  let pub = tt_py2("pub", name)
+  ctx_set(ctx, "keys", list_push(keys, [name, pub]))
+  ensure pub.length == 64
+  return pub
+end
+
+# ---- records feature steps ----
+
+make a function called tt_read takes kind, bytes returns r
+  require (value_class(kind) == 8) and (value_class(bytes) == 9)
+  let r = ["err", "unknown-kind", "test", kind]
+  if kind == "view" then
+    let r = trust_read_view(bytes)
+  elif kind == "genesis" then
+    let r = trust_read_genesis(bytes)
+  elif kind == "transition" then
+    let r = trust_read_transition(bytes)
+  elif kind == "release" then
+    let r = trust_read_release(bytes)
+  elif kind == "withdrawal" then
+    let r = trust_read_withdraw(bytes)
+  elif kind == "signature file" then
+    let r = trust_read_sigs(bytes)
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+make a function called tt_kinds returns kinds
+  require true
+  let kinds = ["view", "genesis", "transition", "release", "withdrawal", "signature file"]
+  ensure list_len(kinds) == 6
+  return kinds
+end
+
+make a function called st_tr_bytes takes ctx returns ok
+  require value_class(ctx) == 12
+  ctx_set(ctx, "bytes", tt_decode(step_arg(ctx, "text")))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_empty takes ctx returns ok
+  require value_class(ctx) == 12
+  ctx_set(ctx, "bytes", [])
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_read_ok takes ctx returns ok
+  require value_class(ctx) == 12
+  let kind = step_arg(ctx, "kind")
+  let r = tt_read(kind, ctx_get(ctx, "bytes"))
+  ctx_set(ctx, "kind", kind)
+  let ok = expect(ctx, "reads as a " + kind + tt_detail(r), r[0], "ok")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_read_fails takes ctx returns ok
+  require value_class(ctx) == 12
+  let kind = step_arg(ctx, "kind")
+  let r = tt_read(kind, ctx_get(ctx, "bytes"))
+  let got = "ok"
+  if r[0] == "err" then
+    let got = r[1]
+  end
+  let ok = expect(ctx, "reading as a " + kind + " fails" + tt_detail(r), got, step_arg(ctx, "code"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_view_shape takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = trust_read_view(ctx_get(ctx, "bytes"))
+  let got = tt_outcome(r)
+  if r[0] == "ok" then
+    let v = r[1]
+    let got = "epoch " + trust_view_epoch(v) + ", " + list_len(trust_view_members(v)) + " members, needs " + trust_quorum_need(v, false)
+  end
+  let want = "epoch " + step_arg(ctx, "e") + ", " + step_arg(ctx, "n") + " members, needs " + step_arg(ctx, "k")
+  let ok = expect(ctx, "the view's shape", got, want)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_view_need takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = trust_read_view(ctx_get(ctx, "bytes"))
+  let got = tt_outcome(r)
+  if r[0] == "ok" then
+    let got = to_s(trust_quorum_need(r[1], false))
+  end
+  let ok = expect(ctx, "signatures the view needs", got, step_arg(ctx, "k"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_view_need_excl takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = trust_read_view(ctx_get(ctx, "bytes"))
+  let got = tt_outcome(r)
+  if r[0] == "ok" then
+    let got = to_s(trust_quorum_need(r[1], true))
+  end
+  let ok = expect(ctx, "signatures an exclusion needs", got, step_arg(ctx, "k"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_hash_py takes ctx returns ok
+  require value_class(ctx) == 12
+  let bytes = ctx_get(ctx, "bytes")
+  let r = tt_read(ctx_get(ctx, "kind"), bytes)
+  let got = tt_outcome(r)
+  if r[0] == "ok" then
+    let got = trust_rec_hash(r[1])
+  end
+  let path = tt_build() + "record.bin"
+  write_file_bytes(path, bytes)
+  let ok = expect(ctx, "the record's hash is Python's SHA-256 of its bytes", got, tt_py2("sha256", path))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_release_names takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = trust_read_release(ctx_get(ctx, "bytes"))
+  let got = tt_outcome(r)
+  if r[0] == "ok" then
+    let rel = r[1]
+    let got = trust_release_package(rel) + " " + trust_release_version(rel) + " " + trust_release_epoch(rel)
+  end
+  let ok = expect(ctx, "the release's names", got, step_arg(ctx, "p") + " " + step_arg(ctx, "v") + " " + step_arg(ctx, "e"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_view_n takes ctx returns ok
+  require value_class(ctx) == 12
+  let n = to_num(step_arg(ctx, "n"))
+  let b = sb_new()
+  sb_push(b, "record patlang-view 1\nepoch 0\nquorum majority\n")
+  let i = 0
+  while i < n do
+    sb_push(b, "member " + i + " ed25519 " + sha256_string_hex("member " + i) + "\n")
+    let i = i + 1
+  end
+  ctx_set(ctx, "bytes", utf8_encode(sb_str(b)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_sigs_n takes ctx returns ok
+  require value_class(ctx) == 12
+  let n = to_num(step_arg(ctx, "n"))
+  let b = sb_new()
+  let sig = tt_repeat("5", 128)
+  let i = 0
+  while i < n do
+    sb_push(b, "sign " + i + " " + sig + "\n")
+    let i = i + 1
+  end
+  ctx_set(ctx, "bytes", utf8_encode(sb_str(b)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_withdraw_n takes ctx returns ok
+  require value_class(ctx) == 12
+  let n = to_num(step_arg(ctx, "n"))
+  let b = sb_new()
+  sb_push(b, "record patlang-withdraw 1\ngroup " + tt_repeat("3", 64) + "\nepoch 2\nview " + tt_repeat("0", 64) + "\npackage zip\nversion 0.1.0\nreason ")
+  sb_push(b, tt_repeat("x", n))
+  sb_push(b, "\n")
+  ctx_set(ctx, "bytes", utf8_encode(sb_str(b)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_prefixes takes ctx returns ok
+  require value_class(ctx) == 12
+  let kind = step_arg(ctx, "kind")
+  let bytes = ctx_get(ctx, "bytes")
+  let n = list_len(bytes)
+  let refused = 0
+  let k = 0
+  while k < n do
+    let pre = []
+    let j = 0
+    while j < k do
+      let pre = list_push(pre, bytes[j])
+      let j = j + 1
+    end
+    if tt_read(kind, pre)[0] == "err" then
+      let refused = refused + 1
+    end
+    let k = k + 1
+  end
+  let ok = expect(ctx, "proper prefixes refused as a " + kind, refused, n)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_random takes ctx returns ok
+  require value_class(ctx) == 12
+  let count = to_num(step_arg(ctx, "n"))
+  let kinds = tt_kinds()
+  let seed = 12345
+  let refused = 0
+  let tried = 0
+  let s = 0
+  while s < count do
+    let seed = (seed * 1103515245 + 12345) % 2147483648
+    let len = seed % 300
+    let bytes = []
+    let j = 0
+    while j < len do
+      let seed = (seed * 1103515245 + 12345) % 2147483648
+      let x = (seed shr 8) % 256
+      # Half the strings are mostly record-like text: letters, digits,
+      # spaces and line ends.
+      if (s % 2) == 0 then
+        let x = 32 + (x % 95)
+        if (seed % 9) == 0 then
+          let x = 10
+        end
+      end
+      let bytes = list_push(bytes, x)
+      let j = j + 1
+    end
+    let k = 0
+    while k < list_len(kinds) do
+      let r = tt_read(kinds[k], bytes)
+      let tried = tried + 1
+      if (value_class(r) == 9) and (r[0] == "err") and (list_len(r) == 4) then
+        let refused = refused + 1
+      end
+      let k = k + 1
+    end
+    let s = s + 1
+  end
+  let ok = expect(ctx, "random byte strings refused with a structured failure", refused, tried)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# "0=a 1=b" -> members [slot, "ed25519", 64 copies of the character].
+make a function called tt_members_spec takes spec returns members
+  require value_class(spec) == 8
+  let words = tt_words(spec)
+  let out = []
+  let i = 0
+  while i < list_len(words) do
+    let p = tt_split_at(words[i], 61)
+    let out = list_push(out, [to_num(p[0]), "ed25519", tt_repeat(p[1], 64)])
+    let i = i + 1
+  end
+  let members = out
+  ensure value_class(members) == 9
+  return members
+end
+
+make a function called st_tr_write_view takes ctx returns ok
+  require value_class(ctx) == 12
+  let w = trust_write_view(step_arg(ctx, "g"), to_num(step_arg(ctx, "e")), step_arg(ctx, "q"), tt_members_spec(step_arg(ctx, "m")))
+  ctx_set(ctx, "written", w)
+  ctx_set(ctx, "kind", "view")
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_write_release takes ctx returns ok
+  require value_class(ctx) == 12
+  let w = trust_write_release(tt_repeat("3", 64), to_num(step_arg(ctx, "e")), tt_repeat("5", 64), step_arg(ctx, "p"), step_arg(ctx, "v"), tt_repeat("9", 64), "2026-11-08")
+  ctx_set(ctx, "written", w)
+  ctx_set(ctx, "kind", "release")
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_write_sigs takes ctx returns ok
+  require value_class(ctx) == 12
+  let words = tt_words(step_arg(ctx, "m"))
+  let sigs = []
+  let i = 0
+  while i < list_len(words) do
+    let p = tt_split_at(words[i], 61)
+    let sigs = list_push(sigs, [to_num(p[0]), tt_repeat(p[1], 128)])
+    let i = i + 1
+  end
+  ctx_set(ctx, "written", trust_write_sigs(sigs))
+  ctx_set(ctx, "kind", "signature file")
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_written_ok takes ctx returns ok
+  require value_class(ctx) == 12
+  let w = ctx_get(ctx, "written")
+  let kind = step_arg(ctx, "kind")
+  let got = tt_outcome(w)
+  if w[0] == "ok" then
+    ctx_set(ctx, "bytes", w[1])
+    let got = tt_outcome(tt_read(kind, w[1]))
+  end
+  let ok = expect(ctx, "written and read back as a " + kind + tt_detail(w), got, "ok")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_written_fails takes ctx returns ok
+  require value_class(ctx) == 12
+  let w = ctx_get(ctx, "written")
+  let got = "ok"
+  if w[0] == "err" then
+    let got = w[1]
+  end
+  let ok = expect(ctx, "the writer refuses", got, step_arg(ctx, "code"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_text_is takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = expect(ctx, "the record's text", tt_text(ctx_get(ctx, "bytes")), tt_text(tt_decode(step_arg(ctx, "text"))))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# ---- groups, logs and packages ----
+
+make a function called tt_dir takes ctx returns d
+  require value_class(ctx) == 12
+  let d = ctx_get(ctx, "dir")
+  ensure value_class(d) == 8
+  return d
+end
+
+make a function called tt_log takes ctx returns d
+  require value_class(ctx) == 12
+  let d = tt_dir(ctx) + "trust/log/"
+  ensure d.length > 0
+  return d
+end
+
+# A fresh scenario directory, with its trust/ subdirectories.
+make a function called tt_new_dir takes ctx returns d
+  require value_class(ctx) == 12
+  let n = 1
+  if ctx_has(ctx, "scenario") then
+    let n = ctx_get(ctx, "scenario") + 1
+  end
+  ctx_set(ctx, "scenario", n)
+  let d = tt_build() + "s" + n + "/"
+  tt_py2("clean", d)
+  tt_py2("mkdir", d + "trust/log")
+  tt_py2("mkdir", d + "trust/release")
+  tt_py2("mkdir", d + "trust/withdraw")
+  ctx_set(ctx, "dir", d)
+  ensure value_class(d) == 8
+  return d
+end
+
+# A view's quorum as its record writes it.
+make a function called tt_quorum_text takes v returns q
+  require v[0] == "view"
+  let k = trust_view_quorum(v)
+  let q = "majority"
+  if k > 0 then
+    let q = to_s(k)
+  end
+  ensure value_class(q) == 8
+  return q
+end
+
+# A signer spec ("alice bob mallory@1") as [slot, name] pairs, names looked
+# up in names ([slot, name] pairs of the view being signed for), then in
+# later ([slot, name] pairs of the latest view): a member admitted later
+# signs with the slot it holds there.
+make a function called tt_signers takes spec, names, later returns signers
+  require (value_class(spec) == 8) and (value_class(names) == 9) and (value_class(later) == 9)
+  let words = tt_words(spec)
+  let out = []
+  let i = 0
+  while i < list_len(words) do
+    let p = tt_split_at(words[i], 64)
+    if p[1] != "" then
+      let out = list_push(out, [to_num(p[1]), p[0]])
+    else
+      let slot = tt_slot_of(names, p[0])
+      if slot < 0 then
+        let slot = tt_slot_of(later, p[0])
+      end
+      if slot < 0 then
+        print("  (test setup: " + p[0] + " is in no view; signing as slot 999)")
+        let slot = 999
+      end
+      let out = list_push(out, [slot, p[0]])
+    end
+    let i = i + 1
+  end
+  let signers = out
+  ensure list_len(signers) == list_len(words)
+  return signers
+end
+
+# The signature file's bytes for signers over a hash.
+make a function called tt_sign takes signers, hash returns bytes
+  require (value_class(signers) == 9) and (value_class(hash) == 8)
+  let sigs = []
+  let i = 0
+  while i < list_len(signers) do
+    let sigs = list_push(sigs, [signers[i][0], tt_py3("sign", signers[i][1], hash)])
+    let i = i + 1
+  end
+  let w = trust_write_sigs(sigs)
+  let bytes = []
+  if w[0] == "ok" then
+    let bytes = w[1]
+  else
+    print("  (test setup: signature file refused" + tt_detail(w) + ")")
+  end
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+# Members for names ([slot, name] pairs, in slot order).
+make a function called tt_members takes ctx, names returns members
+  require value_class(ctx) == 12
+  let out = []
+  let i = 0
+  while i < list_len(names) do
+    let out = list_push(out, [names[i][0], "ed25519", tt_pub(ctx, names[i][1])])
+    let i = i + 1
+  end
+  let members = out
+  ensure list_len(members) == list_len(names)
+  return members
+end
+
+# The ok value of a writer's result; the test stops being meaningful
+# otherwise, so the refusal is printed and counted.
+make a function called tt_must takes ctx, w, what returns bytes
+  require value_class(ctx) == 12
+  let bytes = []
+  if w[0] == "ok" then
+    let bytes = w[1]
+  else
+    expect(ctx, "test setup writes " + what + tt_detail(w), w[0], "ok")
+  end
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+make a function called tt_make_group takes ctx, founders, q, signer_spec returns ok
+  require value_class(ctx) == 12
+  let d = tt_new_dir(ctx)
+  let words = tt_words(founders)
+  let names = []
+  let i = 0
+  while i < list_len(words) do
+    let names = list_push(names, [i, words[i]])
+    let i = i + 1
+  end
+  let vb = tt_must(ctx, trust_write_view("", 0, q, tt_members(ctx, names)), "the epoch-0 view")
+  let view = trust_read_view(vb)[1]
+  let gb = tt_must(ctx, trust_write_genesis("zip", trust_rec_hash(view), "2026-11-08"), "the genesis")
+  let gen = trust_read_genesis(gb)[1]
+  let ghash = trust_rec_hash(gen)
+  write_file_bytes(tt_log(ctx) + "0000-view.rec", vb)
+  write_file_bytes(tt_log(ctx) + "0000-genesis.rec", gb)
+  write_file_bytes(tt_log(ctx) + "0000-genesis.sig", tt_sign(tt_signers(signer_spec, names, names), ghash))
+  ctx_set(ctx, "group", ghash)
+  ctx_set(ctx, "pin", ghash)
+  ctx_set(ctx, "views", [[view, names]])
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_group takes ctx returns ok
+  require value_class(ctx) == 12
+  let f = step_arg(ctx, "names")
+  let ok = tt_make_group(ctx, f, step_arg(ctx, "q"), f)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_group_signed takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_make_group(ctx, step_arg(ctx, "names"), step_arg(ctx, "q"), step_arg(ctx, "signers"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called tt_last_view takes ctx returns entry
+  require value_class(ctx) == 12
+  let views = ctx_get(ctx, "views")
+  let entry = views[list_len(views) - 1]
+  ensure list_len(entry) == 2
+  return entry
+end
+
+make a function called tt_slot_of takes names, name returns slot
+  require value_class(names) == 9
+  let slot = 0 - 1
+  let i = 0
+  while i < list_len(names) do
+    if names[i][1] == name then
+      let slot = names[i][0]
+    end
+    let i = i + 1
+  end
+  ensure value_class(slot) == 2
+  return slot
+end
+
+# Appends a transition to the log: the new view is new_names.
+make a function called tt_transition takes ctx, reason, subject, new_names, evidence, revoke, signer_spec returns ok
+  require value_class(ctx) == 12
+  let last = tt_last_view(ctx)
+  let prev = last[0]
+  let e = trust_view_epoch(prev)
+  let group = ctx_get(ctx, "group")
+  let vb = tt_must(ctx, trust_write_view(group, e + 1, tt_quorum_text(prev), tt_members(ctx, new_names)), "a view")
+  let view = trust_read_view(vb)[1]
+  let tb = tt_must(ctx, trust_write_transition(group, e, trust_rec_hash(prev), e + 1, trust_rec_hash(view), reason, subject, evidence, revoke), "a transition")
+  let t = trust_read_transition(tb)[1]
+  let stem = tt_log(ctx) + tt_pad4(e + 1)
+  write_file_bytes(stem + "-view.rec", vb)
+  write_file_bytes(stem + "-transition.rec", tb)
+  write_file_bytes(stem + "-transition.sig", tt_sign(tt_signers(signer_spec, last[1], new_names), trust_rec_hash(t)))
+  ctx_set(ctx, "views", list_push(ctx_get(ctx, "views"), [view, new_names]))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# names with [slot, name] added in slot order.
+make a function called tt_names_add takes names, slot, name returns out
+  require value_class(names) == 9
+  let r = []
+  let placed = false
+  let i = 0
+  while i < list_len(names) do
+    if (not placed) and (names[i][0] > slot) then
+      let r = list_push(r, [slot, name])
+      let placed = true
+    end
+    let r = list_push(r, names[i])
+    let i = i + 1
+  end
+  if not placed then
+    let r = list_push(r, [slot, name])
+  end
+  let out = r
+  ensure list_len(out) == list_len(names) + 1
+  return out
+end
+
+make a function called tt_names_without takes names, name returns out
+  require value_class(names) == 9
+  let r = []
+  let i = 0
+  while i < list_len(names) do
+    if names[i][1] != name then
+      let r = list_push(r, names[i])
+    end
+    let i = i + 1
+  end
+  let out = r
+  ensure list_len(out) <= list_len(names)
+  return out
+end
+
+make a function called tt_names_renamed takes names, name, new returns out
+  require value_class(names) == 9
+  let r = []
+  let i = 0
+  while i < list_len(names) do
+    if names[i][1] == name then
+      let r = list_push(r, [names[i][0], new])
+    else
+      let r = list_push(r, names[i])
+    end
+    let i = i + 1
+  end
+  let out = r
+  ensure list_len(out) == list_len(names)
+  return out
+end
+
+make a function called tt_evidence takes slot returns h
+  require slot >= 0
+  let h = sha256_string_hex("evidence against slot " + slot)
+  ensure h.length == 64
+  return h
+end
+
+make a function called st_tr_admit takes ctx returns ok
+  require value_class(ctx) == 12
+  let names = tt_last_view(ctx)[1]
+  let slot = to_num(step_arg(ctx, "slot"))
+  let ok = tt_transition(ctx, "admit", slot, tt_names_add(names, slot, step_arg(ctx, "name")), "", "", step_arg(ctx, "signers"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_depart takes ctx returns ok
+  require value_class(ctx) == 12
+  let names = tt_last_view(ctx)[1]
+  let name = step_arg(ctx, "name")
+  let ok = tt_transition(ctx, "depart", tt_slot_of(names, name), tt_names_without(names, name), "", "", step_arg(ctx, "signers"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called tt_exclude takes ctx, revoke returns ok
+  require value_class(ctx) == 12
+  let names = tt_last_view(ctx)[1]
+  let name = step_arg(ctx, "name")
+  let slot = tt_slot_of(names, name)
+  let ok = tt_transition(ctx, "exclude", slot, tt_names_without(names, name), tt_evidence(slot), revoke, step_arg(ctx, "signers"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_exclude takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_exclude(ctx, "")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_exclude_revoke takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_exclude(ctx, step_arg(ctx, "date"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called tt_rekey takes ctx, revoke returns ok
+  require value_class(ctx) == 12
+  let names = tt_last_view(ctx)[1]
+  let name = step_arg(ctx, "name")
+  let ok = tt_transition(ctx, "rekey", tt_slot_of(names, name), tt_names_renamed(names, name, step_arg(ctx, "new")), "", revoke, step_arg(ctx, "signers"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_rekey takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_rekey(ctx, "")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_rekey_revoke takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_rekey(ctx, step_arg(ctx, "date"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_pin_other takes ctx returns ok
+  require value_class(ctx) == 12
+  ctx_set(ctx, "pin", sha256_string_hex("some other group"))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# A record file with one field's value replaced.
+make a function called tt_edit_field takes ctx, path, key, value returns bytes
+  require value_class(ctx) == 12
+  let r = trust_fields(read_file_bytes(path, 0, 1048576))
+  let out = []
+  if r[0] == "ok" then
+    let pairs = r[1]
+    let edited = []
+    let i = 0
+    while i < list_len(pairs) do
+      if pairs[i][0] == key then
+        let edited = list_push(edited, [key, value])
+      else
+        let edited = list_push(edited, pairs[i])
+      end
+      let i = i + 1
+    end
+    let out = trust_fields_bytes(edited)
+    write_file_bytes(path, out)
+  else
+    expect(ctx, "test setup reads " + path + tt_detail(r), r[0], "ok")
+  end
+  let bytes = out
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+make a function called st_tr_entry_field takes ctx returns ok
+  require value_class(ctx) == 12
+  let i = to_num(step_arg(ctx, "i"))
+  let stem = tt_log(ctx) + tt_pad4(i)
+  let tb = tt_edit_field(ctx, stem + "-transition.rec", step_arg(ctx, "key"), tt_text(tt_decode(step_arg(ctx, "value"))))
+  let names = ctx_get(ctx, "views")[i - 1][1]
+  write_file_bytes(stem + "-transition.sig", tt_sign(tt_signers(step_arg(ctx, "signers"), names, tt_last_view(ctx)[1]), sha256_hex(tb)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_entry_field_unsigned takes ctx returns ok
+  require value_class(ctx) == 12
+  let stem = tt_log(ctx) + tt_pad4(to_num(step_arg(ctx, "i")))
+  tt_edit_field(ctx, stem + "-transition.rec", step_arg(ctx, "key"), tt_text(tt_decode(step_arg(ctx, "value"))))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_view_field takes ctx returns ok
+  require value_class(ctx) == 12
+  let stem = tt_log(ctx) + tt_pad4(to_num(step_arg(ctx, "i")))
+  tt_edit_field(ctx, stem + "-view.rec", step_arg(ctx, "key"), tt_text(tt_decode(step_arg(ctx, "value"))))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_check_log takes ctx returns ok
+  require value_class(ctx) == 12
+  let oracle = tt_oracle()
+  let verify = |alg, pub, msg, sig| {
+    let out = str_trim(exec_capture("py", "-3", "-I", oracle, "verify", alg, pub, msg, sig))
+    let ok = out == "true"
+    ensure value_class(ok) == 1
+    return ok
+  }
+  ctx_set(ctx, "result", trust_check_log(tt_log(ctx), ctx_get(ctx, "pin"), verify))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_check_passes takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = ctx_get(ctx, "result")
+  let got = tt_outcome(r)
+  if r[0] == "ok" then
+    let got = "epoch " + trust_state_epoch(r[1])
+  end
+  let ok = expect(ctx, "the log checks" + tt_detail(r), got, "epoch " + step_arg(ctx, "e"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_fails_with takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = ctx_get(ctx, "result")
+  let ok = expect(ctx, "the check fails" + tt_detail(r), tt_outcome(r), step_arg(ctx, "stage") + " " + step_arg(ctx, "code"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# ---- packages ----
+
+make a function called tt_manifest_text takes pkg, ver, file, hash returns text
+  require value_class(pkg) == 8
+  let text = "package " + pkg + "\nversion " + ver + "\nsummary a test package\nentry " + file + "\ninclude " + file + "\nfile " + file + " sha256 " + hash + "\n"
+  ensure value_class(text) == 8
+  return text
+end
+
+make a function called tt_write_package takes ctx, content returns ok
+  require value_class(ctx) == 12
+  let d = tt_dir(ctx)
+  let file = ctx_get(ctx, "file")
+  write_file_bytes(d + file, utf8_encode(content))
+  let hash = sha256_string_hex(content)
+  write_file_bytes(d + "manifest.pkg", utf8_encode(tt_manifest_text(ctx_get(ctx, "pkg"), ctx_get(ctx, "ver"), file, hash)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_package takes ctx returns ok
+  require value_class(ctx) == 12
+  ctx_set(ctx, "pkg", step_arg(ctx, "p"))
+  ctx_set(ctx, "ver", step_arg(ctx, "v"))
+  ctx_set(ctx, "file", step_arg(ctx, "f"))
+  let ok = tt_write_package(ctx, "# a test file\nprint(1)\n")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called tt_manifest_hash takes ctx returns h
+  require value_class(ctx) == 12
+  let h = sha256_file_hex(tt_dir(ctx) + "manifest.pkg")
+  ensure h.length == 64
+  return h
+end
+
+# Writes release/<stored>.rec naming version, and its signatures over
+# sign_kind's form of it ("" for the release itself).
+make a function called tt_release takes ctx, version, stored, epoch, date, signer_spec, sign_kind returns ok
+  require value_class(ctx) == 12
+  let views = ctx_get(ctx, "views")
+  let entry = views[list_len(views) - 1]
+  if epoch < list_len(views) then
+    let entry = views[epoch]
+  end
+  let rb = tt_must(ctx, trust_write_release(ctx_get(ctx, "group"), epoch, trust_rec_hash(entry[0]), ctx_get(ctx, "pkg"), version, tt_manifest_hash(ctx), date), "a release")
+  let signed = rb
+  if sign_kind != "" then
+    let signed = tt_rekind(rb, sign_kind)
+  end
+  let stem = tt_dir(ctx) + "trust/release/" + stored
+  write_file_bytes(stem + ".rec", rb)
+  write_file_bytes(stem + ".sig", tt_sign(tt_signers(signer_spec, entry[1], tt_last_view(ctx)[1]), sha256_hex(signed)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# A record's bytes with its first line replaced by "record <kind>".
+make a function called tt_rekind takes bytes, kind returns out
+  require value_class(bytes) == 9
+  let r = utf8_encode("record " + kind + "\n")
+  let i = 0
+  while (i < list_len(bytes)) and (bytes[i] != 10) do
+    let i = i + 1
+  end
+  let i = i + 1
+  while i < list_len(bytes) do
+    let r = list_push(r, bytes[i])
+    let i = i + 1
+  end
+  let out = r
+  ensure value_class(out) == 9
+  return out
+end
+
+make a function called tt_current_epoch takes ctx returns e
+  require value_class(ctx) == 12
+  let e = list_len(ctx_get(ctx, "views")) - 1
+  ensure e >= 0
+  return e
+end
+
+make a function called st_tr_release takes ctx returns ok
+  require value_class(ctx) == 12
+  let v = step_arg(ctx, "v")
+  let ok = tt_release(ctx, v, v, tt_current_epoch(ctx), "2026-11-08", step_arg(ctx, "signers"), "")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_release_at takes ctx returns ok
+  require value_class(ctx) == 12
+  let v = step_arg(ctx, "v")
+  let ok = tt_release(ctx, v, v, to_num(step_arg(ctx, "e")), step_arg(ctx, "date"), step_arg(ctx, "signers"), "")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_release_kind takes ctx returns ok
+  require value_class(ctx) == 12
+  let v = step_arg(ctx, "v")
+  let ok = tt_release(ctx, v, v, tt_current_epoch(ctx), "2026-11-08", step_arg(ctx, "signers"), step_arg(ctx, "kind"))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_release_named takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_release(ctx, step_arg(ctx, "w"), step_arg(ctx, "v"), tt_current_epoch(ctx), "2026-11-08", step_arg(ctx, "signers"), "")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_withdraw takes ctx returns ok
+  require value_class(ctx) == 12
+  let v = step_arg(ctx, "v")
+  let entry = tt_last_view(ctx)
+  let wb = tt_must(ctx, trust_write_withdraw(ctx_get(ctx, "group"), tt_current_epoch(ctx), trust_rec_hash(entry[0]), ctx_get(ctx, "pkg"), v, "its inflate loop never ends on a crafted stream"), "a withdrawal")
+  let stem = tt_dir(ctx) + "trust/withdraw/" + v
+  write_file_bytes(stem + ".rec", wb)
+  write_file_bytes(stem + ".sig", tt_sign(tt_signers(step_arg(ctx, "signers"), entry[1], entry[1]), sha256_hex(wb)))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_file_changed takes ctx returns ok
+  require value_class(ctx) == 12
+  write_file_bytes(tt_dir(ctx) + step_arg(ctx, "f"), utf8_encode("# a changed file\nprint(2)\n"))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_file_and_manifest takes ctx returns ok
+  require value_class(ctx) == 12
+  let ok = tt_write_package(ctx, "# a changed file\nprint(2)\n")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_file_removed takes ctx returns ok
+  require value_class(ctx) == 12
+  remove_file(tt_dir(ctx) + step_arg(ctx, "f"))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_verify takes ctx returns ok
+  require value_class(ctx) == 12
+  let oracle = tt_oracle()
+  let verify = |alg, pub, msg, sig| {
+    let out = str_trim(exec_capture("py", "-3", "-I", oracle, "verify", alg, pub, msg, sig))
+    let ok = out == "true"
+    ensure value_class(ok) == 1
+    return ok
+  }
+  ctx_set(ctx, "result", trust_verify_package(tt_dir(ctx), ctx_get(ctx, "pin"), verify))
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_tr_verify_passes takes ctx returns ok
+  require value_class(ctx) == 12
+  let r = ctx_get(ctx, "result")
+  let ok = expect(ctx, "the package verifies" + tt_detail(r), tt_outcome(r), "ok")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# The first matching pattern wins, so longer forms come before the forms
+# they extend.
+make a function called register_trust_steps takes ctx returns ok
+  require value_class(ctx) == 12
+  step(ctx, "the bytes \"\"", "st_tr_empty")
+  step(ctx, "the bytes \"{text}\"", "st_tr_bytes")
+  step(ctx, "reading it as a {kind} succeeds", "st_tr_read_ok")
+  step(ctx, "reading it as a {kind} fails with \"{code}\"", "st_tr_read_fails")
+  step(ctx, "the view has epoch {e}, {n} members and needs {k} signatures", "st_tr_view_shape")
+  step(ctx, "the view needs {k} signatures for an exclusion", "st_tr_view_need_excl")
+  step(ctx, "the view needs {k} signatures", "st_tr_view_need")
+  step(ctx, "its hash is the one Python's hashlib gives", "st_tr_hash_py")
+  step(ctx, "the release names package \"{p}\" version \"{v}\" at epoch {e}", "st_tr_release_names")
+  step(ctx, "a view with {n} members", "st_tr_view_n")
+  step(ctx, "a signature file with {n} lines", "st_tr_sigs_n")
+  step(ctx, "a withdrawal whose reason is {n} characters long", "st_tr_withdraw_n")
+  step(ctx, "every proper prefix of it fails to read as a {kind}", "st_tr_prefixes")
+  step(ctx, "{n} pseudo-random byte strings each fail to read as every kind", "st_tr_random")
+  step(ctx, "a view is written with group \"{g}\" epoch {e} quorum \"{q}\" and members \"{m}\"", "st_tr_write_view")
+  step(ctx, "a view is written with group \"\" epoch {e} quorum \"{q}\" and members \"{m}\"", "st_tr_write_view")
+  step(ctx, "a release is written for package \"{p}\" version \"{v}\" at epoch {e}", "st_tr_write_release")
+  step(ctx, "a signature file is written for slots \"{m}\"", "st_tr_write_sigs")
+  step(ctx, "the writing succeeds and reads back as a {kind}", "st_tr_written_ok")
+  step(ctx, "the writing fails with \"{code}\"", "st_tr_written_fails")
+  step(ctx, "its text is \"{text}\"", "st_tr_text_is")
+  step(ctx, "a group founded by \"{names}\" with quorum \"{q}\", the genesis signed by \"{signers}\"", "st_tr_group_signed")
+  step(ctx, "a group founded by \"{names}\" with quorum \"{q}\"", "st_tr_group")
+  step(ctx, "\"{name}\" is admitted as slot {slot}, signed by \"{signers}\"", "st_tr_admit")
+  step(ctx, "\"{name}\" departs, signed by \"{signers}\"", "st_tr_depart")
+  step(ctx, "\"{name}\" is excluded revoking from \"{date}\", signed by \"{signers}\"", "st_tr_exclude_revoke")
+  step(ctx, "\"{name}\" is excluded, signed by \"{signers}\"", "st_tr_exclude")
+  step(ctx, "\"{name}\" rekeys to \"{new}\" revoking from \"{date}\", signed by \"{signers}\"", "st_tr_rekey_revoke")
+  step(ctx, "\"{name}\" rekeys to \"{new}\", signed by \"{signers}\"", "st_tr_rekey")
+  step(ctx, "the pin is a different hash", "st_tr_pin_other")
+  step(ctx, "log entry {i}'s \"{key}\" is changed to \"{value}\" and re-signed by \"{signers}\"", "st_tr_entry_field")
+  step(ctx, "log entry {i}'s \"{key}\" is changed to \"{value}\" without re-signing", "st_tr_entry_field_unsigned")
+  step(ctx, "log entry {i}'s view has its \"{key}\" changed to \"{value}\"", "st_tr_view_field")
+  step(ctx, "the log is checked", "st_tr_check_log")
+  step(ctx, "the check passes at epoch {e}", "st_tr_check_passes")
+  step(ctx, "the check fails at \"{stage}\" with \"{code}\"", "st_tr_fails_with")
+  step(ctx, "the package \"{p}\" version \"{v}\" with the file \"{f}\"", "st_tr_package")
+  step(ctx, "version \"{v}\" is released at epoch {e} dated \"{date}\", signed by \"{signers}\"", "st_tr_release_at")
+  step(ctx, "version \"{v}\" is released, signed over the same lines as a \"{kind}\" record by \"{signers}\"", "st_tr_release_kind")
+  step(ctx, "version \"{v}\" is released, signed by \"{signers}\"", "st_tr_release")
+  step(ctx, "a release naming version \"{w}\" is stored as version \"{v}\", signed by \"{signers}\"", "st_tr_release_named")
+  step(ctx, "version \"{v}\" is withdrawn, signed by \"{signers}\"", "st_tr_withdraw")
+  step(ctx, "the file \"{f}\" is changed and its manifest line updated", "st_tr_file_and_manifest")
+  step(ctx, "the file \"{f}\" is changed", "st_tr_file_changed")
+  step(ctx, "the file \"{f}\" is removed", "st_tr_file_removed")
+  step(ctx, "the package is verified", "st_tr_verify")
+  step(ctx, "the verification passes", "st_tr_verify_passes")
+  step(ctx, "the verification fails at \"{stage}\" with \"{code}\"", "st_tr_fails_with")
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+let ctx = ctx_new()
+register_trust_steps(ctx)
+let only = argv()
+if list_len(only) > 0 then
+  run_feature_file(ctx, only[0])
+else
+  run_feature_file(ctx, "packages/trust/spec/records.feature")
+  run_feature_file(ctx, "packages/trust/spec/log.feature")
+  run_feature_file(ctx, "packages/trust/spec/release.feature")
+end
+if not ctx_report(ctx) then
+  exit_with(1)
+end

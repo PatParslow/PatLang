@@ -1,0 +1,606 @@
+# The trust checks (docs/plans/package-trust.md, "Verifying a package"):
+# quorum certificates, the genesis, the transition log, release
+# statements, withdrawals and revocations.
+#
+# The signature check is not PatLang's: every check that needs one takes a
+# function value verify(alg, public key hex, message hex, signature hex)
+# giving true when the signature holds. The message signed is always a
+# record's hash, so a signature is bound to one record of one kind.
+#
+# A failure is ["err", code, stage, detail]. Stages: "genesis", "log <n>"
+# (the transition log entry n), "release", "withdrawal", "revocation".
+# Codes, beyond the readers' "malformed" and "too-large":
+#   missing            a record file the check needs is absent
+#   pin-mismatch       the genesis record is not the pinned one
+#   view-mismatch      a view is not the one its genesis, transition or
+#                      statement names, or a transition does not start
+#                      from the view before it
+#   epoch-mismatch     a view or transition has the wrong epoch
+#   group-mismatch     a record names another group
+#   founder-missing    a founder did not sign the genesis
+#   not-member         a signature for a slot the view does not have
+#   duplicate-signer   two signatures for one slot
+#   bad-signature      a signature verify refuses
+#   too-few            fewer signatures than the view's quorum
+#   view-change        a new view is not the old one changed as its reason says
+#   subject-missing    a departure or rekey the subject did not sign
+#   epoch-unknown      a statement names an epoch the log does not reach
+#   manifest-mismatch, package-mismatch, version-mismatch
+#                      a release that does not name this manifest
+#   withdrawn          a valid withdrawal names the release
+#   revoked            without its revoked signers a release has too few
+
+# ---- the log state ----
+#
+# A vec: 0 the group (genesis hash), 1 the genesis record, 2 a vec of the
+# views by epoch, 3 the revocations [[alg, key, from date]].
+
+make a function called tr_state_new takes group, genesis, view returns s
+  require (value_class(group) == 8) and (value_class(genesis) == 9)
+  let views = vec_new()
+  vec_push(views, view)
+  let s = vec_new()
+  vec_push(s, group)
+  vec_push(s, genesis)
+  vec_push(s, views)
+  vec_push(s, [])
+  ensure vec_len(s) == 4
+  return s
+end
+
+make a function called trust_state_group takes s returns g
+  require value_class(s) == 12
+  let g = vec_get(s, 0)
+  ensure value_class(g) == 8
+  return g
+end
+
+# The highest epoch the log reaches.
+make a function called trust_state_epoch takes s returns e
+  require value_class(s) == 12
+  let e = vec_len(vec_get(s, 2)) - 1
+  ensure e >= 0
+  return e
+end
+
+# The view of an epoch the log reaches.
+make a function called trust_state_view takes s, epoch returns v
+  require (epoch >= 0) and (epoch <= trust_state_epoch(s))
+  let v = vec_get(vec_get(s, 2), epoch)
+  ensure v[0] == "view"
+  return v
+end
+
+make a function called trust_state_revocations takes s returns rs
+  require value_class(s) == 12
+  let rs = vec_get(s, 3)
+  ensure value_class(rs) == 9
+  return rs
+end
+
+# ---- quorums and certificates ----
+
+# The signatures a decision of the view needs. For an exclusion the subject
+# is left out of the denominator: a majority is of the N - 1 others,
+# floor((N - 1) / 2) + 1, and a count is at most N - 1.
+make a function called trust_quorum_need takes view, excluding returns need
+  require (view[0] == "view") and (value_class(excluding) == 1)
+  let n = list_len(view[5])
+  if excluding then
+    let n = n - 1
+  end
+  let need = (n shr 1) + 1
+  if view[4] > 0 then
+    let need = view[4]
+    if need > n then
+      let need = n
+    end
+  end
+  ensure need >= 0
+  return need
+end
+
+# The index of a slot among a view's members (in slot order), or -1.
+make a function called tr_member_index takes members, slot returns idx
+  require value_class(members) == 9
+  let lo = 0
+  let hi = list_len(members)
+  while lo < hi do
+    let mid = (lo + hi) shr 1
+    if members[mid][0] < slot then
+      let lo = mid + 1
+    else
+      let hi = mid
+    end
+  end
+  let idx = 0 - 1
+  if (lo < list_len(members)) and (members[lo][0] == slot) then
+    let idx = lo
+  end
+  ensure idx >= 0 - 1
+  return idx
+end
+
+# The slots whose signatures over hash count: ["ok", slots] or a failure.
+# Every line must be a distinct member of the view, and every counted
+# signature must hold. The excluded slot (-1 for none) is not counted and
+# its signature is not checked.
+make a function called trust_cert_signers takes view, hash, sigs, verify, excluded, stage returns r
+  require (view[0] == "view") and (sigs[0] == "sigs") and (value_class(hash) == 8)
+  let members = view[5]
+  let seen = vec_new()
+  let i = 0
+  while i < list_len(members) do
+    vec_push(seen, false)
+    let i = i + 1
+  end
+  let lines = sigs[2]
+  let counted = []
+  let i = 0
+  while i < list_len(lines) do
+    let slot = lines[i][0]
+    let idx = tr_member_index(members, slot)
+    if idx < 0 then
+      let r = trust_err("not-member", stage, "slot " + slot + " is not a member of epoch " + view[3])
+      ensure r[0] == "err"
+      return r
+    end
+    if vec_get(seen, idx) then
+      let r = trust_err("duplicate-signer", stage, "slot " + slot + " signed twice")
+      ensure r[0] == "err"
+      return r
+    end
+    vec_set(seen, idx, true)
+    if slot != excluded then
+      let m = members[idx]
+      let ok = verify(m[1], m[2], hash, lines[i][1])
+      if ok != true then
+        let r = trust_err("bad-signature", stage, "slot " + slot + "'s signature does not hold")
+        ensure r[0] == "err"
+        return r
+      end
+      let counted = list_push(counted, slot)
+    end
+    let i = i + 1
+  end
+  let r = ["ok", counted]
+  ensure value_class(r) == 9
+  return r
+end
+
+# A certificate that must reach the view's quorum: ["ok", slots] or a failure.
+make a function called trust_check_cert takes view, hash, sigs, verify, excluded, stage returns r
+  require view[0] == "view"
+  let cr = trust_cert_signers(view, hash, sigs, verify, excluded, stage)
+  let r = cr
+  if cr[0] == "ok" then
+    let need = trust_quorum_need(view, excluded >= 0)
+    if list_len(cr[1]) < need then
+      let r = trust_err("too-few", stage, to_s(list_len(cr[1])) + " counted signatures, " + need + " needed")
+    end
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# ---- genesis ----
+
+# Steps 2: the genesis record is the pinned one, names the epoch-0 view,
+# and every founder signed it. ["ok", state] or a failure.
+make a function called trust_check_genesis takes gbytes, sbytes, vbytes, pin, verify returns r
+  require (value_class(gbytes) == 9) and (value_class(sbytes) == 9) and (value_class(vbytes) == 9)
+  let stage = "genesis"
+  let gr = trust_read_genesis(gbytes)
+  if gr[0] != "ok" then
+    let r = tr_restage(gr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let gen = gr[1]
+  if gen[1] != pin then
+    let r = trust_err("pin-mismatch", stage, "the genesis hash " + gen[1] + " is not the pinned " + pin)
+    ensure r[0] == "err"
+    return r
+  end
+  let vr = trust_read_view(vbytes)
+  if vr[0] != "ok" then
+    let r = tr_restage(vr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let view = vr[1]
+  if view[1] != gen[3] then
+    let r = trust_err("view-mismatch", stage, "the epoch-0 view's hash is not the one the genesis names")
+    ensure r[0] == "err"
+    return r
+  end
+  let sr = trust_read_sigs(sbytes)
+  if sr[0] != "ok" then
+    let r = tr_restage(sr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let cr = trust_cert_signers(view, gen[1], sr[1], verify, 0 - 1, stage)
+  if cr[0] != "ok" then
+    let r = cr
+    ensure r[0] == "err"
+    return r
+  end
+  if list_len(cr[1]) != list_len(view[5]) then
+    let r = trust_err("founder-missing", stage, to_s(list_len(cr[1])) + " of " + list_len(view[5]) + " founders signed")
+    ensure r[0] == "err"
+    return r
+  end
+  let r = ["ok", tr_state_new(gen[1], gen, view)]
+  ensure r[0] == "ok"
+  return r
+end
+
+# A reader's failure at the stage of the check that read it.
+make a function called tr_restage takes e, stage returns r
+  require (e[0] == "err") and (value_class(stage) == 8)
+  let r = trust_err(e[1], stage, e[2] + ": " + e[3])
+  ensure r[0] == "err"
+  return r
+end
+
+# ---- transitions ----
+
+# Whether next is prev changed as reason says for subject: ["ok", true] or
+# a "view-change" failure. Members are in slot order, so one pass compares.
+make a function called tr_view_change takes prev, next, reason, subject, stage returns r
+  require (prev[0] == "view") and (next[0] == "view")
+  let a = prev[5]
+  let b = next[5]
+  let ia = tr_member_index(a, subject)
+  let ib = tr_member_index(b, subject)
+  let problem = ""
+  if reason == "admit" then
+    if (ia >= 0) or (ib < 0) then
+      let problem = "an admission's subject must be new to the view and in the next"
+    end
+  elif (reason == "depart") or (reason == "exclude") then
+    if (ia < 0) or (ib >= 0) then
+      let problem = "a departure's or exclusion's subject must be in the view and not the next"
+    end
+  elif (ia < 0) or (ib < 0) then
+    let problem = "a rekey's subject must be in both views"
+  elif a[ia][2] == b[ib][2] then
+    let problem = "a rekey must change the subject's key"
+  end
+  if (problem == "") and (not tr_same_except(a, b, subject)) then
+    let problem = "members other than the subject changed"
+  end
+  let r = ["ok", true]
+  if problem != "" then
+    let r = trust_err("view-change", stage, problem)
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# Whether two member lists are equal once the subject's slot is left out.
+make a function called tr_same_except takes a, b, subject returns same
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let same = true
+  let i = 0
+  let j = 0
+  while same and ((i < list_len(a)) or (j < list_len(b))) do
+    if (i < list_len(a)) and (a[i][0] == subject) then
+      let i = i + 1
+    elif (j < list_len(b)) and (b[j][0] == subject) then
+      let j = j + 1
+    elif (i >= list_len(a)) or (j >= list_len(b)) then
+      let same = false
+    else
+      let x = a[i]
+      let y = b[j]
+      let same = (x[0] == y[0]) and (x[1] == y[1]) and (x[2] == y[2])
+      let i = i + 1
+      let j = j + 1
+    end
+  end
+  ensure value_class(same) == 1
+  return same
+end
+
+# Step 3 for one log entry: the transition starts from the state's last
+# epoch and view, names the next view, changes it as its reason says, and
+# is signed by a quorum of the last view (the subject of an exclusion left
+# out; the subject of a departure or rekey among the signers). On success
+# the next view joins the state, with any revocation: ["ok", state].
+make a function called trust_check_transition takes s, tbytes, sbytes, vbytes, verify, index returns r
+  require (value_class(tbytes) == 9) and (value_class(sbytes) == 9) and (value_class(vbytes) == 9)
+  let stage = "log " + index
+  let tr = trust_read_transition(tbytes)
+  if tr[0] != "ok" then
+    let r = tr_restage(tr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let t = tr[1]
+  let vr = trust_read_view(vbytes)
+  if vr[0] != "ok" then
+    let r = tr_restage(vr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let next = vr[1]
+  let sr = trust_read_sigs(sbytes)
+  if sr[0] != "ok" then
+    let r = tr_restage(sr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let group = trust_state_group(s)
+  let prev = trust_state_view(s, trust_state_epoch(s))
+  let r = ["ok", s]
+  if (t[2] != group) or (next[2] != group) then
+    let r = trust_err("group-mismatch", stage, "the transition or its view names another group")
+  elif (t[3] != prev[3]) or (t[5] != prev[3] + 1) or (next[3] != t[5]) then
+    let r = trust_err("epoch-mismatch", stage, "from-epoch " + t[3] + " to-epoch " + t[5] + " after epoch " + prev[3])
+  elif t[4] != prev[1] then
+    let r = trust_err("view-mismatch", stage, "from-view is not epoch " + prev[3] + "'s view")
+  elif t[6] != next[1] then
+    let r = trust_err("view-mismatch", stage, "the view beside the transition is not its to-view")
+  end
+  if r[0] != "ok" then
+    ensure r[0] == "err"
+    return r
+  end
+  let excluded = 0 - 1
+  if t[7] == "exclude" then
+    let excluded = t[8]
+  end
+  let cr = trust_check_cert(prev, t[1], sr[1], verify, excluded, stage)
+  if cr[0] != "ok" then
+    let r = cr
+    ensure r[0] == "err"
+    return r
+  end
+  let vc = tr_view_change(prev, next, t[7], t[8], stage)
+  if vc[0] != "ok" then
+    let r = vc
+    ensure r[0] == "err"
+    return r
+  end
+  if ((t[7] == "depart") or (t[7] == "rekey")) and (not tr_has(cr[1], t[8])) then
+    let r = trust_err("subject-missing", stage, "slot " + t[8] + " did not sign its own " + t[7])
+    ensure r[0] == "err"
+    return r
+  end
+  if t[10] > 0 then
+    let m = prev[5][tr_member_index(prev[5], t[8])]
+    vec_set(s, 3, list_push(vec_get(s, 3), [m[1], m[2], t[10]]))
+  end
+  vec_push(vec_get(s, 2), next)
+  let r = ["ok", s]
+  ensure r[0] == "ok"
+  return r
+end
+
+make a function called tr_has takes items, x returns yes
+  require value_class(items) == 9
+  let yes = false
+  let i = 0
+  while (not yes) and (i < list_len(items)) do
+    let yes = items[i] == x
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# ---- files ----
+
+# A file's bytes, at most max: ["ok", bytes], or "missing" / "too-large".
+make a function called trust_read_file takes path, max, stage returns r
+  require (value_class(path) == 8) and (max > 0)
+  if not file_exists(path) then
+    let r = trust_err("missing", stage, path)
+    ensure r[0] == "err"
+    return r
+  end
+  let bytes = read_file_bytes(path, 0, max + 1)
+  let r = ["ok", bytes]
+  if list_len(bytes) > max then
+    let r = trust_err("too-large", stage, path + " is more than " + max + " bytes")
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# A log entry's file name: dir, the entry number in at least four digits,
+# the suffix.
+make a function called tr_entry_path takes dir, n, suffix returns p
+  require n >= 0
+  let num = to_s(n)
+  if num.length < 4 then
+    let num = substr("000", 0, 4 - num.length) + num
+  end
+  let p = dir + num + suffix
+  ensure value_class(p) == 8
+  return p
+end
+
+make a function called trust_max_log_entries returns n
+  require true
+  let n = 10000
+  ensure n > 0
+  return n
+end
+
+# Steps 2 and 3 over a log directory (ending in /): 0000-genesis.rec,
+# 0000-genesis.sig, 0000-view.rec, then for n = 1, 2, ... while
+# NNNN-transition.rec exists, NNNN-transition.sig and NNNN-view.rec.
+# ["ok", state] or the first failure.
+make a function called trust_check_log takes dir, pin, verify returns r
+  require (value_class(dir) == 8) and (value_class(pin) == 8)
+  let max = trust_max_record_bytes()
+  let g = trust_read_file(tr_entry_path(dir, 0, "-genesis.rec"), max, "genesis")
+  let gs = trust_read_file(tr_entry_path(dir, 0, "-genesis.sig"), max, "genesis")
+  let v = trust_read_file(tr_entry_path(dir, 0, "-view.rec"), max, "genesis")
+  let r = g
+  if g[0] != "ok" then
+    let r = g
+  elif gs[0] != "ok" then
+    let r = gs
+  elif v[0] != "ok" then
+    let r = v
+  else
+    let r = trust_check_genesis(g[1], gs[1], v[1], pin, verify)
+  end
+  let n = 1
+  let more = (r[0] == "ok") and file_exists(tr_entry_path(dir, n, "-transition.rec"))
+  while more do
+    let stage = "log " + n
+    if n >= trust_max_log_entries() then
+      let r = trust_err("too-large", stage, "a log holds at most " + trust_max_log_entries() + " entries")
+      ensure r[0] == "err"
+      return r
+    end
+    let t = trust_read_file(tr_entry_path(dir, n, "-transition.rec"), max, stage)
+    let ts = trust_read_file(tr_entry_path(dir, n, "-transition.sig"), max, stage)
+    let tv = trust_read_file(tr_entry_path(dir, n, "-view.rec"), max, stage)
+    if t[0] != "ok" then
+      let r = t
+    elif ts[0] != "ok" then
+      let r = ts
+    elif tv[0] != "ok" then
+      let r = tv
+    else
+      let r = trust_check_transition(r[1], t[1], ts[1], tv[1], verify, n)
+    end
+    let n = n + 1
+    let more = (r[0] == "ok") and file_exists(tr_entry_path(dir, n, "-transition.rec"))
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# ---- releases ----
+
+# Step 5: the release names this manifest (its hash, package and version)
+# and an epoch and view of the log, and a quorum of that view signed it.
+# ["ok", [release, counted slots]] or a failure.
+make a function called trust_check_release takes s, manifest_bytes, rbytes, sbytes, verify returns r
+  require (value_class(manifest_bytes) == 9) and (value_class(rbytes) == 9) and (value_class(sbytes) == 9)
+  let stage = "release"
+  let mr = trust_manifest_names(manifest_bytes)
+  if mr[0] != "ok" then
+    let r = tr_restage(mr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let rr = trust_read_release(rbytes)
+  if rr[0] != "ok" then
+    let r = tr_restage(rr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let rel = rr[1]
+  let sr = trust_read_sigs(sbytes)
+  if sr[0] != "ok" then
+    let r = tr_restage(sr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let r = ["ok", []]
+  if rel[2] != trust_state_group(s) then
+    let r = trust_err("group-mismatch", stage, "the release names another group")
+  elif rel[7] != sha256_hex(manifest_bytes) then
+    let r = trust_err("manifest-mismatch", stage, "the manifest's hash is not the one the release names")
+  elif rel[5] != mr[1][0] then
+    let r = trust_err("package-mismatch", stage, "the release names package " + rel[5] + ", the manifest " + mr[1][0])
+  elif rel[6] != mr[1][1] then
+    let r = trust_err("version-mismatch", stage, "the release names version " + rel[6] + ", the manifest " + mr[1][1])
+  elif rel[3] > trust_state_epoch(s) then
+    let r = trust_err("epoch-unknown", stage, "epoch " + rel[3] + " is beyond the log's " + trust_state_epoch(s))
+  elif rel[4] != trust_state_view(s, rel[3])[1] then
+    let r = trust_err("view-mismatch", stage, "the release's view is not epoch " + rel[3] + "'s")
+  end
+  if r[0] != "ok" then
+    ensure r[0] == "err"
+    return r
+  end
+  let cr = trust_check_cert(trust_state_view(s, rel[3]), rel[1], sr[1], verify, 0 - 1, stage)
+  let r = cr
+  if cr[0] == "ok" then
+    let r = ["ok", [rel, cr[1]]]
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# Step 6, revocations: a signer whose key some transition revoked from a
+# date at or before the release's no longer counts; the release fails when
+# the rest fall short of its view's quorum. ["ok", remaining slots] or a
+# "revoked" failure.
+make a function called trust_check_revocations takes s, rel, counted returns r
+  require (rel[0] == "release") and (value_class(counted) == 9)
+  let view = trust_state_view(s, rel[3])
+  let revs = trust_state_revocations(s)
+  let remaining = []
+  let i = 0
+  while i < list_len(counted) do
+    let m = view[5][tr_member_index(view[5], counted[i])]
+    let revoked = false
+    let k = 0
+    while (not revoked) and (k < list_len(revs)) do
+      let revoked = (revs[k][0] == m[1]) and (revs[k][1] == m[2]) and (revs[k][2] <= rel[8])
+      let k = k + 1
+    end
+    if not revoked then
+      let remaining = list_push(remaining, counted[i])
+    end
+    let i = i + 1
+  end
+  let need = trust_quorum_need(view, false)
+  let r = ["ok", remaining]
+  if list_len(remaining) < need then
+    let r = trust_err("revoked", "revocation", to_s(list_len(counted) - list_len(remaining)) + " signers' keys are revoked; " + list_len(remaining) + " left, " + need + " needed")
+  end
+  ensure value_class(r) == 9
+  return r
+end
+
+# Step 6, withdrawal: a withdrawal of the release's package and version,
+# at an epoch and view of the log, signed by a quorum of that view, gives
+# "withdrawn". A withdrawal that does not hold is a failure of its own:
+# the check never passes over a withdrawal it cannot read or check.
+make a function called trust_check_withdrawal takes s, rel, wbytes, sbytes, verify returns r
+  require (rel[0] == "release") and (value_class(wbytes) == 9) and (value_class(sbytes) == 9)
+  let stage = "withdrawal"
+  let wr = trust_read_withdraw(wbytes)
+  if wr[0] != "ok" then
+    let r = tr_restage(wr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let w = wr[1]
+  let sr = trust_read_sigs(sbytes)
+  if sr[0] != "ok" then
+    let r = tr_restage(sr, stage)
+    ensure r[0] == "err"
+    return r
+  end
+  let r = ["ok", true]
+  if w[2] != trust_state_group(s) then
+    let r = trust_err("group-mismatch", stage, "the withdrawal names another group")
+  elif (w[5] != rel[5]) or (w[6] != rel[6]) then
+    let r = trust_err("version-mismatch", stage, "the withdrawal names " + w[5] + " " + w[6] + ", not the release")
+  elif w[3] > trust_state_epoch(s) then
+    let r = trust_err("epoch-unknown", stage, "epoch " + w[3] + " is beyond the log's " + trust_state_epoch(s))
+  elif w[4] != trust_state_view(s, w[3])[1] then
+    let r = trust_err("view-mismatch", stage, "the withdrawal's view is not epoch " + w[3] + "'s")
+  end
+  if r[0] == "ok" then
+    let cr = trust_check_cert(trust_state_view(s, w[3]), w[1], sr[1], verify, 0 - 1, stage)
+    let r = cr
+    if cr[0] == "ok" then
+      let r = trust_err("withdrawn", stage, rel[5] + " " + rel[6] + " is withdrawn: " + w[7])
+    end
+  end
+  ensure r[0] == "err"
+  return r
+end
