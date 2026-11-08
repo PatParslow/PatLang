@@ -81,3 +81,9 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When v2 builds it as a WebAssembly module and a headless browser runs the module
     Then the browser prints what v2's own build prints, and stops at the same contract
     And the module is byte for byte what bootstrap/ir_wasm.py builds from v2's IR of the program
+
+  Scenario: slots never live at the same time share a WebAssembly local (spec 2.6)
+    Given two programs whose top level runs 100 and 1000 statements, each making temporaries and dropping them
+    When v2 builds each as a WebAssembly module
+    Then the top level's function has as many locals in both, and each module prints in a headless browser what v2's own build of it prints
+    And each module is byte for byte what bootstrap/ir_wasm.py builds from v2's IR of its program

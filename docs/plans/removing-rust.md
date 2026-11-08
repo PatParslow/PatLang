@@ -87,10 +87,16 @@ Made by the project owner on 2026-11-05:
      agree (62), part 2 (93), the language suite on both engines (245), match (26) and the
      block model (211).
    - **Not done:**
-     - **Huge functions.** A function with tens of thousands of slots is slow to start in a
-       browser's first compiler tier. One WASM local per slot word makes each branch cost
-       time in proportion to the locals: `rt_big_frame`'s 15,049-slot `__main` takes 40 s
-       there, and 2 s once optimised ([#250](https://github.com/PatParslow/PatLang/issues/250)).
+     - **Huge functions.** A function with tens of thousands of slots is slow to start in V8's
+       first compiler tier, where each branch costs time in proportion to the locals
+       ([#250](https://github.com/PatParslow/PatLang/issues/250)). Since 2026-11-08, slots never
+       live at the same time share a pair of locals. The compiler's 913 functions need 16,960
+       pairs for their 62,487 slots, but `rt_big_frame`'s `__main` still needs 3,005 pairs for
+       15,049 slots, and takes 26 s in that tier (38 s before; 1.1 s optimised). Its 3,000 `if`
+       conditions are temporaries that a branch reads, which the ownership stage holds until the
+       return, so each keeps a pair. The browser is a presentation layer: the compiler is built
+       as WebAssembly only to check the two writers against each other, never to run there, so
+       this waits until a program that size has to run in a browser.
      - **Writer speed.** The PatLang writer takes about 10 s per MB of module.
 
 ## The survey

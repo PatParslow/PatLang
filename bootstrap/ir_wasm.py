@@ -140,6 +140,142 @@ def structure(instrs, seg_of, nseg):
     return plan
 
 
+# ---- slots to locals --------------------------------------------------------
+
+
+def slot_access(ins):
+    """(writes, reads): the slots an instruction gives a new value outright,
+    and those it reads or changes in part (move's source, clear)."""
+    op = ins[0]
+    if op == "const":
+        return [ins[1]], []
+    if op in ("copy", "move"):
+        return [ins[1]], [ins[2]]
+    if op in ("clear", "retain", "release", "return", "branch"):
+        return [], [ins[1]]
+    if op in ("call", "prim", "closure"):
+        return [ins[1]], ins[3]
+    if op in ("extern", "externf"):
+        return [ins[1]], ins[4]
+    if op == "op":
+        return [ins[1]], [ins[3], ins[4]]
+    if op == "un":
+        return [ins[1]], [ins[3]]
+    if op in ("list", "callv"):
+        return [ins[1]], ins[2]
+    if op in ("label", "jump"):
+        return [], []
+    raise IRError("unknown instruction " + op)
+
+
+def slot_locals(nparams, nslots, instrs):
+    """Which local pair holds each slot, and how many pairs there are.
+
+    A slot's range is the span of instructions from the first to the last at
+    which it is live or named: liveness is over basic blocks (a new one at
+    each label and after each jump, branch or return), reading a slot back
+    through blocks that do not write it. A slot live where the function
+    begins ranges from 0, as each parameter does, since locals start at zero.
+    Slots whose ranges do not overlap share a pair: going through the
+    instructions in order, slots whose ranges begin at an instruction take,
+    in slot order, the pair last given back, or a new one; then slots whose
+    ranges end there give theirs back, in slot order. Parameter k keeps
+    pair k. A slot no instruction names has no pair (-1).
+
+    Reading a slot back can lower its range's start, or raise its end past
+    the last instruction naming it only through a jump back. So once a range
+    starts at 0 and ends at or after every block jumping back, nothing more
+    is read back for that slot; the ranges are the same either way."""
+    n = len(instrs)
+    starts = [0]
+    for k in range(1, n):
+        if instrs[k][0] == "label" or instrs[k - 1][0] in ("jump", "branch", "return"):
+            starts.append(k)
+    nb = len(starts)
+    ends = [starts[i + 1] - 1 for i in range(nb - 1)] + [n - 1]
+    block_of = {}
+    for i in range(nb):
+        if n and instrs[starts[i]][0] == "label":
+            block_of[instrs[starts[i]][1]] = i
+    preds = [[] for _ in range(nb)]
+    back = -1                           # the furthest end of a block jumping back
+    for i in range(nb):
+        last = instrs[ends[i]] if n else ["label"]
+        if last[0] == "jump":
+            succ = [block_of[last[1]]]
+        elif last[0] == "branch":
+            succ = [block_of[last[2]], block_of[last[3]]]
+        elif last[0] == "return":
+            succ = []
+        else:
+            succ = [i + 1] if i + 1 < nb else []
+        for t in succ:
+            preds[t].append(i)
+            if t <= i:
+                back = max(back, ends[i])
+    lo = [-1] * nslots
+    hi = [-1] * nslots
+    for s in range(nparams):
+        lo[s] = 0
+        hi[s] = 0
+    written = [None] * nslots           # per slot, the blocks writing it
+    exposed = []                        # (slot, block): read before any write there
+    for i in range(nb):
+        seen = set()
+        for k in range(starts[i], ends[i] + 1):
+            ws, rs = slot_access(instrs[k])
+            for s in list(rs) + ws:
+                if lo[s] < 0 or k < lo[s]:
+                    lo[s] = k
+                if k > hi[s]:
+                    hi[s] = k
+            for s in rs:
+                if s not in seen:
+                    exposed.append((s, i))
+            for s in ws:
+                seen.add(s)
+                if written[s] is None:
+                    written[s] = set()
+                written[s].add(i)
+    reached = [-1] * nb                 # the slot last found live into each block
+    for s, i in exposed:
+        if reached[i] == s or (lo[s] == 0 and hi[s] >= back):
+            continue
+        reached[i] = s
+        ws = written[s] or ()
+        work = [i]
+        while work and not (lo[s] == 0 and hi[s] >= back):
+            b = work.pop()
+            lo[s] = min(lo[s], starts[b])
+            for p in preds[b]:
+                hi[s] = max(hi[s], ends[p])
+                if p not in ws and reached[p] != s:
+                    reached[p] = s
+                    work.append(p)
+    begin = [[] for _ in range(n + 1)]
+    end = [[] for _ in range(n + 1)]
+    for s in range(nslots):
+        if hi[s] >= 0:
+            begin[lo[s]].append(s)
+            end[hi[s]].append(s)
+    where = [-1] * nslots
+    for s in range(nparams):
+        where[s] = s
+    count = nparams
+    free = []
+    for k in range(n + 1):
+        for s in begin[k]:
+            if s >= nparams:
+                if free:
+                    where[s] = free.pop()
+                else:
+                    where[s] = count
+                    count += 1
+        for s in end[k]:
+            free.append(where[s])
+    return where, count
+
+
 # ---- one function's code ----------------------------------------------------
 
 
@@ -288,13 +424,15 @@ class Module:
         fn_types.append(self.type_of([], []))
         return self.encode(fn_types, bodies)
 
-    # ---- slots: type word in local 2s, data word in local 2s+1 ----
+    # ---- slots: in pair p (see slot_locals), the type word in local 2p and
+    # the data word in local 2p+1 ----
 
     def function(self, fn):
         _, fname, nparams, nslots, instrs, _vars = fn
-        self.T = lambda s: 2 * s
-        self.D = lambda s: 2 * s + 1
-        self.A = 2 * nslots
+        where, npairs = slot_locals(nparams, nslots, instrs)
+        self.T = lambda s: 2 * where[s]
+        self.D = lambda s: 2 * where[s] + 1
+        self.A = 2 * npairs
         self.X = self.A + 1
         b = Body()
         self.b = b
@@ -322,8 +460,8 @@ class Module:
         b.op(UNREACHABLE)
         b.op(END)
         locals_ = []
-        if nslots > nparams:
-            locals_.append(uleb(2 * (nslots - nparams)) + bytes([I64]))
+        if npairs > nparams:
+            locals_.append(uleb(2 * (npairs - nparams)) + bytes([I64]))
         locals_.append(uleb(1) + bytes([I32]))
         locals_.append(uleb(1) + bytes([I64]))
         return vec(locals_) + bytes(b.b)

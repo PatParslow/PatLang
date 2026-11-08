@@ -192,10 +192,20 @@ the main executor calls it once, before anything else runs.
 
 ### Functions
 
-- **Slots.** Slot `s`'s type word is local `2s` and its data word is local `2s+1`. The parameters
-  are the first locals, so a function of `n` parameters takes `2n` i64 parameters. Every function
-  returns two i64 results, the type word first.
-- **Scratch locals.** After the slots come one i32 local, an address, and one i64.
+- **Slots.** Each slot is held in a pair of locals: in pair `p`, the type word is local `2p` and
+  the data word is local `2p+1`. Parameter `k` is pair `k`, so a function of `n` parameters takes
+  `2n` i64 parameters. Every function returns two i64 results, the type word first.
+- **Sharing pairs.** Slots that are never live at the same time share a pair, so a function's
+  locals grow with how many slots are live at once, not with its length. A slot's range runs
+  from the first to the last instruction at which it is live or named. Liveness is over basic
+  blocks, a new one at each label and after each jump, branch or return, and a slot live where
+  the function begins ranges from its first instruction. Going through the instructions in
+  order, the slots whose ranges begin at one each take the pair last given back, or a new pair,
+  in slot order. Then the slots whose ranges end there give their pairs back, in slot order. Both
+  writers do this the same way, so that their modules are the same bytes. A slot the ownership
+  stage holds until a return (a named variable, or a temporary that a branch reads) is live
+  from the start to the last return, so it keeps a pair of its own.
+- **Scratch locals.** After the pairs come one i32 local, an address, and one i64.
 - **Addresses.** A data word used as an address is wrapped to 32 bits.
 - **Counts.** `retain`, `release` and `atomic_add` use `i64.atomic.rmw.add`.
 - **Code addresses.** The table holds every function, in IR order, and then the thread entry. A

@@ -1351,12 +1351,363 @@ make a function called wv_go_if takes f, t, e returns done
 end
 
 # One function's body: its locals, then its code.
+# ---- slots to locals (bootstrap/ir_wasm.py's slot_locals) ----
+
+# [the slots an instruction gives a new value outright, those it reads or
+# changes in part (move's source, clear)]
+make a function called wv_slot_access takes ins returns acc
+  require list_len(ins) > 0
+  let op = ins[0]
+  if op == "const" then
+    return [[ins[1]], []]
+  end
+  if (op == "copy") or (op == "move") then
+    return [[ins[1]], [ins[2]]]
+  end
+  if (op == "clear") or (op == "retain") or (op == "release") or (op == "return") or (op == "branch") then
+    return [[], [ins[1]]]
+  end
+  if (op == "call") or (op == "prim") or (op == "closure") then
+    return [[ins[1]], ins[3]]
+  end
+  if (op == "extern") or (op == "externf") then
+    return [[ins[1]], ins[4]]
+  end
+  if op == "op" then
+    return [[ins[1]], [ins[3], ins[4]]]
+  end
+  if op == "un" then
+    return [[ins[1]], [ins[3]]]
+  end
+  if (op == "list") or (op == "callv") then
+    return [[ins[1]], ins[2]]
+  end
+  if (op == "label") or (op == "jump") then
+    return [[], []]
+  end
+  print("v2 wasm error: unknown instruction " + op)
+  exit_with(1)
+  let acc = [[], []]
+  ensure list_len(acc) == 2
+  return acc
+end
+
+# A vec of n copies of v.
+make a function called wv_filled takes n, v returns out
+  require n >= 0
+  let out = vec_new()
+  let k = 0
+  while k < n do
+    vec_push(out, v)
+    let k = k + 1
+  end
+  ensure vec_len(out) == n
+  return out
+end
+
+# Adds x to the list headed at head[at], in the arrays next and item.
+make a function called wv_link takes head, next, item, at, x returns done
+  require at < vec_len(head)
+  vec_push(item, x)
+  vec_push(next, vec_get(head, at))
+  vec_set(head, at, vec_len(item) - 1)
+  ensure vec_get(head, at) == vec_len(item) - 1
+  return true
+end
+
+# Pushes x onto the stack held in st, whose height is top[0].
+make a function called wv_stack_put takes st, top, x returns done
+  require vec_get(top, 0) <= vec_len(st)
+  let h = vec_get(top, 0)
+  if h < vec_len(st) then
+    vec_set(st, h, x)
+  else
+    vec_push(st, x)
+  end
+  vec_set(top, 0, h + 1)
+  ensure vec_get(top, 0) == h + 1
+  return true
+end
+
+# [which pair of locals holds each slot (a vec, -1 for a slot no instruction
+# names), how many pairs]. A slot's range runs from the first to the last
+# instruction at which it is live or named; liveness is over basic blocks, a
+# new one at each label and after each jump, branch or return. A slot live
+# where the function begins ranges from 0, as each parameter does. Going
+# through the instructions in order, the slots whose ranges begin at one take,
+# in slot order, the pair last given back or a new one; then those whose
+# ranges end there give theirs back, in slot order. Parameter k keeps pair k.
+# Reading a slot back can lower its range's start, or raise its end past the
+# last instruction naming it only through a jump back; so once a range starts
+# at 0 and ends at or after every block jumping back, nothing more is read
+# back for that slot.
+make a function called wv_slot_locals takes nparams, nslots, instrs returns r
+  require (nparams >= 0) and (nslots >= nparams)
+  let n = list_len(instrs)
+  let starts = vec_new()
+  vec_push(starts, 0)
+  let k = 1
+  while k < n do
+    let o = instrs[k][0]
+    let p = instrs[k - 1][0]
+    if (o == "label") or (p == "jump") or (p == "branch") or (p == "return") then
+      vec_push(starts, k)
+    end
+    let k = k + 1
+  end
+  let nb = vec_len(starts)
+  let ends = vec_new()
+  let block_of = vec_new()
+  let i = 0
+  while i < nb do
+    if i + 1 < nb then
+      vec_push(ends, vec_get(starts, i + 1) - 1)
+    else
+      vec_push(ends, n - 1)
+    end
+    if n > 0 then
+      let first = instrs[vec_get(starts, i)]
+      if first[0] == "label" then
+        while vec_len(block_of) <= first[1] do
+          vec_push(block_of, -1)
+        end
+        vec_set(block_of, first[1], i)
+      end
+    end
+    let i = i + 1
+  end
+  let pred_head = wv_filled(nb, -1)
+  let pred_next = vec_new()
+  let pred_blk = vec_new()
+  # the furthest end of a block jumping back
+  let back = -1
+  let i = 0
+  while (i < nb) and (n > 0) do
+    let last = instrs[vec_get(ends, i)]
+    let targets = []
+    if last[0] == "jump" then
+      let targets = [vec_get(block_of, last[1])]
+    elif last[0] == "branch" then
+      let targets = [vec_get(block_of, last[2]), vec_get(block_of, last[3])]
+    end
+    let j = 0
+    while j < list_len(targets) do
+      wv_link(pred_head, pred_next, pred_blk, targets[j], i)
+      if (targets[j] <= i) and (vec_get(ends, i) > back) then
+        let back = vec_get(ends, i)
+      end
+      let j = j + 1
+    end
+    if (last[0] != "jump") and (last[0] != "branch") and (last[0] != "return") then
+      if i + 1 < nb then
+        wv_link(pred_head, pred_next, pred_blk, i + 1, i)
+      end
+    end
+    let i = i + 1
+  end
+  let lo = wv_filled(nslots, -1)
+  let hi = wv_filled(nslots, -1)
+  let s = 0
+  while s < nparams do
+    vec_set(lo, s, 0)
+    vec_set(hi, s, 0)
+    let s = s + 1
+  end
+  # per slot: the blocks reading it before any write there, and those writing it
+  let written_in = wv_filled(nslots, -1)
+  let exp_head = wv_filled(nslots, -1)
+  let exp_next = vec_new()
+  let exp_blk = vec_new()
+  let wr_head = wv_filled(nslots, -1)
+  let wr_next = vec_new()
+  let wr_blk = vec_new()
+  # blocks last to first, so each slot's lists run first to last
+  let i = nb - 1
+  while i >= 0 do
+    let k = vec_get(starts, i)
+    while k <= vec_get(ends, i) do
+      let acc = wv_slot_access(instrs[k])
+      let both = [acc[1], acc[0]]
+      let h = 0
+      while h < 2 do
+        let ss = both[h]
+        let j = 0
+        while j < list_len(ss) do
+          let s = ss[j]
+          if (vec_get(lo, s) < 0) or (k < vec_get(lo, s)) then
+            vec_set(lo, s, k)
+          end
+          if k > vec_get(hi, s) then
+            vec_set(hi, s, k)
+          end
+          if (h == 0) and (vec_get(written_in, s) != i) then
+            wv_link(exp_head, exp_next, exp_blk, s, i)
+          end
+          if (h == 1) and (vec_get(written_in, s) != i) then
+            wv_link(wr_head, wr_next, wr_blk, s, i)
+            vec_set(written_in, s, i)
+          end
+          let j = j + 1
+        end
+        let h = h + 1
+      end
+      let k = k + 1
+    end
+    let i = i - 1
+  end
+  # read each slot back through the blocks that do not write it
+  let wmark = wv_filled(nb, -1)
+  let reached = wv_filled(nb, -1)
+  let work = vec_new()
+  let top = vec_new()
+  vec_push(top, 0)
+  let s = 0
+  while s < nslots do
+    let e = vec_get(wr_head, s)
+    while e >= 0 do
+      vec_set(wmark, vec_get(wr_blk, e), s)
+      let e = vec_get(wr_next, e)
+    end
+    let e = vec_get(exp_head, s)
+    while e >= 0 do
+      let b0 = vec_get(exp_blk, e)
+      let settled = (vec_get(lo, s) == 0) and (vec_get(hi, s) >= back)
+      if (vec_get(reached, b0) != s) and (not settled) then
+        vec_set(reached, b0, s)
+        wv_stack_put(work, top, b0)
+        while (vec_get(top, 0) > 0) and (not ((vec_get(lo, s) == 0) and (vec_get(hi, s) >= back))) do
+          vec_set(top, 0, vec_get(top, 0) - 1)
+          let b = vec_get(work, vec_get(top, 0))
+          if vec_get(starts, b) < vec_get(lo, s) then
+            vec_set(lo, s, vec_get(starts, b))
+          end
+          let q = vec_get(pred_head, b)
+          while q >= 0 do
+            let p = vec_get(pred_blk, q)
+            if vec_get(ends, p) > vec_get(hi, s) then
+              vec_set(hi, s, vec_get(ends, p))
+            end
+            if (vec_get(wmark, p) != s) and (vec_get(reached, p) != s) then
+              vec_set(reached, p, s)
+              wv_stack_put(work, top, p)
+            end
+            let q = vec_get(pred_next, q)
+          end
+        end
+        # a walk stopped early leaves blocks no later walk may take
+        vec_set(top, 0, 0)
+      end
+      let e = vec_get(exp_next, e)
+    end
+    let s = s + 1
+  end
+  # the ranges' ends, each list in slot order
+  let begin_head = wv_filled(n + 1, -1)
+  let end_head = wv_filled(n + 1, -1)
+  let at_next = vec_new()
+  let at_slot = vec_new()
+  let s = nslots - 1
+  while s >= 0 do
+    if vec_get(hi, s) >= 0 then
+      wv_link(begin_head, at_next, at_slot, vec_get(lo, s), s)
+      wv_link(end_head, at_next, at_slot, vec_get(hi, s), s)
+    end
+    let s = s - 1
+  end
+  let where = wv_filled(nslots, -1)
+  let s = 0
+  while s < nparams do
+    vec_set(where, s, s)
+    let s = s + 1
+  end
+  let count = nparams
+  let free = vec_new()
+  let ftop = vec_new()
+  vec_push(ftop, 0)
+  let k = 0
+  while k <= n do
+    let e = vec_get(begin_head, k)
+    while e >= 0 do
+      let s = vec_get(at_slot, e)
+      if s >= nparams then
+        if vec_get(ftop, 0) > 0 then
+          vec_set(ftop, 0, vec_get(ftop, 0) - 1)
+          vec_set(where, s, vec_get(free, vec_get(ftop, 0)))
+        else
+          vec_set(where, s, count)
+          let count = count + 1
+        end
+      end
+      let e = vec_get(at_next, e)
+    end
+    let e = vec_get(end_head, k)
+    while e >= 0 do
+      wv_stack_put(free, ftop, vec_get(where, vec_get(at_slot, e)))
+      let e = vec_get(at_next, e)
+    end
+    let k = k + 1
+  end
+  let r = [where, count]
+  ensure (count >= nparams) and (count <= nslots)
+  return r
+end
+
+# The slots of a list, each as the pair holding it.
+make a function called wv_pairs_of takes slots, where returns out
+  require type_of(slots) == "list"
+  let out = []
+  let k = 0
+  while k < list_len(slots) do
+    let out = list_push(out, vec_get(where, slots[k]))
+    let k = k + 1
+  end
+  ensure list_len(out) == list_len(slots)
+  return out
+end
+
+# An instruction with each slot named as the pair of locals holding it.
+make a function called wv_paired takes ins, where returns out
+  require list_len(ins) > 0
+  let op = ins[0]
+  let out = ins
+  if (op == "label") or (op == "jump") then
+    let out = ins
+  elif (op == "copy") or (op == "move") then
+    let out = list_set(list_set(ins, 1, vec_get(where, ins[1])), 2, vec_get(where, ins[2]))
+  elif (op == "const") or (op == "clear") or (op == "retain") or (op == "release") or (op == "return") or (op == "branch") then
+    let out = list_set(ins, 1, vec_get(where, ins[1]))
+  elif (op == "call") or (op == "prim") or (op == "closure") then
+    let out = list_set(list_set(ins, 1, vec_get(where, ins[1])), 3, wv_pairs_of(ins[3], where))
+  elif (op == "extern") or (op == "externf") then
+    let out = list_set(list_set(ins, 1, vec_get(where, ins[1])), 4, wv_pairs_of(ins[4], where))
+  elif op == "op" then
+    let out = list_set(list_set(list_set(ins, 1, vec_get(where, ins[1])), 3, vec_get(where, ins[3])), 4, vec_get(where, ins[4]))
+  elif op == "un" then
+    let out = list_set(list_set(ins, 1, vec_get(where, ins[1])), 3, vec_get(where, ins[3]))
+  elif (op == "list") or (op == "callv") then
+    let out = list_set(list_set(ins, 1, vec_get(where, ins[1])), 2, wv_pairs_of(ins[2], where))
+  else
+    print("v2 wasm error: unknown instruction " + op)
+    exit_with(1)
+  end
+  ensure list_len(out) == list_len(ins)
+  return out
+end
+
 make a function called wv_function takes m, fn returns body
   require (fn[0] == "Fn") and (fn[3] >= fn[2])
   let fname = fn[1]
   let nparams = fn[2]
-  let nslots = fn[3]
-  let instrs = fn[4]
+  let pairs = wv_slot_locals(nparams, fn[3], fn[4])
+  # from here on, a slot is named by the pair of locals holding it
+  let nslots = pairs[1]
+  let given = fn[4]
+  let instrs = []
+  let k = 0
+  while k < list_len(given) do
+    let instrs = list_push(instrs, wv_paired(given[k], pairs[0]))
+    let k = k + 1
+  end
   let segs = vec_new()
   let nseg = 1
   let k = 0

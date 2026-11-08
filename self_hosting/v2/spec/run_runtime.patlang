@@ -775,6 +775,191 @@ make a function called st_rr_wasm_bytes takes ctx returns ok
   return d and e
 end
 
+# An unsigned LEB128 number in bytes at pos: [value, the position after it].
+make a function called rr_uleb takes bytes, pos returns r
+  require (pos >= 0) and (pos < list_len(bytes))
+  let v = 0
+  let shift = 1
+  let p = pos
+  let more = true
+  while more do
+    let c = bytes[p]
+    let v = v + (c % 128) * shift
+    let shift = shift * 128
+    let p = p + 1
+    let more = c >= 128
+  end
+  ensure p > pos
+  return [v, p]
+end
+
+# The text of the length-prefixed name in bytes at pos: [text, the position after it].
+make a function called rr_wasm_name takes bytes, pos returns r
+  require pos < list_len(bytes)
+  let n = rr_uleb(bytes, pos)
+  let b = sb_new()
+  let k = 0
+  while k < n[0] do
+    sb_push(b, chr(bytes[n[1] + k]))
+    let k = k + 1
+  end
+  let r = [sb_str(b), n[1] + n[0]]
+  ensure r[1] >= pos
+  return r
+end
+
+# The number of locals, beyond its parameters, that a WebAssembly module
+# declares for the function the name section calls fname; -1 if none is.
+make a function called rr_wasm_locals takes bytes, fname returns n
+  require list_len(bytes) >= 8
+  let nimports = 0
+  let locals = []
+  let index = -1
+  let pos = 8
+  while pos < list_len(bytes) do
+    let id = bytes[pos]
+    let size = rr_uleb(bytes, pos + 1)
+    let p = size[1]
+    let next = p + size[0]
+    if id == 2 then
+      let count = rr_uleb(bytes, p)
+      let p = count[1]
+      let k = 0
+      while k < count[0] do
+        let p = rr_wasm_name(bytes, p)[1]
+        let p = rr_wasm_name(bytes, p)[1]
+        let kind = bytes[p]
+        let p = p + 1
+        if kind == 0 then
+          let nimports = nimports + 1
+          let p = rr_uleb(bytes, p)[1]
+        elif kind == 2 then
+          let flags = bytes[p]
+          let p = rr_uleb(bytes, p + 1)[1]
+          if (flags % 2) == 1 then
+            let p = rr_uleb(bytes, p)[1]
+          end
+        else
+          let p = next
+          let k = count[0]
+        end
+        let k = k + 1
+      end
+    elif id == 10 then
+      let count = rr_uleb(bytes, p)
+      let p = count[1]
+      let k = 0
+      while k < count[0] do
+        let body = rr_uleb(bytes, p)
+        let decls = rr_uleb(bytes, body[1])
+        let q = decls[1]
+        let total = 0
+        let j = 0
+        while j < decls[0] do
+          let c = rr_uleb(bytes, q)
+          let total = total + c[0]
+          let q = c[1] + 1
+          let j = j + 1
+        end
+        let locals = list_push(locals, total)
+        let p = body[1] + body[0]
+        let k = k + 1
+      end
+    elif id == 0 then
+      let section = rr_wasm_name(bytes, p)
+      if section[0] == "name" then
+        let q = section[1]
+        while q < next do
+          let sub = bytes[q]
+          let len = rr_uleb(bytes, q + 1)
+          if sub == 1 then
+            let count = rr_uleb(bytes, len[1])
+            let r = count[1]
+            let k = 0
+            while k < count[0] do
+              let at = rr_uleb(bytes, r)
+              let nm = rr_wasm_name(bytes, at[1])
+              if nm[0] == fname then
+                let index = at[0]
+              end
+              let r = nm[1]
+              let k = k + 1
+            end
+          end
+          let q = len[1] + len[0]
+        end
+      end
+    end
+    let pos = next
+  end
+  let n = -1
+  if (index >= nimports) and (index - nimports < list_len(locals)) then
+    let n = locals[index - nimports]
+  end
+  ensure n >= -1
+  return n
+end
+
+# A program whose top level runs n statements, each making temporaries and
+# dropping them; its path.
+make a function called rr_temps_program takes n returns path
+  require n > 0
+  let path = "self_hosting/build/v2_rt_temps_" + n + ".patlang"
+  let b = sb_new()
+  let k = 0
+  while k < n do
+    sb_push(b, "print(" + k + " * 3 + 1)" + nl())
+    let k = k + 1
+  end
+  write_file(path, sb_str(b))
+  ensure file_exists(path)
+  return path
+end
+
+make a function called st_rr_wasm_locals takes ctx returns ok
+  let counts = []
+  let ok = true
+  let sizes = [100, 1000]
+  let i = 0
+  while i < 2 do
+    let src = rr_temps_program(sizes[i])
+    let wasm = "self_hosting/build/v2_rt_temps_" + sizes[i] + ".wasm"
+    let exe = "self_hosting/build/v2_rt_temps_" + sizes[i] + ".exe"
+    v2_compile([src, exe])
+    let own = rr_clean(exec_capture(exe))
+    let w = rr_clean(v2_compile([src, wasm, "--wasm"])[0])
+    let a = expect(ctx, "v2 writes the module of " + sizes[i] + " statements", w, "v2: " + wasm)
+    let out = rr_clean(exec_capture("py", "-3", "-I", "self_hosting/v2/wasm/run_browser.py", wasm))
+    let b = expect(ctx, "it prints what v2's own build prints", (own != "") and (out == own), true)
+    let counts = list_push(counts, rr_wasm_locals(read_file_bytes(wasm, 0, 1073741824), "__main"))
+    let ok = ok and a and b
+    let i = i + 1
+  end
+  let c = expect(ctx, "__main has as many locals in both", "" + counts[0] + " " + counts[1], "" + counts[0] + " " + counts[0])
+  return ok and c and (counts[0] > 0)
+end
+
+make a function called st_rr_wasm_locals_bytes takes ctx returns ok
+  let ok = true
+  let sizes = [100, 1000]
+  let i = 0
+  while i < 2 do
+    let src = "self_hosting/build/v2_rt_temps_" + sizes[i] + ".patlang"
+    let wasm = "self_hosting/build/v2_rt_temps_" + sizes[i] + ".wasm"
+    let ir = "self_hosting/build/v2_rt_temps_" + sizes[i] + ".ir"
+    let py_wasm = "self_hosting/build/v2_rt_temps_" + sizes[i] + "_py.wasm"
+    v2_compile([src, ir, "--ir"])
+    let r = rr_clean(exec_capture("py", "-3", "-I", "bootstrap/ir_wasm.py", ir, py_wasm))
+    let d = expect(ctx, "ir_wasm.py builds a module from the IR", r, "ir_wasm: " + py_wasm)
+    let mine = read_file_bytes(wasm, 0, 1073741824)
+    let theirs = read_file_bytes(py_wasm, 0, 1073741824)
+    let e = expect(ctx, "the two modules of " + sizes[i] + " statements are the same bytes", (list_len(mine) > 0) and (mine == theirs), true)
+    let ok = ok and d and e
+    let i = i + 1
+  end
+  return ok
+end
+
 make a function called register_runtime_steps takes ctx returns done
   let noops = ["the int 9223372036854775807 in a local", "its two words are read with the runtime's word accessors", "1.5 stored into a list and read back, a million times in a loop", "the heap's bytes in use are compared before and after", "a string literal, a heap string, an int whose bits look like a pointer, and a float", "type_of is applied to each", "a list of 1000 ints", "the list's buffer size is read", "a function adding two ints in a loop, with no handler registered for any event", "its generated code is inspected", "a runtime function returning one of its arguments unchanged", "it is called with a fresh string and the caller releases its own copy of the argument", "s = " + chr(34) + "a" + chr(34) + " + " + chr(34) + "b" + chr(34) + ", t = s, then s is rebound", "t is read", "a list holding a fresh string, the only reference to that string", "the list is released", "an object field holding a fresh string, overwritten with another", "the first string's count is read", "an int, a float, a bool and unit", "each is retained and released ten times", "the compiler's source", "it is searched for lists of runtime function names", "a program making a million small allocations within 100 MB", "its system calls for memory are counted", "a string grown one character at a time to 4000 characters", "the heap's bytes in use are read", "8 threads, each allocating and freeing a million blocks of its own", "the shared pool's lock is counted", "thread A making blocks that thread B releases", "thread B then allocates blocks of the same size class", "thread A only allocating and thread B only releasing, for a million blocks", "the run ends", "a program that allocates 500 MB, frees it, then allocates 500 MB again", "its committed memory is read", "the runtime's source", "each function's declaration is read", "a runtime function changed to return a borrowed argument without a reference of its own", "a program calls it", "a value built with a type word naming no class, or with a heap type word and a freed block in its data word", "it is passed to a function requiring a live value", "a program whose function has a require clause it breaks, built in the default way and in every other build mode", "each build runs", "the compiler and runtime sources", "they are searched for what decides whether a require or ensure is checked", "each compiler stage's job function", "its declaration is read", "the new runtime's source", "it is compiled", "the declaration of int's to_s is looked for", "every compiler stage", "its source is searched for __vars reads and writes", "a program whose function f calls g", "g's body changes without changing its ownership summary", "a program with a when handler, a rule, and a function reached only through apply", "the same input compiled once with one worker and once with eight, with the ready order shuffled", "the two executables are compared", "two functions each containing a closure and a loop", "they are compiled in either order"]
   let i = 0
@@ -811,6 +996,10 @@ make a function called register_runtime_steps takes ctx returns done
   step(ctx, "v2 builds it as a WebAssembly module and a headless browser runs the module", "st_rr_noop")
   step(ctx, "the browser prints what v2's own build prints, and stops at the same contract", "st_rr_wasm")
   step(ctx, "the module is byte for byte what bootstrap/ir_wasm.py builds from v2's IR of the program", "st_rr_wasm_bytes")
+  step(ctx, "two programs whose top level runs 100 and 1000 statements, each making temporaries and dropping them", "st_rr_noop")
+  step(ctx, "v2 builds each as a WebAssembly module", "st_rr_noop")
+  step(ctx, "the top level's function has as many locals in both, and each module prints in a headless browser what v2's own build of it prints", "st_rr_wasm_locals")
+  step(ctx, "each module is byte for byte what bootstrap/ir_wasm.py builds from v2's IR of its program", "st_rr_wasm_locals_bytes")
   step(ctx, "each stops at that call, naming the clause", "st_rr_contract_fails")
   step(ctx, "exactly one place reads that setting, and no contract refers to it", "st_rr_one_setting")
   step(ctx, "it requires well-formed input artefacts and ensures a well-formed output artefact", "st_rr_stage_contracts")
