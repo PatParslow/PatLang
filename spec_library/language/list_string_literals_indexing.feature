@@ -15,3 +15,8 @@ Feature: list/string literals and indexing
     When .length is read
     Then it is the real element/character count (3 and 5 respectively)
 
+  Scenario: A feature file's text reaches its steps as the characters it holds, whatever their encoding length
+    Given "café λ€😀", written in this file as UTF-8
+    When indexed at 3, 5, 6 and 7
+    Then the results are "é", "λ", "€" and "😀", and .length is 8
+
