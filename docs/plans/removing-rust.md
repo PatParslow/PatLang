@@ -60,6 +60,39 @@ Made by the project owner on 2026-11-05:
    ([#248](https://github.com/PatParslow/PatLang/issues/248)). This can run alongside steps 2 and 3.
    The old compiler can't retire until it is done, being the only WASM route.
 
+   Progress, 2026-11-07:
+   - `compile.patlang ... --wasm` writes a WebAssembly module from the IR
+     (`self_hosting/v2/wasm.patlang`). It uses its own encoder, with no `rustc` or LLVM.
+     `bootstrap/ir_wasm.py` writes the same bytes from the IR text. The two agree byte for byte
+     on the compiler's own 8.5 MB module, and `gates.sh` checks this.
+   - The host in `self_hosting/v2/wasm/` runs the module in a browser or in Node. Each thread
+     and each fibre is a Worker over one shared memory, and the program runs in a Worker,
+     never on a browser's main thread. A fibre takes the per-thread context of the thread that
+     resumes it. `docs/spec/ir.md` gives the module's form and the host.
+   - Of v2's 99 runtime spec fixtures, 85 give the same output and exit code under Node as
+     on the v2 interpreter. Of the other 14:
+     - 8 use files or processes, which a browser does not have;
+     - 4 are where the interpreter differs from the native build, and WASM gives what the
+       scenarios expect;
+     - 3 are fixtures that must fail to compile.
+   - The `compiler_structure.feature` scenario runs a program with a fibre, a thread, an
+     operator event and a broken contract in headless Chrome. It checks that the program
+     prints what v2's own build prints.
+   - **The IR keeps enough structure.** Functions are laid out as nested WASM loops and
+     blocks. Where the jumps cross, a loop is lengthened or a block started earlier. All
+     829 of the compiler's functions are laid out this way, and so are the 6,456 of
+     `rt_big_frame` and the fixtures' functions. A jump into a loop other than at its head
+     could not be, and v2's lowering never makes one.
+   - In the gates run of 2026-11-07, every suite passed: part 1 on both engines (99), engines
+     agree (62), part 2 (93), the language suite on both engines (245), match (26) and the
+     block model (211).
+   - **Not done:**
+     - **Huge functions.** A function with tens of thousands of slots is slow to start in a
+       browser's first compiler tier. One WASM local per slot word makes each branch cost
+       time in proportion to the locals: `rt_big_frame`'s 15,049-slot `__main` takes 40 s
+       there, and 2 s once optimised ([#250](https://github.com/PatParslow/PatLang/issues/250)).
+     - **Writer speed.** The PatLang writer takes about 10 s per MB of module.
+
 ## The survey
 
 On 2026-11-05, 418 programs that existed at the `pre-v2` tag were compiled with v2, from

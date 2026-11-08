@@ -3,6 +3,7 @@
 #   pat --ir-run self_hosting/v2/compile.patlang SRC.patlang OUT.exe
 #       [--workers N] [--shuffle SEED] [--no-cache]
 #   pat --ir-run self_hosting/v2/compile.patlang SRC.patlang OUT.ir --ir
+#   pat --ir-run self_hosting/v2/compile.patlang SRC.patlang OUT.wasm --wasm
 #
 # Stages, each a function of its inputs: parse the runtime and the program,
 # lower each declaration (lower.patlang), then one job per function
@@ -16,7 +17,9 @@
 # OUT.asm, OUT.facts (the program facts), OUT.ledger (each job's
 # function and whether it was built or reused) and OUT.timing (each
 # phase's time in ms). With --ir it writes the program's IR to OUT.ir
-# instead (docs/spec/ir.md), for a reader to build from, and nothing else.
+# instead (docs/spec/ir.md), for a reader to build from, and nothing else;
+# with --wasm, the program as a WebAssembly module for the host in
+# self_hosting/v2/wasm/ (wasm.patlang), and nothing else.
 include "../lib/x64_pe_link.patlang"
 include "ir.patlang"
 include "lower.patlang"
@@ -26,6 +29,7 @@ include "contracts.patlang"
 include "x64.patlang"
 include "jobs.patlang"
 include "ir_text.patlang"
+include "wasm.patlang"
 
 # A name's index in fns, from a table of 1024 buckets of [name, index]; -1 when
 # no function declares it.
@@ -296,6 +300,27 @@ make a function called v2_write_ir takes src_path, out_path returns result
   return ["ok", out_path]
 end
 
+# The program as a WebAssembly module (docs/spec/ir.md, "The WASM form"),
+# built from the same IR as --ir writes.
+make a function called v2_write_wasm takes src_path, out_path returns result
+  let front = v2_front_end(src_path, "")
+  if front[0] == "error" then
+    return front
+  end
+  let lowered = front[1]
+  let fns = v2_reachable(lowered[0], lowered[3])
+  let owned = []
+  let i = 0
+  while i < list_len(fns) do
+    let owned = list_push(owned, own_function(fns[i]))
+    let i = i + 1
+  end
+  if not write_file_bytes(out_path, wv_module(owned, xv_facts_used(lowered[2])[0])) then
+    return ["error", ["could not write " + out_path]]
+  end
+  return ["ok", out_path]
+end
+
 let args = argv()
 if (list_len(args) >= 2) and (args[0] == "--evict") then
   let dir = v2_artefact_dir()
@@ -307,6 +332,7 @@ if (list_len(args) >= 2) and (args[0] == "--evict") then
 elif list_len(args) < 2 then
   print("usage: compile.patlang SRC.patlang OUT.exe [--workers N] [--shuffle SEED] [--no-cache]")
   print("       compile.patlang SRC.patlang OUT.ir --ir")
+  print("       compile.patlang SRC.patlang OUT.wasm --wasm")
   print("       compile.patlang --evict KEEP_MB")
   exit_with(2)
 else
@@ -314,6 +340,7 @@ else
   let seed = 0
   let cache = true
   let ir = false
+  let wasm = false
   let i = 2
   while i < list_len(args) do
     if (args[i] == "--workers") and (i + 1 < list_len(args)) then
@@ -326,12 +353,16 @@ else
       let cache = false
     elif args[i] == "--ir" then
       let ir = true
+    elif args[i] == "--wasm" then
+      let wasm = true
     end
     let i = i + 1
   end
   let r = []
   if ir then
     let r = v2_write_ir(args[0], args[1])
+  elif wasm then
+    let r = v2_write_wasm(args[0], args[1])
   else
     let r = v2_compile(args[0], args[1], workers, seed, cache)
   end

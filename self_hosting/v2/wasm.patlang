@@ -1,0 +1,1684 @@
+# The WASM form of a program (docs/spec/ir.md, "The WASM form"): what
+# compile.patlang --wasm writes, from the IR after the ownership stage. Byte
+# for byte what bootstrap/ir_wasm.py writes from the same IR. The module runs
+# under the host in self_hosting/v2/wasm/, each thread and fibre on its own
+# Worker over one shared memory.
+
+make a function called wv_data_base returns n
+  let n = 131072
+  ensure n == 2 * 65536
+  return n
+end
+
+make a function called wv_state returns n
+  let n = 65536
+  ensure n == 65536
+  return n
+end
+
+make a function called wv_min64 returns n
+  let n = 0 - 9223372036854775807 - 1
+  ensure n < 0
+  return n
+end
+
+# ---- bytes ----
+
+make a function called wv_uleb takes b, n returns done
+  require n >= 0
+  let more = true
+  while more do
+    let low = n band 127
+    let n = n shr 7
+    if n > 0 then
+      vec_push(b, low + 128)
+    else
+      vec_push(b, low)
+      let more = false
+    end
+  end
+  return true
+end
+
+# A word as a signed 64-bit int: one of 2^63 or more is its bits.
+make a function called wv_signed64 takes n returns s
+  require (n >= wv_min64()) and (n < 18446744073709551616)
+  let s = n
+  if s >= 9223372036854775808 then
+    let s = s - 18446744073709551616
+  end
+  ensure (s >= wv_min64()) and (s < 9223372036854775808)
+  return s
+end
+
+make a function called wv_sleb takes b, n returns done
+  require (n >= wv_min64()) and (n < 9223372036854775808)
+  let more = true
+  while more do
+    let low = n band 127
+    let n = n shr 7
+    if ((n == 0) and ((low band 64) == 0)) or ((n == 0 - 1) and ((low band 64) != 0)) then
+      vec_push(b, low)
+      let more = false
+    else
+      vec_push(b, low + 128)
+    end
+  end
+  return true
+end
+
+make a function called wv_append takes dst, src returns done
+  let n = vec_len(src)
+  let i = 0
+  while i < n do
+    vec_push(dst, vec_get(src, i))
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called wv_utf8 takes s returns bytes
+  require type_of(s) == "string"
+  let bytes = vec_new()
+  let i = 0
+  while i < s.length do
+    xv_utf8(bytes, char_code(s, i))
+    let i = i + 1
+  end
+  ensure vec_len(bytes) >= s.length
+  return bytes
+end
+
+make a function called wv_name takes b, s returns done
+  let raw = wv_utf8(s)
+  wv_uleb(b, vec_len(raw))
+  return wv_append(b, raw)
+end
+
+make a function called wv_section takes out, id, body returns done
+  require (id >= 0) and (id <= 12)
+  vec_push(out, id)
+  wv_uleb(out, vec_len(body))
+  return wv_append(out, body)
+end
+
+# ---- instructions ----
+
+make a function called wv_i64 takes b, n returns done
+  vec_push(b, 66)
+  return wv_sleb(b, wv_signed64(n))
+end
+
+make a function called wv_i32 takes b, n returns done
+  vec_push(b, 65)
+  return wv_sleb(b, n)
+end
+
+make a function called wv_get takes b, i returns done
+  vec_push(b, 32)
+  return wv_uleb(b, i)
+end
+
+make a function called wv_set takes b, i returns done
+  vec_push(b, 33)
+  return wv_uleb(b, i)
+end
+
+make a function called wv_tee takes b, i returns done
+  vec_push(b, 34)
+  return wv_uleb(b, i)
+end
+
+make a function called wv_mem takes b, opcode, align, offset returns done
+  vec_push(b, opcode)
+  wv_uleb(b, align)
+  return wv_uleb(b, offset)
+end
+
+# i64.atomic.rmw.add, aligned, at offset 0
+make a function called wv_atomic_add takes b returns done
+  vec_push(b, 254)
+  wv_uleb(b, 31)
+  wv_uleb(b, 3)
+  return wv_uleb(b, 0)
+end
+
+make a function called wv_call takes b, at returns done
+  vec_push(b, 16)
+  return wv_uleb(b, at)
+end
+
+make a function called wv_br takes b, depth returns done
+  vec_push(b, 12)
+  return wv_uleb(b, depth)
+end
+
+make a function called wv_br_if takes b, depth returns done
+  vec_push(b, 13)
+  return wv_uleb(b, depth)
+end
+
+make a function called wv_f64_bytes takes b, high returns done
+  # a double whose low six bytes are zero: -2^63 is c3e0..., 2^63 43e0...
+  let k = 0
+  while k < 6 do
+    vec_push(b, 0)
+    let k = k + 1
+  end
+  vec_push(b, 224)
+  vec_push(b, high)
+  return true
+end
+
+# ---- the module's tables ----
+#
+# m: [types, imports, import keys, data, function index, plus_events,
+#     thread table index]. A type is a key: "e" for each i64 and "f" for each
+# f64 parameter, ">", then its results. An import: [lib, func, type, floats].
+
+make a function called wv_type_of takes m, key returns at
+  let types = m[0]
+  let n = vec_len(types)
+  let i = 0
+  while i < n do
+    if vec_get(types, i) == key then
+      return i
+    end
+    let i = i + 1
+  end
+  vec_push(types, key)
+  let at = n
+  ensure at >= 0
+  return at
+end
+
+make a function called wv_repeat takes s, n returns text
+  let b = sb_new()
+  let i = 0
+  while i < n do
+    sb_push(b, s)
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  ensure text.length == n * s.length
+  return text
+end
+
+make a function called wv_fn_type takes m, nparams returns at
+  return wv_type_of(m, wv_repeat("ee", nparams) + ">ee")
+end
+
+make a function called wv_import_key takes lib, func, n, floats returns key
+  let kind = "i"
+  if floats then
+    let kind = "f"
+  end
+  let key = lib + "!" + func + "/" + n + kind
+  return key
+end
+
+make a function called wv_imported takes m, lib, func, n, floats returns at
+  let key = wv_import_key(lib, func, n, floats)
+  let keys = m[2]
+  let count = vec_len(keys)
+  let i = 0
+  while i < count do
+    if vec_get(keys, i) == key then
+      return i
+    end
+    let i = i + 1
+  end
+  let vt = "e"
+  if floats then
+    let vt = "f"
+  end
+  let t = wv_type_of(m, wv_repeat(vt, n) + ">" + vt)
+  vec_push(keys, key)
+  vec_push(m[1], [lib, func, t, floats])
+  let at = count
+  ensure at >= 0
+  return at
+end
+
+make a function called wv_string takes m, text returns at
+  let data = m[3]
+  while (vec_len(data) % 8) != 0 do
+    vec_push(data, 0)
+  end
+  let at = wv_data_base() + vec_len(data)
+  let raw = wv_utf8(text)
+  wv_word(data, 0)
+  wv_word(data, 0)
+  wv_word(data, vec_len(raw))
+  wv_word(data, text.length)
+  wv_append(data, raw)
+  ensure at >= wv_data_base()
+  return at
+end
+
+make a function called wv_word takes b, n returns done
+  require n >= 0
+  let k = 0
+  while k < 8 do
+    vec_push(b, n band 255)
+    let n = n shr 8
+    let k = k + 1
+  end
+  return true
+end
+
+# [function index, nparams, table index] of a function, or false
+make a function called wv_fn takes m, name returns entry
+  let entry = xpl_index_lookup(m[4], name)
+  return entry
+end
+
+make a function called wv_need_fn takes m, name returns entry
+  let entry = wv_fn(m, name)
+  if entry == false then
+    print("v2 wasm error: a call to " + name + ", which the IR lacks")
+    exit_with(1)
+  end
+  ensure type_of(entry) == "list"
+  return entry
+end
+
+# ---- one function ----
+#
+# f: [m, body, segment of each label (a vec), segments, current segment
+#     (a vec of one), address local, scratch local, the layout, the open
+#     constructs, whether this instruction is its segment's last (a vec of
+#     one), how many constructs are open (a vec of one)]
+
+make a function called wv_t takes s returns i
+  return 2 * s
+end
+
+make a function called wv_d takes s returns i
+  return 2 * s + 1
+end
+
+make a function called wv_push takes f, s returns done
+  wv_get(f[1], wv_t(s))
+  return wv_get(f[1], wv_d(s))
+end
+
+make a function called wv_set_int takes f, d returns done
+  let b = f[1]
+  wv_set(b, wv_d(d))
+  wv_i64(b, 2)
+  return wv_set(b, wv_t(d))
+end
+
+make a function called wv_set_bool takes f, d returns done
+  let b = f[1]
+  vec_push(b, 173)
+  wv_set(b, wv_d(d))
+  wv_i64(b, 1)
+  return wv_set(b, wv_t(d))
+end
+
+make a function called wv_set_unit takes f, d returns done
+  let b = f[1]
+  wv_i64(b, 0)
+  wv_set(b, wv_t(d))
+  wv_i64(b, 0)
+  return wv_set(b, wv_d(d))
+end
+
+make a function called wv_set_result takes f, d returns done
+  wv_set(f[1], wv_d(d))
+  return wv_set(f[1], wv_t(d))
+end
+
+make a function called wv_call_fn takes f, name, slots, d returns done
+  let entry = wv_need_fn(f[0], name)
+  if entry[1] != list_len(slots) then
+    print("v2 wasm error: " + name + " takes " + entry[1] + ", called with " + list_len(slots))
+    exit_with(1)
+  end
+  let i = 0
+  while i < list_len(slots) do
+    wv_push(f, slots[i])
+    let i = i + 1
+  end
+  wv_call(f[1], entry[0])
+  return wv_set_result(f, d)
+end
+
+make a function called wv_addr takes f, s returns done
+  wv_get(f[1], wv_d(s))
+  vec_push(f[1], 167)
+  return true
+end
+
+make a function called wv_addr2 takes f, a, o returns done
+  let b = f[1]
+  wv_get(b, wv_d(a))
+  wv_get(b, wv_d(o))
+  vec_push(b, 124)
+  vec_push(b, 167)
+  return true
+end
+
+make a function called wv_heap takes f, s returns done
+  let b = f[1]
+  wv_get(b, wv_t(s))
+  wv_i64(b, 4294967296)
+  vec_push(b, 131)
+  wv_i64(b, 0)
+  vec_push(b, 82)
+  return true
+end
+
+make a function called wv_is_class takes f, s, cls returns done
+  wv_get(f[1], wv_t(s))
+  wv_i64(f[1], cls)
+  vec_push(f[1], 81)
+  return true
+end
+
+make a function called wv_count takes f, which, s returns done
+  require (which == "retain") or (which == "release")
+  let b = f[1]
+  let x = f[6]
+  wv_heap(f, s)
+  vec_push(b, 4)
+  vec_push(b, 64)
+  wv_addr(f, s)
+  if which == "retain" then
+    wv_i64(b, 1)
+  else
+    wv_i64(b, 0 - 1)
+  end
+  wv_atomic_add(b)
+  wv_tee(b, x)
+  wv_i64(b, 1)
+  if which == "retain" then
+    vec_push(b, 83)
+  else
+    vec_push(b, 87)
+  end
+  vec_push(b, 4)
+  vec_push(b, 64)
+  if which == "retain" then
+    let entry = wv_need_fn(f[0], "rt_fail_released_twice")
+    wv_call(b, entry[0])
+  else
+    let entry = wv_need_fn(f[0], "rt_release_last")
+    wv_i64(b, 2)
+    wv_get(b, wv_t(s))
+    wv_i64(b, 2)
+    wv_get(b, wv_d(s))
+    wv_i64(b, 2)
+    wv_get(b, x)
+    wv_call(b, entry[0])
+  end
+  vec_push(b, 26)
+  vec_push(b, 26)
+  vec_push(b, 11)
+  vec_push(b, 11)
+  return true
+end
+
+make a function called wv_op_fn takes op returns name
+  let ops = [["+", "op_add"], ["q+", "op_add_quiet"], ["a+", "op_add_taken"], ["-", "op_sub"], ["*", "op_mul"], ["/", "op_div"], ["%", "op_mod"], ["<", "op_lt"], [">", "op_gt"], ["<=", "op_le"], [">=", "op_ge"], ["==", "op_eq"], ["!=", "op_ne"], ["band", "op_band"], ["bor", "op_bor"], ["bxor", "op_bxor"], ["shl", "op_shl"], ["shr", "op_shr"]]
+  let i = 0
+  while i < list_len(ops) do
+    if ops[i][0] == op then
+      return ops[i][1]
+    end
+    let i = i + 1
+  end
+  print("v2 wasm error: unknown operator " + op)
+  exit_with(1)
+  return ""
+end
+
+# The comparison's opcode, or 0 for an operator that compares nothing.
+make a function called wv_cmp_code takes op returns code
+  let code = 0
+  if op == "<" then
+    let code = 83
+  elif op == ">" then
+    let code = 85
+  elif op == "<=" then
+    let code = 87
+  elif op == ">=" then
+    let code = 89
+  elif op == "==" then
+    let code = 81
+  elif op == "!=" then
+    let code = 82
+  end
+  ensure code >= 0
+  return code
+end
+
+make a function called wv_bit_code takes op returns code
+  let code = 0
+  if op == "band" then
+    let code = 131
+  elif op == "bor" then
+    let code = 132
+  elif op == "bxor" then
+    let code = 133
+  elif op == "shl" then
+    let code = 134
+  elif op == "shr" then
+    let code = 135
+  end
+  ensure code >= 0
+  return code
+end
+
+make a function called wv_operator takes f, op, d, a, c returns done
+  let b = f[1]
+  let x = f[6]
+  let name = wv_op_fn(op)
+  vec_push(b, 2)
+  vec_push(b, 64)
+  vec_push(b, 2)
+  vec_push(b, 64)
+  if op != "/" then
+    wv_is_class(f, a, 2)
+    wv_is_class(f, c, 2)
+    vec_push(b, 113)
+    vec_push(b, 69)
+    wv_br_if(b, 0)
+    if ((op == "+") or (op == "a+")) and f[0][5] then
+      wv_i32(b, wv_state())
+      wv_mem(b, 41, 3, 2064)
+      wv_i64(b, 0)
+      vec_push(b, 82)
+      wv_br_if(b, 0)
+    end
+    if wv_cmp_code(op) != 0 then
+      wv_get(b, wv_d(a))
+      wv_get(b, wv_d(c))
+      vec_push(b, wv_cmp_code(op))
+      wv_set_bool(f, d)
+    elif wv_bit_code(op) != 0 then
+      wv_get(b, wv_d(a))
+      wv_get(b, wv_d(c))
+      vec_push(b, wv_bit_code(op))
+      wv_set_int(f, d)
+    elif op == "%" then
+      wv_get(b, wv_d(c))
+      vec_push(b, 80)
+      wv_br_if(b, 0)
+      wv_get(b, wv_d(a))
+      wv_get(b, wv_d(c))
+      vec_push(b, 129)
+      wv_set_int(f, d)
+    elif (op == "+") or (op == "q+") or (op == "a+") or (op == "-") then
+      wv_get(b, wv_d(a))
+      wv_get(b, wv_d(c))
+      if op == "-" then
+        vec_push(b, 125)
+      else
+        vec_push(b, 124)
+      end
+      wv_set(b, x)
+      if op == "-" then
+        wv_get(b, wv_d(a))
+        wv_get(b, wv_d(c))
+        vec_push(b, 133)
+        wv_get(b, wv_d(a))
+        wv_get(b, x)
+        vec_push(b, 133)
+      else
+        wv_get(b, wv_d(a))
+        wv_get(b, x)
+        vec_push(b, 133)
+        wv_get(b, wv_d(c))
+        wv_get(b, x)
+        vec_push(b, 133)
+      end
+      vec_push(b, 131)
+      wv_i64(b, 0)
+      vec_push(b, 83)
+      wv_br_if(b, 0)
+      wv_get(b, x)
+      wv_set_int(f, d)
+    else
+      # *: b == -1 overflows only at a == MIN; otherwise r / b == a unless
+      # it overflowed, b == 0 giving 0
+      wv_get(b, wv_d(a))
+      wv_get(b, wv_d(c))
+      vec_push(b, 126)
+      wv_set(b, x)
+      wv_get(b, wv_d(c))
+      wv_i64(b, 0 - 1)
+      vec_push(b, 81)
+      vec_push(b, 4)
+      vec_push(b, 64)
+      wv_get(b, wv_d(a))
+      wv_i64(b, wv_min64())
+      vec_push(b, 81)
+      wv_br_if(b, 1)
+      vec_push(b, 5)
+      wv_get(b, wv_d(c))
+      wv_i64(b, 0)
+      vec_push(b, 82)
+      vec_push(b, 4)
+      vec_push(b, 64)
+      wv_get(b, x)
+      wv_get(b, wv_d(c))
+      vec_push(b, 127)
+      wv_get(b, wv_d(a))
+      vec_push(b, 82)
+      wv_br_if(b, 2)
+      vec_push(b, 11)
+      vec_push(b, 11)
+      wv_get(b, x)
+      wv_set_int(f, d)
+    end
+    wv_br(b, 1)
+  end
+  vec_push(b, 11)
+  wv_call_fn(f, name, [a, c], d)
+  vec_push(b, 11)
+  return true
+end
+
+make a function called wv_unary takes f, op, d, a returns done
+  require (op == "-") or (op == "bnot") or (op == "not")
+  let b = f[1]
+  vec_push(b, 2)
+  vec_push(b, 64)
+  vec_push(b, 2)
+  vec_push(b, 64)
+  if op == "not" then
+    wv_is_class(f, a, 1)
+  else
+    wv_is_class(f, a, 2)
+  end
+  vec_push(b, 69)
+  wv_br_if(b, 0)
+  let name = "op_not"
+  if op == "-" then
+    let name = "op_neg"
+    wv_get(b, wv_d(a))
+    wv_i64(b, wv_min64())
+    vec_push(b, 81)
+    wv_br_if(b, 0)
+    wv_i64(b, 0)
+    wv_get(b, wv_d(a))
+    vec_push(b, 125)
+    wv_set_int(f, d)
+  elif op == "bnot" then
+    let name = "op_bnot"
+    wv_get(b, wv_d(a))
+    wv_i64(b, 0 - 1)
+    vec_push(b, 133)
+    wv_set_int(f, d)
+  else
+    wv_get(b, wv_d(a))
+    wv_i64(b, 1)
+    vec_push(b, 133)
+    wv_set(b, wv_d(d))
+    wv_i64(b, 1)
+    wv_set(b, wv_t(d))
+  end
+  wv_br(b, 1)
+  vec_push(b, 11)
+  wv_call_fn(f, name, [a], d)
+  vec_push(b, 11)
+  return true
+end
+
+make a function called wv_f64_of takes f, s returns done
+  wv_get(f[1], wv_d(s))
+  vec_push(f[1], 191)
+  return true
+end
+
+make a function called wv_word_code takes name returns code
+  let codes = [["word_add", 124], ["word_sub", 125], ["word_mul", 126], ["word_and", 131], ["word_or", 132], ["word_xor", 133], ["word_shl", 134], ["word_shr", 136], ["word_div", 127], ["word_rem", 129]]
+  let i = 0
+  while i < list_len(codes) do
+    if codes[i][0] == name then
+      return codes[i][1]
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+make a function called wv_prim takes f, name, d, args returns done
+  let b = f[1]
+  let x = f[6]
+  let at = f[5]
+  if name == "value_class" then
+    wv_get(b, wv_t(args[0]))
+    wv_i64(b, 4294967295)
+    vec_push(b, 131)
+    return wv_set_int(f, d)
+  end
+  if name == "value_data" then
+    wv_get(b, wv_d(args[0]))
+    return wv_set_int(f, d)
+  end
+  if name == "value_type_word" then
+    wv_get(b, wv_t(args[0]))
+    return wv_set_int(f, d)
+  end
+  if name == "value_make" then
+    wv_get(b, wv_d(args[0]))
+    wv_get(b, wv_d(args[1]))
+    return wv_set_result(f, d)
+  end
+  if name == "value_live" then
+    let a = args[0]
+    wv_get(b, wv_t(a))
+    wv_i64(b, 34)
+    vec_push(b, 136)
+    vec_push(b, 80)
+    wv_get(b, wv_t(a))
+    wv_i64(b, 4294967295)
+    vec_push(b, 131)
+    wv_tee(b, x)
+    wv_i64(b, 13)
+    vec_push(b, 87)
+    wv_get(b, x)
+    wv_i64(b, 63)
+    vec_push(b, 89)
+    vec_push(b, 114)
+    vec_push(b, 113)
+    vec_push(b, 4)
+    vec_push(b, 127)
+    wv_heap(f, a)
+    vec_push(b, 4)
+    vec_push(b, 127)
+    wv_addr(f, a)
+    wv_mem(b, 41, 3, 0)
+    wv_i64(b, 1)
+    vec_push(b, 89)
+    vec_push(b, 5)
+    wv_i32(b, 1)
+    vec_push(b, 11)
+    vec_push(b, 5)
+    wv_i32(b, 0)
+    vec_push(b, 11)
+    return wv_set_bool(f, d)
+  end
+  if name == "runtime_state" then
+    wv_i64(b, wv_state())
+    return wv_set_int(f, d)
+  end
+  if name == "thread_entry_address" then
+    wv_i64(b, f[0][6])
+    return wv_set_int(f, d)
+  end
+  if name == "atomic_add" then
+    wv_addr(f, args[0])
+    wv_get(b, wv_d(args[1]))
+    wv_atomic_add(b)
+    return wv_set_int(f, d)
+  end
+  if (name == "mem_load_value") or (name == "mem_take_value") then
+    wv_addr2(f, args[0], args[1])
+    wv_set(b, at)
+    wv_get(b, at)
+    wv_mem(b, 41, 3, 0)
+    wv_set(b, wv_t(d))
+    wv_get(b, at)
+    wv_mem(b, 41, 3, 8)
+    wv_set(b, wv_d(d))
+    if name == "mem_load_value" then
+      return wv_count(f, "retain", d)
+    end
+    wv_get(b, at)
+    wv_i64(b, 0)
+    wv_mem(b, 55, 3, 0)
+    wv_get(b, at)
+    wv_i64(b, 0)
+    wv_mem(b, 55, 3, 8)
+    return true
+  end
+  if (name == "mem_store_value") or (name == "mem_init_value") then
+    let v = args[2]
+    wv_count(f, "retain", v)
+    wv_addr2(f, args[0], args[1])
+    wv_set(b, at)
+    if name == "mem_store_value" then
+      wv_get(b, at)
+      wv_mem(b, 41, 3, 0)
+      wv_set(b, wv_t(d))
+      wv_get(b, at)
+      wv_mem(b, 41, 3, 8)
+      wv_set(b, wv_d(d))
+      wv_count(f, "release", d)
+    end
+    wv_get(b, at)
+    wv_get(b, wv_t(v))
+    wv_mem(b, 55, 3, 0)
+    wv_get(b, at)
+    wv_get(b, wv_d(v))
+    wv_mem(b, 55, 3, 8)
+    return wv_set_unit(f, d)
+  end
+  if (name == "mem_load") or (name == "mem_load_byte") then
+    wv_addr2(f, args[0], args[1])
+    if name == "mem_load" then
+      wv_mem(b, 41, 3, 0)
+    else
+      wv_mem(b, 49, 0, 0)
+    end
+    return wv_set_int(f, d)
+  end
+  if (name == "mem_store") or (name == "mem_store_byte") then
+    wv_addr2(f, args[0], args[1])
+    wv_get(b, wv_d(args[2]))
+    if name == "mem_store" then
+      wv_mem(b, 55, 3, 0)
+    else
+      wv_mem(b, 60, 0, 0)
+    end
+    return wv_set_unit(f, d)
+  end
+  if name == "int_to_float" then
+    wv_get(b, wv_d(args[0]))
+    vec_push(b, 185)
+    vec_push(b, 189)
+    return wv_set_int(f, d)
+  end
+  if name == "float_to_int" then
+    # truncating, and the minimum int when out of range or NaN, as
+    # cvttsd2si gives
+    wv_f64_of(f, args[0])
+    vec_push(b, 68)
+    wv_f64_bytes(b, 195)
+    vec_push(b, 102)
+    wv_f64_of(f, args[0])
+    vec_push(b, 68)
+    wv_f64_bytes(b, 67)
+    vec_push(b, 99)
+    vec_push(b, 113)
+    vec_push(b, 4)
+    vec_push(b, 126)
+    wv_f64_of(f, args[0])
+    vec_push(b, 176)
+    vec_push(b, 5)
+    wv_i64(b, wv_min64())
+    vec_push(b, 11)
+    return wv_set_int(f, d)
+  end
+  if (name == "float_add") or (name == "float_sub") or (name == "float_mul") or (name == "float_div") then
+    wv_f64_of(f, args[0])
+    wv_f64_of(f, args[1])
+    if name == "float_add" then
+      vec_push(b, 160)
+    elif name == "float_sub" then
+      vec_push(b, 161)
+    elif name == "float_mul" then
+      vec_push(b, 162)
+    else
+      vec_push(b, 163)
+    end
+    vec_push(b, 189)
+    return wv_set_int(f, d)
+  end
+  if (name == "float_lt") or (name == "float_eq") then
+    wv_f64_of(f, args[0])
+    wv_f64_of(f, args[1])
+    if name == "float_lt" then
+      vec_push(b, 99)
+    else
+      vec_push(b, 97)
+    end
+    vec_push(b, 173)
+    return wv_set_int(f, d)
+  end
+  let code = wv_word_code(name)
+  if code == 0 then
+    print("v2 wasm error: unknown primitive " + name)
+    exit_with(1)
+  end
+  wv_get(b, wv_d(args[0]))
+  wv_get(b, wv_d(args[1]))
+  vec_push(b, code)
+  return wv_set_int(f, d)
+end
+
+make a function called wv_class_of_kind takes kind returns cls
+  let cls = 0 - 1
+  if kind == "int" then
+    let cls = 2
+  elif kind == "bool" then
+    let cls = 1
+  elif kind == "unit" then
+    let cls = 0
+  end
+  return cls
+end
+
+make a function called wv_const takes f, d, kind, text returns done
+  let b = f[1]
+  if kind == "str" then
+    wv_i64(b, 8)
+    wv_set(b, wv_t(d))
+    wv_i64(b, wv_string(f[0], "" + text))
+    return wv_set(b, wv_d(d))
+  end
+  let cls = 3
+  let bits = 0
+  if kind == "float" then
+    let bits = float_to_bits(to_num("" + text))
+  elif kind == "unit" then
+    let cls = 0
+  else
+    let cls = wv_class_of_kind(kind)
+    if cls < 0 then
+      print("v2 wasm error: unknown constant kind " + kind)
+      exit_with(1)
+    end
+    let bits = to_num("" + text)
+  end
+  wv_i64(b, cls)
+  wv_set(b, wv_t(d))
+  wv_i64(b, bits)
+  return wv_set(b, wv_d(d))
+end
+
+make a function called wv_fill takes f, d, slots returns done
+  let b = f[1]
+  let k = 0
+  while k < list_len(slots) do
+    let s = slots[k]
+    wv_count(f, "retain", s)
+    wv_addr(f, d)
+    wv_get(b, wv_t(s))
+    wv_mem(b, 55, 3, 32 + 16 * k)
+    wv_addr(f, d)
+    wv_get(b, wv_d(s))
+    wv_mem(b, 55, 3, 40 + 16 * k)
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called wv_alloc takes f, name, d, n returns done
+  let entry = wv_need_fn(f[0], name)
+  wv_i64(f[1], 2)
+  wv_i64(f[1], n)
+  wv_call(f[1], entry[0])
+  return wv_set_result(f, d)
+end
+
+make a function called wv_seg takes f, label returns seg
+  let seg = vec_get(f[2], label)
+  ensure seg > 0
+  return seg
+end
+
+make a function called wv_instruction takes f, fname, ins returns done
+  let b = f[1]
+  let op = ins[0]
+  if op == "const" then
+    return wv_const(f, ins[1], ins[2], ins[3])
+  end
+  if (op == "copy") or (op == "move") then
+    wv_push(f, ins[2])
+    wv_set_result(f, ins[1])
+    if op == "move" then
+      wv_i64(b, 0)
+      wv_set(b, wv_t(ins[2]))
+    end
+    return true
+  end
+  if op == "clear" then
+    wv_i64(b, 0)
+    return wv_set(b, wv_t(ins[1]))
+  end
+  if op == "call" then
+    return wv_call_fn(f, ins[2], ins[3], ins[1])
+  end
+  if op == "op" then
+    return wv_operator(f, ins[2], ins[1], ins[3], ins[4])
+  end
+  if op == "un" then
+    return wv_unary(f, ins[2], ins[1], ins[3])
+  end
+  if op == "prim" then
+    return wv_prim(f, ins[2], ins[1], ins[3])
+  end
+  if (op == "extern") or (op == "externf") then
+    let floats = op == "externf"
+    let slots = ins[4]
+    let k = 0
+    while k < list_len(slots) do
+      wv_get(b, wv_d(slots[k]))
+      if floats then
+        vec_push(b, 191)
+      end
+      let k = k + 1
+    end
+    wv_call(b, wv_imported(f[0], ins[2], ins[3], list_len(slots), floats))
+    if floats then
+      vec_push(b, 189)
+    end
+    return wv_set_int(f, ins[1])
+  end
+  if op == "label" then
+    # falls into the next segment
+    wv_close_after(f, vec_get(f[4], 0))
+    vec_set(f[4], 0, wv_seg(f, ins[1]))
+    return wv_open_at(f, vec_get(f[4], 0))
+  end
+  if op == "jump" then
+    return wv_go(f, wv_seg(f, ins[1]))
+  end
+  if op == "branch" then
+    let s = ins[1]
+    wv_get(b, wv_t(s))
+    wv_i64(b, 2)
+    vec_push(b, 87)
+    vec_push(b, 4)
+    vec_push(b, 127)
+    wv_get(b, wv_d(s))
+    wv_i64(b, 0)
+    vec_push(b, 82)
+    vec_push(b, 5)
+    let entry = wv_need_fn(f[0], "rt_truthy")
+    wv_push(f, s)
+    wv_call(b, entry[0])
+    wv_set(b, f[6])
+    vec_push(b, 26)
+    wv_get(b, f[6])
+    wv_i64(b, 0)
+    vec_push(b, 82)
+    vec_push(b, 11)
+    return wv_go_if(f, wv_seg(f, ins[2]), wv_seg(f, ins[3]))
+  end
+  if op == "return" then
+    wv_push(f, ins[1])
+    vec_push(b, 15)
+    return true
+  end
+  if (op == "retain") or (op == "release") then
+    return wv_count(f, op, ins[1])
+  end
+  if op == "list" then
+    wv_alloc(f, "rt_list_alloc", ins[1], list_len(ins[2]))
+    return wv_fill(f, ins[1], ins[2])
+  end
+  if op == "closure" then
+    let target = wv_fn(f[0], ins[2])
+    if target == false then
+      print("v2 wasm error: a closure of " + ins[2] + ", which the IR lacks")
+      exit_with(1)
+    end
+    wv_alloc(f, "rt_closure_alloc", ins[1], list_len(ins[3]))
+    wv_addr(f, ins[1])
+    wv_i64(b, target[2])
+    wv_mem(b, 55, 3, 16)
+    return wv_fill(f, ins[1], ins[3])
+  end
+  if op == "callv" then
+    let slots = ins[2]
+    let k = 0
+    while k < list_len(slots) do
+      wv_push(f, slots[k])
+      let k = k + 1
+    end
+    wv_addr(f, slots[0])
+    wv_mem(b, 41, 3, 16)
+    vec_push(b, 167)
+    vec_push(b, 17)
+    wv_uleb(b, wv_fn_type(f[0], list_len(slots)))
+    vec_push(b, 0)
+    return wv_set_result(f, ins[1])
+  end
+  print("v2 wasm error: unknown instruction " + op + " in " + fname)
+  exit_with(1)
+  return false
+end
+
+# ---- control flow ----
+#
+# The code before a function's first label and the code after each label are
+# its segments. wv_structure lays them out as nested loops and blocks.
+
+# Whether the instruction at k is its segment's last.
+make a function called wv_is_last takes instrs, k returns yes
+  let yes = true
+  if k + 1 < list_len(instrs) then
+    let yes = instrs[k + 1][0] == "label"
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called wv_need takes loops, blocks, i, t returns done
+  if t > i then
+    if (vec_get(blocks, t) < 0) or (i < vec_get(blocks, t)) then
+      vec_set(blocks, t, i)
+    end
+  else
+    if vec_get(loops, t) < i then
+      vec_set(loops, t, i)
+    end
+  end
+  return true
+end
+
+# The structured layout (bootstrap/ir_wasm.py's structure(), the same
+# rules): a jump back is a br to a loop beginning at its target and ending
+# after the last segment that jumps back there; a jump forward is a br to a
+# block ending just before its target, beginning in the first segment that
+# jumps there; a jump or branch arm to the very next segment, as its
+# segment's last instruction, falls through. Where two cross, a loop's end
+# moves later or a block's start earlier, until all nest; a block that
+# begins before a loop and ends inside it cannot, and then the layout is
+# false. Otherwise, for each segment, the constructs beginning there,
+# outermost first, each [kind, last segment, key]: "loop" keyed by its first
+# segment, "block" by its target.
+make a function called wv_structure takes instrs, segs, nseg returns plan
+  require nseg >= 1
+  let loops = vec_new()
+  let blocks = vec_new()
+  let k = 0
+  while k < nseg do
+    vec_push(loops, 0 - 1)
+    vec_push(blocks, 0 - 1)
+    let k = k + 1
+  end
+  let seg = 0
+  let k = 0
+  while k < list_len(instrs) do
+    let ins = instrs[k]
+    let last = wv_is_last(instrs, k)
+    if ins[0] == "label" then
+      let seg = vec_get(segs, ins[1])
+    elif ins[0] == "jump" then
+      let t = vec_get(segs, ins[1])
+      if not (last and (t == seg + 1)) then
+        wv_need(loops, blocks, seg, t)
+      end
+    elif ins[0] == "branch" then
+      let t = vec_get(segs, ins[2])
+      let e = vec_get(segs, ins[3])
+      if last and (e == seg + 1) then
+        if t != seg + 1 then
+          wv_need(loops, blocks, seg, t)
+        end
+      elif last and (t == seg + 1) then
+        wv_need(loops, blocks, seg, e)
+      else
+        wv_need(loops, blocks, seg, t)
+        wv_need(loops, blocks, seg, e)
+      end
+    end
+    let k = k + 1
+  end
+  # the constructs, as parallel vecs: kind (1 a loop, 2 a block), start,
+  # last segment, key
+  let kinds = vec_new()
+  let starts = vec_new()
+  let lasts = vec_new()
+  let keys = vec_new()
+  let k = 0
+  while k < nseg do
+    if vec_get(loops, k) >= 0 then
+      vec_push(kinds, 1)
+      vec_push(starts, k)
+      vec_push(lasts, vec_get(loops, k))
+      vec_push(keys, k)
+    end
+    let k = k + 1
+  end
+  let k = 0
+  while k < nseg do
+    if vec_get(blocks, k) >= 0 then
+      vec_push(kinds, 2)
+      vec_push(starts, vec_get(blocks, k))
+      vec_push(lasts, k - 1)
+      vec_push(keys, k)
+    end
+    let k = k + 1
+  end
+  let n = vec_len(kinds)
+  let changed = true
+  while changed do
+    let changed = false
+    # each construct, under the segment it starts at
+    let at = vec_new()
+    let k = 0
+    while k < nseg do
+      vec_push(at, vec_new())
+      let k = k + 1
+    end
+    let k = 0
+    while k < n do
+      vec_push(vec_get(at, vec_get(starts, k)), k)
+      let k = k + 1
+    end
+    let p = 0
+    while p < nseg do
+      let here = vec_get(at, p)
+      let x = 0
+      while x < vec_len(here) do
+        let a = vec_get(here, x)
+        # a construct starting later inside a, and ending after it
+        let q = vec_get(starts, a) + 1
+        while q <= vec_get(lasts, a) do
+          let there = vec_get(at, q)
+          let y = 0
+          while y < vec_len(there) do
+            let c = vec_get(there, y)
+            let crosses = (vec_get(starts, a) < vec_get(starts, c)) and (vec_get(starts, c) <= vec_get(lasts, a)) and (vec_get(lasts, a) < vec_get(lasts, c))
+            if crosses then
+              if (vec_get(kinds, a) == 1) and (vec_get(kinds, c) == 1) then
+                vec_set(lasts, a, vec_get(lasts, c))
+              elif vec_get(kinds, c) == 2 then
+                vec_set(starts, c, vec_get(starts, a))
+              else
+                return false
+              end
+              let changed = true
+            end
+            let y = y + 1
+          end
+          let q = q + 1
+        end
+        let x = x + 1
+      end
+      let p = p + 1
+    end
+  end
+  let plan = vec_new()
+  let k = 0
+  while k < nseg do
+    vec_push(plan, vec_new())
+    let k = k + 1
+  end
+  let k = 0
+  while k < n do
+    let kind = "loop"
+    if vec_get(kinds, k) == 2 then
+      let kind = "block"
+    end
+    wv_plan_insert(vec_get(plan, vec_get(starts, k)), [kind, vec_get(lasts, k), vec_get(keys, k)])
+    let k = k + 1
+  end
+  ensure vec_len(plan) == nseg
+  return plan
+end
+
+# Into the constructs beginning at one segment, outermost first: the one
+# ending later first, and a block before a loop ending with it.
+make a function called wv_plan_insert takes list, item returns done
+  let k = 0
+  let n = vec_len(list)
+  let placed = false
+  while (k < n) and (not placed) do
+    if wv_plan_before(item, vec_get(list, k)) then
+      let placed = true
+    else
+      let k = k + 1
+    end
+  end
+  vec_push(list, item)
+  let j = vec_len(list) - 1
+  while j > k do
+    vec_set(list, j, vec_get(list, j - 1))
+    let j = j - 1
+  end
+  vec_set(list, k, item)
+  return true
+end
+
+make a function called wv_plan_before takes a, c returns yes
+  let yes = false
+  if a[1] > c[1] then
+    let yes = true
+  elif (a[1] == c[1]) and (a[0] == "block") and (c[0] == "loop") then
+    let yes = true
+  end
+  return yes
+end
+
+make a function called wv_open_at takes f, p returns done
+  let here = vec_get(f[7], p)
+  let k = 0
+  while k < vec_len(here) do
+    let item = vec_get(here, k)
+    if item[0] == "loop" then
+      vec_push(f[1], 3)
+    else
+      vec_push(f[1], 2)
+    end
+    vec_push(f[1], 64)
+    wv_stack_push(f, [item[0], item[2], item[1]])
+    let k = k + 1
+  end
+  return true
+end
+
+# The open constructs: f[8] a vec holding them, f[10] how many are open.
+make a function called wv_stack_len takes f returns n
+  let n = vec_get(f[10], 0)
+  ensure n >= 0
+  return n
+end
+
+make a function called wv_stack_push takes f, item returns done
+  let n = wv_stack_len(f)
+  if n < vec_len(f[8]) then
+    vec_set(f[8], n, item)
+  else
+    vec_push(f[8], item)
+  end
+  vec_set(f[10], 0, n + 1)
+  return true
+end
+
+make a function called wv_close_after takes f, q returns done
+  let stack = f[8]
+  let more = true
+  while more do
+    let more = false
+    let n = wv_stack_len(f)
+    if n > 0 then
+      if vec_get(stack, n - 1)[2] == q then
+        vec_push(f[1], 11)
+        vec_set(f[10], 0, n - 1)
+        let more = true
+      end
+    end
+  end
+  let k = 0
+  while k < wv_stack_len(f) do
+    if vec_get(stack, k)[2] == q then
+      print("v2 wasm error: constructs that do not nest")
+      exit_with(1)
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+# The br depth from here to segment target: the block ending just before
+# it, or the loop it heads.
+make a function called wv_depth takes f, target returns depth
+  let stack = f[8]
+  let kind = "loop"
+  if target > vec_get(f[4], 0) then
+    let kind = "block"
+  end
+  let n = wv_stack_len(f)
+  let k = n - 1
+  while k >= 0 do
+    let item = vec_get(stack, k)
+    if (item[0] == kind) and (item[1] == target) then
+      return n - 1 - k
+    end
+    let k = k - 1
+  end
+  print("v2 wasm error: no construct for a jump to segment " + target)
+  exit_with(1)
+  return 0
+end
+
+make a function called wv_go takes f, target returns done
+  if not (vec_get(f[9], 0) and (target == vec_get(f[4], 0) + 1)) then
+    wv_br(f[1], wv_depth(f, target))
+  end
+  return true
+end
+
+# With the condition on the stack: to t when it is true, else to e.
+make a function called wv_go_if takes f, t, e returns done
+  let b = f[1]
+  let last = vec_get(f[9], 0)
+  let nxt = vec_get(f[4], 0) + 1
+  if last and (e == nxt) then
+    if t == nxt then
+      vec_push(b, 26)
+    else
+      wv_br_if(b, wv_depth(f, t))
+    end
+  elif last and (t == nxt) then
+    vec_push(b, 69)
+    wv_br_if(b, wv_depth(f, e))
+  else
+    wv_br_if(b, wv_depth(f, t))
+    wv_br(b, wv_depth(f, e))
+  end
+  return true
+end
+
+# One function's body: its locals, then its code.
+make a function called wv_function takes m, fn returns body
+  require (fn[0] == "Fn") and (fn[3] >= fn[2])
+  let fname = fn[1]
+  let nparams = fn[2]
+  let nslots = fn[3]
+  let instrs = fn[4]
+  let segs = vec_new()
+  let nseg = 1
+  let k = 0
+  while k < list_len(instrs) do
+    let ins = instrs[k]
+    if ins[0] == "label" then
+      while vec_len(segs) <= ins[1] do
+        vec_push(segs, 0)
+      end
+      vec_set(segs, ins[1], nseg)
+      let nseg = nseg + 1
+    end
+    let k = k + 1
+  end
+  let code = vec_new()
+  let cur = vec_new()
+  vec_push(cur, 0)
+  let at = 2 * nslots
+  let last = vec_new()
+  vec_push(last, false)
+  let plan = wv_structure(instrs, segs, nseg)
+  let open = vec_new()
+  vec_push(open, 0)
+  let f = [m, code, segs, nseg, cur, at, at + 1, plan, vec_new(), last, open]
+  if plan == false then
+    print("v2 wasm error: control flow the WASM form cannot lay out, in " + fname)
+    exit_with(1)
+  else
+    wv_open_at(f, 0)
+    let k = 0
+    while k < list_len(instrs) do
+      vec_set(last, 0, wv_is_last(instrs, k))
+      wv_instruction(f, fname, instrs[k])
+      let k = k + 1
+    end
+    wv_close_after(f, nseg - 1)
+    if wv_stack_len(f) != 0 then
+      print("v2 wasm error: constructs left open in " + fname)
+      exit_with(1)
+    end
+  end
+  vec_push(code, 0)
+  vec_push(code, 11)
+  let body = vec_new()
+  if nslots > nparams then
+    wv_uleb(body, 3)
+    wv_uleb(body, 2 * (nslots - nparams))
+    vec_push(body, 126)
+  else
+    wv_uleb(body, 2)
+  end
+  wv_uleb(body, 1)
+  vec_push(body, 127)
+  wv_uleb(body, 1)
+  vec_push(body, 126)
+  wv_append(body, code)
+  ensure vec_len(body) > 0
+  return body
+end
+
+# ---- the entries ----
+
+make a function called wv_entry_main takes m returns body
+  let body = vec_new()
+  vec_push(body, 0)
+  let names = ["runtime_init", "__main"]
+  let k = 0
+  while k < 2 do
+    let entry = wv_need_fn(m, names[k])
+    if entry[1] != 0 then
+      print("v2 wasm error: " + names[k] + " takes arguments")
+      exit_with(1)
+    end
+    wv_call(body, entry[0])
+    vec_push(body, 26)
+    vec_push(body, 26)
+    let k = k + 1
+  end
+  wv_i64(body, 0)
+  wv_call(body, wv_imported(m, "KERNEL32.DLL", "ExitProcess", 1, false))
+  vec_push(body, 26)
+  vec_push(body, 11)
+  return body
+end
+
+make a function called wv_entry_thread takes m returns body
+  let body = vec_new()
+  vec_push(body, 0)
+  let entry = wv_need_fn(m, "rt_thread_main")
+  wv_i64(body, 2)
+  wv_get(body, 0)
+  wv_call(body, entry[0])
+  vec_push(body, 26)
+  vec_push(body, 26)
+  wv_i64(body, 0)
+  vec_push(body, 11)
+  return body
+end
+
+make a function called wv_entry_init takes m returns body
+  let body = vec_new()
+  vec_push(body, 0)
+  wv_i32(body, wv_data_base())
+  wv_i32(body, 0)
+  wv_i32(body, vec_len(m[3]))
+  vec_push(body, 252)
+  wv_uleb(body, 8)
+  wv_uleb(body, 0)
+  vec_push(body, 0)
+  vec_push(body, 252)
+  wv_uleb(body, 9)
+  wv_uleb(body, 0)
+  vec_push(body, 11)
+  return body
+end
+
+# ---- the module ----
+
+make a function called wv_type_bytes takes out, key returns done
+  vec_push(out, 96)
+  let params = vec_new()
+  let results = vec_new()
+  let into = params
+  let i = 0
+  while i < key.length do
+    let c = key[i]
+    if c == ">" then
+      let into = results
+    elif c == "e" then
+      vec_push(into, 126)
+    else
+      vec_push(into, 124)
+    end
+    let i = i + 1
+  end
+  wv_uleb(out, vec_len(params))
+  wv_append(out, params)
+  wv_uleb(out, vec_len(results))
+  return wv_append(out, results)
+end
+
+# The types every body uses, in a fixed order: the imports', then each
+# function's, then each callv's, then the entries'.
+make a function called wv_collect takes m, fns returns done
+  wv_imported(m, "KERNEL32.DLL", "ExitProcess", 1, false)
+  let k = 0
+  while k < list_len(fns) do
+    let instrs = fns[k][4]
+    let i = 0
+    while i < list_len(instrs) do
+      let ins = instrs[i]
+      if (ins[0] == "extern") or (ins[0] == "externf") then
+        wv_imported(m, ins[2], ins[3], list_len(ins[4]), ins[0] == "externf")
+      end
+      let i = i + 1
+    end
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(fns) do
+    wv_fn_type(m, fns[k][2])
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(fns) do
+    let instrs = fns[k][4]
+    let i = 0
+    while i < list_len(instrs) do
+      if instrs[i][0] == "callv" then
+        wv_fn_type(m, list_len(instrs[i][2]))
+      end
+      let i = i + 1
+    end
+    let k = k + 1
+  end
+  wv_type_of(m, ">")
+  wv_type_of(m, "e>e")
+  return true
+end
+
+make a function called wv_module takes fns, plus_events returns bytes
+  require type_of(fns) == "list"
+  let m0 = [vec_new(), vec_new(), vec_new(), vec_new(), false, plus_events, list_len(fns)]
+  wv_collect(m0, fns)
+  let base = vec_len(m0[1])
+  let names = []
+  let values = []
+  let k = 0
+  while k < list_len(fns) do
+    let names = list_push(names, fns[k][1])
+    let values = list_push(values, [base + k, fns[k][2], k])
+    let k = k + 1
+  end
+  let m = [m0[0], m0[1], m0[2], m0[3], xpl_build_index(names, values), plus_events, list_len(fns)]
+  let n = list_len(fns)
+  let main_at = base + n
+  let thread_at = base + n + 1
+  let init_at = base + n + 2
+  let bodies = vec_new()
+  let k = 0
+  while k < n do
+    vec_push(bodies, wv_function(m, fns[k]))
+    let k = k + 1
+  end
+  vec_push(bodies, wv_entry_main(m))
+  vec_push(bodies, wv_entry_thread(m))
+  vec_push(bodies, wv_entry_init(m))
+  let types = m[0]
+  let imports = m[1]
+  let data = m[3]
+  let out = vec_new()
+  vec_extend(out, [0, 97, 115, 109, 1, 0, 0, 0])
+  let s = vec_new()
+  wv_uleb(s, vec_len(types))
+  let k = 0
+  while k < vec_len(types) do
+    wv_type_bytes(s, vec_get(types, k))
+    let k = k + 1
+  end
+  wv_section(out, 1, s)
+  let pages = floor((wv_data_base() + vec_len(data) + 65535) / 65536)
+  let s = vec_new()
+  wv_uleb(s, vec_len(imports) + 1)
+  wv_name(s, "env")
+  wv_name(s, "memory")
+  vec_push(s, 2)
+  vec_push(s, 3)
+  wv_uleb(s, pages)
+  wv_uleb(s, 65536)
+  let k = 0
+  while k < vec_len(imports) do
+    let im = vec_get(imports, k)
+    wv_name(s, im[0])
+    wv_name(s, im[1])
+    vec_push(s, 0)
+    wv_uleb(s, im[2])
+    let k = k + 1
+  end
+  wv_section(out, 2, s)
+  let s = vec_new()
+  wv_uleb(s, n + 3)
+  let k = 0
+  while k < n do
+    wv_uleb(s, wv_fn_type(m, fns[k][2]))
+    let k = k + 1
+  end
+  wv_uleb(s, wv_type_of(m, ">"))
+  wv_uleb(s, wv_type_of(m, "e>e"))
+  wv_uleb(s, wv_type_of(m, ">"))
+  wv_section(out, 3, s)
+  let s = vec_new()
+  wv_uleb(s, 1)
+  vec_push(s, 112)
+  vec_push(s, 0)
+  wv_uleb(s, n + 1)
+  wv_section(out, 4, s)
+  let s = vec_new()
+  wv_uleb(s, 4)
+  wv_name(s, "main")
+  vec_push(s, 0)
+  wv_uleb(s, main_at)
+  wv_name(s, "thread_entry")
+  vec_push(s, 0)
+  wv_uleb(s, thread_at)
+  wv_name(s, "init_memory")
+  vec_push(s, 0)
+  wv_uleb(s, init_at)
+  wv_name(s, "table")
+  vec_push(s, 1)
+  wv_uleb(s, 0)
+  wv_section(out, 7, s)
+  let s = vec_new()
+  wv_uleb(s, 1)
+  vec_extend(s, [0, 65, 0, 11])
+  wv_uleb(s, n + 1)
+  let k = 0
+  while k < n do
+    wv_uleb(s, base + k)
+    let k = k + 1
+  end
+  wv_uleb(s, thread_at)
+  wv_section(out, 9, s)
+  let s = vec_new()
+  wv_uleb(s, 1)
+  wv_section(out, 12, s)
+  let s = vec_new()
+  wv_uleb(s, vec_len(bodies))
+  let k = 0
+  while k < vec_len(bodies) do
+    let body = vec_get(bodies, k)
+    wv_uleb(s, vec_len(body))
+    wv_append(s, body)
+    let k = k + 1
+  end
+  wv_section(out, 10, s)
+  let s = vec_new()
+  wv_uleb(s, 1)
+  vec_push(s, 1)
+  wv_uleb(s, vec_len(data))
+  wv_append(s, data)
+  wv_section(out, 11, s)
+  let sub = vec_new()
+  wv_uleb(sub, n + 3)
+  let k = 0
+  while k < n do
+    wv_uleb(sub, base + k)
+    wv_name(sub, fns[k][1])
+    let k = k + 1
+  end
+  wv_uleb(sub, main_at)
+  wv_name(sub, "main")
+  wv_uleb(sub, thread_at)
+  wv_name(sub, "thread_entry")
+  wv_uleb(sub, init_at)
+  wv_name(sub, "init_memory")
+  let s = vec_new()
+  wv_name(s, "name")
+  vec_push(s, 1)
+  wv_uleb(s, vec_len(sub))
+  wv_append(s, sub)
+  wv_section(out, 0, s)
+  let bytes = vec_to_list(out)
+  ensure (bytes[0] == 0) and (bytes[1] == 97)
+  return bytes
+end

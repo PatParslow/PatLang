@@ -14,6 +14,11 @@ run it also rewrites `v2_compiler.ir` with `v2.exe ... --ir`, builds a compiler
 from it with the reader, and checks that this compiler builds the compiler
 byte for byte as `v2.exe` does.
 
+`ir_wasm.py` builds a WebAssembly module from the same IR (GitHub #248), byte
+for byte what `v2.exe SRC OUT.wasm --wasm` writes. The module runs under the
+host in `self_hosting/v2/wasm/`, in a browser or in Node. The gates check
+that the two writers give the same bytes for the compiler's own module.
+
 The rest of this directory is the earlier bootstrap of the old compiler,
 described below.
 

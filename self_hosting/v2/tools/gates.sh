@@ -55,6 +55,18 @@ else
   st "bootstrap: differs from v2.exe"
 fi
 
+# The WASM form (spec 2.6): the compiler as a WebAssembly module, written by
+# v2.exe and by bootstrap/ir_wasm.py from the same IR, must be the same bytes.
+$B/v2.exe self_hosting/v2/compile.patlang $B/v2_compiler.wasm --wasm > "$D/wasm.log" 2>&1
+st "compiler as WASM: exit $?"
+py -3 -I bootstrap/ir_wasm.py bootstrap/v2_compiler.ir $B/v2_compiler_py.wasm >> "$D/wasm.log" 2>&1
+st "ir_wasm.py: exit $?"
+if cmp -s $B/v2_compiler.wasm $B/v2_compiler_py.wasm; then
+  st "wasm: identical to ir_wasm.py's"
+else
+  st "wasm: differs from ir_wasm.py's"
+fi
+
 # The interpreter, built by that compiler.
 $B/v2.exe self_hosting/v2/interp.patlang $B/v2_interp.exe --workers 8 > "$D/interp.log" 2>&1
 st "interpreter: exit $?"

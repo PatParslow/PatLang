@@ -75,3 +75,9 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     Given a program reaching each kind of instruction, an operator event, a fiber, a thread and a broken contract
     When v2 writes its IR and the reader builds an executable from it
     Then the reader's build prints what v2's own build prints, and stops at the same contract
+
+  Scenario: a program built as WebAssembly runs in a browser as v2's own build does (spec 2.6)
+    Given a program reaching each kind of instruction, an operator event, a fiber, a thread and a broken contract
+    When v2 builds it as a WebAssembly module and a headless browser runs the module
+    Then the browser prints what v2's own build prints, and stops at the same contract
+    And the module is byte for byte what bootstrap/ir_wasm.py builds from v2's IR of the program

@@ -314,3 +314,13 @@ summary (2.5) and stated as the function's contract (2.4).
   only its standard library, and builds for Windows x64. It builds the
   compiler from the compiler's own IR. That compiler builds the compiler,
   the result builds it again, and the last two are byte identical.
+- `compile.patlang SRC OUT.wasm --wasm` builds the program, from the same
+  IR, as a WebAssembly module. It runs in a browser, or in Node, under the
+  host in `self_hosting/v2/wasm/`, and gives the output and exit code that
+  v2's own build gives. The exceptions are what a browser has none of:
+  files, processes and sockets. `bootstrap/ir_wasm.py` builds the same
+  module, byte for byte, from the IR text. `docs/spec/ir.md` gives the
+  module's form and the host.
+- Each thread and each fibre runs on a Worker of its own, sharing one
+  memory. A fibre is still a fibre (1.8): one runs at a time on its thread,
+  and it uses the per-thread context of the thread that resumed it.

@@ -162,3 +162,114 @@ py -3 bootstrap/ir_reader.py IN.ir OUT.exe
 It builds an x64 Windows executable. It builds the compiler from the compiler's own IR. That
 compiler builds the compiler, and the result builds it again. The last two builds are byte
 identical, and `self_hosting/v2/tools/gates.sh` checks this.
+
+## The WASM form
+
+```
+v2.exe SRC.patlang OUT.wasm --wasm
+py -3 bootstrap/ir_wasm.py IN.ir OUT.wasm
+```
+
+`self_hosting/v2/wasm.patlang` builds a WebAssembly module from the IR, and
+`bootstrap/ir_wasm.py` builds the same module, byte for byte, from the IR's text form. The module
+uses multiple results, bulk memory and threads (shared memory and atomics), which current browsers
+and Node have.
+
+### The memory
+
+The module imports `env.memory`, a shared memory with a maximum of 65,536 pages, from the host.
+Every executor (see below) instantiates the module over the same memory.
+
+| Address | What is there |
+|---|---|
+| 4096 to 65,535 | What the host writes: the command line, as a C string at 4096. |
+| 65,536 | The runtime's state, the 65,536 bytes `runtime_state` gives. |
+| 131,072 | The string constants, laid out as for `const`, one after another at 8-byte boundaries. |
+| From the first page after the module's initial pages | The heap: the runtime reserves it with `VirtualAlloc`, and the host grows the memory as the runtime commits it. |
+
+The constants are a passive data segment. The export `init_memory` copies them into place, and
+the main executor calls it once, before anything else runs.
+
+### Functions
+
+- **Slots.** Slot `s`'s type word is local `2s` and its data word is local `2s+1`. The parameters
+  are the first locals, so a function of `n` parameters takes `2n` i64 parameters. Every function
+  returns two i64 results, the type word first.
+- **Scratch locals.** After the slots come one i32 local, an address, and one i64.
+- **Addresses.** A data word used as an address is wrapped to 32 bits.
+- **Counts.** `retain`, `release` and `atomic_add` use `i64.atomic.rmw.add`.
+- **Code addresses.** The table holds every function, in IR order, and then the thread entry. A
+  function's code address is its table index. `closure` stores it, and `callv` calls through it
+  with `call_indirect`.
+- **The thread entry** is a function `(i64 job) -> i64` that calls `rt_thread_main(job)` and gives 0.
+- **Externs.** Each `LIB!FUNC` is an import with module `LIB` and name `FUNC`. Its parameters and
+  result are i64 for `extern`, and f64 for `externf`.
+- **Exports.** The module exports `main`, `thread_entry`, `init_memory` and `table`. `main` calls
+  `runtime_init()` and `__main()`, and then `KERNEL32.DLL!ExitProcess(0)`.
+- **Names.** A name section gives each function its IR name.
+
+The operators, primitives and counts mean what the tables above say. Three cases are written out:
+
+- `float_to_int` gives the minimum int when its argument is NaN or out of range, as x64's
+  conversion does.
+- `float_eq` is ordered, so NaN is equal to nothing.
+- `%` of the minimum int by -1 gives 0.
+
+### Control flow
+
+The code before a function's first label, and the code after each label, are its segments. They
+are laid out as nested loops and blocks:
+
+- **A jump back** is a `br` to a `loop`. The loop begins at the target segment and ends after the
+  last segment that jumps back to it.
+- **A jump forward** is a `br` to a `block`. The block ends just before the target segment and
+  begins in the first segment that jumps there.
+- **Falling through.** A jump or branch arm to the next segment falls through, when it is its
+  segment's last instruction.
+- **Making them nest.** Where two of these cross, a loop's end moves later or a block's start moves
+  earlier, until all nest.
+
+A block that begins before a loop and ends inside it cannot nest. Such a block would come from a
+jump into a loop at a segment other than its first, which v2's lowering never makes. A writer
+stops with an error naming the function.
+
+## The WASM host
+
+`self_hosting/v2/wasm/` runs a module, in a browser or in Node:
+
+```
+node self_hosting/v2/wasm/run_node.mjs PROGRAM.wasm [ARGS...]
+py -3 self_hosting/v2/wasm/run_browser.py PROGRAM.wasm [ARGS...]
+```
+
+`run_browser.py` serves the page and the program from 127.0.0.1, with the headers that make the
+page cross-origin isolated, which `SharedArrayBuffer` needs. It runs the page in a headless Chrome,
+which posts back the output and the exit code. A page of your own can serve `index.html`,
+`page.mjs`, `launcher.mjs`, `executor.mjs` and `layout.mjs` in the same way, with
+`?wasm=URL&args=[...]`.
+
+- **Executors.** The launcher (`launcher.mjs`) never runs the program, so it can stay on a
+  browser's main thread, which may not block. The program runs on executors (`executor.mjs`),
+  each a Worker:
+  - the main executor runs `main`;
+  - `CreateThread` makes an executor that calls the thread entry;
+  - `CreateFiber` makes one that waits until it is switched to.
+- **Starting an executor.** An executor gives the new executor's handle back at once, and asks the
+  launcher to start its Worker. It never waits for that Worker to start, so it works where a
+  Worker cannot make Workers of its own.
+- **The control block.** The executors share a `SharedArrayBuffer` with the launcher. It holds
+  each executor's gate and thread, each thread's finished flag and TLS slots, and the output
+  buffer's lock.
+- **Fibres.** `SwitchToFiber` clears the switching executor's gate, gives the target its own
+  thread, opens the target's gate, and waits on its own. One executor of a thread runs at a time.
+  `TlsGetValue` and `TlsSetValue` use the slots of the executor's thread at the moment. So a fibre
+  uses the per-thread context of whichever thread resumed it, as on Windows.
+- **The cost of a fibre.** A fibre costs a Worker. Starting one takes milliseconds, against
+  microseconds natively, and so does each `budgeted` block, which runs on a fibre.
+- **Output.** `WriteFile` to the standard output appends to the shared buffer under its lock.
+  Output therefore keeps the order in which the threads wrote it, and the launcher writes it out.
+- **The exit.** `ExitProcess` records the exit code. The launcher then writes the remaining output
+  and stops every Worker. A trap in any executor gives exit code 101, after a line naming the trap.
+- **What a browser has none of.** There are no files, processes or sockets, so each of those calls
+  fails as Windows reports a file that is not there. `GetEnvironmentVariableA` finds only what the
+  launcher is given, which by default is nothing, and the standard input is empty.
