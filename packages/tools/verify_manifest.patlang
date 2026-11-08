@@ -1,0 +1,185 @@
+# Checks a package's files against the SHA-256 hashes its manifest gives.
+# From the repository root:
+#
+#   ./self_hosting/build/v2.exe packages/tools/verify_manifest.patlang packages/tools/build/verify_manifest.exe --workers 2
+#   ./packages/tools/build/verify_manifest.exe packages/deflate [packages/zip ...]
+#
+# For each package directory it reads manifest.pkg (format: packages/README.md),
+# hashes every `file <path> sha256 <hex>` entry's file (relative to the
+# directory) and prints one line per entry:
+#
+#   ok <path>
+#   MISMATCH <path> manifest <hex> file <hex>
+#   MISSING <path>
+#   MALFORMED line <n>: <text>
+#
+# then a summary line. The exit code is 0 when every entry of every package
+# is ok, 1 when any is mismatched, missing or malformed (or a manifest has
+# no file entries, or cannot be read), and 2 when no directory is given.
+include "../sha256/sha256.patlang"
+
+# A manifest's lines (as Strings, without line ends), from its bytes. The
+# manifest is ASCII; a line is built from its bytes, never by indexing a
+# large String.
+make a function called vm_lines takes bytes returns lines
+  require value_class(bytes) == 9
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    let c = bytes[i]
+    if c == 10 then
+      let out = list_push(out, sb_str(cur))
+      let cur = sb_new()
+    elif c != 13 then
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  if sb_len(cur) > 0 then
+    let out = list_push(out, sb_str(cur))
+  end
+  let lines = out
+  ensure value_class(lines) == 9
+  return lines
+end
+
+# A short line's space-separated words (runs of spaces and tabs separate).
+make a function called vm_words takes line returns words
+  require value_class(line) == 8
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  while i < line.length do
+    let c = char_code(line, i)
+    if (c == 32) or (c == 9) then
+      if sb_len(cur) > 0 then
+        let out = list_push(out, sb_str(cur))
+      end
+      let cur = sb_new()
+    else
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  if sb_len(cur) > 0 then
+    let out = list_push(out, sb_str(cur))
+  end
+  let words = out
+  ensure value_class(words) == 9
+  return words
+end
+
+# The manifest's lowercase form of a hex digest (manifests may write either case).
+make a function called vm_lower takes text returns low
+  require value_class(text) == 8
+  let b = sb_new()
+  let i = 0
+  while i < text.length do
+    let c = char_code(text, i)
+    if (c >= 65) and (c <= 90) then
+      let c = c + 32
+    end
+    sb_push(b, chr(c))
+    let i = i + 1
+  end
+  let low = sb_str(b)
+  ensure low.length == text.length
+  return low
+end
+
+# Checks one package directory: [ok count, failure count].
+make a function called vm_check_package takes dir returns counts
+  require value_class(dir) == 8
+  let base = dir
+  if not (ends_with_slash(dir)) then
+    let base = dir + "/"
+  end
+  let mpath = base + "manifest.pkg"
+  print("package " + dir)
+  if not file_exists(mpath) then
+    print("  MISSING manifest " + mpath)
+    let counts = [0, 1]
+    ensure list_len(counts) == 2
+    return counts
+  end
+  let lines = vm_lines(read_file_bytes(mpath, 0, 16777216))
+  let good = 0
+  let bad = 0
+  let entries = 0
+  let i = 0
+  while i < list_len(lines) do
+    let words = vm_words(lines[i])
+    if (list_len(words) > 0) and (words[0] == "file") then
+      let entries = entries + 1
+      if (list_len(words) != 4) or (words[2] != "sha256") or (words[3].length != 64) then
+        print("  MALFORMED line " + (i + 1) + ": " + lines[i])
+        let bad = bad + 1
+      else
+        let path = words[1]
+        let want = vm_lower(words[3])
+        let got = sha256_file_hex(base + path)
+        if got == "" then
+          print("  MISSING " + path)
+          let bad = bad + 1
+        elif got == want then
+          print("  ok " + path)
+          let good = good + 1
+        else
+          print("  MISMATCH " + path + " manifest " + want + " file " + got)
+          let bad = bad + 1
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if entries == 0 then
+    print("  NO file entries in " + mpath)
+    let bad = bad + 1
+  end
+  let counts = [good, bad]
+  ensure list_len(counts) == 2
+  return counts
+end
+
+make a function called ends_with_slash takes s returns yes
+  require value_class(s) == 8
+  let yes = false
+  if s.length > 0 then
+    let c = char_code(s, s.length - 1)
+    let yes = (c == 47) or (c == 92)
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called vm_main takes dirs returns code
+  require value_class(dirs) == 9
+  if list_len(dirs) == 0 then
+    print("usage: verify_manifest <package directory> [<package directory> ...]")
+    let code = 2
+    ensure code == 2
+    return code
+  end
+  let good = 0
+  let bad = 0
+  let i = 0
+  while i < list_len(dirs) do
+    let c = vm_check_package(dirs[i])
+    let good = good + c[0]
+    let bad = bad + c[1]
+    let i = i + 1
+  end
+  print(to_s(good) + " ok, " + bad + " failed")
+  let code = 0
+  if bad > 0 then
+    let code = 1
+  end
+  ensure (code == 0) or (code == 1)
+  return code
+end
+
+let code = vm_main(argv())
+if code != 0 then
+  exit_with(code)
+end

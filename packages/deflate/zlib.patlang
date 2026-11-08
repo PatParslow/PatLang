@@ -1,0 +1,94 @@
+# The zlib wrapper (RFC 1950) around DEFLATE, and reading whole files as
+# byte lists.
+#
+#   zlib_compress(bytes, mode) -> the zlib stream (mode as deflate_raw's)
+#   zlib_decompress(bytes)     -> ["ok", bytes] | ["err", message]
+#   pkg_read_bytes(path)       -> a file's bytes ([] when it cannot be read)
+
+make a function called zlib_compress takes bytes, mode returns z
+  require value_class(bytes) == 9
+  # CMF 0x78: method 8, 32 KB window; FLG 0x9C: default level, check bits.
+  let v = vec_new()
+  vec_push(v, 120)
+  vec_push(v, 156)
+  def_stream(v, bytes, mode)
+  let a = adler32_bytes(bytes)
+  vec_push(v, (a shr 24) band 255)
+  vec_push(v, (a shr 16) band 255)
+  vec_push(v, (a shr 8) band 255)
+  vec_push(v, a band 255)
+  let z = vec_to_list(v)
+  ensure list_len(z) >= 7
+  return z
+end
+
+make a function called zlib_decompress takes bytes returns r
+  require value_class(bytes) == 9
+  let n = list_len(bytes)
+  if n < 2 then
+    let r = ["err", "truncated: no zlib header"]
+    ensure list_len(r) == 2
+    return r
+  end
+  let cmf = bytes[0]
+  let flg = bytes[1]
+  if ((cmf band 15) != 8) or ((cmf shr 4) > 7) or (((cmf * 256 + flg) % 31) != 0) then
+    let r = ["err", "bad zlib header"]
+    ensure list_len(r) == 2
+    return r
+  end
+  if (flg band 32) != 0 then
+    let r = ["err", "bad zlib header: a preset dictionary is not supported"]
+    ensure list_len(r) == 2
+    return r
+  end
+  let inf = inflate_raw(bytes, 2)
+  if inf[0] != "ok" then
+    let r = ["err", inf[1]]
+    ensure list_len(r) == 2
+    return r
+  end
+  let at = inf[2]
+  if at + 4 > n then
+    let r = ["err", "truncated: no Adler-32 trailer"]
+    ensure list_len(r) == 2
+    return r
+  end
+  let want = (bytes[at] shl 24) bor (bytes[at + 1] shl 16) bor (bytes[at + 2] shl 8) bor bytes[at + 3]
+  if adler32_bytes(inf[1]) != want then
+    let r = ["err", "adler32 mismatch"]
+    ensure list_len(r) == 2
+    return r
+  end
+  let r = ["ok", inf[1]]
+  ensure list_len(r) == 2
+  return r
+end
+
+# One read of up to 1 GB at a time; a file that fits is returned as read.
+make a function called pkg_read_bytes takes path returns bytes
+  require value_class(path) == 8
+  let window = 1073741824
+  let first = read_file_bytes(path, 0, window)
+  if list_len(first) < window then
+    let bytes = first
+    ensure value_class(bytes) == 9
+    return bytes
+  end
+  let out = first
+  let offset = window
+  let more = true
+  while more do
+    let part = read_file_bytes(path, offset, window)
+    let i = 0
+    while i < list_len(part) do
+      let out = list_push(out, part[i])
+      let i = i + 1
+    end
+    let offset = offset + list_len(part)
+    let more = list_len(part) == window
+  end
+  let bytes = out
+  ensure value_class(bytes) == 9
+  return bytes
+end

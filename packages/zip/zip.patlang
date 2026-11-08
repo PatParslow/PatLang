@@ -1,0 +1,438 @@
+# zip package: reads and writes zip archives (PKWARE APPNOTE): local file
+# headers, the central directory and the end-of-central-directory record;
+# entries stored (method 0) or deflated (method 8), each CRC-32 checked on
+# reading.
+#
+#   zip_build(entries)  -> the archive's bytes
+#       entries: a list of [name, bytes, method], method "stored" or
+#       "deflated"; a name ending in "/" is a directory (give it no bytes)
+#   zip_read(archive)   -> ["ok", entries] | ["err", message]
+#       entries as zip_build takes them, in central-directory order
+#   zip_directory(archive) -> ["ok", records] | ["err", message]
+#       one record per entry, without reading its data:
+#       [name, method number, crc32, compressed size, size, local header
+#       offset, flags]
+#
+# Names are written as UTF-8, with flag bit 11 set when a name is not
+# ASCII. A name read without bit 11 is taken byte for byte (each byte one
+# character, as Latin-1) rather than as code page 437.
+#
+# Not supported, and reported as errors when read: ZIP64 (archives or
+# entries of 4 GB or more, or 65535 entries or more), encryption, archives
+# split over several disks, and methods other than 0 and 8. Entries are
+# written with the date 1980-01-01 00:00, the earliest DOS date.
+
+include "../deflate/deflate.patlang"
+
+# ---- names ----
+
+# A string's UTF-8 bytes. Names are short, so indexing the string per
+# character is fine here.
+make a function called zip_name_bytes takes name returns bytes
+  require value_class(name) == 8
+  let out = []
+  let i = 0
+  while i < name.length do
+    let c = char_code(name, i)
+    if c < 128 then
+      let out = list_push(out, c)
+    elif c < 2048 then
+      let out = list_push(out, 192 bor (c shr 6))
+      let out = list_push(out, 128 bor (c band 63))
+    elif c < 65536 then
+      let out = list_push(out, 224 bor (c shr 12))
+      let out = list_push(out, 128 bor ((c shr 6) band 63))
+      let out = list_push(out, 128 bor (c band 63))
+    else
+      let out = list_push(out, 240 bor (c shr 18))
+      let out = list_push(out, 128 bor ((c shr 12) band 63))
+      let out = list_push(out, 128 bor ((c shr 6) band 63))
+      let out = list_push(out, 128 bor (c band 63))
+    end
+    let i = i + 1
+  end
+  let bytes = out
+  ensure list_len(bytes) >= name.length
+  return bytes
+end
+
+# A string from UTF-8 bytes; a malformed sequence's lead byte is taken as
+# one character.
+make a function called zip_name_from_bytes takes bytes returns name
+  require value_class(bytes) == 9
+  let b = sb_new()
+  let n = list_len(bytes)
+  let i = 0
+  while i < n do
+    let c = bytes[i]
+    let width = 1
+    let v = c
+    if (c >= 192) and (c < 224) then
+      let width = 2
+      let v = c band 31
+    elif (c >= 224) and (c < 240) then
+      let width = 3
+      let v = c band 15
+    elif (c >= 240) and (c < 248) then
+      let width = 4
+      let v = c band 7
+    end
+    let good = (width > 1) and (i + width <= n)
+    let k = 1
+    while good and (k < width) do
+      if (bytes[i + k] band 192) != 128 then
+        let good = false
+      else
+        let v = (v shl 6) bor (bytes[i + k] band 63)
+      end
+      let k = k + 1
+    end
+    if good then
+      sb_push(b, chr(v))
+      let i = i + width
+    else
+      sb_push(b, chr(c))
+      let i = i + 1
+    end
+  end
+  let name = sb_str(b)
+  ensure value_class(name) == 8
+  return name
+end
+
+make a function called zip_bytes_text takes bytes, lo, hi, utf8 returns name
+  require (lo >= 0) and (lo <= hi) and (hi <= list_len(bytes))
+  let part = []
+  let i = lo
+  while i < hi do
+    let part = list_push(part, bytes[i])
+    let i = i + 1
+  end
+  let name = ""
+  if utf8 then
+    let name = zip_name_from_bytes(part)
+  else
+    let b = sb_new()
+    let k = 0
+    while k < list_len(part) do
+      sb_push(b, chr(part[k]))
+      let k = k + 1
+    end
+    let name = sb_str(b)
+  end
+  ensure value_class(name) == 8
+  return name
+end
+
+# ---- little-endian fields ----
+
+make a function called zip_put16 takes out, v returns ok
+  require (v >= 0) and (v < 65536)
+  vec_push(out, v band 255)
+  vec_push(out, v shr 8)
+  let ok = true
+  ensure ok
+  return ok
+end
+
+make a function called zip_put32 takes out, v returns ok
+  require (v >= 0) and (v <= 4294967295)
+  vec_push(out, v band 255)
+  vec_push(out, (v shr 8) band 255)
+  vec_push(out, (v shr 16) band 255)
+  vec_push(out, (v shr 24) band 255)
+  let ok = true
+  ensure ok
+  return ok
+end
+
+make a function called zip_put_all takes out, bytes returns ok
+  require value_class(bytes) == 9
+  let i = 0
+  while i < list_len(bytes) do
+    vec_push(out, bytes[i])
+    let i = i + 1
+  end
+  let ok = true
+  ensure ok
+  return ok
+end
+
+make a function called zip_get16 takes z, at returns v
+  require (at >= 0) and (at + 2 <= list_len(z))
+  let v = z[at] bor (z[at + 1] shl 8)
+  ensure (v >= 0) and (v < 65536)
+  return v
+end
+
+make a function called zip_get32 takes z, at returns v
+  require (at >= 0) and (at + 4 <= list_len(z))
+  let v = z[at] bor (z[at + 1] shl 8) bor (z[at + 2] shl 16) bor (z[at + 3] shl 24)
+  ensure (v >= 0) and (v <= 4294967295)
+  return v
+end
+
+# ---- writing ----
+
+make a function called zip_is_ascii takes bytes returns yes
+  require value_class(bytes) == 9
+  let yes = true
+  let i = 0
+  while yes and (i < list_len(bytes)) do
+    if bytes[i] > 127 then
+      let yes = false
+    end
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called zip_build takes entries returns z
+  require value_class(entries) == 9
+  require list_len(entries) < 65535
+  let out = vec_new()
+  let table = crc32_table()
+  # Per entry: [name bytes, method number, crc, compressed size, size,
+  # local header offset, flags, is a directory]
+  let records = []
+  let i = 0
+  while i < list_len(entries) do
+    let e = entries[i]
+    let nb = zip_name_bytes(e[0])
+    let data = e[1]
+    let method = 0
+    let body = data
+    if e[2] == "deflated" then
+      let method = 8
+      let body = deflate_raw(data, "dynamic")
+    end
+    let flags = 0
+    if not zip_is_ascii(nb) then
+      let flags = 2048
+    end
+    let crc = crc32_update(0, table, data, 0, list_len(data))
+    let offset = vec_len(out)
+    let is_dir = (list_len(nb) > 0) and (nb[list_len(nb) - 1] == 47)
+    let records = list_push(records, [nb, method, crc, list_len(body), list_len(data), offset, flags, is_dir])
+    zip_put32(out, 67324752)
+    zip_put16(out, 20)
+    zip_put16(out, flags)
+    zip_put16(out, method)
+    zip_put16(out, 0)
+    zip_put16(out, 33)
+    zip_put32(out, crc)
+    zip_put32(out, list_len(body))
+    zip_put32(out, list_len(data))
+    zip_put16(out, list_len(nb))
+    zip_put16(out, 0)
+    zip_put_all(out, nb)
+    zip_put_all(out, body)
+    let i = i + 1
+  end
+  let cd_start = vec_len(out)
+  let i = 0
+  while i < list_len(records) do
+    let r = records[i]
+    zip_put32(out, 33639248)
+    zip_put16(out, 20)
+    zip_put16(out, 20)
+    zip_put16(out, r[6])
+    zip_put16(out, r[1])
+    zip_put16(out, 0)
+    zip_put16(out, 33)
+    zip_put32(out, r[2])
+    zip_put32(out, r[3])
+    zip_put32(out, r[4])
+    zip_put16(out, list_len(r[0]))
+    zip_put16(out, 0)
+    zip_put16(out, 0)
+    zip_put16(out, 0)
+    zip_put16(out, 0)
+    # external attributes: MS-DOS directory bit for a directory
+    if r[7] then
+      zip_put32(out, 16)
+    else
+      zip_put32(out, 0)
+    end
+    zip_put32(out, r[5])
+    zip_put_all(out, r[0])
+    let i = i + 1
+  end
+  let cd_size = vec_len(out) - cd_start
+  zip_put32(out, 101010256)
+  zip_put16(out, 0)
+  zip_put16(out, 0)
+  zip_put16(out, list_len(records))
+  zip_put16(out, list_len(records))
+  zip_put32(out, cd_size)
+  zip_put32(out, cd_start)
+  zip_put16(out, 0)
+  let z = vec_to_list(out)
+  ensure list_len(z) >= 22
+  return z
+end
+
+# ---- reading ----
+
+# The end-of-central-directory record's offset, or -1. It is searched
+# backwards over at most the 22-byte record plus the longest comment, and
+# must account for the archive's last byte.
+make a function called zip_find_eocd takes z returns at
+  require value_class(z) == 9
+  let n = list_len(z)
+  let at = 0 - 1
+  let p = n - 22
+  let lowest = n - 22 - 65535
+  if lowest < 0 then
+    let lowest = 0
+  end
+  while (at < 0) and (p >= lowest) do
+    if (z[p] == 80) and (z[p + 1] == 75) and (z[p + 2] == 5) and (z[p + 3] == 6) then
+      if p + 22 + zip_get16(z, p + 20) == n then
+        let at = p
+      end
+    end
+    let p = p - 1
+  end
+  ensure at >= (0 - 1)
+  return at
+end
+
+make a function called zip_err takes message returns r
+  require value_class(message) == 8
+  let r = ["err", message]
+  ensure r[0] == "err"
+  return r
+end
+
+make a function called zip_directory takes z returns r
+  require value_class(z) == 9
+  let n = list_len(z)
+  let e = zip_find_eocd(z)
+  if e < 0 then
+    return zip_err("not a zip archive: no end of central directory")
+  end
+  if (zip_get16(z, e + 4) != 0) or (zip_get16(z, e + 6) != 0) then
+    return zip_err("archives split over several disks are not supported")
+  end
+  let count = zip_get16(z, e + 10)
+  let cd_size = zip_get32(z, e + 12)
+  let cd_start = zip_get32(z, e + 16)
+  if (count == 65535) or (cd_size == 4294967295) or (cd_start == 4294967295) then
+    return zip_err("zip64 is not supported")
+  end
+  if cd_start + cd_size > e then
+    return zip_err("truncated: the central directory runs past its end record")
+  end
+  let records = []
+  let p = cd_start
+  let k = 0
+  while k < count do
+    if p + 46 > e then
+      return zip_err("truncated: central directory entry " + k)
+    end
+    if zip_get32(z, p) != 33639248 then
+      return zip_err("bad central directory entry " + k)
+    end
+    let flags = zip_get16(z, p + 8)
+    let method = zip_get16(z, p + 10)
+    let crc = zip_get32(z, p + 16)
+    let csize = zip_get32(z, p + 20)
+    let usize = zip_get32(z, p + 24)
+    let nlen = zip_get16(z, p + 28)
+    let xlen = zip_get16(z, p + 30)
+    let clen = zip_get16(z, p + 32)
+    let offset = zip_get32(z, p + 42)
+    if p + 46 + nlen + xlen + clen > e then
+      return zip_err("truncated: central directory entry " + k)
+    end
+    let name = zip_bytes_text(z, p + 46, p + 46 + nlen, (flags band 2048) != 0)
+    if (csize == 4294967295) or (usize == 4294967295) or (offset == 4294967295) then
+      return zip_err("zip64 is not supported (entry " + name + ")")
+    end
+    let records = list_push(records, [name, method, crc, csize, usize, offset, flags])
+    let p = p + 46 + nlen + xlen + clen
+    let k = k + 1
+  end
+  let r = ["ok", records]
+  ensure list_len(r) == 2
+  return r
+end
+
+# One entry's data, checked: ["ok", bytes] or ["err", message].
+make a function called zip_entry_data takes z, rec, table returns r
+  require (list_len(rec) == 7) and (list_len(table) == 256)
+  let name = rec[0]
+  let off = rec[5]
+  if off + 30 > list_len(z) then
+    return zip_err("truncated: local header of " + name)
+  end
+  if zip_get32(z, off) != 67324752 then
+    return zip_err("bad local header for " + name)
+  end
+  if (rec[6] band 1) != 0 then
+    return zip_err("encrypted entries are not supported (" + name + ")")
+  end
+  let at = off + 30 + zip_get16(z, off + 26) + zip_get16(z, off + 28)
+  if at + rec[3] > list_len(z) then
+    return zip_err("truncated: data of " + name)
+  end
+  let data = []
+  if rec[1] == 0 then
+    let buf = []
+    let i = at
+    while i < at + rec[3] do
+      let buf = list_push(buf, z[i])
+      let i = i + 1
+    end
+    let data = buf
+  elif rec[1] == 8 then
+    let inf = inflate_raw(z, at)
+    if inf[0] != "ok" then
+      return zip_err("bad deflate data in " + name + ": " + inf[1])
+    end
+    if inf[2] > at + rec[3] then
+      return zip_err("bad deflate data in " + name + ": it runs past the entry's compressed size")
+    end
+    let data = inf[1]
+  else
+    return zip_err("unsupported compression method " + rec[1] + " (" + name + ")")
+  end
+  if list_len(data) != rec[4] then
+    return zip_err("size mismatch in " + name + ": " + list_len(data) + " bytes, the directory says " + rec[4])
+  end
+  if crc32_update(0, table, data, 0, list_len(data)) != rec[2] then
+    return zip_err("crc mismatch in " + name)
+  end
+  let r = ["ok", data]
+  ensure list_len(r) == 2
+  return r
+end
+
+make a function called zip_read takes z returns r
+  require value_class(z) == 9
+  let d = zip_directory(z)
+  if d[0] != "ok" then
+    return d
+  end
+  let table = crc32_table()
+  let entries = []
+  let i = 0
+  while i < list_len(d[1]) do
+    let rec = d[1][i]
+    let got = zip_entry_data(z, rec, table)
+    if got[0] != "ok" then
+      return got
+    end
+    let method = "stored"
+    if rec[1] == 8 then
+      let method = "deflated"
+    end
+    let entries = list_push(entries, [rec[0], got[1], method])
+    let i = i + 1
+  end
+  let r = ["ok", entries]
+  ensure list_len(r) == 2
+  return r
+end

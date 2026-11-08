@@ -1,0 +1,441 @@
+# Runs packages/zip/spec/zip.feature, from the repository root:
+#
+#   ./self_hosting/build/v2.exe packages/zip/spec/run_spec.patlang packages/zip/build/run_spec.exe --workers 2
+#   ./packages/zip/build/run_spec.exe [feature file]
+#
+# Python's zipfile (spec/oracle.py, run as `py -3 -I`) is the reference.
+# Scratch files go to packages/zip/build/.
+include "../../../self_hosting/lib/includes.patlang"
+include "../../../self_hosting/lib/gherkin.patlang"
+include "../zip.patlang"
+
+make a function called zs_dir returns d
+  let d = "packages/zip/build/"
+  ensure d.length > 0
+  return d
+end
+
+# One oracle call, its output trimmed. exec_capture's arguments are its
+# call's own, so one call per count.
+make a function called zs_run takes script, a returns out
+  require list_len(a) > 0
+  let n = list_len(a)
+  let raw = ""
+  if n == 1 then
+    let raw = exec_capture("py", "-3", "-I", script, a[0])
+  elif n == 2 then
+    let raw = exec_capture("py", "-3", "-I", script, a[0], a[1])
+  elif n == 3 then
+    let raw = exec_capture("py", "-3", "-I", script, a[0], a[1], a[2])
+  elif n == 4 then
+    let raw = exec_capture("py", "-3", "-I", script, a[0], a[1], a[2], a[3])
+  else
+    let raw = exec_capture("py", "-3", "-I", script, a[0], a[1], a[2], a[3], a[4])
+  end
+  let out = str_trim(raw)
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called zs_py takes a returns out
+  require list_len(a) > 0
+  let out = zs_run("packages/zip/spec/oracle.py", a)
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called zs_gen takes kind, n, path returns out
+  require value_class(path) == 8
+  let out = zs_run("packages/deflate/spec/oracle.py", ["gen", kind, n, path])
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called zs_hex takes bytes returns h
+  require value_class(bytes) == 9
+  let digits = "0123456789abcdef"
+  let b = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    sb_push(b, substr(digits, bytes[i] shr 4, 1))
+    sb_push(b, substr(digits, bytes[i] band 15, 1))
+    let i = i + 1
+  end
+  let h = sb_str(b)
+  ensure h.length == 2 * list_len(bytes)
+  return h
+end
+
+make a function called zs_hex_digit takes c returns v
+  require c >= 0
+  let v = 0
+  if (c >= 48) and (c <= 57) then
+    let v = c - 48
+  elif (c >= 97) and (c <= 102) then
+    let v = c - 87
+  elif (c >= 65) and (c <= 70) then
+    let v = c - 55
+  end
+  ensure (v >= 0) and (v < 16)
+  return v
+end
+
+# A name from the feature: \uXXXX escapes become their characters.
+make a function called zs_unescape takes text returns name
+  require value_class(text) == 8
+  let b = sb_new()
+  let n = text.length
+  let i = 0
+  while i < n do
+    let c = char_code(text, i)
+    if (c == 92) and (i + 5 < n + 0) and (char_code(text, i + 1) == 117) then
+      let v = 0
+      let k = 2
+      while k < 6 do
+        let v = v * 16 + zs_hex_digit(char_code(text, i + k))
+        let k = k + 1
+      end
+      sb_push(b, chr(v))
+      let i = i + 6
+    else
+      sb_push(b, chr(c))
+      let i = i + 1
+    end
+  end
+  let name = sb_str(b)
+  ensure value_class(name) == 8
+  return name
+end
+
+make a function called zs_same_bytes takes a, b returns same
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let same = list_len(a) == list_len(b)
+  let i = 0
+  while same and (i < list_len(a)) do
+    if a[i] != b[i] then
+      let same = false
+    end
+    let i = i + 1
+  end
+  ensure value_class(same) == 1
+  return same
+end
+
+make a function called zs_split takes text, sep returns parts
+  require value_class(text) == 8
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  while i < text.length do
+    let c = char_code(text, i)
+    if c == sep then
+      let out = list_push(out, sb_str(cur))
+      let cur = sb_new()
+    elif c != 13 then
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  let out = list_push(out, sb_str(cur))
+  let parts = out
+  ensure list_len(parts) >= 1
+  return parts
+end
+
+make a function called zs_method_number takes method returns n
+  require value_class(method) == 8
+  let n = 0
+  if method == "deflated" then
+    let n = 8
+  end
+  ensure (n == 0) or (n == 8)
+  return n
+end
+
+# ---- steps ----
+
+make a function called zs_entries takes ctx returns entries
+  let entries = []
+  if ctx_has(ctx, "entries") then
+    let entries = ctx_get(ctx, "entries")
+  end
+  ensure value_class(entries) == 9
+  return entries
+end
+
+make a function called st_zs_entry takes ctx returns ok
+  let k = list_len(zs_entries(ctx))
+  let path = zs_dir() + "entry" + k + ".bin"
+  let r = zs_gen(step_arg(ctx, "kind"), step_arg(ctx, "n"), path)
+  let data = pkg_read_bytes(path)
+  let name = zs_unescape(step_arg(ctx, "name"))
+  ctx_set(ctx, "entries", list_push(zs_entries(ctx), [name, data, step_arg(ctx, "method")]))
+  return expect(ctx, "test data for " + name, r + " " + list_len(data), "ok " + step_arg(ctx, "n"))
+end
+
+make a function called st_zs_dir_entry takes ctx returns ok
+  ctx_set(ctx, "entries", list_push(zs_entries(ctx), [zs_unescape(step_arg(ctx, "name")), [], "stored"]))
+  return true
+end
+
+make a function called st_zs_py_crc takes ctx returns ok
+  let out = zs_py(["zipextract", zs_dir() + "pl.zip", zs_dir() + "py_out"])
+  let lines = zs_split(out, 10)
+  ctx_set(ctx, "py_lines", lines)
+  return expect(ctx, "Python's testzip()", lines[0], "testzip ok")
+end
+
+# The entries a zip was built from, against what Python extracted.
+make a function called zs_check_python takes ctx, expected returns ok
+  require value_class(expected) == 9
+  let out = zs_py(["zipextract", zs_dir() + "pl.zip", zs_dir() + "py_out"])
+  let lines = zs_split(out, 10)
+  let ok = expect(ctx, "Python's testzip()", lines[0], "testzip ok")
+  let ok = expect(ctx, "Python's entry count", list_len(lines) - 1, list_len(expected)) and ok
+  let i = 0
+  while (i < list_len(expected)) and (i + 1 < list_len(lines)) do
+    let e = expected[i]
+    let f = zs_split(lines[i + 1], 32)
+    let ok = expect(ctx, "entry " + i + " name", f[1], zs_hex(zip_name_bytes(e[0]))) and ok
+    let ok = expect(ctx, "entry " + i + " method", f[2], to_s(zs_method_number(e[2]))) and ok
+    let got = pkg_read_bytes(zs_dir() + "py_out/" + i + ".bin")
+    let ok = expect(ctx, "entry " + i + " bytes (" + list_len(e[1]) + ")", zs_same_bytes(got, e[1]), true) and ok
+    let i = i + 1
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_zs_py_same takes ctx returns ok
+  return zs_check_python(ctx, ctx_get(ctx, "built"))
+end
+
+make a function called st_zs_write_keep takes ctx returns ok
+  let entries = zs_entries(ctx)
+  let z = zip_build(entries)
+  ctx_set(ctx, "zip", z)
+  ctx_set(ctx, "built", entries)
+  ctx_set(ctx, "entries", [])
+  write_file_bytes(zs_dir() + "pl.zip", z)
+  return true
+end
+
+make a function called st_zs_read takes ctx returns ok
+  ctx_set(ctx, "read", zip_read(ctx_get(ctx, "zip")))
+  return true
+end
+
+make a function called zs_check_read takes ctx, expected returns ok
+  require value_class(expected) == 9
+  let r = ctx_get(ctx, "read")
+  if r[0] != "ok" then
+    return expect(ctx, "PatLang reads the zip", r[0] + ": " + r[1], "ok")
+  end
+  let got = r[1]
+  let ok = expect(ctx, "entry count", list_len(got), list_len(expected))
+  let i = 0
+  while (i < list_len(expected)) and (i < list_len(got)) do
+    let ok = expect(ctx, "entry " + i + " name", got[i][0], expected[i][0]) and ok
+    let ok = expect(ctx, "entry " + i + " method", got[i][2], expected[i][2]) and ok
+    let ok = expect(ctx, "entry " + i + " bytes (" + list_len(expected[i][1]) + ")", zs_same_bytes(got[i][1], expected[i][1]), true) and ok
+    let i = i + 1
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_zs_pl_same takes ctx returns ok
+  return zs_check_read(ctx, ctx_get(ctx, "built"))
+end
+
+# Python writes a zip; the names in the spec are escaped, sent as hex.
+make a function called zs_py_write takes ctx, spec, comment returns ok
+  require value_class(spec) == 8
+  let items = []
+  if spec != "" then
+    let items = zs_split(spec, 44)
+  end
+  let b = sb_new()
+  let i = 0
+  while i < list_len(items) do
+    let eq = zs_split(items[i], 61)
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, zs_hex(zip_name_bytes(zs_unescape(eq[0]))) + "=" + eq[1])
+    let i = i + 1
+  end
+  let path = zs_dir() + "py.zip"
+  let r = ""
+  if comment == "" then
+    let r = zs_py(["zipmake", path, sb_str(b)])
+  else
+    let r = zs_py(["zipmake", path, sb_str(b), comment])
+  end
+  ctx_set(ctx, "zip", pkg_read_bytes(path))
+  let ok = expect(ctx, "Python wrote the zip", r, "ok")
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called st_zs_py_write takes ctx returns ok
+  return zs_py_write(ctx, step_arg(ctx, "spec"), "")
+end
+
+make a function called st_zs_py_write_empty takes ctx returns ok
+  return zs_py_write(ctx, "", "")
+end
+
+make a function called st_zs_py_write_comment takes ctx returns ok
+  return zs_py_write(ctx, step_arg(ctx, "spec"), step_arg(ctx, "comment"))
+end
+
+# What Python's zipfile reads from the zip in ctx, as [name, bytes, method]
+# entries (the zip is written to a file for it first).
+make a function called st_zs_pl_matches_py takes ctx returns ok
+  write_file_bytes(zs_dir() + "check.zip", ctx_get(ctx, "zip"))
+  let out = zs_py(["zipextract", zs_dir() + "check.zip", zs_dir() + "py_out"])
+  let lines = zs_split(out, 10)
+  let ok = expect(ctx, "Python's testzip()", lines[0], "testzip ok")
+  let expected = []
+  let i = 1
+  while i < list_len(lines) do
+    let f = zs_split(lines[i], 32)
+    let method = "stored"
+    if f[2] == "8" then
+      let method = "deflated"
+    end
+    let name = zip_name_from_bytes(zs_unhex(f[1]))
+    let expected = list_push(expected, [name, pkg_read_bytes(zs_dir() + "py_out/" + f[0] + ".bin"), method])
+    let i = i + 1
+  end
+  return zs_check_read(ctx, expected) and ok
+end
+
+make a function called zs_unhex takes h returns bytes
+  require value_class(h) == 8
+  let out = []
+  let i = 0
+  while i + 1 < h.length do
+    let out = list_push(out, zs_hex_digit(char_code(h, i)) * 16 + zs_hex_digit(char_code(h, i + 1)))
+    let i = i + 2
+  end
+  let bytes = out
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+make a function called st_zs_read_count takes ctx returns ok
+  let r = ctx_get(ctx, "read")
+  if r[0] != "ok" then
+    return expect(ctx, "PatLang reads the zip", r[0] + ": " + r[1], "ok")
+  end
+  return expect(ctx, "entry count", to_s(list_len(r[1])), step_arg(ctx, "n"))
+end
+
+make a function called st_zs_change_data takes ctx returns ok
+  let z = ctx_get(ctx, "zip")
+  let d = zip_directory(z)
+  if d[0] != "ok" then
+    return expect(ctx, "the zip's directory", d[0] + ": " + d[1], "ok")
+  end
+  let want = zs_unescape(step_arg(ctx, "name"))
+  let i = 0
+  while i < list_len(d[1]) do
+    let rec = d[1][i]
+    if rec[0] == want then
+      let off = rec[5]
+      let nlen = z[off + 26] + 256 * z[off + 27]
+      let elen = z[off + 28] + 256 * z[off + 29]
+      let at = off + 30 + nlen + elen
+      ctx_set(ctx, "zip", list_set(z, at, z[at] bxor 1))
+      return true
+    end
+    let i = i + 1
+  end
+  return expect(ctx, "an entry named " + want, "none", "one")
+end
+
+make a function called st_zs_cut_half takes ctx returns ok
+  let z = ctx_get(ctx, "zip")
+  let out = []
+  let i = 0
+  while i < (list_len(z) shr 1) do
+    let out = list_push(out, z[i])
+    let i = i + 1
+  end
+  ctx_set(ctx, "zip", out)
+  return true
+end
+
+make a function called st_zs_bytes takes ctx returns ok
+  let parts = zs_split(step_arg(ctx, "list"), 32)
+  let out = []
+  let i = 0
+  while i < list_len(parts) do
+    let out = list_push(out, to_num(parts[i]))
+    let i = i + 1
+  end
+  ctx_set(ctx, "zip", out)
+  return true
+end
+
+make a function called st_zs_fails takes ctx returns ok
+  let r = ctx_get(ctx, "read")
+  let got = r[0]
+  if r[0] == "err" then
+    let got = "err " + contains_text(r[1], step_arg(ctx, "msg")) + " (" + r[1] + ")"
+  end
+  return expect(ctx, "fails with " + step_arg(ctx, "msg") + ": " + got, starts_with(got, "err true"), true)
+end
+
+make a function called st_zs_py_first_hex takes ctx returns ok
+  let out = zs_py(["zipextract", zs_dir() + "pl.zip", zs_dir() + "py_out"])
+  let lines = zs_split(out, 10)
+  if list_len(lines) < 2 then
+    return expect(ctx, "Python reads an entry", out, "an entry")
+  end
+  return expect(ctx, "Python's first entry name as UTF-8 hex", zs_split(lines[1], 32)[1], step_arg(ctx, "hex"))
+end
+
+make a function called st_zs_first_chars takes ctx returns ok
+  let r = ctx_get(ctx, "read")
+  if r[0] != "ok" then
+    return expect(ctx, "PatLang reads the zip", r[0] + ": " + r[1], "ok")
+  end
+  let name = r[1][0][0]
+  let ok = expect(ctx, "first entry name's characters", to_s(name.length), step_arg(ctx, "n"))
+  return expect(ctx, "its sixth character", "U+" + zs_hex([char_code(name, 5) shr 8, char_code(name, 5) band 255]), "U+" + step_arg(ctx, "cp")) and ok
+end
+
+make a function called register_zip_steps takes ctx returns ok
+  step(ctx, "a zip entry \"{name}\" of test data \"{kind}\" of {n} bytes, {method}", "st_zs_entry")
+  step(ctx, "a zip directory entry \"{name}\"", "st_zs_dir_entry")
+  step(ctx, "PatLang writes the zip", "st_zs_write_keep")
+  step(ctx, "Python's zipfile finds every CRC correct", "st_zs_py_crc")
+  step(ctx, "Python's zipfile gives back every entry's name, method and bytes", "st_zs_py_same")
+  step(ctx, "PatLang reads it", "st_zs_read")
+  step(ctx, "PatLang gives back every entry's name, method and bytes", "st_zs_pl_same")
+  step(ctx, "Python writes a zip of \"\"", "st_zs_py_write_empty")
+  step(ctx, "Python writes a zip of \"{spec}\" with the comment \"{comment}\"", "st_zs_py_write_comment")
+  step(ctx, "Python writes a zip of \"{spec}\"", "st_zs_py_write")
+  step(ctx, "PatLang reads the entries Python's zipfile reads, with the same names, methods and bytes", "st_zs_pl_matches_py")
+  step(ctx, "PatLang reads {n} entries", "st_zs_read_count")
+  step(ctx, "the first data byte of entry \"{name}\" is changed", "st_zs_change_data")
+  step(ctx, "it is cut to half its length", "st_zs_cut_half")
+  step(ctx, "the archive bytes {list}", "st_zs_bytes")
+  step(ctx, "Python's zipfile names the first entry with the UTF-8 bytes {hex}", "st_zs_py_first_hex")
+  step(ctx, "PatLang's first entry name has {n} characters, its sixth U+{cp}", "st_zs_first_chars")
+  step(ctx, "PatLang's read fails with \"{msg}\"", "st_zs_fails")
+  return true
+end
+
+let ctx = ctx_new()
+register_zip_steps(ctx)
+let only = argv()
+if list_len(only) > 0 then
+  run_feature_file(ctx, only[0])
+else
+  run_feature_file(ctx, "packages/zip/spec/zip.feature")
+end
+ctx_report(ctx)

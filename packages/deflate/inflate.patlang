@@ -1,0 +1,590 @@
+# Inflate: decodes a raw DEFLATE stream (RFC 1951): stored, fixed-Huffman
+# and dynamic-Huffman blocks.
+#
+#   inflate_raw(bytes, start) -> ["ok", output bytes, end]
+#                              | ["err", message, byte position]
+#
+# bytes is a list of ints; the stream starts at bytes[start]; end is the
+# index of the first byte after the stream (where a zlib trailer starts).
+#
+# Starting point: self_hosting/lib/inflate.patlang (a puff.c-shaped decoder
+# for PNG). From it this file keeps the RFC tables (length and distance
+# bases and extra bits, the code-length order), the fixed-code lengths, the
+# dynamic header's code-length decoding (repeat codes 16, 17, 18) and the
+# canonical code assignment. It differs where that file's limits would bite
+# here: input is a List<Int> (O(1) indexing) instead of a String read with
+# char_code; output grows in a vec instead of a pre-sized raw buffer;
+# Huffman codes decode by one table lookup on the next bits instead of bit by
+# bit; the bit reader keeps up to 32 bits in a local; and malformed input
+# (truncation, bad codes, over-subscribed codes, distances too far back,
+# stored-length mismatch, block type 3) is reported instead of ignored.
+#
+# Bit reader state is a vec [pos, bitbuf, bitcnt, error]: pos is the next
+# input byte to load; bitbuf holds bitcnt loaded, unconsumed bits, the next
+# one lowest. Loading past the input's end loads zero bytes (a code near
+# the end may need more lookahead than the stream has); having CONSUMED a
+# bit past the end is the truncation error.
+
+make a function called inf_lbase returns t
+  let t = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
+  ensure list_len(t) == 29
+  return t
+end
+
+make a function called inf_lext returns t
+  let t = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+  ensure list_len(t) == 29
+  return t
+end
+
+make a function called inf_dbase returns t
+  let t = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
+  ensure list_len(t) == 30
+  return t
+end
+
+make a function called inf_dext returns t
+  let t = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+  ensure list_len(t) == 30
+  return t
+end
+
+# The order code-length code lengths are sent in (RFC 1951 3.2.7).
+make a function called inf_clc_order returns t
+  let t = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+  ensure list_len(t) == 19
+  return t
+end
+
+# n copies of v.
+make a function called inf_filled takes n, v returns l
+  require n >= 0
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, v)
+    let i = i + 1
+  end
+  let l = out
+  ensure list_len(l) == n
+  return l
+end
+
+# The low n bits of code, reversed (Huffman codes are packed from their
+# most significant bit; the bit reader delivers the first bit lowest).
+make a function called inf_reverse takes code, n returns r
+  require (code >= 0) and (n >= 0) and (n <= 16)
+  let x = code
+  let out = 0
+  let i = 0
+  while i < n do
+    let out = (out shl 1) bor (x band 1)
+    let x = x shr 1
+    let i = i + 1
+  end
+  let r = out
+  ensure r >= 0
+  return r
+end
+
+# A decoding table for a canonical Huffman code given each symbol's code
+# length (0 for unused): [table, bits, problem]. table has 2^bits entries,
+# indexed by the next bits of input (first bit lowest); an entry is
+# symbol * 16 + code length, or -1 where no code matches (an incomplete code,
+# which RFC 1951 allows for one-symbol distance codes). problem is "" or
+# "over-subscribed". bits is the longest code length, at least 1.
+make a function called inf_table takes lengths returns huff
+  require value_class(lengths) == 9
+  let n = list_len(lengths)
+  let count = inf_filled(16, 0)
+  let maxlen = 0
+  let s = 0
+  while s < n do
+    let l = lengths[s]
+    let count = list_set(count, l, count[l] + 1)
+    if l > maxlen then
+      let maxlen = l
+    end
+    let s = s + 1
+  end
+  let problem = ""
+  let left = 1
+  let l = 1
+  while l <= 15 do
+    let left = (left shl 1) - count[l]
+    if left < 0 then
+      let problem = "over-subscribed"
+    end
+    let l = l + 1
+  end
+  if maxlen == 0 then
+    let maxlen = 1
+  end
+  let first = inf_filled(16, 0)
+  let code = 0
+  let l = 1
+  while l <= 15 do
+    let code = (code + count[l - 1]) shl 1
+    if l == 1 then
+      let code = 0
+    end
+    let first = list_set(first, l, code)
+    let l = l + 1
+  end
+  let size = 1 shl maxlen
+  let table = inf_filled(size, 0 - 1)
+  if problem == "" then
+    let s = 0
+    while s < n do
+      let l = lengths[s]
+      if l > 0 then
+        let c = first[l]
+        let first = list_set(first, l, c + 1)
+        let k = inf_reverse(c, l)
+        let step = 1 shl l
+        let entry = s * 16 + l
+        while k < size do
+          let table = list_set(table, k, entry)
+          let k = k + step
+        end
+      end
+      let s = s + 1
+    end
+  end
+  let huff = [table, maxlen, problem]
+  ensure (list_len(huff[0]) == (1 shl huff[1])) and (huff[1] >= 1)
+  return huff
+end
+
+make a function called inf_fixed_lit returns huff
+  let lengths = inf_filled(144, 8)
+  let i = 144
+  while i < 256 do
+    let lengths = list_push(lengths, 9)
+    let i = i + 1
+  end
+  while i < 280 do
+    let lengths = list_push(lengths, 7)
+    let i = i + 1
+  end
+  while i < 288 do
+    let lengths = list_push(lengths, 8)
+    let i = i + 1
+  end
+  let huff = inf_table(lengths)
+  ensure huff[1] == 9
+  return huff
+end
+
+make a function called inf_fixed_dist returns huff
+  let huff = inf_table(inf_filled(30, 5))
+  ensure huff[1] == 5
+  return huff
+end
+
+# ---- the bit reader, through the state vec ----
+
+make a function called inf_state takes start returns st
+  require start >= 0
+  let st = vec_new()
+  vec_push(st, start)
+  vec_push(st, 0)
+  vec_push(st, 0)
+  vec_push(st, "")
+  ensure vec_len(st) == 4
+  return st
+end
+
+make a function called inf_fail takes st, message returns ok
+  require value_class(message) == 8
+  if vec_get(st, 3) == "" then
+    vec_set(st, 3, message)
+  end
+  let ok = false
+  ensure ok == false
+  return ok
+end
+
+# Bits consumed past the end of the input mean the stream was cut short.
+make a function called inf_check_end takes st, n returns ok
+  require n >= 0
+  let ok = true
+  let pos = vec_get(st, 0)
+  if pos > n then
+    if (pos * 8 - vec_get(st, 2)) > n * 8 then
+      let ok = inf_fail(st, "truncated: the stream ends inside a block")
+    end
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# The next n bits (n <= 24) as a value, first bit lowest.
+make a function called inf_bits takes input, st, n returns v
+  require (n >= 0) and (n <= 24)
+  let size = list_len(input)
+  let pos = vec_get(st, 0)
+  let buf = vec_get(st, 1)
+  let cnt = vec_get(st, 2)
+  while cnt < n do
+    if pos < size then
+      let buf = buf bor (input[pos] shl cnt)
+    end
+    let pos = pos + 1
+    let cnt = cnt + 8
+  end
+  let v = buf band ((1 shl n) - 1)
+  vec_set(st, 0, pos)
+  vec_set(st, 1, buf shr n)
+  vec_set(st, 2, cnt - n)
+  inf_check_end(st, size)
+  ensure (v >= 0) and (v < (1 shl n) + 1)
+  return v
+end
+
+# The next symbol of a Huffman code, or -1 (and the state's error) for a
+# bit pattern that is no code.
+make a function called inf_symbol takes input, st, huff returns sym
+  require list_len(huff) == 3
+  let size = list_len(input)
+  let bits = huff[1]
+  let pos = vec_get(st, 0)
+  let buf = vec_get(st, 1)
+  let cnt = vec_get(st, 2)
+  while cnt < bits do
+    if pos < size then
+      let buf = buf bor (input[pos] shl cnt)
+    end
+    let pos = pos + 1
+    let cnt = cnt + 8
+  end
+  let e = huff[0][buf band ((1 shl bits) - 1)]
+  if e < 0 then
+    vec_set(st, 0, pos)
+    vec_set(st, 1, buf)
+    vec_set(st, 2, cnt)
+    inf_fail(st, "bad code")
+    let sym = 0 - 1
+    ensure sym >= (0 - 1)
+    return sym
+  end
+  let l = e band 15
+  vec_set(st, 0, pos)
+  vec_set(st, 1, buf shr l)
+  vec_set(st, 2, cnt - l)
+  inf_check_end(st, size)
+  let sym = e shr 4
+  ensure sym >= (0 - 1)
+  return sym
+end
+
+# ---- block bodies ----
+
+# A dynamic block's two codes, read from its header: [litlen, dist] or []
+# (and the state's error).
+make a function called inf_dynamic_codes takes input, st returns codes
+  require vec_len(st) == 4
+  let hlit = inf_bits(input, st, 5) + 257
+  let hdist = inf_bits(input, st, 5) + 1
+  let hclen = inf_bits(input, st, 4) + 4
+  if (hlit > 286) or (hdist > 30) then
+    inf_fail(st, "bad dynamic header: too many length or distance codes")
+    let codes = []
+    ensure value_class(codes) == 9
+    return codes
+  end
+  let order = inf_clc_order()
+  let cl = inf_filled(19, 0)
+  let j = 0
+  while j < hclen do
+    let cl = list_set(cl, order[j], inf_bits(input, st, 3))
+    let j = j + 1
+  end
+  let clh = inf_table(cl)
+  if clh[2] != "" then
+    inf_fail(st, "bad dynamic header: code-length code " + clh[2])
+    let codes = []
+    ensure value_class(codes) == 9
+    return codes
+  end
+  let total = hlit + hdist
+  let lengths = []
+  while (list_len(lengths) < total) and (vec_get(st, 3) == "") do
+    let sym = inf_symbol(input, st, clh)
+    if (sym >= 0) and (sym < 16) then
+      let lengths = list_push(lengths, sym)
+    elif sym == 16 then
+      if list_len(lengths) == 0 then
+        inf_fail(st, "bad dynamic header: repeat with no previous length")
+      else
+        let prev = lengths[list_len(lengths) - 1]
+        let rep = inf_bits(input, st, 2) + 3
+        let r = 0
+        while r < rep do
+          let lengths = list_push(lengths, prev)
+          let r = r + 1
+        end
+      end
+    elif sym == 17 then
+      let lengths = list_extend_zeros(lengths, inf_bits(input, st, 3) + 3)
+    elif sym == 18 then
+      let lengths = list_extend_zeros(lengths, inf_bits(input, st, 7) + 11)
+    end
+  end
+  if vec_get(st, 3) != "" then
+    let codes = []
+    ensure value_class(codes) == 9
+    return codes
+  end
+  if list_len(lengths) > total then
+    inf_fail(st, "bad dynamic header: lengths repeat past the end")
+    let codes = []
+    ensure value_class(codes) == 9
+    return codes
+  end
+  if lengths[256] == 0 then
+    inf_fail(st, "bad dynamic header: no end-of-block code")
+    let codes = []
+    ensure value_class(codes) == 9
+    return codes
+  end
+  let litl = []
+  let i = 0
+  while i < hlit do
+    let litl = list_push(litl, lengths[i])
+    let i = i + 1
+  end
+  let distl = []
+  while i < total do
+    let distl = list_push(distl, lengths[i])
+    let i = i + 1
+  end
+  let lh = inf_table(litl)
+  let dh = inf_table(distl)
+  if lh[2] != "" then
+    inf_fail(st, "bad dynamic header: literal/length code " + lh[2])
+  elif dh[2] != "" then
+    inf_fail(st, "bad dynamic header: distance code " + dh[2])
+  end
+  let codes = [lh, dh]
+  ensure list_len(codes) == 2
+  return codes
+end
+
+make a function called list_extend_zeros takes l, n returns r
+  require (value_class(l) == 9) and (n >= 0)
+  let out = l
+  let i = 0
+  while i < n do
+    let out = list_push(out, 0)
+    let i = i + 1
+  end
+  let r = out
+  ensure list_len(r) == list_len(l) + n
+  return r
+end
+
+# One Huffman-coded block's symbols, up to and including end-of-block,
+# appended to out (a vec of bytes). The hot loop: the bit reader's state is
+# in locals, written back to st at the end. Returns whether it ended
+# cleanly (otherwise st holds the error).
+make a function called inf_codes takes input, st, lh, dh, out returns ok
+  require (list_len(lh) == 3) and (list_len(dh) == 3)
+  let size = list_len(input)
+  let limit = size * 8
+  let lbase = inf_lbase()
+  let lext = inf_lext()
+  let dbase = inf_dbase()
+  let dext = inf_dext()
+  let ltab = lh[0]
+  let lbits = lh[1]
+  let lmask = (1 shl lbits) - 1
+  let dtab = dh[0]
+  let dbits = dh[1]
+  let dmask = (1 shl dbits) - 1
+  let pos = vec_get(st, 0)
+  let buf = vec_get(st, 1)
+  let cnt = vec_get(st, 2)
+  let olen = vec_len(out)
+  let problem = ""
+  let going = true
+  while going do
+    # 15 bits cover the longest code; the extra bits refill below.
+    while cnt < 15 do
+      if pos < size then
+        let buf = buf bor (input[pos] shl cnt)
+      end
+      let pos = pos + 1
+      let cnt = cnt + 8
+    end
+    let e = ltab[buf band lmask]
+    if e < 0 then
+      let problem = "bad code"
+      let going = false
+    else
+      let l = e band 15
+      let sym = e shr 4
+      let buf = buf shr l
+      let cnt = cnt - l
+      if sym < 256 then
+        vec_push(out, sym)
+        let olen = olen + 1
+      elif sym == 256 then
+        let going = false
+      elif sym > 285 then
+        let problem = "bad length code"
+        let going = false
+      else
+        let li = sym - 257
+        let xb = lext[li]
+        while cnt < xb do
+          if pos < size then
+            let buf = buf bor (input[pos] shl cnt)
+          end
+          let pos = pos + 1
+          let cnt = cnt + 8
+        end
+        let length = lbase[li] + (buf band ((1 shl xb) - 1))
+        let buf = buf shr xb
+        let cnt = cnt - xb
+        while cnt < 15 do
+          if pos < size then
+            let buf = buf bor (input[pos] shl cnt)
+          end
+          let pos = pos + 1
+          let cnt = cnt + 8
+        end
+        let de = dtab[buf band dmask]
+        if de < 0 then
+          let problem = "bad distance code"
+          let going = false
+        else
+          let dl = de band 15
+          let dsym = de shr 4
+          let buf = buf shr dl
+          let cnt = cnt - dl
+          if dsym > 29 then
+            let problem = "bad distance code"
+            let going = false
+          else
+            let xd = dext[dsym]
+            while cnt < xd do
+              if pos < size then
+                let buf = buf bor (input[pos] shl cnt)
+              end
+              let pos = pos + 1
+              let cnt = cnt + 8
+            end
+            let dist = dbase[dsym] + (buf band ((1 shl xd) - 1))
+            let buf = buf shr xd
+            let cnt = cnt - xd
+            if dist > olen then
+              let problem = "distance too far back"
+              let going = false
+            else
+              let from_at = olen - dist
+              let c = 0
+              while c < length do
+                vec_push(out, vec_get(out, from_at + c))
+                let c = c + 1
+              end
+              let olen = olen + length
+            end
+          end
+        end
+      end
+    end
+    if pos > size then
+      if (pos * 8 - cnt) > limit then
+        let problem = "truncated: the stream ends inside a block"
+        let going = false
+      end
+    end
+  end
+  vec_set(st, 0, pos)
+  vec_set(st, 1, buf)
+  vec_set(st, 2, cnt)
+  let ok = true
+  if problem != "" then
+    let ok = inf_fail(st, problem)
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# A stored block's bytes appended to out; the header's 3 bits are read.
+make a function called inf_stored takes input, st, out returns ok
+  require vec_len(st) == 4
+  let size = list_len(input)
+  # Drop to a byte boundary, then hand back whole bytes still buffered.
+  inf_bits(input, st, vec_get(st, 2) band 7)
+  let len = inf_bits(input, st, 16)
+  let nlen = inf_bits(input, st, 16)
+  let pos = vec_get(st, 0) - (vec_get(st, 2) shr 3)
+  vec_set(st, 0, pos)
+  vec_set(st, 1, 0)
+  vec_set(st, 2, 0)
+  if vec_get(st, 3) != "" then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  if (len bxor nlen) != 65535 then
+    let ok = inf_fail(st, "bad stored block: length check fails")
+    ensure value_class(ok) == 1
+    return ok
+  end
+  if pos + len > size then
+    let ok = inf_fail(st, "truncated: the stream ends inside a stored block")
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let i = pos
+  while i < pos + len do
+    vec_push(out, input[i])
+    let i = i + 1
+  end
+  vec_set(st, 0, pos + len)
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called inflate_raw takes bytes, start returns r
+  require (value_class(bytes) == 9) and (start >= 0)
+  let st = inf_state(start)
+  let out = vec_new()
+  let fixed = []
+  let last = false
+  while (not last) and (vec_get(st, 3) == "") do
+    let last = inf_bits(bytes, st, 1) == 1
+    let btype = inf_bits(bytes, st, 2)
+    if vec_get(st, 3) != "" then
+      let last = true
+    elif btype == 0 then
+      inf_stored(bytes, st, out)
+    elif btype == 1 then
+      if list_len(fixed) == 0 then
+        let fixed = [inf_fixed_lit(), inf_fixed_dist()]
+      end
+      inf_codes(bytes, st, fixed[0], fixed[1], out)
+    elif btype == 2 then
+      let codes = inf_dynamic_codes(bytes, st)
+      if vec_get(st, 3) == "" then
+        inf_codes(bytes, st, codes[0], codes[1], out)
+      end
+    else
+      inf_fail(st, "bad block type 3")
+    end
+  end
+  let consumed = vec_get(st, 0) * 8 - vec_get(st, 2)
+  let end_at = (consumed + 7) shr 3
+  if vec_get(st, 3) != "" then
+    let r = ["err", vec_get(st, 3), end_at]
+    ensure list_len(r) == 3
+    return r
+  end
+  let r = ["ok", vec_to_list(out), end_at]
+  ensure list_len(r) == 3
+  return r
+end

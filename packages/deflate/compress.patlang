@@ -1,0 +1,715 @@
+# Deflate: writes a raw DEFLATE stream (RFC 1951).
+#
+#   deflate_raw(bytes, mode) -> the compressed bytes
+#
+# mode is one of
+#   "stored"   stored blocks only (no compression)
+#   "fixed"    LZ77 matching, fixed-Huffman blocks
+#   "dynamic"  LZ77 matching; each block is written whichever of dynamic
+#              Huffman, fixed Huffman or stored is smallest for it
+#
+# LZ77 uses a 32 KB window, 3-byte hash chains (32768 heads, followed at
+# most 32 links per position) and greedy matching; every position, inside
+# matches too, goes into the chains. Code lengths are built per block with
+# Huffman's algorithm and limited to 15 bits (7 for the code-length code)
+# by flattening the frequencies and building again until the limit holds.
+
+# ---- shared tables ----
+
+make a function called def_filled takes n, v returns l
+  require n >= 0
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, v)
+    let i = i + 1
+  end
+  let l = out
+  ensure list_len(l) == n
+  return l
+end
+
+# For each match length 0..258: the length symbol's index (0..28) into the
+# RFC's length table; entries below 3 are unused.
+make a function called def_len_index returns t
+  let lbase = inf_lbase()
+  let out = [0, 0, 0]
+  let li = 0
+  let l = 3
+  while l <= 258 do
+    while (li < 28) and (lbase[li + 1] <= l) do
+      let li = li + 1
+    end
+    let out = list_push(out, li)
+    let l = l + 1
+  end
+  let t = out
+  ensure (list_len(t) == 259) and (t[258] == 28) and (t[3] == 0)
+  return t
+end
+
+# For each distance 0..32768: the distance code (0..29); entry 0 unused.
+make a function called def_dist_index returns t
+  let dbase = inf_dbase()
+  let out = [0]
+  let di = 0
+  let d = 1
+  while d <= 32768 do
+    while (di < 29) and (dbase[di + 1] <= d) do
+      let di = di + 1
+    end
+    let out = list_push(out, di)
+    let d = d + 1
+  end
+  let t = out
+  ensure (list_len(t) == 32769) and (t[1] == 0) and (t[32768] == 29)
+  return t
+end
+
+# ---- LZ77 ----
+
+# The tokens for bytes: a literal is its byte (0..255), a match is
+# distance * 512 + length (length 3..258, distance 1..32768).
+make a function called def_lz77 takes data, max_chain returns tokens
+  require (value_class(data) == 9) and (max_chain >= 1)
+  let n = list_len(data)
+  let head = def_filled(32768, 0 - 1)
+  let prev = def_filled(32768, 0 - 1)
+  let toks = []
+  let i = 0
+  while i < n do
+    let best = 0
+    let bestd = 0
+    if i + 2 < n then
+      let h = ((data[i] shl 10) bxor (data[i + 1] shl 5) bxor data[i + 2]) band 32767
+      let cand = head[h]
+      let prev = list_set(prev, i band 32767, cand)
+      let head = list_set(head, h, i)
+      let limit = n - i
+      if limit > 258 then
+        let limit = 258
+      end
+      let chain = max_chain
+      while (cand >= 0) and (i - cand <= 32768) and (chain > 0) do
+        if data[cand + best] == data[i + best] then
+          let k = 0
+          while (k < limit) and (data[cand + k] == data[i + k]) do
+            let k = k + 1
+          end
+          if k > best then
+            let best = k
+            let bestd = i - cand
+            if k >= limit then
+              let chain = 0
+            end
+          end
+        end
+        let older = prev[cand band 32767]
+        if older >= cand then
+          let cand = 0 - 1
+        else
+          let cand = older
+        end
+        let chain = chain - 1
+      end
+    end
+    if best >= 3 then
+      let toks = list_push(toks, bestd * 512 + best)
+      let j = i + 1
+      let stop = i + best
+      while j < stop do
+        if j + 2 < n then
+          let h2 = ((data[j] shl 10) bxor (data[j + 1] shl 5) bxor data[j + 2]) band 32767
+          let prev = list_set(prev, j band 32767, head[h2])
+          let head = list_set(head, h2, j)
+        end
+        let j = j + 1
+      end
+      let i = stop
+    else
+      let toks = list_push(toks, data[i])
+      let i = i + 1
+    end
+  end
+  let tokens = toks
+  ensure list_len(tokens) <= n
+  return tokens
+end
+
+# ---- Huffman code lengths ----
+
+# Code lengths for the frequencies by Huffman's algorithm, with no length
+# over limit. Every code has at least two symbols (a lone used symbol gets
+# a partner), so each is complete, which every inflater accepts. The
+# selection of the two lightest nodes is a scan, O(m^2) for m used symbols;
+# m is at most the alphabet size (286), not the input size.
+make a function called def_code_lengths takes freqs, limit returns lengths
+  require (value_class(freqs) == 9) and (limit >= 1) and (list_len(freqs) >= 2)
+  let n = list_len(freqs)
+  let f = []
+  let used = 0
+  let i = 0
+  while i < n do
+    let f = list_push(f, freqs[i])
+    if freqs[i] > 0 then
+      let used = used + 1
+    end
+    let i = i + 1
+  end
+  # Two symbols at least: a partner for a lone one (or two for none).
+  let i = 0
+  while (used < 2) and (i < n) do
+    if f[i] == 0 then
+      let f = list_set(f, i, 1)
+      let used = used + 1
+    end
+    let i = i + 1
+  end
+  let result = []
+  let tries = 0
+  while list_len(result) == 0 do
+    let attempt = def_huffman_depths(f)
+    let deepest = 0
+    let k = 0
+    while k < n do
+      if attempt[k] > deepest then
+        let deepest = attempt[k]
+      end
+      let k = k + 1
+    end
+    if deepest <= limit then
+      let result = attempt
+    else
+      # Flatten: halve every used weight, keeping it at least 1.
+      let k = 0
+      while k < n do
+        if f[k] > 0 then
+          let f = list_set(f, k, (f[k] shr 1) bor 1)
+        end
+        let k = k + 1
+      end
+    end
+    let tries = tries + 1
+  end
+  let lengths = result
+  ensure list_len(lengths) == list_len(freqs)
+  return lengths
+end
+
+# The depth of each leaf in a Huffman tree over the weights (0 for weight 0).
+make a function called def_huffman_depths takes w returns depths
+  require value_class(w) == 9
+  let n = list_len(w)
+  # Nodes 0..n-1 are leaves; merged nodes follow. alive marks roots.
+  let weight = []
+  let parent = []
+  let alive = []
+  let roots = 0
+  let i = 0
+  while i < n do
+    let weight = list_push(weight, w[i])
+    let parent = list_push(parent, 0 - 1)
+    let alive = list_push(alive, w[i] > 0)
+    if w[i] > 0 then
+      let roots = roots + 1
+    end
+    let i = i + 1
+  end
+  while roots > 1 do
+    let a = 0 - 1
+    let b = 0 - 1
+    let k = 0
+    while k < list_len(weight) do
+      if alive[k] then
+        if (a < 0) or (weight[k] < weight[a]) then
+          let b = a
+          let a = k
+        elif (b < 0) or (weight[k] < weight[b]) then
+          let b = k
+        end
+      end
+      let k = k + 1
+    end
+    let m = list_len(weight)
+    let weight = list_push(weight, weight[a] + weight[b])
+    let parent = list_push(parent, 0 - 1)
+    let alive = list_push(alive, true)
+    let parent = list_set(parent, a, m)
+    let parent = list_set(parent, b, m)
+    let alive = list_set(alive, a, false)
+    let alive = list_set(alive, b, false)
+    let roots = roots - 1
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let d = 0
+    if w[i] > 0 then
+      let p = parent[i]
+      while p >= 0 do
+        let d = d + 1
+        let p = parent[p]
+      end
+    end
+    let out = list_push(out, d)
+    let i = i + 1
+  end
+  let depths = out
+  ensure list_len(depths) == n
+  return depths
+end
+
+# The canonical codes for code lengths, each bit-reversed for the
+# first-bit-lowest writer.
+make a function called def_codes takes lengths returns codes
+  require value_class(lengths) == 9
+  let n = list_len(lengths)
+  let count = def_filled(16, 0)
+  let i = 0
+  while i < n do
+    let count = list_set(count, lengths[i], count[lengths[i]] + 1)
+    let i = i + 1
+  end
+  let count = list_set(count, 0, 0)
+  let nextc = def_filled(16, 0)
+  let code = 0
+  let l = 1
+  while l <= 15 do
+    let code = (code + count[l - 1]) shl 1
+    let nextc = list_set(nextc, l, code)
+    let l = l + 1
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let l = lengths[i]
+    if l > 0 then
+      let out = list_push(out, inf_reverse(nextc[l], l))
+      let nextc = list_set(nextc, l, nextc[l] + 1)
+    else
+      let out = list_push(out, 0)
+    end
+    let i = i + 1
+  end
+  let codes = out
+  ensure list_len(codes) == n
+  return codes
+end
+
+# ---- the bit writer: out is a vec of bytes, w the vec [bitbuf, bitcnt] ----
+
+make a function called def_writer returns w
+  let w = vec_new()
+  vec_push(w, 0)
+  vec_push(w, 0)
+  ensure vec_len(w) == 2
+  return w
+end
+
+make a function called def_put takes out, w, value, n returns ok
+  require (n >= 0) and (n <= 24) and (value >= 0)
+  let buf = vec_get(w, 0) bor (value shl vec_get(w, 1))
+  let cnt = vec_get(w, 1) + n
+  while cnt >= 8 do
+    vec_push(out, buf band 255)
+    let buf = buf shr 8
+    let cnt = cnt - 8
+  end
+  vec_set(w, 0, buf)
+  vec_set(w, 1, cnt)
+  let ok = true
+  ensure vec_get(w, 1) < 8
+  return ok
+end
+
+# Pads to a byte boundary with zero bits.
+make a function called def_align takes out, w returns ok
+  require vec_len(w) == 2
+  if vec_get(w, 1) > 0 then
+    vec_push(out, vec_get(w, 0) band 255)
+  end
+  vec_set(w, 0, 0)
+  vec_set(w, 1, 0)
+  let ok = true
+  ensure vec_get(w, 1) == 0
+  return ok
+end
+
+# Stored blocks for data[lo..hi-1], at most 65535 bytes each; the last one
+# final when last is true. An empty range still writes one empty block.
+make a function called def_put_stored takes out, w, data, lo, hi, last returns ok
+  require (lo >= 0) and (lo <= hi) and (hi <= list_len(data))
+  let at = lo
+  let going = true
+  while going do
+    let take = hi - at
+    if take > 65535 then
+      let take = 65535
+    end
+    let final_bit = 0
+    if last and (at + take == hi) then
+      let final_bit = 1
+    end
+    def_put(out, w, final_bit, 3)
+    def_align(out, w)
+    vec_push(out, take band 255)
+    vec_push(out, take shr 8)
+    vec_push(out, (take band 255) bxor 255)
+    vec_push(out, (take shr 8) bxor 255)
+    let i = at
+    while i < at + take do
+      vec_push(out, data[i])
+      let i = i + 1
+    end
+    let at = at + take
+    let going = at < hi
+  end
+  let ok = true
+  ensure vec_get(w, 1) == 0
+  return ok
+end
+
+# The tokens toks[lo..hi-1] and end-of-block, with the given codes. The hot
+# loop: the writer's state is in locals, written back at the end.
+make a function called def_put_tokens takes out, w, toks, lo, hi, lcode, llen, dcode, dlen, tabs returns ok
+  require (lo >= 0) and (lo <= hi) and (hi <= list_len(toks))
+  let lext = inf_lext()
+  let lbase = inf_lbase()
+  let dext = inf_dext()
+  let dbase = inf_dbase()
+  let lidx = tabs[0]
+  let didx = tabs[1]
+  let buf = vec_get(w, 0)
+  let cnt = vec_get(w, 1)
+  let i = lo
+  while i < hi do
+    let t = toks[i]
+    if t < 256 then
+      let buf = buf bor (lcode[t] shl cnt)
+      let cnt = cnt + llen[t]
+    else
+      let length = t band 511
+      let dist = t shr 9
+      let li = lidx[length]
+      let sym = 257 + li
+      let buf = buf bor (lcode[sym] shl cnt)
+      let cnt = cnt + llen[sym]
+      let buf = buf bor ((length - lbase[li]) shl cnt)
+      let cnt = cnt + lext[li]
+      while cnt >= 8 do
+        vec_push(out, buf band 255)
+        let buf = buf shr 8
+        let cnt = cnt - 8
+      end
+      let di = didx[dist]
+      let buf = buf bor (dcode[di] shl cnt)
+      let cnt = cnt + dlen[di]
+      let buf = buf bor ((dist - dbase[di]) shl cnt)
+      let cnt = cnt + dext[di]
+    end
+    while cnt >= 8 do
+      vec_push(out, buf band 255)
+      let buf = buf shr 8
+      let cnt = cnt - 8
+    end
+    let i = i + 1
+  end
+  let buf = buf bor (lcode[256] shl cnt)
+  let cnt = cnt + llen[256]
+  while cnt >= 8 do
+    vec_push(out, buf band 255)
+    let buf = buf shr 8
+    let cnt = cnt - 8
+  end
+  vec_set(w, 0, buf)
+  vec_set(w, 1, cnt)
+  let ok = true
+  ensure vec_get(w, 1) < 8
+  return ok
+end
+
+make a function called def_fixed_llen returns l
+  let out = def_filled(144, 8)
+  let i = 144
+  while i < 288 do
+    if i < 256 then
+      let out = list_push(out, 9)
+    elif i < 280 then
+      let out = list_push(out, 7)
+    else
+      let out = list_push(out, 8)
+    end
+    let i = i + 1
+  end
+  let l = out
+  ensure list_len(l) == 288
+  return l
+end
+
+# The code-length code's run-length encoding of lengths: a list of
+# symbol + 32 * extra-bits value.
+make a function called def_rle_lengths takes lengths returns items
+  require value_class(lengths) == 9
+  let n = list_len(lengths)
+  let out = []
+  let i = 0
+  while i < n do
+    let v = lengths[i]
+    let run = 1
+    while (i + run < n) and (lengths[i + run] == v) do
+      let run = run + 1
+    end
+    let i = i + run
+    if v == 0 then
+      while run >= 11 do
+        let r = run
+        if r > 138 then
+          let r = 138
+        end
+        let out = list_push(out, 18 + 32 * (r - 11))
+        let run = run - r
+      end
+      if run >= 3 then
+        let out = list_push(out, 17 + 32 * (run - 3))
+        let run = 0
+      end
+    else
+      let out = list_push(out, v)
+      let run = run - 1
+      while run >= 3 do
+        let r = run
+        if r > 6 then
+          let r = 6
+        end
+        let out = list_push(out, 16 + 32 * (r - 3))
+        let run = run - r
+      end
+    end
+    while run > 0 do
+      let out = list_push(out, v)
+      let run = run - 1
+    end
+  end
+  let items = out
+  ensure value_class(items) == 9
+  return items
+end
+
+# One block of toks[lo..hi-1], covering data[blo..bhi-1]; last marks the
+# final block. In "fixed" mode always fixed Huffman; in "dynamic" mode the
+# smallest of dynamic, fixed and stored.
+make a function called def_block takes out, w, data, blo, bhi, toks, lo, hi, last, mode, tabs returns ok
+  require (lo <= hi) and (blo <= bhi)
+  let lext = inf_lext()
+  let dext = inf_dext()
+  let lidx = tabs[0]
+  let didx = tabs[1]
+  let lf = def_filled(286, 0)
+  let df = def_filled(30, 0)
+  let extra = 0
+  let i = lo
+  while i < hi do
+    let t = toks[i]
+    if t < 256 then
+      let lf = list_set(lf, t, lf[t] + 1)
+    else
+      let li = lidx[t band 511]
+      let di = didx[t shr 9]
+      let lf = list_set(lf, 257 + li, lf[257 + li] + 1)
+      let df = list_set(df, di, df[di] + 1)
+      let extra = extra + lext[li] + dext[di]
+    end
+    let i = i + 1
+  end
+  let lf = list_set(lf, 256, 1)
+  let final_bit = 0
+  if last then
+    let final_bit = 1
+  end
+  let fl = tabs[2]
+  let fixed_bits = 3 + extra
+  let s = 0
+  while s < 286 do
+    let fixed_bits = fixed_bits + lf[s] * fl[s]
+    let s = s + 1
+  end
+  let s = 0
+  while s < 30 do
+    let fixed_bits = fixed_bits + df[s] * 5
+    let s = s + 1
+  end
+  if mode == "fixed" then
+    def_put(out, w, final_bit + 2, 3)
+    let ok = def_put_tokens(out, w, toks, lo, hi, tabs[3], fl, tabs[5], tabs[4], tabs)
+    ensure value_class(ok) == 1
+    return ok
+  end
+  # Dynamic: the codes, their header, and its size.
+  let ll = def_code_lengths(lf, 15)
+  let dl = def_code_lengths(df, 15)
+  let hlit = 286
+  while (hlit > 257) and (ll[hlit - 1] == 0) do
+    let hlit = hlit - 1
+  end
+  let hdist = 30
+  while (hdist > 1) and (dl[hdist - 1] == 0) do
+    let hdist = hdist - 1
+  end
+  let both = []
+  let s = 0
+  while s < hlit do
+    let both = list_push(both, ll[s])
+    let s = s + 1
+  end
+  let s = 0
+  while s < hdist do
+    let both = list_push(both, dl[s])
+    let s = s + 1
+  end
+  let items = def_rle_lengths(both)
+  let cf = def_filled(19, 0)
+  let k = 0
+  while k < list_len(items) do
+    let cs = items[k] band 31
+    let cf = list_set(cf, cs, cf[cs] + 1)
+    let k = k + 1
+  end
+  let cl = def_code_lengths(cf, 7)
+  let order = inf_clc_order()
+  let hclen = 19
+  while (hclen > 4) and (cl[order[hclen - 1]] == 0) do
+    let hclen = hclen - 1
+  end
+  let ebits = [2, 3, 7]
+  let dyn_bits = 3 + 14 + 3 * hclen + extra
+  let k = 0
+  while k < list_len(items) do
+    let cs = items[k] band 31
+    let dyn_bits = dyn_bits + cl[cs]
+    if cs >= 16 then
+      let dyn_bits = dyn_bits + ebits[cs - 16]
+    end
+    let k = k + 1
+  end
+  let s = 0
+  while s < 286 do
+    let dyn_bits = dyn_bits + lf[s] * ll[s]
+    let s = s + 1
+  end
+  let s = 0
+  while s < 30 do
+    let dyn_bits = dyn_bits + df[s] * dl[s]
+    let s = s + 1
+  end
+  let chunks = 1
+  let rest = bhi - blo
+  while rest > 65535 do
+    let rest = rest - 65535
+    let chunks = chunks + 1
+  end
+  let stored_bits = 8 + chunks * 40 + (bhi - blo) * 8
+  if (stored_bits < dyn_bits) and (stored_bits < fixed_bits) then
+    let ok = def_put_stored(out, w, data, blo, bhi, last)
+    ensure value_class(ok) == 1
+    return ok
+  end
+  if fixed_bits <= dyn_bits then
+    def_put(out, w, final_bit + 2, 3)
+    let ok = def_put_tokens(out, w, toks, lo, hi, tabs[3], fl, tabs[5], tabs[4], tabs)
+    ensure value_class(ok) == 1
+    return ok
+  end
+  def_put(out, w, final_bit + 4, 3)
+  def_put(out, w, hlit - 257, 5)
+  def_put(out, w, hdist - 1, 5)
+  def_put(out, w, hclen - 4, 4)
+  let k = 0
+  while k < hclen do
+    def_put(out, w, cl[order[k]], 3)
+    let k = k + 1
+  end
+  let ccodes = def_codes(cl)
+  let k = 0
+  while k < list_len(items) do
+    let cs = items[k] band 31
+    def_put(out, w, ccodes[cs], cl[cs])
+    if cs >= 16 then
+      def_put(out, w, items[k] shr 5, ebits[cs - 16])
+    end
+    let k = k + 1
+  end
+  let ok = def_put_tokens(out, w, toks, lo, hi, def_codes(ll), ll, def_codes(dl), dl, tabs)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# The bytes a token stands for.
+make a function called def_token_size takes t returns n
+  require t >= 0
+  let n = 1
+  if t >= 256 then
+    let n = t band 511
+  end
+  ensure n >= 1
+  return n
+end
+
+# The tables every block uses, built once per stream: [length index,
+# distance index, fixed literal/length lengths and codes, fixed distance
+# lengths and codes].
+make a function called def_tables returns tabs
+  let fl = def_fixed_llen()
+  let fd = def_filled(30, 5)
+  let tabs = [def_len_index(), def_dist_index(), fl, def_codes(fl), fd, def_codes(fd)]
+  ensure list_len(tabs) == 6
+  return tabs
+end
+
+# The DEFLATE stream for bytes appended to out, a vec of bytes.
+make a function called def_stream takes out, bytes, mode returns ok
+  require value_class(bytes) == 9
+  require (mode == "stored") or (mode == "fixed") or (mode == "dynamic")
+  let w = def_writer()
+  let n = list_len(bytes)
+  if mode == "stored" then
+    def_put_stored(out, w, bytes, 0, n, true)
+  else
+    let tabs = def_tables()
+    let toks = def_lz77(bytes, 32)
+    let nt = list_len(toks)
+    let per_block = 16384
+    let lo = 0
+    let blo = 0
+    let going = true
+    while going do
+      let hi = lo + per_block
+      if hi > nt then
+        let hi = nt
+      end
+      let bhi = blo
+      let k = lo
+      while k < hi do
+        let bhi = bhi + def_token_size(toks[k])
+        let k = k + 1
+      end
+      def_block(out, w, bytes, blo, bhi, toks, lo, hi, hi == nt, mode, tabs)
+      let lo = hi
+      let blo = bhi
+      let going = lo < nt
+    end
+  end
+  def_align(out, w)
+  let ok = true
+  ensure vec_get(w, 1) == 0
+  return ok
+end
+
+make a function called deflate_raw takes bytes, mode returns compressed
+  require value_class(bytes) == 9
+  require (mode == "stored") or (mode == "fixed") or (mode == "dynamic")
+  let out = vec_new()
+  def_stream(out, bytes, mode)
+  let compressed = vec_to_list(out)
+  ensure value_class(compressed) == 9
+  return compressed
+end
