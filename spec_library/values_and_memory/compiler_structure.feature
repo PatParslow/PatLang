@@ -46,6 +46,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When it is stored as an artefact record and read back
     Then the chunk and assembly read back are the ones stored
 
+  Scenario: a job's key tells values apart by their structure
+    Given lists, strings of one- to four-byte characters, integers of every sign and size, booleans, a float and a file
+    When jobs.patlang hashes each, and each value built a second time
+    Then values that differ hash differently, a value built twice hashes the same, and a file hashes as its length then its bytes
+
   Scenario: registrations are recorded, not rediscovered
     Given a program with a when handler, a rule, and a function reached only through apply
     When it is compiled

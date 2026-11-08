@@ -18,50 +18,100 @@
 # order the jobs ran in, so any worker count gives the same executable.
 
 # ---- hashing: two 32-bit FNV-1a lanes ----
+#
+# A hash is [a, b]. jb_mix mixes one code into it; the functions below
+# keep the two lanes in locals while they mix a whole string or integer,
+# so each costs one list, not one per character. An integer is mixed as
+# its eight bytes, low first (its two's complement, so every fixnum has its
+# own bytes), never through its decimal text.
 
 make a function called jb_mix takes h, c returns out
+  require list_len(h) == 2
   let a = ((h[0] bxor c) * 16777619) % 4294967296
   let b = ((h[1] bxor ((c + 101) % 256)) * 16777619) % 4294967296
-  return [a, b]
+  let out = [a, b]
+  ensure list_len(out) == 2
+  return out
 end
 
 make a function called jb_hash_new returns h
-  return [2166136261, 84696351]
+  let h = [2166136261, 84696351]
+  ensure list_len(h) == 2
+  return h
+end
+
+# Lanes a and b with the code `tag` mixed in (none when tag < 0), then
+# each character of s.
+make a function called jb_lanes takes a, b, tag, s returns out
+  require (a >= 0) and (b >= 0) and (type_of(s) == "string")
+  if tag >= 0 then
+    let a = ((a bxor tag) * 16777619) % 4294967296
+    let b = ((b bxor ((tag + 101) % 256)) * 16777619) % 4294967296
+  end
+  let n = s.length
+  let i = 0
+  while i < n do
+    let c = char_code(s, i)
+    let a = ((a bxor c) * 16777619) % 4294967296
+    let b = ((b bxor ((c + 101) % 256)) * 16777619) % 4294967296
+    let i = i + 1
+  end
+  let out = [a, b]
+  ensure list_len(out) == 2
+  return out
+end
+
+# Lanes a and b with the code `tag` mixed in, then the eight bytes of the
+# fixnum n.
+make a function called jb_lanes_int takes a, b, tag, n returns out
+  require (a >= 0) and (b >= 0) and (tag >= 0) and (value_class(n) == 2)
+  let a = ((a bxor tag) * 16777619) % 4294967296
+  let b = ((b bxor ((tag + 101) % 256)) * 16777619) % 4294967296
+  let x = n
+  let k = 0
+  while k < 8 do
+    let c = x band 255
+    let a = ((a bxor c) * 16777619) % 4294967296
+    let b = ((b bxor ((c + 101) % 256)) * 16777619) % 4294967296
+    let x = x shr 8
+    let k = k + 1
+  end
+  let out = [a, b]
+  ensure (list_len(out) == 2) and (k == 8)
+  return out
 end
 
 make a function called jb_mix_text takes h, s returns out
-  let h = jb_mix(h, 83)
-  let n = s.length
-  let h = jb_mix_int(h, n)
-  let i = 0
-  while i < n do
-    let h = jb_mix(h, char_code(s, i))
-    let i = i + 1
-  end
-  return h
+  require list_len(h) == 2
+  let h = jb_lanes_int(h[0], h[1], 83, s.length)
+  let out = jb_lanes(h[0], h[1], -1, s)
+  ensure list_len(out) == 2
+  return out
 end
 
+# A length or count.
 make a function called jb_mix_int takes h, n returns out
-  let h = jb_mix(h, 73)
-  return jb_mix_text_plain(h, "" + n)
+  require list_len(h) == 2
+  let out = jb_lanes_int(h[0], h[1], 73, n)
+  ensure list_len(out) == 2
+  return out
 end
 
 make a function called jb_mix_text_plain takes h, s returns out
-  let i = 0
-  while i < s.length do
-    let h = jb_mix(h, char_code(s, i))
-    let i = i + 1
-  end
-  return h
+  require list_len(h) == 2
+  let out = jb_lanes(h[0], h[1], -1, s)
+  ensure list_len(out) == 2
+  return out
 end
 
 # A value's structure: a list's length then each element; a string's
-# length then its bytes; anything else its printed form, tagged.
+# length then its characters; a fixnum its bytes; anything else its type
+# and printed form, tagged.
 make a function called jb_mix_value takes h, v returns out
-  let t = type_of(v)
-  if t == "list" then
-    let h = jb_mix(h, 76)
-    let h = jb_mix_int(h, list_len(v))
+  require list_len(h) == 2
+  let c = value_class(v)
+  if c == 9 then
+    let h = jb_lanes_int(h[0], h[1], 76, list_len(v))
     let i = 0
     while i < list_len(v) do
       let h = jb_mix_value(h, v[i])
@@ -69,11 +119,15 @@ make a function called jb_mix_value takes h, v returns out
     end
     return h
   end
-  if t == "string" then
+  if c == 8 then
     return jb_mix_text(h, v)
   end
-  let h = jb_mix(h, 79)
-  return jb_mix_text_plain(h, t + ":" + v)
+  if c == 2 then
+    return jb_lanes_int(h[0], h[1], 105, v)
+  end
+  let out = jb_lanes(h[0], h[1], 79, type_of(v) + ":" + v)
+  ensure list_len(out) == 2
+  return out
 end
 
 # A file's bytes as a list (O(n) to walk, where indexing a large string is
@@ -98,14 +152,22 @@ make a function called jb_read_bytes takes path returns bytes
 end
 
 make a function called jb_mix_file takes h, path returns out
+  require list_len(h) == 2
   let bytes = jb_read_bytes(path)
-  let h = jb_mix_int(h, list_len(bytes))
+  let n = list_len(bytes)
+  let h = jb_mix_int(h, n)
+  let a = h[0]
+  let b = h[1]
   let i = 0
-  while i < list_len(bytes) do
-    let h = jb_mix(h, bytes[i])
+  while i < n do
+    let c = bytes[i]
+    let a = ((a bxor c) * 16777619) % 4294967296
+    let b = ((b bxor ((c + 101) % 256)) * 16777619) % 4294967296
     let i = i + 1
   end
-  return h
+  let out = [a, b]
+  ensure list_len(out) == 2
+  return out
 end
 
 # A hash as text: its two lanes in decimal.

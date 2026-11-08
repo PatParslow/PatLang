@@ -198,7 +198,17 @@ Since the survey, by the project owner's decisions below, with the gates passing
 - **#242.** Spec 1.9 includes `AST`, and the 7 syntax-definition demos give the same output as
   `pat`. In those demos the `AST` route builds nodes and then drops them.
 - **#245.** Bare undefined names stay an error, and the programs using them were changed, apart from
-  the four in `rust-runtime/examples`.
+  the four in `rust-runtime/examples`. Checked again on 2026-11-08, the issue's other four programs
+  give the same output on v2 and its interpreter:
+  - `mandelbrot_demo` prints what `pat` prints, apart from its own timing line.
+  - `x64_float_bitwise_native` stops at `band` on a float, as spec 1.11 says and its header
+    records; `pat` prints 62.
+  - `robots_demo` prints a `SIGNAL` line each time a robot's fiber emits, as its header says it
+    should. `pat` prints none: its handler no longer fires for an event emitted inside a fiber.
+  - `cga_classifier` prints everything `pat` prints except a last `true`: `pat` prints the value
+    of the program's last top-level expression, and v2 does not. The project owner decided on
+    2026-11-08 that a program's value is treated as any function's: nothing prints it unless the
+    program does (spec 1.13). v2 is right.
 - **#244.** The name `unit` is the unit value unless a program binds it (spec 1.13), as on `pat`.
   The 16 programs that stopped on it now compile on v2. The 15 that use the `world`
   libraries, and `interp_budget_probe`, then stop on `set_var`, which is gone, and they fail on `pat` too.
@@ -242,7 +252,9 @@ an include path that doesn't exist; the one checked, `family_tree_main`, fails o
   its 457 stored functions 8.9 s and linking 15.1 s. Writing relocations straight into the
   sections, resolving local targets per chunk and reading stored records as text took the reading
   to 2.7 s and the link to 8.2 s, about 18 s in all; the compiler's own warm link went from
-  49.2 s to 22.0 s.
+  49.2 s to 22.0 s. Hashing keys with the lanes in locals and integers as bytes took the keys from
+  4.1 s to 1.05 s, and a `vec_extend` that makes room once took the link to 6.7 s: about 12.3 s in
+  all; the gates pass on both.
 - **Named objects** took quadratic time: 814 ms at 1,000 objects and 49.7 s at 8,000, where `pat` goes
   from 57 ms to 84 ms ([#236](https://github.com/PatParslow/PatLang/issues/236)). Now 0.63 s at 8,000,
   growing about linearly.

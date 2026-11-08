@@ -41,6 +41,11 @@ Feature: values and objects with identity (spec 1.5)
     When vec_len(v) is read
     Then it is 1
 
+  Scenario: a vec extended with a list keeps its order, and a list taken from it before keeps its value
+    Given a vec holding 1, a list taken from it, then vec_extend with three elements, with an empty list, and with the vec's own contents, and a second vec extended twice with 10000 numbers
+    When the vecs and the lists taken from them are read
+    Then the first vec holds its elements twice in order, the lists taken earlier are unchanged, and the second vec holds 20000 numbers
+
   Scenario: a bool array keeps its identity when it grows
     Given a = bool_array_new(0), b = a, then 100 bool_array_push calls on a
     When bool_array_len(b) is read

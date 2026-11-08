@@ -148,9 +148,12 @@ milestone 11). What they needed beyond this plan's first draft:
 - **`quiet_operators()`**, a primitive declaration at a file's top level:
   that file's operators raise no events. The runtime's files declare it,
   so its own arithmetic never raises a program's `added` events.
-- **Calls are fitted to the declaration**: missing arguments are unit,
-  and a last parameter named `rest` receives the remaining arguments as a
-  list (`send`, `exec_capture`). The symbol index this needs is the swarm
+- **Calls are fitted to the declaration**: a last parameter named `rest`
+  receives the remaining arguments as a list (`send`, `exec_capture`).
+  Missing arguments were unit and extra ones dropped, silently, on every
+  engine including `pat`; since the project owner's decision of 2026-11-08
+  a wrong number is an error (spec 1.13): refused when compiling a call by
+  name, a failed precondition when calling a closure. Not yet built. The symbol index this needs is the swarm
   plan's barrier B1.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
@@ -423,6 +426,25 @@ sources described under "Removing the globals".
   own character. Identifiers are ASCII, so no program met it, but the new scenario "a stored
   record reads back as written, whatever characters its names hold" failed on it (RED) and passes
   on the new reader.
+- **A job's key (GitHub #239).** Hashing a function's IR allocated a list for every byte mixed, and
+  turned every integer into decimal text first. The two lanes are now kept in locals for a whole
+  string or integer, and an integer is mixed as its eight bytes. A warm build of a one-line program
+  computes its keys in 1.06 s, where it took 4.08 s, and the compiler hash in 0.13 s, where it took
+  0.43 s; the executable is byte identical. The new scenario "a job's key tells values apart by
+  their structure" passes on both engines, and fails on a copy that mixes only an integer's low
+  byte. Gates pass (below).
+- **`vec_extend` (GitHub #239).** It pushed its items one call at a time, each through
+  `list_push`'s checks. It now makes room once (`rt_list_reserve`, new in `runtime/lists.patlang`)
+  and copies each element in with a reference of its own, as `rt_list_copy` does. The link of a
+  warm one-line build takes 6.7 s, where it took 7.6 s, so the whole warm build is about 12.3 s
+  (front end 2.2, keys 1.05, jobs 2.2, link 6.7). The program built is byte identical to the same
+  program built by the previous compiler from the same runtime sources. A new scenario, "a vec
+  extended with a list keeps its order, and a list taken from it before keeps its value", passes;
+  peak memory stays at 5.4 MB from 500 to 4,000 rounds of extending and dropping vecs. Gates
+  pass (below).
+- **v2 gates on 2026-11-08, after the keys and `vec_extend`:** fixpoint byte identical, bootstrap
+  and WASM identical; part1_v2 100/100, part1_interp 100/100, engines_agree 62/62, part2 104/104,
+  language 250/250 on both engines, match 26/26, block model 211/211.
 - **v2 gates on 2026-11-08, after the relocations and the reader:** compilers a and b byte
   identical; the bootstrap reader's build identical to v2.exe; the WebAssembly writers agree;
   Part 1 99/99 on v2 and on the interpreter; engines agree 62/62; Part 2 103/103; the language

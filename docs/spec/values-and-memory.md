@@ -118,7 +118,8 @@ running it.
   if the next iteration, judged by the recent ones, would pass the deadline. It
   gives `["done", value]` or `["paused", handle]`; passing the handle back continues
   the body. The body captures what it reads as a closure does.
-- `thread_spawn(closure)` calls a closure with no arguments on a thread of its own.
+- `thread_spawn(closure, args...)` calls the closure with the arguments that follow it, none or
+  more, on a thread of its own; their number is checked as any closure call's is (1.13).
   `thread_poll(id)` says, without waiting, whether it has finished. `thread_result(id)`
   waits for it and gives what it returned, once: taking the result gives back all the
   thread held, and a further call stops the program.
@@ -183,10 +184,19 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 
 ### 1.13 Functions, commands and includes
 
+- A call gives a function exactly as many arguments as it takes. A last parameter named `rest`
+  takes any further arguments, as a list, and fewer than the parameters before it is still too
+  few. A call naming a function with the wrong number is refused when the program is compiled,
+  naming the function and both numbers. A closure knows how many parameters it takes, and a
+  call with the wrong number, through a variable, `apply`, `parallel_map` or a thread's start,
+  stops the program as a failed precondition of the closure, naming both numbers.
 - A function that ends without `return` gives the value of its last statement. An
   expression gives its value and a `let` the value it bound. An `if` or a `while` gives the
   value of the last statement it ran, or `unit` if it ran none, and a function with no
   statements gives `unit`.
+- A program's top-level statements give their value as a function's body does, and, as with a
+  function whose value its caller does not use, nothing prints it: a program writes only what
+  it prints. (`pat` printed the value of a program's last top-level expression; v2 does not.)
 - The name `unit` in a program is that value, unless the program binds `unit` itself, as a
   parameter or with `let`.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
