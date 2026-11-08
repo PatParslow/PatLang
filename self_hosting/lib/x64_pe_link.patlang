@@ -290,6 +290,7 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     # symbol-visibility semantics.
     let syms = chunk[4]
     let local_names = []
+    let local_at = []
     let si = 0
     let sn = to_num(list_len(syms))
     while si < sn do
@@ -310,8 +311,9 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
       if not is_global then
         let key = "$L" + ci + "$" + name
         let local_names = list_push(local_names, name)
+        let local_at = list_push(local_at, vec_len(all_symbols) + 1)
       end
-      vec_push(all_symbols, [key, section, base + offset])
+      vec_push(all_symbols, [key, section, base + offset, is_global])
       let si = si + 1
     end
 
@@ -331,7 +333,13 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     # matter for a membership check -- local_names doubles as its own
     # value list; xpl_index_lookup returning anything other than `false`
     # means "found".
-    let local_names_index = xpl_build_index(local_names, local_names)
+    #
+    # The index gives a local name's place in all_symbols, plus one, so a
+    # relocation to a local is resolved here: it needs no key built for
+    # it and no second lookup, and the symbol table indexed below holds
+    # only the global names. A relocation's last field is that place plus
+    # one, or 0 for a global target looked up by name.
+    let local_names_index = xpl_build_index(local_names, local_at)
     let relocs = chunk[5]
     let ri = 0
     let rn = to_num(list_len(relocs))
@@ -346,11 +354,11 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
       if section == "data" then
         let base = data_base
       end
-      let target_key = target
-      if xpl_index_lookup(local_names_index, target) != false then
-        let target_key = "$L" + ci + "$" + target
+      let local = xpl_index_lookup(local_names_index, target)
+      if local == false then
+        let local = 0
       end
-      vec_push(all_relocs, [section, base + offset, target_key, kind, addend])
+      vec_push(all_relocs, [section, base + offset, target, kind, addend, local])
       let ri = ri + 1
     end
     let ci = ci + 1
@@ -591,6 +599,7 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
   # build time).
   let symtab_names = []
   let symtab_values = []
+  let sym_rvas = vec_new()
   let si = 0
   let sn = vec_len(all_symbols)
   while si < sn do
@@ -606,8 +615,11 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
         let base_rva = bss_rva
       end
     end
-    let symtab_names = list_push(symtab_names, name)
-    let symtab_values = list_push(symtab_values, base_rva + offset)
+    vec_push(sym_rvas, base_rva + offset)
+    if sym[3] then
+      let symtab_names = list_push(symtab_names, name)
+      let symtab_values = list_push(symtab_values, base_rva + offset)
+    end
     let si = si + 1
   end
   let ti = 0
@@ -644,7 +656,12 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     let target = reloc[2]
     let kind = reloc[3]
     let addend = reloc[4]
-    let target_rva = xpl_index_lookup(symtab_index, target)
+    let target_rva = false
+    if reloc[5] > 0 then
+      let target_rva = vec_get(sym_rvas, reloc[5] - 1)
+    else
+      let target_rva = xpl_index_lookup(symtab_index, target)
+    end
     if not target_rva then
       # Distinguish the two very different reasons a lookup can miss,
       # rather than reporting both as "undefined symbol". A bare linear
@@ -681,21 +698,10 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     # codegen_x64.patlang's x64_vstack_push/x64_analyze_dynamic_bins --
     # benefits without needing to change anything here.
     if kind == "ABS64" then
-      let value_bytes = xa_int_to_bytes_le(image_base + target_rva + addend, 8)
-      let bi = 0
-      while bi < 8 do
-        vec_set(merged_data, offset + bi, value_bytes[bi])
-        let bi = bi + 1
-      end
+      xpl_put_le(merged_data, offset, image_base + target_rva + addend, 8)
     else
       let reloc_rva = text_rva + thunk_area_size + offset
-      let value = (target_rva + addend) - (reloc_rva + 4)
-      let value_bytes = xa_int_to_bytes_le(value, 4)
-      let bi = 0
-      while bi < 4 do
-        vec_set(merged_text, offset + bi, value_bytes[bi])
-        let bi = bi + 1
-      end
+      xpl_put_le(merged_text, offset, (target_rva + addend) - (reloc_rva + 4), 4)
     end
     let ri = ri + 1
   end
@@ -739,6 +745,22 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     return "LINK ERROR: write_file_bytes failed for " + out_path
   end
   return out_path
+end
+
+# Writes the low n bytes of value into vec v from offset, least
+# significant first: two's complement for a negative value, since band
+# and shr work on the 64-bit int.
+make a function called xpl_put_le takes v, offset, value, n returns done
+  require (offset >= 0) and (offset + n <= vec_len(v))
+  let x = value
+  let i = 0
+  while i < n do
+    vec_set(v, offset + i, x band 255)
+    let x = x shr 8
+    let i = i + 1
+  end
+  ensure i == n
+  return true
 end
 
 make a function called xpl_patch_bytes takes lst, offset, value_bytes returns out

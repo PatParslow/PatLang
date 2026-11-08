@@ -41,6 +41,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When the program is built again
     Then that function is built again, and the program runs
 
+  Scenario: a stored record reads back as written, whatever characters its names hold
+    Given a chunk whose symbol and relocation names are ASCII, two-, three- and four-byte UTF-8
+    When it is stored as an artefact record and read back
+    Then the chunk and assembly read back are the ones stored
+
   Scenario: registrations are recorded, not rediscovered
     Given a program with a when handler, a rule, and a function reached only through apply
     When it is compiled

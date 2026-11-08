@@ -238,6 +238,11 @@ an include path that doesn't exist; the one checked, `family_tree_main`, fails o
   compiler's link of itself takes 73 s, where it took 151 s, and its self-compile 369 s, where it
   took 456 s. Encoding the assembler's bytes from the top down took the link to about 50 s, and
   sizing the linker's name index to its names took it to 30.4 s (`rt_facts`: 20.9 s to 12.5 s).
+  On 2026-11-08 a warm build of a one-line program took 32 s: front end 2.6 s, keys 4.5 s, reading
+  its 457 stored functions 8.9 s and linking 15.1 s. Writing relocations straight into the
+  sections, resolving local targets per chunk and reading stored records as text took the reading
+  to 2.7 s and the link to 8.2 s, about 18 s in all; the compiler's own warm link went from
+  49.2 s to 22.0 s.
 - **Named objects** took quadratic time: 814 ms at 1,000 objects and 49.7 s at 8,000, where `pat` goes
   from 57 ms to 84 ms ([#236](https://github.com/PatParslow/PatLang/issues/236)). Now 0.63 s at 8,000,
   growing about linearly.

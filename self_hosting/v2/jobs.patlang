@@ -266,19 +266,22 @@ make a function called jb_chunk_text takes chunk returns text
   return sb_str(b)
 end
 
-# A stored chunk back: its records' bytes (KEY.chunk), each line's fields
-# read byte by byte, then its sections from KEY.text and KEY.data.
+# A stored chunk back: its record (KEY.chunk) as text, each line's fields
+# cut out where its spaces are, then its sections from KEY.text and KEY.data.
+# The record is read through str_intern's handle, so reading a character
+# costs the same wherever it is, whatever characters the names hold.
 #
 # Gives [chunk, assembly text], or false unless every artefact is complete: the
 # record ends in its "z" line and each file has the length the record gives. An
 # artefact being written, by this build or another, is shorter than that, and a
 # job's artefacts are the same bytes whoever writes them.
-make a function called jb_chunk_from_bytes takes bytes, stem returns stored
-  let n = list_len(bytes)
+make a function called jb_chunk_from_text takes text, stem returns stored
+  let h = str_intern(text)
+  let n = sc_len(h)
   if n < 3 then
     return false
   end
-  if (bytes[n - 1] != 10) or (bytes[n - 2] != 122) or (bytes[n - 3] != 10) then
+  if (sc_code(h, n - 3) != 10) or (sc_code(h, n - 2) != 122) or (sc_code(h, n - 1) != 10) then
     return false
   end
   let asm_text = ""
@@ -290,48 +293,89 @@ make a function called jb_chunk_from_bytes takes bytes, stem returns stored
   let ext = []
   let i = 0
   while i < n do
-    let fields = []
-    let field = sb_new()
-    let has = false
-    while (i < n) and (bytes[i] != 10) do
-      let c = bytes[i]
+    # the line's fields, each as where it starts and where it ends
+    let starts = []
+    let pasts = []
+    let a = i
+    let c = sc_code(h, i)
+    while (i < n) and (c != 10) do
       if c == 32 then
-        let fields = list_push(fields, sb_str(field))
-        let field = sb_new()
-      elif c != 13 then
-        sb_push(field, chr(c))
+        let starts = list_push(starts, a)
+        let pasts = list_push(pasts, i)
+        let a = i + 1
       end
       let i = i + 1
+      let c = sc_code(h, i)
     end
-    let fields = list_push(fields, sb_str(field))
+    let past = i
+    if (past > a) and (sc_code(h, past - 1) == 13) then
+      let past = past - 1
+    end
+    let starts = list_push(starts, a)
+    let pasts = list_push(pasts, past)
     let i = i + 1
-    let tag = fields[0]
-    if tag == "t" then
-      let text_bytes = read_file_bytes(stem + ".text", 0, to_num(fields[1]))
-      if list_len(text_bytes) != to_num(fields[1]) then
+    let tag = sc_code(h, starts[0])
+    if pasts[0] - starts[0] != 1 then
+      let tag = 0
+    end
+    if tag == 116 then
+      let size = jb_num_at(h, starts[1], pasts[1])
+      let text_bytes = read_file_bytes(stem + ".text", 0, size)
+      if list_len(text_bytes) != size then
         return false
       end
-    elif tag == "d" then
-      let data_bytes = read_file_bytes(stem + ".data", 0, to_num(fields[1]))
-      if list_len(data_bytes) != to_num(fields[1]) then
+    elif tag == 100 then
+      let size = jb_num_at(h, starts[1], pasts[1])
+      let data_bytes = read_file_bytes(stem + ".data", 0, size)
+      if list_len(data_bytes) != size then
         return false
       end
-    elif tag == "a" then
+    elif tag == 97 then
       let asm_text = read_file(stem + ".asm")
-      if byte_length(asm_text) != to_num(fields[1]) then
+      if byte_length(asm_text) != jb_num_at(h, starts[1], pasts[1]) then
         return false
       end
-    elif tag == "b" then
-      let bss = to_num(fields[1])
-    elif tag == "s" then
-      let syms = list_push(syms, [fields[1], fields[2], to_num(fields[3]), fields[4] == "1"])
-    elif tag == "r" then
-      let relocs = list_push(relocs, [fields[1], to_num(fields[2]), fields[3], fields[4], to_num(fields[5])])
-    elif tag == "e" then
-      let ext = list_push(ext, fields[1])
+    elif tag == 98 then
+      let bss = jb_num_at(h, starts[1], pasts[1])
+    elif tag == 115 then
+      let syms = list_push(syms, [jb_field(h, starts, pasts, 1), jb_field(h, starts, pasts, 2), jb_num_at(h, starts[3], pasts[3]), jb_field(h, starts, pasts, 4) == "1"])
+    elif tag == 114 then
+      let relocs = list_push(relocs, [jb_field(h, starts, pasts, 1), jb_num_at(h, starts[2], pasts[2]), jb_field(h, starts, pasts, 3), jb_field(h, starts, pasts, 4), jb_num_at(h, starts[5], pasts[5])])
+    elif tag == 101 then
+      let ext = list_push(ext, jb_field(h, starts, pasts, 1))
     end
   end
   return [["ChunkImage", text_bytes, data_bytes, bss, syms, relocs, ext], asm_text]
+end
+
+# A line's field k, from where it starts to where it ends.
+make a function called jb_field takes h, starts, pasts, k returns field
+  require (k >= 0) and (k < list_len(starts)) and (list_len(starts) == list_len(pasts))
+  let field = sc_substr(h, starts[k], pasts[k] - starts[k])
+  ensure field.length == pasts[k] - starts[k]
+  return field
+end
+
+# The integer written in h, a str_intern handle, from a up to past: digits,
+# after a "-" if negative, as "" + n writes it.
+make a function called jb_num_at takes h, a, past returns n
+  require (a >= 0) and (past >= a) and (past <= sc_len(h))
+  let i = a
+  let negative = false
+  if (i < past) and (sc_code(h, i) == 45) then
+    let negative = true
+    let i = i + 1
+  end
+  let n = 0
+  while i < past do
+    let n = n * 10 + (sc_code(h, i) - 48)
+    let i = i + 1
+  end
+  if negative then
+    let n = 0 - n
+  end
+  ensure (n >= 0) or negative
+  return n
 end
 
 # ---- running the jobs ----
@@ -562,12 +606,12 @@ make a function called jb_run_job takes job returns result
   let asm_path = jb_artefact_path(dir, job[4], ".asm")
   let t0 = now_ms()
   if (dir != "") and file_exists(chunk_path) and file_exists(asm_path) then
-    let record = jb_read_bytes(chunk_path)
-    let stored = jb_chunk_from_bytes(record, jb_artefact_path(dir, job[4], ""))
+    let record = read_file(chunk_path)
+    let stored = jb_chunk_from_text(record, jb_artefact_path(dir, job[4], ""))
     if stored != false then
       # marks the job as just used, for eviction. The same bytes, so another
       # build reading it finds it whole or short, and a short one is built again.
-      write_file_bytes(chunk_path, record)
+      write_file(chunk_path, record)
       return [job[0], stored[0], stored[1], "reused", [now_ms() - t0, 0, 0]]
     end
   end

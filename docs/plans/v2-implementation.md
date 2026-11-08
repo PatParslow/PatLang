@@ -407,6 +407,27 @@ sources described under "Removing the globals".
   hundreds in all, so making and freeing empty buckets took about a quarter of the link. The
   bucket count now doubles up to the number of names. The compiler's link of itself went from
   47.8 s to 30.4 s, and `rt_facts` links in 12.5 s, where it took 20.9 s.
+- **The link's relocations (GitHub #239).** Each relocation built its value's bytes as lists
+  (`xa_int_to_bytes_le`), and one to a chunk's local symbol made a `$L` key and was looked up
+  twice, once among the chunk's locals and once in the whole table. A relocation's bytes now go
+  straight into the section with `band` and `shr`, a local target is resolved to its symbol in
+  the first pass, and the symbol table indexed for the rest holds only global names. On
+  2026-11-08 a warm build of a one-line program linked in 8.2 s, where it took 16.1 s, and the
+  compiler's link of itself took 22.0 s, where it took 49.2 s. Both executables are byte
+  identical to before, and the compiler's build of itself is byte identical to its own.
+- **Reading a stored artefact (GitHub #239).** The record was read byte by byte, each byte made
+  into a one-character string and each number read back from text, which took most of a warm
+  build's jobs. It is now read as text through `str_intern`'s handle, each field cut out with
+  `sc_substr` and each number read digit by digit. The jobs of a warm build of the compiler take
+  7.8 s, where they took 29.0 s. The old reader also turned each byte of a non-ASCII name into its
+  own character. Identifiers are ASCII, so no program met it, but the new scenario "a stored
+  record reads back as written, whatever characters its names hold" failed on it (RED) and passes
+  on the new reader.
+- **v2 gates on 2026-11-08, after the relocations and the reader:** compilers a and b byte
+  identical; the bootstrap reader's build identical to v2.exe; the WebAssembly writers agree;
+  Part 1 99/99 on v2 and on the interpreter; engines agree 62/62; Part 2 103/103; the language
+  suite 245/245 on the interpreter and compiled by v2; match 26/26; the block model suite
+  211/211.
 - **v2 gates on 2026-11-07, after the name index:** Part 1 89/89 on v2 and on the interpreter;
   `engines_agree.feature` 62/62; Part 2 83/83; the language suite 242/242 on the interpreter
   and compiled by v2; the match suite 26/26 and the block-model suite 211/211 on the
