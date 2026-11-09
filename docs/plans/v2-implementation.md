@@ -190,6 +190,16 @@ milestone 11). What they needed beyond this plan's first draft:
   it was built" failed before (RED: a keyless copy of v2.exe reused stored code) and now
   passes. Gates: part 1 121/121 on both engines, engines agree 62/62, part 2 111/111,
   language 251/251 on both, match 26/26, block model 211/211.
+- **The logic engine's work grows with what each call needs (#252).** The rules are a vec,
+  and a second index keeps each predicate's rules in a vec of its own (`logic.patlang`,
+  state 4224 and 4464), so `rule_add` pushes in place and a goal visits only its own
+  predicate's rules. A rule whose head holds a constant the goal contradicts is skipped
+  before renaming, and a ground fact is not renamed at all; solutions gather in a vec.
+  The issue's probe: 8,000 rules added in 69 ms (was 8,784), and a bound goal over 6,400
+  facts in 9.9 ms (was 96). The scenario "the logic engine's work grows with what each call
+  needs" (programs.feature) failed on all three counts before and passes on both engines.
+  Gates: part 1 122/122 on both engines, engines agree 62/62, part 2 111/111, language
+  251/251 on both, match 26/26, block model 211/211.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

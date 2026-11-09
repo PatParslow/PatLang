@@ -7,7 +7,9 @@
 # expansions, an action being [name, preconditions, adds, deletes, cost].
 #
 # State (runtime_state(), rt_global_get/set):
-#   4224 the rules
+#   4224 the rules, a vec, in the order they were added
+#   4464 the rules by predicate: a list of [predicate, vec of its rules], so a
+#        goal visits only its own predicate's rules
 #   4240 the actions
 #   4256 what each action runs: [name, closure]
 #   4272 named goals: [name, goals]
@@ -18,13 +20,19 @@ quiet_operators()
 
 make a function called rt_logic_init returns r
   let st = runtime_state()
-  let off = 4224
+  let off = 4240
   while off <= 4272 do
     mem_store(st, off, 0)
     mem_store(st, word_add(off, 8), 0)
     mem_init_value(st, off, [])
     let off = word_add(off, 16)
   end
+  mem_store(st, 4224, 0)
+  mem_store(st, 4232, 0)
+  mem_init_value(st, 4224, vec_new())
+  mem_store(st, 4464, 0)
+  mem_store(st, 4472, 0)
+  mem_init_value(st, 4464, [])
   mem_store(st, 4288, 0)
   let table = rt_alloc(8 * 256)
   let k = 0
@@ -42,10 +50,52 @@ end
 
 make a function called rule_add takes head_pred, head_args, body returns done
   require (value_class(head_pred) == 8) and (value_class(head_args) == 9) and (value_class(body) == 9)
-  rt_global_set(4224, list_push(rt_global_get(4224), [head_pred, head_args, body]))
+  let rule = [head_pred, head_args, body]
+  vec_push(rt_global_get(4224), rule)
+  vec_push(rt_pred_rules(head_pred), rule)
   let done = true
   ensure value_class(done) == 1
   return done
+end
+
+# Where pred is in the rules by predicate, or -1.
+make a function called rt_pred_index takes pred returns i
+  require value_live(pred)
+  let i = rt_pairs_index(rt_global_get(4464), pred)
+  ensure i >= 0 - 1
+  return i
+end
+
+# The vec of pred's rules, made the first time pred has one. The index is
+# taken out while it grows, so nothing else holds it and the push does not
+# copy it.
+make a function called rt_pred_rules takes pred returns v
+  require value_live(pred)
+  let i = rt_pred_index(pred)
+  if i >= 0 then
+    let v = rt_global_get(4464)[i][1]
+    ensure value_class(v) == 12
+    return v
+  end
+  let v = vec_new()
+  let st = runtime_state()
+  mem_init_value(st, 4464, list_push(mem_take_value(st, 4464), [pred, v]))
+  ensure value_class(v) == 12
+  return v
+end
+
+# pred's rules as a list, in the order they were added; [] when it has none.
+make a function called rt_rules_of takes pred returns rules
+  require value_live(pred)
+  let i = rt_pred_index(pred)
+  if i < 0 then
+    let rules = []
+    ensure value_class(rules) == 9
+    return rules
+  end
+  let rules = vec_to_list(rt_global_get(4464)[i][1])
+  ensure value_class(rules) == 9
+  return rules
 end
 
 # ---- contract clauses that held ----
@@ -258,6 +308,34 @@ make a function called logic_fresh_rename takes rule returns renamed
   return renamed
 end
 
+# Whether a goal's arguments could unify with a rule's head: false when some
+# place holds two different constants, which no renaming changes.
+make a function called rt_may_unify takes args, head, subst returns yes
+  require (value_class(args) == 9) and (value_class(head) == 9) and (value_class(subst) == 9)
+  if list_len(args) != list_len(head) then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let k = 0
+  while k < list_len(head) do
+    if not is_logic_var(head[k]) then
+      let q = logic_walk(args[k], subst)
+      if (not is_logic_var(q)) and (q != head[k]) then
+        let yes = false
+        ensure value_class(yes) == 1
+        return yes
+      end
+    end
+    let k = k + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Each of pred's rules whose head could match is renamed, unless it is a
+# ground fact, which has no variables to keep apart, then unified.
 make a function called solve_goal takes pred, args, subst, depth returns results
   require value_live(pred) and (value_class(args) == 9) and (value_class(subst) == 9) and (value_class(depth) == 2)
   if depth > 200 then
@@ -265,20 +343,23 @@ make a function called solve_goal takes pred, args, subst, depth returns results
     ensure (value_class(results) == 9)
     return results
   end
-  let rules = rt_global_get(4224)
-  let out = []
+  let rules = rt_rules_of(pred)
+  let out = vec_new()
   let i = 0
   while i < list_len(rules) do
-    if rules[i][0] == pred then
-      let rule = logic_fresh_rename(rules[i])
+    let rule = rules[i]
+    if rt_may_unify(args, rule[1], subst) then
+      if (list_len(rule[2]) > 0) or (not rt_is_ground(rule[1])) then
+        let rule = logic_fresh_rename(rule)
+      end
       let u = unify_args(args, rule[1], subst)
       if u[0] == "Ok" then
-        let out = v2_list_concat(out, resolve_conjuncts(rule[2], u[1], depth + 1))
+        vec_extend(out, resolve_conjuncts(rule[2], u[1], depth + 1))
       end
     end
     let i = i + 1
   end
-  let results = out
+  let results = vec_to_list(out)
   ensure (value_class(results) == 9)
   return results
 end
@@ -309,13 +390,13 @@ make a function called resolve_conjuncts takes body, subst, depth returns result
     return results
   end
   let found = solve_goal(first[0], apply_subst(first[1], subst), subst, depth)
-  let out = []
+  let out = vec_new()
   let i = 0
   while i < list_len(found) do
-    let out = v2_list_concat(out, resolve_conjuncts(rest, found[i], depth))
+    vec_extend(out, resolve_conjuncts(rest, found[i], depth))
     let i = i + 1
   end
-  let results = out
+  let results = vec_to_list(out)
   ensure (value_class(results) == 9)
   return results
 end
@@ -378,7 +459,7 @@ end
 
 # The state a plan starts from: every rule that is a ground fact.
 make a function called rt_ground_facts returns state
-  let rules = rt_global_get(4224)
+  let rules = vec_to_list(rt_global_get(4224))
   let out = []
   let i = 0
   while i < list_len(rules) do

@@ -220,6 +220,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   gives it, `""` before any report.
 - `action_clear()` forgets every action `action_add` added, and `plan_incremental(goals)` gives
   what `plan(goals)` gives.
+- Adding a rule takes about the same time however many rules there are. A goal's cost does not
+  depend on the rules of other predicates, and finding its solutions takes time in proportion
+  to their number.
 - A program may define a function with a name the runtime has. The program's calls reach its
   function, directly, from a closure or by name, and the runtime goes on using its own. Two of a
   program's files defining one name is an error, naming it, and nothing of the program runs.

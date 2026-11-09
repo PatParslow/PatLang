@@ -31,6 +31,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When the program runs
     Then the status is empty, then the second report; both plans are the action, and after action_clear there is no plan
 
+  Scenario: the logic engine's work grows with what each call needs
+    Given 4,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 4,000 and 8,000 solutions
+    When a program times them
+    Then twice the rules take no more than about three times as long, the other predicate's rules cost the goal little, and twice the solutions take no more than about three times as long
+
   Scenario: a file reached by two includes is included once
     Given a program whose two included files both include a third
     When it runs
