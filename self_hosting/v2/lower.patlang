@@ -414,15 +414,21 @@ end
 make a function called lw_call takes fb, name, args returns d
   let fslot = lw_var_slot(fb, name)
   if fslot >= 0 then
-    let slots = [fslot]
-    let i = 0
+    return lw_callv(fb, fslot, args, 0)
+  end
+  if name == "closure_call_unchecked" then
+    # a closure's call with arguments already fitted to it (rt_apply_unchecked)
+    if list_len(args) == 0 then
+      lw_error(fb, "closure_call_unchecked needs a closure")
+      return lw_const(fb, "unit", "")
+    end
+    let rest = []
+    let i = 1
     while i < list_len(args) do
-      let slots = list_push(slots, lw_expr(fb, args[i]))
+      let rest = list_push(rest, args[i])
       let i = i + 1
     end
-    let d = lw_new_slot(fb)
-    lw_emit(fb, ["callv", d, slots])
-    return d
+    return lw_callv(fb, lw_expr(fb, args[0]), rest, 1)
   end
   let name = lw_call_target(fb, name)
   if name == "extern_call" then
@@ -431,6 +437,35 @@ make a function called lw_call takes fb, name, args returns d
   if name == "extern_call_float" then
     return lw_extern(fb, args, "externf")
   end
+  return lw_call_named(fb, name, args)
+end
+
+# A call of the closure in slot fslot with these arguments, at most 8
+# (runtime/closures.patlang's rt_closure_call_N fit them); unchecked is 1
+# when they are already fitted to it (closure_call_unchecked).
+make a function called lw_callv takes fb, fslot, args, unchecked returns d
+  require fslot >= 0
+  if list_len(args) > 8 then
+    lw_error(fb, "a closure is called with at most 8 arguments, given " + list_len(args))
+  end
+  let slots = [fslot]
+  let i = 0
+  while i < list_len(args) do
+    let slots = list_push(slots, lw_expr(fb, args[i]))
+    let i = i + 1
+  end
+  let d = lw_new_slot(fb)
+  if unchecked == 1 then
+    lw_emit(fb, ["callv", d, slots, 1])
+  else
+    lw_emit(fb, ["callv", d, slots])
+  end
+  ensure d >= 0
+  return d
+end
+
+# A call naming a function, a runtime function or a primitive.
+make a function called lw_call_named takes fb, name, args returns d
   let args = lw_fit_args(fb, name, args)
   let slots = []
   let i = 0
@@ -454,10 +489,12 @@ make a function called lw_call takes fb, name, args returns d
   return d
 end
 
-# A call's arguments fitted to the declared function: missing ones are
-# unit; when the last parameter is named rest, it receives the arguments
-# from its position on as a list. Calls of undeclared names are left as
-# they are.
+# A call's arguments fitted to the declared function: it takes exactly as
+# many as the function has parameters, and a call with another number is an
+# error naming the function and both numbers (spec 1.13). When the last
+# parameter is named rest, it receives the arguments from its position on as
+# a list, and fewer than the parameters before it is too few. Calls of
+# undeclared names are left as they are.
 make a function called lw_fit_args takes fb, name, args returns fitted
   let params = lw_params_of(fb, name)
   if params == false then
@@ -476,9 +513,13 @@ make a function called lw_fit_args takes fb, name, args returns fitted
     let k = k + 1
   end
   if (n > 0) and (params[n - 1] == "rest") then
+    if list_len(args) < n - 1 then
+      lw_error(fb, lw_shown_name(name) + " takes at least " + lw_count_text(n - 1) + ", given " + list_len(args))
+      return args
+    end
     let fixed = []
     let i = 0
-    while (i < n - 1) and (i < list_len(args)) do
+    while i < n - 1 do
       let fixed = list_push(fixed, args[i])
       let i = i + 1
     end
@@ -487,16 +528,36 @@ make a function called lw_fit_args takes fb, name, args returns fitted
       let rest = list_push(rest, args[i])
       let i = i + 1
     end
-    while list_len(fixed) < n - 1 do
-      let fixed = list_push(fixed, ["Unit"])
-    end
     return list_push(fixed, ["List", rest])
   end
-  let fitted = args
-  while list_len(fitted) < n do
-    let fitted = list_push(fitted, ["Unit"])
+  if list_len(args) != n then
+    lw_error(fb, lw_shown_name(name) + " takes " + lw_count_text(n) + ", given " + list_len(args))
   end
+  let fitted = args
   return fitted
+end
+
+# "1 argument" or "n arguments".
+make a function called lw_count_text takes n returns text
+  require n >= 0
+  let text = n + " arguments"
+  if n == 1 then
+    let text = "1 argument"
+  end
+  ensure text.length > 0
+  return text
+end
+
+# A function's name as its source has it: a program's own function is lowered
+# under a prefix (lw_user_name) that the source never wrote.
+make a function called lw_shown_name takes name returns shown
+  let prefix = lw_user_name("")
+  let shown = name
+  if str_starts_with(name, prefix) then
+    let shown = substr(name, prefix.length, name.length - prefix.length)
+  end
+  ensure shown.length > 0
+  return shown
 end
 
 # extern_call("KERNEL32.DLL", "WriteFile", args...): the library and the
@@ -550,7 +611,8 @@ end
 # A closure literal: its body is lifted to a function of its own, named
 # from this declaration, taking the closure itself first and then its
 # parameters. The closure holds the values of the variables its body reads
-# that are bound here, captured now (by snapshot).
+# that are bound here, captured now (by snapshot), and how many parameters
+# it takes, and whether the last is named rest (runtime/closures.patlang).
 make a function called lw_closure takes fb, params, body, raises returns d
   let n = vec_get(fb[3], 2)
   vec_set(fb[3], 2, n + 1)
@@ -576,7 +638,11 @@ make a function called lw_closure takes fb, params, body, raises returns d
     let k = k + 1
   end
   let d = lw_new_slot(fb)
-  lw_emit(fb, ["closure", d, fname, slots])
+  let takes_rest = 0
+  if (list_len(pnames) > 0) and (pnames[list_len(pnames) - 1] == "rest") then
+    let takes_rest = 1
+  end
+  lw_emit(fb, ["closure", d, fname, slots, list_len(pnames), takes_rest])
   return d
 end
 
@@ -1228,7 +1294,7 @@ make a function called lw_function_with takes name, params, body, captured, lift
     lw_emit(fb, ["prim", block, "value_data", [0]])
     let k = 0
     while k < list_len(captured) do
-      let off = lw_const(fb, "int", (32 + 16 * k).to_s)
+      let off = lw_const(fb, "int", (48 + 16 * k).to_s)
       let v = lw_new_slot(fb)
       lw_emit(fb, ["prim", v, "mem_load_value", [block, off]])
       let s = lw_bind(fb, captured[k])

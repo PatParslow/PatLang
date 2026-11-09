@@ -676,9 +676,11 @@ make a function called xv_list takes b, d, slots, n returns done
   return true
 end
 
-# A closure: rt_closure_alloc(n), its code address at block + 16, then each
-# captured value, with a reference of its own, at block + 32 + 16k.
-make a function called xv_closure takes b, d, fname, slots, n returns done
+# A closure: rt_closure_alloc(n), its code address at block + 16, the number
+# of parameters it takes at block + 32, 1 at block + 40 when the last is named
+# rest, then each captured value, with a reference of its own, at
+# block + 48 + 16k (runtime/closures.patlang).
+make a function called xv_closure takes b, d, fname, slots, nparams, takes_rest, n returns done
   let count = list_len(slots)
   xv_line(b, "mov rax, " + count)
   xv_line(b, "push rax")
@@ -690,33 +692,70 @@ make a function called xv_closure takes b, d, fname, slots, n returns done
   xv_line(b, "mov rcx, " + xv_d(d))
   xv_line(b, "lea rax, [rel " + xv_sym(fname) + "]")
   xv_line(b, "mov [rcx+16], rax")
+  xv_line(b, "mov rax, " + nparams)
+  xv_line(b, "mov [rcx+32], rax")
+  xv_line(b, "mov rax, " + takes_rest)
+  xv_line(b, "mov [rcx+40], rax")
   let k = 0
   while k < count do
     xv_count(b, "rt_retain", slots[k], "cl" + n + "_" + k)
     xv_line(b, "mov rax, " + xv_d(d))
     xv_line(b, "mov rcx, " + xv_t(slots[k]))
-    xv_line(b, "mov [rax+" + (32 + 16 * k) + "], rcx")
+    xv_line(b, "mov [rax+" + (48 + 16 * k) + "], rcx")
     xv_line(b, "mov rcx, " + xv_d(slots[k]))
-    xv_line(b, "mov [rax+" + (40 + 16 * k) + "], rcx")
+    xv_line(b, "mov [rax+" + (56 + 16 * k) + "], rcx")
     let k = k + 1
   end
   return true
 end
 
 # A call of the closure in slots[0]: every slot pushed as an argument, the
-# closure first, then a call to the code address it holds.
-make a function called xv_callv takes b, d, slots returns done
+# closure first, then a call to the code address it holds. When the closure
+# takes another number of parameters, or its last is named rest, the same
+# arguments go to rt_closure_call_N (N the call's count, at most 8: lw_call),
+# which fits them as a call naming a function does (spec 1.13).
+# closure_call_unchecked (unchecked = 1), for arguments already fitted, calls
+# the code address alone.
+make a function called xv_callv takes b, d, slots, unchecked, n returns done
+  let given = list_len(slots) - 1
   let i = list_len(slots) - 1
   while i >= 0 do
     xv_push_arg(b, slots[i])
     let i = i - 1
   end
   xv_line(b, "mov rax, " + xv_d(slots[0]))
-  xv_line(b, "mov rax, [rax+16]")
+  if unchecked == 1 then
+    xv_line(b, "mov rax, [rax+16]")
+  else
+    let fit = ".cv_fit_" + n
+    let go = ".cv_call_" + n
+    xv_line(b, "mov rcx, [rax+32]")
+    xv_line(b, "mov rdx, " + given)
+    xv_line(b, "cmp rcx, rdx")
+    xv_line(b, "jne " + fit)
+    xv_line(b, "mov rcx, [rax+40]")
+    xv_line(b, "mov rdx, 0")
+    xv_line(b, "cmp rcx, rdx")
+    xv_line(b, "jne " + fit)
+    xv_line(b, "mov rax, [rax+16]")
+    xv_line(b, "jmp " + go)
+    sb_push(b, fit + ":" + xv_nl())
+    xv_line(b, "lea rax, [rel " + xv_sym(xv_closure_fitter(given)) + "]")
+    sb_push(b, go + ":" + xv_nl())
+  end
   xv_line(b, "call rax")
   xv_line(b, "add rsp, " + (16 * list_len(slots)))
   xv_store_result(b, d)
   return true
+end
+
+# The runtime function that fits a closure call of given arguments
+# (runtime/closures.patlang).
+make a function called xv_closure_fitter takes given returns name
+  require (given >= 0) and (given <= 8)
+  let name = "rt_closure_call_" + given
+  ensure name.length > 0
+  return name
 end
 
 make a function called xv_const takes b, ins, data, label returns done
@@ -862,9 +901,9 @@ make a function called xv_fn_asm takes func, facts returns asm
     elif op == "list" then
       xv_list(b, ins[1], ins[2], i)
     elif op == "closure" then
-      xv_closure(b, ins[1], ins[2], ins[3], i)
+      xv_closure(b, ins[1], ins[2], ins[3], ins[4], ins[5], i)
     elif op == "callv" then
-      xv_callv(b, ins[1], ins[2])
+      xv_callv(b, ins[1], ins[2], ir_callv_unchecked(ins), i)
     elif op == "move" then
       xv_line(b, "mov rax, " + xv_t(ins[2]))
       xv_line(b, "mov " + xv_t(ins[1]) + ", rax")

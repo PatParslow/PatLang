@@ -188,8 +188,14 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   takes any further arguments, as a list, and fewer than the parameters before it is still too
   few. A call naming a function with the wrong number is refused when the program is compiled,
   naming the function and both numbers. A closure knows how many parameters it takes, and a
-  call with the wrong number, through a variable, `apply`, `parallel_map` or a thread's start,
-  stops the program as a failed precondition of the closure, naming both numbers.
+  call with the wrong number, through a variable, `apply`, `send`, `parallel_map` or a thread's
+  start, stops the program as a failed precondition of the closure (or of the function `apply`
+  or `parallel_map` named, or of the method `send` named), naming both numbers. However it is
+  called, a closure's arguments are fitted as a call naming a function's are, so a last
+  parameter named `rest` takes any further ones. A closure is called with at most 8
+  arguments; a call with more is refused when the program is compiled. A function declared
+  `takes none`, or without `takes`, has no parameters; `none` is never a parameter's name.
+  How to group parameters rather than pass many is in `docs/guides/passing-parameters.md`.
 - A function that ends without `return` gives the value of its last statement. An
   expression gives its value and a `let` the value it bound. An `if` or a `while` gives the
   value of the last statement it ran, or `unit` if it ran none, and a function with no

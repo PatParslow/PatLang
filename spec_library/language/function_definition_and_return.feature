@@ -15,3 +15,8 @@ Feature: function definition and return
     When its result is printed
     Then a single BLANK line is printed -- NOT the text "nil"/"undefined", and NOT silently nothing at all; a function's implicit return is genuinely Unit only when its tail statement's own value IS Unit
 
+
+  Scenario: a function declared `takes none` takes no parameters
+    Given a function declared `takes none` that returns 7
+    When it is called with no arguments
+    Then it returns 7, a call with no arguments fitting a function with no parameters

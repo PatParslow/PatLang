@@ -153,8 +153,33 @@ milestone 11). What they needed beyond this plan's first draft:
   Missing arguments were unit and extra ones dropped, silently, on every
   engine including `pat`; since the project owner's decision of 2026-11-08
   a wrong number is an error (spec 1.13): refused when compiling a call by
-  name, a failed precondition when calling a closure. Not yet built. The symbol index this needs is the swarm
-  plan's barrier B1.
+  name (`lw_fit_args`), a failed precondition when calling a closure. A
+  closure's block now holds how many parameters it takes (at 32) and whether
+  the last is named `rest` (at 40), its captured values moving to 48. A
+  `callv` whose closure takes as many parameters as it is given, none of
+  them `rest`, calls it directly; otherwise the same arguments go to
+  `rt_closure_call_N` (`runtime/closures.patlang`), which fits them as a
+  named call does (`rt_closure_fit`) and calls the closure through
+  `closure_call_unchecked`, a `callv` marked as already fitted. So a closure
+  is fitted alike through a variable, `apply`, `send`, `parallel_map` and
+  `thread_spawn(closure, args...)`. This is the x64 and WebAssembly code
+  generators, the interpreter, and both Python bootstrap readers. A closure
+  call has at most 8 arguments, refused beyond that when compiling. Each
+  layout or runtime-interface change was bootstrapped in two steps (the new
+  compiler built first against the runtime the installed one was built
+  with), and the fixpoint holds. `takes none` now means no parameters, in
+  `self_hosting/lib/parser.patlang` (a language scenario in
+  `function_definition_and_return.feature`); before, it declared a
+  parameter named `none`, which the padding of missing arguments hid.
+  `new`'s optional name is now its `rest`. The gates pass (2026-11-09):
+  fixpoint, bootstrap and WebAssembly identical; part 1 119/119 on both
+  engines, engines agree 62/62, part 2 104/104, language 251/251 on both,
+  match 26/26, block model 211/211. A program's value is not printed (spec 1.13),
+  now a scenario in `programs.feature`, which passed before this change. The cache reused code from the old code
+  generator during this change, because a job's key hashes the compiler's
+  sources on disk rather than the compiler that runs
+  ([#254](https://github.com/PatParslow/PatLang/issues/254)). The symbol
+  index this needs is the swarm plan's barrier B1.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing
@@ -552,7 +577,9 @@ Open questions from this work:
 
 - An unfinished fiber keeps its stack, and its id can still resume it.
 - A fiber that yields inside an event handler shares its thread's list of running events.
-- `thread_spawn` of a closure with parameters is not caught: a thread passes it none.
+- `thread_spawn` of a closure with parameters is not caught: a thread passes it none. Settled
+  on 2026-11-08: `thread_spawn(closure, args...)` passes the arguments after the closure, and
+  their number is checked before the thread starts (spec 1.8, 1.13).
 - A `syntax` definition must start a line.
 
 ## 8. Baseline

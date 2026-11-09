@@ -182,10 +182,15 @@ make a function called iv_translate takes func returns tr
       let code = iv_push_slots(code, vars, ins[2])
     elif op == "closure" then
       let code = iv_put3(code, 11, ins[1], list_len(aux))
-      let aux = list_push(aux, ins[2])
+      let aux = list_push(aux, [ins[2], ins[5]])
       let code = iv_push_slots(code, vars, ins[3])
     elif op == "callv" then
-      let code = iv_put2(code, 12, ins[1])
+      # 16: closure_call_unchecked's, its arguments already fitted
+      let kind = 12
+      if ir_callv_unchecked(ins) == 1 then
+        let kind = 16
+      end
+      let code = iv_put2(code, kind, ins[1])
       let code = iv_push_slots(code, vars, ins[2])
     else
       print("interpreter: " + op + " needs the compiler")
@@ -436,9 +441,9 @@ make a function called iv_rare takes table, ab, at, block, kind, pc returns next
     let vals = iv_read_words(block, at + 64, mem_load(at, 48))
     mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_closure(table, mem_load_value(ab, 32 + 16 * mem_load(at, 32)), vals))
     let pc = pc + 4 + mem_load(at, 48)
-  elif kind == 12 then
+  elif (kind == 12) or (kind == 16) then
     let vals = iv_read_words(block, at + 48, mem_load(at, 32))
-    mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_call_closure(vals))
+    mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_call_closure(vals, kind == 16))
     let pc = pc + 3 + mem_load(at, 32)
   else
     return extern_call("KERNEL32.DLL", "ExitProcess", 80)
@@ -560,27 +565,28 @@ make a function called iv_runtime_function takes name returns f
 end
 
 # Each argument passed as a temporary, so that a value moved out of a temporary
-# reaches the function held once. The first slot code's word is at w.
+# reaches the function held once. The call naming it has fitted the arguments
+# already (lw_fit_args), so the closure is called unchecked. The first slot code's word is at w.
 make a function called iv_call_native takes f, block, w, n returns r
   if n == 0 then
-    return f()
+    return closure_call_unchecked(f)
   end
   if n == 1 then
-    return f(iv_read(block, mem_load(w, 0)))
+    return closure_call_unchecked(f, iv_read(block, mem_load(w, 0)))
   end
   if n == 2 then
-    return f(iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)))
+    return closure_call_unchecked(f, iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)))
   end
   if n == 3 then
-    return f(iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)), iv_read(block, mem_load(w, 32)))
+    return closure_call_unchecked(f, iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)), iv_read(block, mem_load(w, 32)))
   end
   if n == 4 then
-    return f(iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)), iv_read(block, mem_load(w, 32)), iv_read(block, mem_load(w, 48)))
+    return closure_call_unchecked(f, iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)), iv_read(block, mem_load(w, 32)), iv_read(block, mem_load(w, 48)))
   end
   if n == 5 then
-    return f(iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)), iv_read(block, mem_load(w, 32)), iv_read(block, mem_load(w, 48)), iv_read(block, mem_load(w, 64)))
+    return closure_call_unchecked(f, iv_read(block, mem_load(w, 0)), iv_read(block, mem_load(w, 16)), iv_read(block, mem_load(w, 32)), iv_read(block, mem_load(w, 48)), iv_read(block, mem_load(w, 64)))
   end
-  return rt_apply(f, iv_read_words(block, w, n))
+  return rt_apply_unchecked(f, iv_read_words(block, w, n))
 end
 
 # ---- closures ----
@@ -593,15 +599,25 @@ make a function called iv_holder takes captured returns holder
   let block = value_data(holder)
   let k = 0
   while k < list_len(captured) do
-    mem_init_value(block, 32 + 16 * k, captured[k])
+    mem_init_value(block, 48 + 16 * k, captured[k])
     let k = k + 1
   end
   return holder
 end
 
 # A closure of a lifted function of the program, callable by anything a compiled
-# closure is. Its parameters after the holder are the lifted function's.
-make a function called iv_closure takes table, name, captured returns c
+# closure is. Its parameters after the holder are the lifted function's, so it
+# takes as many (runtime/closures.patlang); lifted is [name, 1 when the last
+# is named rest, else 0].
+make a function called iv_closure takes table, lifted, captured returns c
+  let c = iv_closure_of(table, lifted[0], captured)
+  if lifted[1] == 1 then
+    mem_store(value_data(c), 40, 1)
+  end
+  return c
+end
+
+make a function called iv_closure_of takes table, name, captured returns c
   let entry = iv_find(table, name)
   let holder = iv_holder(captured)
   let n = ir_fn_nparams(entry[1]) - 1
@@ -632,13 +648,17 @@ make a function called iv_closure takes table, name, captured returns c
   return |a, b, c, d, e, g, h, j| { return iv_run(table, entry, [holder, a, b, c, d, e, g, h, j]) }
 end
 
-# ["callv", dst, [closure, args...]].
-make a function called iv_call_closure takes vals returns r
+# ["callv", dst, [closure, args...]]: fitted to the closure as a compiled call
+# fits them (rt_apply's calls are callv), unless unchecked, already fitted.
+make a function called iv_call_closure takes vals, unchecked returns r
   let args = []
   let i = 1
   while i < list_len(vals) do
     let args = list_push(args, vals[i])
     let i = i + 1
+  end
+  if unchecked then
+    return rt_apply_unchecked(vals[0], args)
   end
   return rt_apply(vals[0], args)
 end

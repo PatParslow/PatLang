@@ -933,16 +933,18 @@ class Module:
         b.i64(bits)
         b.set(self.D(d))
 
-    def fill(self, d, slots):
+    def fill(self, d, slots, base):
+        """Each slot's value, with a reference of its own, at d's block +
+        base + 16k: a list's items from 32, a closure's captured values from 48."""
         b = self.b
         for k, s in enumerate(slots):
             self.count("retain", s)
             self.addr(d)
             b.get(self.T(s))
-            b.mem(STORE64, 3, 32 + 16 * k)
+            b.mem(STORE64, 3, base + 16 * k)
             self.addr(d)
             b.get(self.D(s))
-            b.mem(STORE64, 3, 40 + 16 * k)
+            b.mem(STORE64, 3, base + 8 + 16 * k)
 
     def alloc(self, fname, d, n):
         at, nparams = self.index[fname]
@@ -1017,7 +1019,7 @@ class Module:
             self.count(op, ins[1])
         elif op == "list":
             self.alloc("rt_list_alloc", ins[1], len(ins[2]))
-            self.fill(ins[1], ins[2])
+            self.fill(ins[1], ins[2], 32)
         elif op == "closure":
             if ins[2] not in self.table:
                 raise IRError("a closure of " + ins[2] + ", which the IR lacks")
@@ -1025,14 +1027,41 @@ class Module:
             self.addr(ins[1])
             b.i64(self.table[ins[2]])
             b.mem(STORE64, 3, 16)
-            self.fill(ins[1], ins[3])
+            # how many parameters it takes, and whether the last is named rest
+            self.addr(ins[1])
+            b.i64(ins[4])
+            b.mem(STORE64, 3, 32)
+            self.addr(ins[1])
+            b.i64(ins[5])
+            b.mem(STORE64, 3, 40)
+            self.fill(ins[1], ins[3], 48)
         elif op == "callv":
             slots = ins[2]
             for s in slots:
                 self.push(s)
+            # as wasm.patlang: the closure's table index, or, when it takes
+            # another number of parameters or its last is named rest,
+            # rt_closure_call_N's, which fits the same arguments (spec 1.13)
             self.addr(slots[0])
             b.mem(LOAD64, 3, 16)
             b.op(I32_WRAP)
+            if not (len(ins) > 3 and ins[3] == 1):
+                given = len(slots) - 1
+                if given > 8:
+                    raise IRError("a closure call of %d arguments, more than 8" % given)
+                fitter = "rt_closure_call_%d" % given
+                if fitter not in self.table:
+                    raise IRError("a call to " + fitter + ", which the IR lacks")
+                b.i32(self.table[fitter])
+                self.addr(slots[0])
+                b.mem(LOAD64, 3, 32)
+                b.i64(given)
+                b.op(I64_EQ)
+                self.addr(slots[0])
+                b.mem(LOAD64, 3, 40)
+                b.op(I64_EQZ)
+                b.op(I32_AND)
+                b.op(0x1B)                  # select
             b.op(0x11)
             b.b.extend(uleb(self.fn_type(len(slots))))
             b.op(0x00)

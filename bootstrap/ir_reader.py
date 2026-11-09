@@ -621,15 +621,17 @@ class FnGen:
         self.set_value(d, RAX, RDX)
         return self.fill(d, slots)
 
-    def fill(self, d, slots):
+    def fill(self, d, slots, base=32):
+        """Each slot's value, with a reference of its own, at d's block +
+        base + 16k: a list's items from 32, a closure's captured values from 48."""
         c = self.c
         for k, s in enumerate(slots):
             self.count("retain", s)
             self.load_d(RAX, d)
             self.load_t(RCX, s)
-            c.store(RAX, 32 + 16 * k, RCX)
+            c.store(RAX, base + 16 * k, RCX)
             self.load_d(RCX, s)
-            c.store(RAX, 40 + 16 * k, RCX)
+            c.store(RAX, base + 8 + 16 * k, RCX)
 
     def function(self, fn):
         _, name, nparams, nslots, instrs, _vars = fn
@@ -725,14 +727,43 @@ class FnGen:
                 self.load_d(RCX, ins[1])
                 c.lea_rip(RAX, "text", sym(ins[2]))
                 c.store(RCX, 16, RAX)
-                self.fill(ins[1], ins[3])
+                # how many parameters it takes, and whether the last is named rest
+                c.mov_imm(RAX, ins[4])
+                c.store(RCX, 32, RAX)
+                c.mov_imm(RAX, ins[5])
+                c.store(RCX, 40, RAX)
+                self.fill(ins[1], ins[3], 48)
             elif op == "callv":
+                # as xv_callv: a closure taking another number of parameters,
+                # or whose last is named rest, gets the same arguments through
+                # rt_closure_call_N, which fits them (spec 1.13); an
+                # unchecked call (closure_call_unchecked) calls it as it is
                 slots = ins[2]
+                given = len(slots) - 1
                 for sl in reversed(slots):
                     c.push_mem(RBP, self.d(sl))
                     c.push_mem(RBP, self.t(sl))
                 self.load_d(RAX, slots[0])
-                c.load(RAX, RAX, 16)
+                if len(ins) > 3 and ins[3] == 1:
+                    c.load(RAX, RAX, 16)
+                else:
+                    fit, go = c.new_label(), c.new_label()
+                    c.load(RCX, RAX, 32)
+                    c.mov_imm(RDX, given)
+                    c.alu("cmp", RCX, RDX)
+                    c.jcc(JNE, fit)
+                    c.load(RCX, RAX, 40)
+                    c.mov_imm(RDX, 0)
+                    c.alu("cmp", RCX, RDX)
+                    c.jcc(JNE, fit)
+                    c.load(RAX, RAX, 16)
+                    c.jmp(go)
+                    c.place(fit)
+                    if given > 8:
+                        raise IRError("a closure call of %d arguments, more than 8" % given)
+                    fitter = "rt_closure_call_%d" % given
+                    c.lea_rip(RAX, "text", sym(fitter))
+                    c.place(go)
                 c.emit(0xFF, 0xD0)            # call rax
                 c.alu_imm("add", RSP, 16 * len(slots))
                 self.set_value(ins[1], RAX, RDX)

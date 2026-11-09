@@ -18,6 +18,16 @@ Feature: fibers, budgeted blocks and threads (spec 1.8)
     When each is polled until it has finished, and its result taken
     Then each result is what its closure returned
 
+  Scenario: a thread calls its closure with the arguments that follow it
+    Given closures taking two parameters, none and a list, each spawned with that many arguments
+    When each thread's result is taken
+    Then each is what its closure returned for those arguments
+
+  Scenario: a thread started with the wrong number of arguments stops the program
+    Given a closure taking two parameters, spawned with one
+    When the program runs
+    Then it stops before the thread starts, as a failed precondition of the closure, naming both numbers
+
   Scenario: threads call a function together, the first time it has been called
     Given a function that calls 8 others, none of them called before
     When parallel_map runs it on 16 threads

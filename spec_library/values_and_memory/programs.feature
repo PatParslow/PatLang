@@ -45,3 +45,38 @@ Feature: what functions, commands and includes give (spec 1.13)
     Given a program and a file it includes that define one function name
     When the program is given
     Then both engines report that the name is declared twice, and nothing runs
+
+  Scenario: a program's value is not printed
+    Given a program whose last statements are a call whose value nothing uses, and an int
+    When it runs
+    Then it prints only what it printed itself
+
+  Scenario: a call naming a function with the wrong number of arguments is refused
+    Given a function taking two arguments, and one taking one and rest, each called with too few or too many, and a closure called with nine
+    When the program is compiled
+    Then both engines refuse it, naming the function and both numbers, and that a closure takes at most 8, and nothing runs
+
+  Scenario: a closure called with the wrong number of arguments stops the program
+    Given a closure taking two parameters, called with two and then with one
+    When the program runs
+    Then the first call gives its value, and the second stops the program as a failed precondition of the closure, naming both numbers
+
+  Scenario: a function called by name takes exactly its arguments, and rest any further ones
+    Given apply and parallel_map of a function taking two arguments and of one taking one and rest
+    When each is called
+    Then each gives its value, rest holding the further arguments as a list
+
+  Scenario: a function called by name with the wrong number of arguments stops the program
+    Given apply of a function taking two arguments, with one
+    When the program runs
+    Then it stops as a failed precondition of the function, naming it and both numbers
+
+  Scenario: a closure whose last parameter is named rest takes any further arguments
+    Given a closure taking one parameter and rest, called through a variable with one and with three arguments, and on a thread with two
+    When each is called
+    Then rest holds the further arguments as a list each time, as for a function
+
+  Scenario: a closure taking rest, called with too few arguments, stops the program
+    Given a closure taking one parameter and rest, called with none
+    When the program runs
+    Then it stops as a failed precondition of the closure, saying it takes at least 1 argument
