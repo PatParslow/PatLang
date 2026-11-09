@@ -10,11 +10,14 @@
 # block-model suite's steps still start pat, the old engine they test.
 #
 # Each step's result goes to self_hosting/build/v2_gates/status as it
-# finishes, and its output to a log beside it.
+# finishes, and its output to a log beside it. The previous run's files move
+# to v2_gates/previous first, so everything in v2_gates is from this run.
 cd "$(dirname "$0")/../../.." || exit 1
 B=self_hosting/build
 D=$B/v2_gates
-mkdir -p "$D"
+rm -rf "$D/previous"
+mkdir -p "$D/previous"
+find "$D" -maxdepth 1 -type f -exec mv {} "$D/previous/" \;
 ST=$D/status
 : > "$ST"
 st() { echo "$(date +%H:%M:%S) $*" >> "$ST"; }
