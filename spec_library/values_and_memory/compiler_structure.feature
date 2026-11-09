@@ -51,6 +51,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When jobs.patlang hashes each, and each value built a second time
     Then values that differ hash differently, a value built twice hashes the same, and a file hashes as its length then its bytes
 
+  Scenario: a compiler's cache key is the one recorded when it was built
+    Given a program that declares jb_compiler_key, an ordinary program, and a copy of v2.exe with no key beside it
+    When each program is compiled, and the copy builds a program twice
+    Then the first has its key beside it and the second none, the copy says it builds without the cache and builds each function again, and no source on disk goes into the key
+
   Scenario: registrations are recorded, not rediscovered
     Given a program with a when handler, a rule, and a function reached only through apply
     When it is compiled

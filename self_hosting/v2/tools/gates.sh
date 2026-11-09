@@ -21,7 +21,7 @@ st() { echo "$(date +%H:%M:%S) $*" >> "$ST"; }
 tests() { tr -d '\000' < "$1" | grep -a '^tests:'; }
 
 # The compiler. v2.exe builds a, a builds b; a and b must be byte identical,
-# and b becomes v2.exe.
+# and b becomes v2.exe, with the key written beside it.
 if [ ! -f $B/v2.exe ]; then
   py -3 -I bootstrap/ir_reader.py bootstrap/v2_compiler.ir $B/v2.exe > "$D/boot.log" 2>&1
   st "first compiler, from the IR: exit $?"
@@ -33,6 +33,8 @@ st "compiler b: exit $?"
 if cmp -s $B/v2_gen_a.exe $B/v2_gen_b.exe; then
   st "fixpoint: a and b byte identical"
   cp $B/v2_gen_b.exe $B/v2.exe
+  # its cache key, the hash of the sources it was built from (#254)
+  cp $B/v2_gen_b.exe.key $B/v2.exe.key
 else
   st "fixpoint: a and b differ"
   st "stopped"

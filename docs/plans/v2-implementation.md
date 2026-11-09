@@ -180,6 +180,16 @@ milestone 11). What they needed beyond this plan's first draft:
   sources on disk rather than the compiler that runs
   ([#254](https://github.com/PatParslow/PatLang/issues/254)). The symbol
   index this needs is the swarm plan's barrier B1.
+- **A compiler's key is recorded when it is built (#254).** When v2 builds a program that
+  declares `jb_compiler_key`, it writes `OUT.key` beside it: the hash of every source the
+  program was built from, as they were read. The compiler reads the key beside itself
+  (`jb_compiler_key`, `jobs.patlang`) and mixes it into every job's key, so sources changed
+  on disk since it was built no longer take part. A compiler with no key, the IR reader's
+  first one for instance, builds without the cache and says so. The gates install
+  compiler b's key with it. The scenario "a compiler's cache key is the one recorded when
+  it was built" failed before (RED: a keyless copy of v2.exe reused stored code) and now
+  passes. Gates: part 1 121/121 on both engines, engines agree 62/62, part 2 111/111,
+  language 251/251 on both, match 26/26, block model 211/211.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing
