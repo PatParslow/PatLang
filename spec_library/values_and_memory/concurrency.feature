@@ -33,6 +33,12 @@ Feature: fibers, budgeted blocks and threads (spec 1.8)
     When parallel_map runs it on 16 threads
     Then each thread gives what one thread alone would give
 
+  Scenario: a handler that yields on a fiber does not hold back its event elsewhere
+    Given a handler for ping that yields when it runs on a fiber
+    And a fiber that raises ping
+    When the fiber is resumed, the program raises ping while the fiber waits, and the fiber is resumed again
+    Then the handler ran for the fiber, for the program while the fiber waited, and for the program after
+
   Scenario: a finished fiber cannot be resumed
     Given a fiber that has returned
     When it is resumed

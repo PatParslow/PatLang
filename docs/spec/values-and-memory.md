@@ -63,7 +63,9 @@ any event is (`emit`, `when`), with nothing specific to operators.
   result.
 - While a handler for an event runs, nothing it does on the same thread
   raises that event again: an `added` handler that adds two ints does not
-  call itself. Other events are raised as usual. (Added 2026-11-02, while
+  call itself. Other events are raised as usual. A handler running on a fiber
+  holds back its event on that fiber only: if it yields, whoever resumed the
+  fiber raises the event as usual. (Added 2026-11-02, while
   writing the scenarios: without it, any handler for an arithmetic event
   that does arithmetic never returns.)
 

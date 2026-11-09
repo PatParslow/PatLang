@@ -575,8 +575,12 @@ As decided by the project owner, `set_global`, `get_global`, `set_var` and
 
 Open questions from this work:
 
-- An unfinished fiber keeps its stack, and its id can still resume it.
+- An unfinished fiber keeps its stack, and its id can still resume it. Settled on
+  2026-11-09: that is what a fiber is for (spec 1.8).
 - A fiber that yields inside an event handler shares its thread's list of running events.
+  Settled on 2026-11-09: each fiber has its own list, swapped in and out by `fiber_resume`
+  (spec 1.4; `concurrency.feature`). The gates pass (2026-11-09), part 1 120/120 on both
+  engines.
 - `thread_spawn` of a closure with parameters is not caught: a thread passes it none. Settled
   on 2026-11-08: `thread_spawn(closure, args...)` passes the arguments after the closure, and
   their number is checked before the thread starts (spec 1.8, 1.13).
