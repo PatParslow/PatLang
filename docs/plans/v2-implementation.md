@@ -584,7 +584,12 @@ Open questions from this work:
 - `thread_spawn` of a closure with parameters is not caught: a thread passes it none. Settled
   on 2026-11-08: `thread_spawn(closure, args...)` passes the arguments after the closure, and
   their number is checked before the thread starts (spec 1.8, 1.13).
-- A `syntax` definition must start a line.
+- A `syntax` definition must start a line. Settled on 2026-11-09: it need not, since line
+  breaks are not syntax. Only v2's check for whether a file needs expanding
+  (`v2_defines_syntax`) looked at line starts; the extractor already finds a definition
+  anywhere outside strings and comments. That check now looks for the word anywhere
+  (`syntax_definitions.feature`); compiling the compiler takes as long as before. The
+  gates pass (2026-11-09), part 1 121/121 on both engines.
 
 ## 8. Baseline
 

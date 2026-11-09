@@ -12,6 +12,12 @@ Feature: a syntax definition extends the language for the program (spec 1.9)
     When the program runs
     Then the included file's definition expands the program's block
 
+  Scenario: a definition need not start a line
+    Given a syntax definition written on the same line as a statement before it
+    And a block in that syntax
+    When the program runs
+    Then the statement runs, and the block runs as its rule says
+
   Scenario: AST.Name(args) gives a node
     Given rules and ordinary code using AST.Name(args), nested, in a closure, and with a variable named AST
     When the program runs

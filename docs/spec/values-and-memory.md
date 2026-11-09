@@ -138,8 +138,9 @@ running it.
 - `AST.Name(args)` gives a node, the list `["Name", args...]`, in a rule or in any other
   code, and nodes nest. A rule can pass one to a function:
   `return handle(AST.Route(verb, path));`. A variable named `AST` keeps its meaning.
-- A definition starts a line, and holds in its own file and the files collected after
-  it, each file coming after the files it includes.
+- A definition may stand anywhere a statement may, on a line of its own or not, and holds
+  in its own file and the files collected after it, each file coming after the files it
+  includes.
 
 ### 1.10 Text
 
