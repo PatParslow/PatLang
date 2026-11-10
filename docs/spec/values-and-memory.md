@@ -245,6 +245,16 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   adds each solution to the store `target` as a fact of `pred`.
 - `plan_in(stores, goals)` plans from the ground facts of the stores listed; `plan`, `pursue`
   and `plan_incremental` plan from those of the default store and the contracts store.
+- `using kb as logic do ... end` gives a block a store for the `logic` role. Inside it,
+  `rule_add`, `fact`, `solve`, `query`, `rules_clear`, `plan`, `plan_incremental`,
+  `plan_with_state` and a `rule` declaration with no `in` use `kb` alone in place of the
+  default and contracts stores (`rule_add_to`, `fact_in`, `solve_in`, `query_in`,
+  `rules_clear_in`, `plan_in` and `plan_with_state_in` are the forms taking a store). The
+  compiler makes this change where the block's text is, so it reaches a closure written inside
+  the block, which keeps the store after the block ends, and not a function the block calls.
+  An inner block giving the same role uses its own store until it ends, and a form naming its
+  store keeps it. The store expression is evaluated once, when the block starts. A role other
+  than `logic`, or one role given twice, is an error when compiling.
 - A program may define a function with a name the runtime has. The program's calls reach its
   function, directly, from a closure or by name, and the runtime goes on using its own. Two of a
   program's files defining one name is an error, naming it, and nothing of the program runs.

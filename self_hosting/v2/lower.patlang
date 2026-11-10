@@ -686,6 +686,70 @@ make a function called lw_collect_vars takes node, acc returns done
   return true
 end
 
+# A using block's statements with the plain forms of a role given the block's
+# store, an expression (spec 1.13). Rewriting stops at a named function, whose
+# use of a store is in its own text, and at an inner block giving the same
+# role. A rule declaration naming its store, and a call giving one, keep it.
+make a function called lw_using_rewrite takes node, role, store returns out
+  if type_of(node) != "list" then
+    return node
+  end
+  if list_len(node) == 0 then
+    return node
+  end
+  if node[0] == "Func" then
+    return node
+  end
+  if node[0] == "Using" then
+    let binds = lw_using_rewrite(node[1], role, store)
+    let shadowed = false
+    let i = 0
+    while i < list_len(node[1]) do
+      if node[1][i][1] == role then
+        let shadowed = true
+      end
+      let i = i + 1
+    end
+    if shadowed then
+      return ["Using", binds, node[2]]
+    end
+    return ["Using", binds, lw_using_rewrite(node[2], role, store)]
+  end
+  if (node[0] == "RuleDecl") and (list_len(node) == 4) then
+    return ["RuleDecl", node[1], node[2], node[3], "", store]
+  end
+  let out = []
+  let i = 0
+  while i < list_len(node) do
+    let out = list_push(out, lw_using_rewrite(node[i], role, store))
+    let i = i + 1
+  end
+  if (out[0] == "Call") and (list_len(out) == 3) then
+    let to = lw_using_form(role, out[1], list_len(out[2]))
+    if to != "" then
+      return ["Call", to, v2_concat([store], out[2])]
+    end
+  end
+  return out
+end
+
+# The form taking a store that a role's plain form becomes in a using block,
+# or "" when the name and argument count are not one of the role's forms.
+make a function called lw_using_form takes role, name, n returns to
+  if role != "logic" then
+    return ""
+  end
+  let forms = [["rule_add", 3, "rule_add_to"], ["solve", 2, "solve_in"], ["fact", 3, "fact_in"], ["query", 3, "query_in"], ["rules_clear", 0, "rules_clear_in"], ["plan", 1, "plan_in"], ["plan_incremental", 1, "plan_in"], ["plan_with_state", 1, "plan_with_state_in"]]
+  let i = 0
+  while i < list_len(forms) do
+    if (forms[i][0] == name) and (forms[i][1] == n) then
+      return forms[i][2]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
 # ---- statements ----
 
 make a function called lw_stmts takes fb, stmts returns done
@@ -819,8 +883,26 @@ make a function called lw_stmt takes fb, st returns done
     lw_emit(fb, ["return", r])
     return true
   end
+  if kind == "Using" then
+    let body = st[2]
+    let i = 0
+    while i < list_len(st[1]) do
+      let n = vec_get(fb[3], 2)
+      vec_set(fb[3], 2, n + 1)
+      let hidden = "__using_" + n
+      lw_stmt(fb, ["Let", hidden, st[1][i][0]])
+      let body = lw_using_rewrite(body, st[1][i][1], ["Var", hidden])
+      let i = i + 1
+    end
+    lw_stmts(fb, body)
+    return true
+  end
   if kind == "RuleDecl" then
     vec_push(fb[7][4], st[1] + "/" + list_len(st[2]))
+    if list_len(st) > 5 then
+      lw_expr(fb, ["Call", "rule_add_to", [st[5], ["Str", st[1]], lw_rule_tokens(st[2]), lw_rule_goals(st[3])]])
+      return true
+    end
     if list_len(st) > 4 then
       let store = ["Call", "logic_store_named", [["Str", st[4]]]]
       lw_expr(fb, ["Call", "rule_add_to", [store, ["Str", st[1]], lw_rule_tokens(st[2]), lw_rule_goals(st[3])]])
@@ -1187,6 +1269,11 @@ make a function called lw_assigns takes stmts, name returns yes
       end
     end
     if st[0] == "While" then
+      if lw_assigns(st[2], name) then
+        return true
+      end
+    end
+    if st[0] == "Using" then
       if lw_assigns(st[2], name) then
         return true
       end

@@ -223,6 +223,21 @@ milestone 11). What they needed beyond this plan's first draft:
   planner over a list of stores is `rt_plan_from`. Gates: part 1 125 on each engine, engines
   agree 62, part 2 111, language 254 on each engine, match 26, block model 211; the compiler
   reaches a fixpoint and the IR reader's and WASM builds match.
+- **`using` blocks (#253).** As the project owner decided on 2026-11-10, the default store
+  stays, and `using kb as logic do ... end` gives the plain logic forms (`rule_add`, `fact`,
+  `solve`, `query`, `rules_clear`, `plan`, `plan_incremental`, `plan_with_state` and a `rule`
+  declaration with no `in`) the store `kb` instead. The parser gives `["Using", [[expr, role],
+  ...], body]`; `lw_using_rewrite` (`self_hosting/v2/lower.patlang`) rewrites the body to the
+  forms taking a store, binding the store once to a hidden local, so a closure written inside
+  captures it and a named function called from inside is untouched. It stops at an inner block
+  giving the same role. New runtime forms `fact_in`, `query_in`, `rules_clear_in` and
+  `plan_with_state_in`. `logic` is the one role: the planner's actions, event handlers and
+  signals are not yet store values, and another role is an error when compiling. Spec 1.13,
+  the grammar, `using_store_blocks.feature` (six scenarios) in the language suite, and "a using
+  block naming a role with no store is refused when compiling" in programs.feature. Both
+  failed before and pass on both engines. The gates pass (2026-11-10): part 1 127/127 on
+  both engines, engines agree 62/62, part 2 111/111, language 270/270 on both engines, match
+  26/26, block model 211/211.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

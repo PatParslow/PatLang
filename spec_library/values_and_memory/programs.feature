@@ -16,6 +16,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When exec_capture runs it
     Then it gives both
 
+  Scenario: a using block naming a role with no store is refused when compiling
+    Given a program with `using kb as planner do ... end`
+    When it is compiled
+    Then the error names the unknown role, and nothing runs
+
   Scenario: list_dir of a path with no directory gives an empty list
     Given a path with no directory at it, and a directory with files
     When list_dir reads each
