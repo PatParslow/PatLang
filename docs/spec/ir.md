@@ -55,9 +55,9 @@ what the instructions say.
   | `float` | 3 |
   | `string` | 8 |
 
-  Classes 0 to 14 are the runtime's own (spec 1.1): `unit`, `bool`, `int`, `float`, `bigint`,
+  Classes 0 to 15 are the runtime's own (spec 1.1): `unit`, `bool`, `int`, `float`, `bigint`,
   `rational`, `complex`, `interval`, `string`, `list`, `closure`, `string_builder`, `vec`,
-  `bool_array` and `rule_store`, in that order. A class a program declares is 63 or more.
+  `bool_array`, `rule_store` and `modint`, in that order. A class a program declares is 63 or more.
 - Bit 32 is the heap bit. When it is set, the data word points to a heap block whose first word
   is its reference count.
 
@@ -121,7 +121,7 @@ A word result is an int.
 | `value_data` | The data word. |
 | `value_type_word` | The whole type word. |
 | `value_make(t, d)` | The value whose type word is `t`'s data and whose data word is `d`'s data. |
-| `value_live` | A bool, true when all of these hold: no type-word bit above 33 is set; the class is 14 or less, or 63 or more; and if the heap bit is set, the block's count is at least 1. |
+| `value_live` | A bool, true when all of these hold: no type-word bit above 33 is set; the class is 15 or less, or 63 or more; and if the heap bit is set, the block's count is at least 1. |
 | `runtime_state` | The address of the 65,536 zeroed bytes of the runtime's state. |
 | `thread_entry_address` | The address of the thread entry (see below). |
 | `atomic_add(p, n)` | A locked exchange-add at `p`, giving the value before. |

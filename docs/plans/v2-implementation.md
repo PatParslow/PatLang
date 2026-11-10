@@ -238,6 +238,22 @@ milestone 11). What they needed beyond this plan's first draft:
   failed before and pass on both engines. The gates pass (2026-11-10): part 1 127/127 on
   both engines, engines agree 62/62, part 2 111/111, language 270/270 on both engines, match
   26/26, block model 211/211.
+- **Integers modulo n (#251, first of three increments).** As the project owner decided on
+  2026-11-10: `mod_make(x, n)`, `mod_value` and `mod_modulus`, no new syntax; `type_of` gives
+  `modint`, printing as `3 mod 7`; the bit operators, and the new `rotl` and `rotr`, only when
+  n is 2^k (k up to 62), stopping the program otherwise. Class 15, in `runtime/numbers.patlang`:
+  residue at 16 and modulus at 32, freed by the `rt_finalize` branch for rationals, so
+  `value_live`'s limit is 15 in x64, WASM, both Python readers and `ir.md`. Operators reach it
+  through `op_add_quiet`, `op_sub`, `op_mul`, `op_div` and the `op_b*`/`op_sh*` slow paths;
+  `/` multiplies by the inverse from the extended Euclidean algorithm, and `pow` squares and
+  multiplies. Spec 1.14 and `modular_integers.feature` (nine scenarios, including a SHA-256
+  written on modint words against the four FIPS 180-4 example digests), plus a modint row in
+  bounded_memory, and `modular_integers.feature` (two scenarios) in the language suite. The
+  feature failed before and passes on both engines (19/19), as do bounded_memory (22/22) and
+  the language feature (16/16 interpreted and compiled). The gates pass (2026-11-10):
+  part 1 147/147 on both engines, engines agree 62/62, part 2 111/111, language 286/286 on both
+  engines, match 26/26, block model 211/211. The second increment is constant-time routines with v2's check for value-dependent
+  branches, the third X25519 and Ed25519 against RFC 7748/8032 and Wycheproof.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

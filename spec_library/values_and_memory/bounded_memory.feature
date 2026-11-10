@@ -17,6 +17,7 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
       | i / 7, a rational                          |
       | sqrt(0 - 4) * i, a complex number          |
       | interval_make(i, i + 1) + 1, an interval   |
+      | mod_make(i, 1000003) * 3 + 1, a modint     |
       | a new Widget object, unnamed               |
       | a string builder with 10 pushes, read back |
       | a vec with 10 pushes, read back            |

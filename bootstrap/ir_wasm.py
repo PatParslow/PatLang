@@ -759,7 +759,7 @@ class Module:
             return self.set_result(d)
         if pname == "value_live":
             a = args[0]
-            # no bit above 33, and a class of 14 or less or 63 or more
+            # no bit above 33, and a class of 15 or less or 63 or more
             b.get(self.T(a))
             b.i64(34)
             b.op(I64_SHR_U, I64_EQZ)
@@ -767,7 +767,7 @@ class Module:
             b.i64(0xFFFFFFFF)
             b.op(I64_AND)
             b.tee(self.X)
-            b.i64(14)
+            b.i64(15)
             b.op(I64_LE_S)
             b.get(self.X)
             b.i64(63)

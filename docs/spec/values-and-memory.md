@@ -17,7 +17,7 @@ memory use.
 Every value is an object of a class, and carries that class with it.
 `type_of(v)` names the class: `int`, `bigint`, `float`, `rational`,
 `complex`, `interval`, `bool`, `unit`, `string`, `list`, `closure`,
-`string_builder`, `vec`, `bool_array`, `rule_store`, or the class a `class` declaration
+`string_builder`, `vec`, `bool_array`, `rule_store`, `modint`, or the class a `class` declaration
 or `new` gave it. No value is ever classless, and no operation changes a
 value's class without producing a new value.
 
@@ -258,6 +258,27 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - A program may define a function with a name the runtime has. The program's calls reach its
   function, directly, from a closure or by name, and the runtime goes on using its own. Two of a
   program's files defining one name is an error, naming it, and nothing of the program runs.
+
+### 1.14 Integers modulo n
+
+`mod_make(x, n)` gives a `modint`: the integer `x` reduced modulo the integer `n`, with `n` at
+least 2; any other call stops the program at its `require`. `mod_value(m)` gives the residue,
+from 0 to n - 1, and `mod_modulus(m)` gives n, each an `int` or a `bigint` (1.3). A modint
+prints as `3 mod 7`, and `type_of` and `numeric_kind` give `modint`. A modint's modulus is
+fixed when it is made, and no operation changes it.
+
+- `+`, `-`, `*` and unary `-` give the modint with the same modulus. An integer operand counts
+  as the modint it reduces to. Two modints with different moduli, or an operand of any other
+  class, stop the program.
+- `a / b` is `a` times the inverse of `b`. A `b` with no inverse (one sharing a factor with n)
+  stops the program. `pow(m, k)`, for an integer `k`, is `m` multiplied by itself `k` times, and
+  for a negative `k` the inverse's power; `pow(m, 0)` is 1 modulo n.
+- Two modints are equal when their moduli and their residues are; an integer equals a modint
+  when it reduces to it. `<` and its relatives, and `%`, stop the program.
+- When n is 2^k, for k from 1 to 62, a modint is a k-bit word: `band`, `bor` and `bxor` act on
+  the words, an integer operand counting as the word it reduces to, `bnot` complements all k bits, `shl` and `shr` shift by an `int` count from 0 to
+  k, the bits shifted out lost and zeros shifted in, and `rotl(m, s)` and `rotr(m, s)` rotate
+  by `s` from 0 to k. For any other n these stop the program.
 
 ## Part 2: the new version's runtime and compiler
 

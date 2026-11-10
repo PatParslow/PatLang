@@ -1,6 +1,6 @@
 # v2 runtime: the operators' slow paths (x64.patlang inlines two ints),
-# complex numbers and intervals. Classes: int 2, float 3, bigint 4, rational 5,
-# complex 6, interval 7. Mixed real operands take the higher kind: a float makes a
+# complex numbers, intervals and integers modulo n. Classes: int 2, float 3,
+# bigint 4, rational 5, complex 6, interval 7, modint 15. Mixed real operands take the higher kind: a float makes a
 # float; otherwise a rational makes a rational, which is an integer again
 # when it divides evenly; otherwise integers. A complex operand makes a
 # complex result, which is real again when its imaginary part is zero. An
@@ -202,6 +202,245 @@ make a function called rt_interval_arith takes op, a, b returns r
   return r
 end
 
+# ---- integers modulo n (spec 1.14) ----
+# A modint's block holds its residue, 0 to n - 1, at 16 and its modulus n at 32,
+# each an int or a bigint. Class 15.
+
+make a function called rt_modint_heap_type returns t
+  let t = 4294967311
+  ensure (word_and(t, 4294967295) == 15) and (word_and(t, 4294967296) != 0)
+  return t
+end
+
+# x modulo n, from 0 to n - 1: int_divmod's remainder takes the dividend's sign.
+make a function called rt_mod_reduce takes x, n returns r
+  require rt_is_integer(x) and rt_is_integer(n) and (n >= 2)
+  let r = int_divmod(x, n)[1]
+  if r < 0 then
+    let r = r + n
+  end
+  ensure rt_is_integer(r) and (r >= 0) and (r < n)
+  return r
+end
+
+make a function called mod_make takes x, n returns m
+  require rt_is_integer(x) and rt_is_integer(n) and (n >= 2)
+  let block = rt_alloc(32)
+  mem_init_value(block, 16, rt_mod_reduce(x, n))
+  mem_init_value(block, 32, n)
+  let m = value_make(rt_modint_heap_type(), block)
+  ensure value_class(m) == 15
+  return m
+end
+
+make a function called mod_value takes m returns v
+  require value_class(m) == 15
+  let v = mem_load_value(value_data(m), 16)
+  ensure rt_is_integer(v) and (v >= 0)
+  return v
+end
+
+make a function called mod_modulus takes m returns n
+  require value_class(m) == 15
+  let n = mem_load_value(value_data(m), 32)
+  ensure rt_is_integer(n) and (n >= 2)
+  return n
+end
+
+make a function called rt_modint_to_s takes m returns s
+  require value_class(m) == 15
+  let s = to_s(mod_value(m)) + " mod " + to_s(mod_modulus(m))
+  ensure value_class(s) == 8
+  return s
+end
+
+# The modulus of whichever operand is a modint, a's when both are.
+make a function called rt_mod_modulus_of takes a, b returns n
+  require (value_class(a) == 15) or (value_class(b) == 15)
+  if value_class(a) == 15 then
+    let n = mod_modulus(a)
+    ensure rt_is_integer(n) and (n >= 2)
+    return n
+  end
+  let n = mod_modulus(b)
+  ensure rt_is_integer(n) and (n >= 2)
+  return n
+end
+
+# v's residue modulo n: a modint of that modulus, or an integer reduced. Any
+# other operand stops the program, naming the modint class.
+make a function called rt_mod_operand takes v, n returns r
+  require value_live(v) and rt_is_integer(n) and (n >= 2)
+  if value_class(v) == 15 then
+    if mod_modulus(v) != n then
+      rt_fail_class(15)
+    end
+    let r = mod_value(v)
+    ensure rt_is_integer(r) and (r >= 0) and (r < n)
+    return r
+  end
+  if not rt_is_integer(v) then
+    rt_fail_class(15)
+  end
+  let r = rt_mod_reduce(v, n)
+  ensure rt_is_integer(r) and (r >= 0) and (r < n)
+  return r
+end
+
+# y's inverse modulo n by the extended Euclidean algorithm; a y sharing a factor
+# with n has none, and stops the program.
+make a function called rt_mod_inverse takes y, n returns inv
+  require rt_is_integer(y) and rt_is_integer(n) and (y >= 0) and (y < n)
+  let old_r = y
+  let r = n
+  let old_s = 1
+  let s = 0
+  while r != 0 do
+    let q = int_divmod(old_r, r)[0]
+    let next_r = old_r - q * r
+    let old_r = r
+    let r = next_r
+    let next_s = old_s - q * s
+    let old_s = s
+    let s = next_s
+  end
+  if old_r != 1 then
+    rt_fail_class(15)
+  end
+  let inv = rt_mod_reduce(old_s, n)
+  ensure rt_is_integer(inv) and (rt_mod_reduce(inv * y, n) == 1)
+  return inv
+end
+
+make a function called rt_modint_arith takes op, a, b returns r
+  require (op >= 0) and (op <= 3) and ((value_class(a) == 15) or (value_class(b) == 15))
+  let n = rt_mod_modulus_of(a, b)
+  let x = rt_mod_operand(a, n)
+  let y = rt_mod_operand(b, n)
+  if op == 0 then
+    let r = mod_make(x + y, n)
+  elif op == 1 then
+    let r = mod_make(x - y, n)
+  elif op == 2 then
+    let r = mod_make(x * y, n)
+  else
+    let r = mod_make(x * rt_mod_inverse(y, n), n)
+  end
+  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+# m to the integer power k: square and multiply, the inverse's power for k < 0.
+make a function called rt_modint_pow takes m, k returns r
+  require (value_class(m) == 15) and value_live(k)
+  if not rt_is_integer(k) then
+    rt_fail_class(15)
+  end
+  let n = mod_modulus(m)
+  let b = mod_value(m)
+  let e = k
+  if k < 0 then
+    let b = rt_mod_inverse(b, n)
+    let e = 0 - k
+  end
+  let acc = rt_mod_reduce(1, n)
+  while e > 0 do
+    let qr = int_divmod(e, 2)
+    if qr[1] == 1 then
+      let acc = rt_mod_reduce(acc * b, n)
+    end
+    let b = rt_mod_reduce(b * b, n)
+    let e = qr[0]
+  end
+  let r = mod_make(acc, n)
+  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+# k when m's modulus is 2^k, for k from 1 to 62; any other modulus stops the
+# program, naming the modint class.
+make a function called rt_mod_bits takes m returns k
+  require value_class(m) == 15
+  let n = mod_modulus(m)
+  if (value_class(n) != 2) or (n > 4611686018427387904) or (word_and(n, n - 1) != 0) then
+    rt_fail_class(15)
+  end
+  let k = 1
+  while word_shl(1, k) < n do
+    let k = k + 1
+  end
+  ensure (k >= 1) and (k <= 62) and (word_shl(1, k) == n)
+  return k
+end
+
+# band, bor and bxor (op 0, 1, 2) of two k-bit words.
+make a function called rt_modint_bitwise takes op, a, b returns r
+  require (op >= 0) and (op <= 2) and ((value_class(a) == 15) or (value_class(b) == 15))
+  let n = rt_mod_modulus_of(a, b)
+  let x = rt_mod_operand(a, n)
+  let y = rt_mod_operand(b, n)
+  if value_class(a) == 15 then
+    rt_mod_bits(a)
+  else
+    rt_mod_bits(b)
+  end
+  if op == 0 then
+    let r = mod_make(word_and(x, y), n)
+  elif op == 1 then
+    let r = mod_make(word_or(x, y), n)
+  else
+    let r = mod_make(word_xor(x, y), n)
+  end
+  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+# The count of a shift or rotation of the word m: an int from 0 to k.
+make a function called rt_mod_count takes m, s returns k
+  require (value_class(m) == 15) and value_live(s)
+  let k = rt_mod_bits(m)
+  if (value_class(s) != 2) or (s < 0) or (s > k) then
+    rt_fail_class(15)
+  end
+  ensure (k >= 1) and (k <= 62) and (s >= 0) and (s <= k)
+  return k
+end
+
+# shl and shr (op 0, 1): the bits shifted out lost, zeros shifted in.
+make a function called rt_modint_shift takes op, m, s returns r
+  require ((op == 0) or (op == 1)) and value_live(m) and value_live(s)
+  if value_class(m) != 15 then
+    rt_fail_class(15)
+  end
+  rt_mod_count(m, s)
+  let n = mod_modulus(m)
+  if op == 0 then
+    let r = mod_make(word_and(word_shl(mod_value(m), s), n - 1), n)
+  else
+    let r = mod_make(word_shr(mod_value(m), s), n)
+  end
+  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+make a function called rotl takes m, s returns r
+  require (value_class(m) == 15) and value_live(s)
+  let k = rt_mod_count(m, s)
+  let n = mod_modulus(m)
+  let v = mod_value(m)
+  let r = mod_make(word_and(word_or(word_shl(v, s), word_shr(v, k - s)), n - 1), n)
+  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+make a function called rotr takes m, s returns r
+  require (value_class(m) == 15) and value_live(s)
+  let k = rt_mod_count(m, s)
+  let r = rotl(m, k - s)
+  ensure (value_class(r) == 15) and (mod_modulus(r) == mod_modulus(m))
+  return r
+end
+
 # ---- the operators ----
 
 make a function called rt_arith takes op, a, b returns r
@@ -386,6 +625,11 @@ make a function called op_add_quiet takes a, b returns r
     ensure value_live(r)
     return r
   end
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_arith(0, a, b)
+    ensure value_live(r)
+    return r
+  end
   rt_check_numbers(a, b)
   let r = rt_arith(0, a, b)
   ensure value_live(r)
@@ -396,6 +640,11 @@ make a function called op_sub takes a, b returns r
   require value_live(a) and value_live(b)
   if rt_is_object(a) then
     let r = send(a, "-", b)
+    ensure value_live(r)
+    return r
+  end
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_arith(1, a, b)
     ensure value_live(r)
     return r
   end
@@ -412,6 +661,11 @@ make a function called op_mul takes a, b returns r
     ensure value_live(r)
     return r
   end
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_arith(2, a, b)
+    ensure value_live(r)
+    return r
+  end
   rt_check_numbers(a, b)
   let r = rt_arith(2, a, b)
   ensure value_live(r)
@@ -425,6 +679,11 @@ make a function called op_div takes a, b returns r
     ensure value_live(r)
     return r
   end
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_arith(3, a, b)
+    ensure value_live(r)
+    return r
+  end
   rt_check_numbers(a, b)
   let r = rt_arith(3, a, b)
   ensure value_live(r)
@@ -434,6 +693,9 @@ end
 # The remainder, truncating: its sign is the dividend's.
 make a function called op_mod takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_has_class(a, b, 15) then
+    rt_fail_class(15)
+  end
   rt_check_numbers(a, b)
   if rt_has_class(a, b, 7) then
     rt_fail_class(7)
@@ -490,6 +752,11 @@ make a function called op_neg takes a returns r
   end
   if c == 7 then
     let r = interval_make(op_neg(interval_hi(a)), op_neg(interval_lo(a)))
+    ensure value_live(r)
+    return r
+  end
+  if c == 15 then
+    let r = mod_make(0 - mod_value(a), mod_modulus(a))
     ensure value_live(r)
     return r
   end
@@ -592,6 +859,9 @@ make a function called op_lt takes a, b returns r
     ensure value_live(r)
     return r
   end
+  if rt_has_class(a, b, 15) then
+    rt_fail_class(15)
+  end
   rt_check_reals(a, b)
   let r = rt_real_cmp(a, b) < 0
   ensure value_live(r)
@@ -635,6 +905,21 @@ make a function called op_eq takes a, b returns r
       return r
     end
   end
+  if (ca == 15) and (cb == 15) then
+    let r = (mod_modulus(a) == mod_modulus(b)) and (mod_value(a) == mod_value(b))
+    ensure value_class(r) == 1
+    return r
+  end
+  if (ca == 15) and rt_is_integer(b) then
+    let r = rt_mod_reduce(b, mod_modulus(a)) == mod_value(a)
+    ensure value_class(r) == 1
+    return r
+  end
+  if (cb == 15) and rt_is_integer(a) then
+    let r = rt_mod_reduce(a, mod_modulus(b)) == mod_value(b)
+    ensure value_class(r) == 1
+    return r
+  end
   if rt_is_real(a) and rt_is_real(b) then
     let r = rt_real_cmp(a, b) == 0
     ensure value_class(r) == 1
@@ -674,6 +959,11 @@ end
 
 make a function called op_band takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_bitwise(0, a, b)
+    ensure value_class(r) == 15
+    return r
+  end
   let r = rt_fail_class(value_class(a))
   ensure false
   return r
@@ -681,6 +971,11 @@ end
 
 make a function called op_bor takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_bitwise(1, a, b)
+    ensure value_class(r) == 15
+    return r
+  end
   let r = rt_fail_class(value_class(a))
   ensure false
   return r
@@ -688,14 +983,27 @@ end
 
 make a function called op_bxor takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_bitwise(2, a, b)
+    ensure value_class(r) == 15
+    return r
+  end
   let r = rt_fail_class(value_class(a))
   ensure false
   return r
 end
 
 # Only reached for a value that is not an int: an int's complement is inline.
+# A k-bit word's complement flips its k bits.
 make a function called op_bnot takes a returns r
   require value_live(a)
+  if value_class(a) == 15 then
+    rt_mod_bits(a)
+    let n = mod_modulus(a)
+    let r = mod_make(word_xor(mod_value(a), n - 1), n)
+    ensure value_class(r) == 15
+    return r
+  end
   let r = rt_fail_class(value_class(a))
   ensure false
   return r
@@ -703,6 +1011,11 @@ end
 
 make a function called op_shl takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_shift(0, a, b)
+    ensure value_class(r) == 15
+    return r
+  end
   let r = rt_fail_class(value_class(a))
   ensure false
   return r
@@ -710,6 +1023,11 @@ end
 
 make a function called op_shr takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_has_class(a, b, 15) then
+    let r = rt_modint_shift(1, a, b)
+    ensure value_class(r) == 15
+    return r
+  end
   let r = rt_fail_class(value_class(a))
   ensure false
   return r
