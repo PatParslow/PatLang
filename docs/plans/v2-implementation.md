@@ -200,6 +200,29 @@ milestone 11). What they needed beyond this plan's first draft:
   needs" (programs.feature) failed on all three counts before and passes on both engines.
   Gates: part 1 122/122 on both engines, engines agree 62/62, part 2 111/111, language
   251/251 on both, match 26/26, block model 211/211.
+- **Rules live in stores (#255).** A store is a cell, class `rule_store` (14), holding its
+  rules, its index by predicate and a hash of its ground facts, so it holds each fact once.
+  Named stores are a list at state 4464 (4224 is now unused): the program's rules are in
+  `"default"`, contract facts in `"contracts"`, and `solve`, `query` and `plan` read both.
+  `solve_in`, `solve_into` and `plan_in` take a store or a list of stores; a rule's
+  `in NAME` and a body goal's `from NAME` (`self_hosting/lib/parser.patlang`) name a store,
+  looked up when solving, so a rule never holds a store and no cycle forms. `rules_clear`
+  empties the default store, and `store_delete` forgets a name. Spec 1.13; the scenario "rules
+  live in stores, which goals draw from together and solve into" (programs.feature), a
+  `rule_store` row in bounded_memory.feature and `type_of` in values_are_objects.feature,
+  and in the language suite "a rule declaration can name the store it goes in…"
+  (rule_declaration_sugar.feature). The grammar (`docs/grammar/patlang-full.peg`) has
+  `in` and `from`. A new built-in class moves `value_live`'s limit from 13 to 14 in every
+  back end (`x64.patlang`, `wasm.patlang`, `bootstrap/ir_reader.py`, `bootstrap/ir_wasm.py`)
+  and in `docs/spec/ir.md`, so the first compiler with it came from the IR reader: the
+  compiler the old one builds rejects a store. The old engine (`pat`, `patc1`) does not have
+  `in` or `from`, so its own language run cannot read the steps file. `list_dir` of a path
+  with no directory now gives `[]` instead of ending the program (the scenario "list_dir of a
+  path with no directory gives an empty list"). Both scenarios in programs.feature failed
+  before and pass on both engines. `plan_with_state(goals)` keeps its one-argument form; the
+  planner over a list of stores is `rt_plan_from`. Gates: part 1 125 on each engine, engines
+  agree 62, part 2 111, language 254 on each engine, match 26, block model 211; the compiler
+  reaches a fixpoint and the IR reader's and WASM builds match.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

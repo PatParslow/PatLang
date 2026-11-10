@@ -17,7 +17,7 @@ memory use.
 Every value is an object of a class, and carries that class with it.
 `type_of(v)` names the class: `int`, `bigint`, `float`, `rational`,
 `complex`, `interval`, `bool`, `unit`, `string`, `list`, `closure`,
-`string_builder`, `vec`, `bool_array`, or the class a `class` declaration
+`string_builder`, `vec`, `bool_array`, `rule_store`, or the class a `class` declaration
 or `new` gave it. No value is ever classless, and no operation changes a
 value's class without producing a new value.
 
@@ -80,7 +80,7 @@ any event is (`emit`, `when`), with nothing specific to operators.
   lists are equal when their contents are. Closure equality is not
   specified here.
 - **Objects with identity:** class instances, objects made by `new`,
-  string builders, vecs and bool arrays. A change made through one holder
+  string builders, vecs, bool arrays and rule stores. A change made through one holder
   is seen through every holder, and `bool_array_push` keeps the same
   array when it grows. Two of them are equal only if they are the same
   object.
@@ -209,6 +209,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - The name `unit` in a program is that value, unless the program binds `unit` itself, as a
   parameter or with `let`.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
+- `list_dir(path)` gives a directory's entries, sorted, a subdirectory's name ending in `/`. A
+  path with no directory to read gives `[]`, as `read_file` gives `""` for a file it cannot
+  read, and the program goes on; `file_exists` tells a missing path from an empty directory.
 - `exec_peak_memory(program, args)` runs the program with the list of arguments and gives two
   things: what it wrote to standard output, followed by what it wrote to standard error if it
   exited non-zero, and its peak working set in bytes, or -1 where the system gives none.
@@ -223,6 +226,25 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - Adding a rule takes about the same time however many rules there are. A goal's cost does not
   depend on the rules of other predicates, and finding its solutions takes time in proportion
   to their number.
+- Rules live in stores. `logic_store_new()` gives a new, unnamed store, which goes when its last
+  holder does. `logic_store_named(name)` gives the store with that name, made the first time
+  the name is used, and it lives until `store_delete(name)`; the name then names a new, empty
+  store. The program's own rules are in the store named `"default"`, and the runtime records
+  `contract_holds` facts in the store named `"contracts"`. `rule_add`, `fact` and a `rule`
+  declaration add to the default store; `rule_add_to(store, pred, args, body)` adds to the
+  store given, and `rule head(args) in NAME :- ...` to the store named NAME.
+  `rules_clear()` empties the default store.
+- A store holds each ground fact (a rule with no body and no variables) once: adding a fact
+  the store holds changes nothing.
+- `solve_in(stores, pred, args)` solves against a store or a list of stores: a goal sees the
+  rules of every store listed, store by store in the order listed and, within a store, in the
+  order they were added. A rule's body goals are solved against the same stores, except a goal
+  written `pred(args) from NAME`, which is solved against the store named NAME alone.
+  `solve(pred, args)` and `query` solve against the default store and the contracts store.
+- `solve_into(target, stores, pred, args)` gives what `solve_in(stores, pred, args)` gives, and
+  adds each solution to the store `target` as a fact of `pred`.
+- `plan_in(stores, goals)` plans from the ground facts of the stores listed; `plan`, `pursue`
+  and `plan_incremental` plan from those of the default store and the contracts store.
 - A program may define a function with a name the runtime has. The program's calls reach its
   function, directly, from a closure or by name, and the runtime goes on using its own. Two of a
   program's files defining one name is an error, naming it, and nothing of the program runs.

@@ -21,6 +21,7 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
       | a string builder with 10 pushes, read back |
       | a vec with 10 pushes, read back            |
       | a bool array with 100 pushes               |
+      | a rule store with 10 facts, solved          |
       | a closure capturing i                      |
       | exec_capture of "echo"                     |
       | read_file of a small file                  |

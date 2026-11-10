@@ -16,6 +16,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When exec_capture runs it
     Then it gives both
 
+  Scenario: list_dir of a path with no directory gives an empty list
+    Given a path with no directory at it, and a directory with files
+    When list_dir reads each
+    Then the first gives [] and the program goes on, file_exists says the path is missing, and the second gives entries
+
   Scenario: exec_peak_memory gives a command's output and its peak memory
     Given a command that writes to both outputs, once exiting 0 and once exiting 3
     When exec_peak_memory runs each
@@ -30,6 +35,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     Given a status read before any report and after two, and a one-action plan found with plan and with plan_incremental, then the actions cleared
     When the program runs
     Then the status is empty, then the second report; both plans are the action, and after action_clear there is no plan
+
+  Scenario: rules live in stores, which goals draw from together and solve into
+    Given a store with one fact added twice through two holders, rules declared in a named store and read with from, two stores each holding q, a store solved into twice, a plan from a store's facts, a contract checked, the default store cleared and a named store deleted
+    When the program runs
+    Then each prints what spec 1.13 says of stores
 
   Scenario: the logic engine's work grows with what each call needs
     Given 4,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 4,000 and 8,000 solutions

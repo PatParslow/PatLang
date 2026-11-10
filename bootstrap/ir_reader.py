@@ -410,7 +410,7 @@ class FnGen:
             c.jcc(JNE, bad)
             c.mov_imm(RCX, 0xFFFFFFFF)
             c.alu("and", RCX, RAX)
-            c.alu_imm("cmp", RCX, 13)
+            c.alu_imm("cmp", RCX, 14)
             c.jcc(JLE, known)
             c.alu_imm("cmp", RCX, 63)
             c.jcc(JL, bad)

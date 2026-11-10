@@ -2,9 +2,9 @@
 Feature: every value is an object of a class, and answers methods through it (spec 1.1, 1.2)
 
   Scenario: type_of names the class of every kind of value
-    Given the values 7, 2^70, 1.5, 6/4, true, the unit value print returns, "hi", [1, 2], a closure, sb_new(), vec_new() and bool_array_new(3)
+    Given the values 7, 2^70, 1.5, 6/4, true, the unit value print returns, "hi", [1, 2], a closure, sb_new(), vec_new(), bool_array_new(3) and logic_store_new()
     When type_of is applied to each
-    Then the results are int, bigint, float, rational, bool, unit, string, list, closure, string_builder, vec, bool_array
+    Then the results are int, bigint, float, rational, bool, unit, string, list, closure, string_builder, vec, bool_array, rule_store
 
   Scenario: new returns the object, of the class it names
     Given w = new("Widget", "w1")
