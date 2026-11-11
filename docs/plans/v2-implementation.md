@@ -289,7 +289,10 @@ milestone 11). What they needed beyond this plan's first draft:
   reuses the header already worked out. `self_hosting/v2/tools/curve25519_vectors.py` writes
   `cv_vectors.patlang` from RFC 7748, RFC 8032 and Wycheproof. `curve25519.feature` (five
   scenarios): the FIPS 180-4 digests, RFC 7748's outputs and its 1,000-iteration case (the
-  1,000,000-iteration one is not run), all 518 Wycheproof X25519 cases, RFC 8032's keys and
+  1,000,000-iteration one runs outside the suite, at about 167 ms an iteration, with
+  self_hosting/v2/tools/x25519_million.patlang, which saves a checkpoint every 1,000
+  iterations and resumes from it; a run stopped at 2,000 and resumed reaches the same k at
+  3,000 as one run straight through; started 2026-11-11, not yet finished), all 518 Wycheproof X25519 cases, RFC 8032's keys and
   signatures, and Wycheproof Ed25519 verification (117 valid accepted, 64 invalid rejected,
   and the 29 marked acceptable all accepted). Two new scenarios in the language suite's
   `modular_integers.feature`, and a fifth in `constant_time.feature`: the check finds no
