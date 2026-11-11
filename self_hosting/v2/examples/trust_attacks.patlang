@@ -1,0 +1,271 @@
+# Attacks on package trust (docs/plans/package-trust.md), with every signature
+# made and checked by Ed25519 written in PatLang (self_hosting/v2/lib).
+#
+# The publishers of package zip are alice, bob and carol, two of three needed.
+# Carol's key leaks, so alice and bob exclude her at epoch 1 and revoke her key
+# from 2026-11-01, and then release zip 0.1.0. A consumer has pinned the
+# group's genesis hash. Mallory wants the consumer to install her trojan, and
+# tries what an attacker holding no publisher key, or only carol's leaked one,
+# can try. The checks are packages/trust's; the verifier passed to them is
+# PatLang's ed25519_verify, where the trust specs use Python's.
+#
+# Keys come from the seeds packages/trust/spec/oracle.py uses,
+# SHA-256("patlang-trust-test " + name), so its keys and these are the same.
+include "../../../packages/trust/trust.patlang"
+include "../lib/curve25519.patlang"
+
+make a function called seed_of takes name returns seed
+  require type_of(name) == "string"
+  let seed = cv_hex_bytes(sha256_string_hex("patlang-trust-test " + name))
+  ensure list_len(seed) == 32
+  return seed
+end
+
+make a function called pub_of takes name returns pub
+  require type_of(name) == "string"
+  let pub = cv_hex(ed25519_public(seed_of(name)))
+  ensure str_len(pub) == 64
+  return pub
+end
+
+# name's signature over a record's hash, in hex.
+make a function called sign_hex takes name, hash returns sig
+  require (type_of(name) == "string") and (str_len(hash) == 64)
+  let sig = cv_hex(ed25519_sign(seed_of(name), cv_hex_bytes(hash)))
+  ensure str_len(sig) == 128
+  return sig
+end
+
+# A signature file: signers [[slot, name]] over hash.
+make a function called sigs_by takes signers, hash returns bytes
+  require type_of(signers) == "list"
+  let lines = []
+  let i = 0
+  while i < list_len(signers) do
+    let lines = list_push(lines, [signers[i][0], sign_hex(signers[i][1], hash)])
+    let i = i + 1
+  end
+  let bytes = must(trust_write_sigs(lines))
+  ensure type_of(bytes) == "list"
+  return bytes
+end
+
+# A writer's bytes; the demonstration is meaningless without them.
+make a function called must takes w returns bytes
+  require type_of(w) == "list"
+  let bytes = []
+  if w[0] == "ok" then
+    let bytes = w[1]
+  else
+    print("setup failed: " + w[1] + " " + w[3])
+  end
+  ensure type_of(bytes) == "list"
+  return bytes
+end
+
+make a function called hash_of takes reader, bytes returns h
+  require type_of(reader) == "string"
+  let h = trust_rec_hash(apply(reader, bytes)[1])
+  ensure str_len(h) == 64
+  return h
+end
+
+make a function called manifest_for takes version, code returns bytes
+  require type_of(version) == "string"
+  let bytes = utf8_encode("package zip\nversion " + version + "\nfile zip.patlang sha256 " + sha256_string_hex(code) + "\n")
+  ensure list_len(bytes) > 0
+  return bytes
+end
+
+# Everything a consumer checks, in the plan's order: the genesis against the
+# pin, each log entry [transition, signatures, view], the release [record,
+# signatures] against the manifest, revocations, and a withdrawal [record,
+# signatures] when there is one ([] when not).
+make a function called consumer_check takes pin, genesis, log, manifest, release, withdrawal, verify returns r
+  require (type_of(genesis) == "list") and (type_of(log) == "list")
+  let r = trust_check_genesis(genesis[0], genesis[1], genesis[2], pin, verify)
+  let s = []
+  if r[0] == "ok" then
+    let s = r[1]
+  end
+  let i = 0
+  while (r[0] == "ok") and (i < list_len(log)) do
+    let e = log[i]
+    let r = trust_check_transition(s, e[0], e[1], e[2], verify, i + 1)
+    let i = i + 1
+  end
+  if r[0] == "ok" then
+    let r = trust_check_release(s, manifest, release[0], release[1], verify)
+  end
+  if r[0] == "ok" then
+    let rel = r[1][0]
+    let r = trust_check_revocations(s, rel, r[1][1])
+    if (r[0] == "ok") and (list_len(withdrawal) == 2) then
+      let r = trust_check_withdrawal(s, rel, withdrawal[0], withdrawal[1], verify)
+    end
+  end
+  ensure type_of(r) == "list"
+  return r
+end
+
+make a function called outcome takes r returns text
+  require type_of(r) == "list"
+  let text = "ACCEPTED"
+  if r[0] != "ok" then
+    let text = "refused, " + r[1] + " at " + r[2] + ": " + r[3]
+  end
+  ensure str_len(text) > 0
+  return text
+end
+
+# A signature with L added to its S half: the same point equation holds, so a
+# verifier that does not insist on S < L would accept it (RFC 8032 5.1.7).
+make a function called malleate takes sig_hex returns out
+  require str_len(sig_hex) == 128
+  let sig = cv_hex_bytes(sig_hex)
+  let l = cv_to_bytes(cv_fe(cv_l()))
+  let bytes = cv_slice(sig, 0, 32)
+  let carry = 0
+  let i = 0
+  while i < 32 do
+    # byte by byte, with a carry: S + L < 2^253, so nothing carries out
+    let t = mod_value(sig[32 + i]) + mod_value(l[i]) + carry
+    let bytes = list_push(bytes, cv_byte(t % 256))
+    let carry = 0
+    if t >= 256 then
+      let carry = 1
+    end
+    let i = i + 1
+  end
+  let out = cv_hex(bytes)
+  ensure str_len(out) == 128
+  return out
+end
+
+let verify = |alg, pub, msg, sig| {
+  let ok = false
+  if alg == "ed25519" then
+    let ok = ed25519_verify(cv_hex_bytes(pub), cv_hex_bytes(msg), cv_hex_bytes(sig))
+  end
+  ensure value_class(ok) == 1
+  return ok
+}
+
+# ---- the group, its log and its release ----
+
+let pa = pub_of("alice")
+let pb = pub_of("bob")
+let pc = pub_of("carol")
+let pm = pub_of("mallory")
+print("alice   " + pa)
+print("bob     " + pb)
+print("carol   " + pc)
+print("mallory " + pm)
+
+let v0 = must(trust_write_view("", 0, "majority", [[0, "ed25519", pa], [1, "ed25519", pb], [2, "ed25519", pc]]))
+let v0h = hash_of("trust_read_view", v0)
+let gb = must(trust_write_genesis("zip", v0h, "2026-11-08"))
+let pin = hash_of("trust_read_genesis", gb)
+let genesis = [gb, sigs_by([[0, "alice"], [1, "bob"], [2, "carol"]], pin), v0]
+print("pinned genesis " + pin)
+
+let v1 = must(trust_write_view(pin, 1, "majority", [[0, "ed25519", pa], [1, "ed25519", pb]]))
+let v1h = hash_of("trust_read_view", v1)
+let evidence = sha256_string_hex("carol's key was posted on a paste site")
+let t1 = must(trust_write_transition(pin, 0, v0h, 1, v1h, "exclude", 2, evidence, "2026-11-01"))
+let t1h = hash_of("trust_read_transition", t1)
+let log = [[t1, sigs_by([[0, "alice"], [1, "bob"]], t1h), v1]]
+
+let manifest = manifest_for("0.1.0", "the real zip")
+let rb = must(trust_write_release(pin, 1, v1h, "zip", "0.1.0", sha256_hex(manifest), "2026-11-10"))
+let rh = hash_of("trust_read_release", rb)
+let rs = sigs_by([[0, "alice"], [1, "bob"]], rh)
+let release = [rb, rs]
+
+print("")
+print("the genuine release: " + outcome(consumer_check(pin, genesis, log, manifest, release, [], verify)))
+print("")
+
+# ---- Mallory's attempts ----
+
+let trojan = manifest_for("0.1.0", "the real zip, and a back door")
+print("1. ship the trojan under the genuine release")
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, release, [], verify)))
+
+let tb = must(trust_write_release(pin, 1, v1h, "zip", "0.1.0", sha256_hex(trojan), "2026-11-10"))
+let th = hash_of("trust_read_release", tb)
+print("2. a release for the trojan, signed with her own key as alice and bob")
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [tb, must(trust_write_sigs([[0, sign_hex("mallory", th)], [1, sign_hex("mallory", th)]]))], [], verify)))
+
+print("3. the same, signed as a slot the group does not have")
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [tb, sigs_by([[5, "mallory"]], th)], [], verify)))
+
+print("4. alice's genuine signature on the trojan (say she was tricked), listed twice")
+let ta = sign_hex("alice", th)
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [tb, must(trust_write_sigs([[0, ta], [0, ta]]))], [], verify)))
+
+print("5. alice's signature alone")
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [tb, must(trust_write_sigs([[0, ta]]))], [], verify)))
+
+print("6. 0.1.0's genuine signatures copied onto a release of the trojan as 0.2.0")
+let trojan2 = manifest_for("0.2.0", "the real zip, and a back door")
+let t2b = must(trust_write_release(pin, 1, v1h, "zip", "0.2.0", sha256_hex(trojan2), "2026-11-10"))
+print("   " + outcome(consumer_check(pin, genesis, log, trojan2, [t2b, rs], [], verify)))
+
+print("7. a whole counterfeit group: her own view, genesis and release")
+let mv0 = must(trust_write_view("", 0, "1", [[0, "ed25519", pm]]))
+let mgb = must(trust_write_genesis("zip", hash_of("trust_read_view", mv0), "2026-11-08"))
+let mpin = hash_of("trust_read_genesis", mgb)
+let mrb = must(trust_write_release(mpin, 0, hash_of("trust_read_view", mv0), "zip", "0.1.0", sha256_hex(trojan), "2026-11-10"))
+let mgen = [mgb, sigs_by([[0, "mallory"]], mpin), mv0]
+let mrel = [mrb, sigs_by([[0, "mallory"]], hash_of("trust_read_release", mrb))]
+print("   to a consumer who pinned the real group: " + outcome(consumer_check(pin, mgen, [], trojan, mrel, [], verify)))
+print("   to one who pinned hers on first use: " + outcome(consumer_check(mpin, mgen, [], trojan, mrel, [], verify)))
+
+print("8. carol's leaked key with alice's tricked signature, at epoch 1")
+let t1rb = must(trust_write_release(pin, 1, v1h, "zip", "0.1.0", sha256_hex(trojan), "2026-11-10"))
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [t1rb, sigs_by([[0, "alice"], [2, "carol"]], hash_of("trust_read_release", t1rb))], [], verify)))
+
+print("9. the same at epoch 0, when carol was still a member, dated after her revocation")
+let t0rb = must(trust_write_release(pin, 0, v0h, "zip", "0.1.0", sha256_hex(trojan), "2026-11-10"))
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [t0rb, sigs_by([[0, "alice"], [2, "carol"]], hash_of("trust_read_release", t0rb))], [], verify)))
+
+print("10. the same, backdated to before the revocation")
+let tbrb = must(trust_write_release(pin, 0, v0h, "zip", "0.1.0", sha256_hex(trojan), "2026-10-20"))
+print("   " + outcome(consumer_check(pin, genesis, log, trojan, [tbrb, sigs_by([[0, "alice"], [2, "carol"]], hash_of("trust_read_release", tbrb))], [], verify)))
+print("   (the plan's stated limit: a backdated release is stopped only by its other")
+print("   signers, and here alice signed it)")
+
+print("11. the genuine release with bob's signature malleated, S + L in place of S")
+let rsig = trust_read_sigs(rs)[1][2]
+let mall = malleate(rsig[1][1])
+let s_old = cv_int(cv_slice(cv_hex_bytes(rsig[1][1]), 32, 64))
+let s_new = cv_int(cv_slice(cv_hex_bytes(mall), 32, 64))
+print("   the new S is the old one plus L, so the same scalar modulo L: " + to_s((s_new - s_old == cv_l()) and (mod_make(s_new, cv_l()) == mod_make(s_old, cv_l()))))
+print("   " + outcome(consumer_check(pin, genesis, log, manifest, [rb, must(trust_write_sigs([[0, rsig[0][1]], [1, mall]]))], [], verify)))
+
+print("12. the genuine release with one bit of bob's signature flipped")
+let bent = cv_hex_bytes(rsig[1][1])
+let bent = list_set(bent, 40, bent[40] bxor 1)
+print("   " + outcome(consumer_check(pin, genesis, log, manifest, [rb, must(trust_write_sigs([[0, rsig[0][1]], [1, cv_hex(bent)]]))], [], verify)))
+
+print("13. a log entry admitting herself, signed by carol's leaked key and her own")
+let v2 = must(trust_write_view(pin, 2, "majority", [[0, "ed25519", pa], [1, "ed25519", pb], [3, "ed25519", pm]]))
+let t2 = must(trust_write_transition(pin, 1, v1h, 2, hash_of("trust_read_view", v2), "admit", 3, "", ""))
+let t2h = hash_of("trust_read_transition", t2)
+let forged_log = list_push(log, [t2, sigs_by([[2, "carol"], [3, "mallory"]], t2h), v2])
+print("   " + outcome(consumer_check(pin, genesis, forged_log, manifest, release, [], verify)))
+
+print("14. the exclusion replayed, to roll the log back to carol's epoch")
+print("   " + outcome(consumer_check(pin, genesis, list_push(log, log[0]), manifest, release, [], verify)))
+
+print("15. a withdrawal of the genuine release, signed by her own key")
+let wb = must(trust_write_withdraw(pin, 1, v1h, "zip", "0.1.0", "it is broken"))
+let wh = hash_of("trust_read_withdraw", wb)
+print("   " + outcome(consumer_check(pin, genesis, log, manifest, release, [wb, sigs_by([[0, "mallory"]], wh)], verify)))
+print("   (a withdrawal that does not check still refuses the package: she can deny")
+print("   the release, never get the trojan in)")
+
+print("")
+print("and when alice and bob withdraw 0.1.0 themselves:")
+print("   " + outcome(consumer_check(pin, genesis, log, manifest, release, [wb, sigs_by([[0, "alice"], [1, "bob"]], wh)], verify)))

@@ -282,9 +282,13 @@ PatLang-native signing is a language feature, integers modulo n as a built-in nu
   branch or memory access in the compiled routines depends on a value.
 
 With that, Ed25519 and X25519 can be written in PatLang and checked against the vectors of RFC 8032
-and RFC 7748 and Wycheproof's. Until then the OS and browser do the secret work. #251 comes after
-the v2 goal, as part of the numeric-system review; whether T2's OS calls are built first, or wait
-for it, is a decision for the owner.
+and RFC 7748 and Wycheproof's. Since 2026-11-11 they are (#251, closed): self_hosting/v2/lib/
+has SHA-512, X25519 and Ed25519 on modints, passing RFC 7748, RFC 8032 and Wycheproof, and v2's
+--constant-time check finds no value-dependent branch or access in key agreement, key making or
+signing. self_hosting/v2/examples/trust_attacks.patlang passes d25519_verify to these checks as
+the verifier and makes every key and signature with it; its keys are the ones spec/oracle.py makes
+from the same seeds. Whether the package uses them in place of the OS calls, for verifying and for
+signing, is still the owner's decision (above).
 
 ### Test oracle
 

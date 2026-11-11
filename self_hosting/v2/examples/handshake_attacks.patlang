@@ -1,0 +1,167 @@
+# Attacks on a key exchange between two members of a group, the kind of
+# pairwise handshake docs/plans/ensemble-membership.md describes, using X25519
+# and Ed25519 written in PatLang (self_hosting/v2/lib) and HMAC-SHA-256 from
+# packages/sha256.
+#
+# Alice and Bob each hold an Ed25519 identity key whose public half the other
+# has pinned. A handshake:
+#   Alice -> Bob    her ephemeral X25519 public key ea
+#   Bob -> Alice    his ephemeral eb, and his signature over "bob" ea eb
+#   Alice -> Bob    her signature over "alice" ea eb
+# Each checks the other's signature against the pinned key, refuses a shared
+# secret of all zeros, and derives the session key from it. Mallory sits on the
+# wire and can drop, change, replay and reflect any message.
+include "../../../packages/sha256/sha256.patlang"
+include "../lib/curve25519.patlang"
+
+# 32 bytes standing in for a random source, which v2 does not have yet.
+make a function called seed_of takes label returns seed
+  require type_of(label) == "string"
+  let seed = cv_hex_bytes(sha256_string_hex("handshake demo " + label))
+  ensure list_len(seed) == 32
+  return seed
+end
+
+make a function called text_bytes takes text returns bytes
+  require type_of(text) == "string"
+  let bytes = cv_hex_bytes(bytes_to_hex(utf8_encode(text)))
+  ensure list_len(bytes) == str_len(text)
+  return bytes
+end
+
+make a function called base_point returns u
+  require true
+  let u = cv_hex_bytes("0900000000000000000000000000000000000000000000000000000000000000")
+  ensure list_len(u) == 32
+  return u
+end
+
+make a function called eph_public takes label returns pub
+  require type_of(label) == "string"
+  let pub = x25519(seed_of(label), base_point())
+  ensure list_len(pub) == 32
+  return pub
+end
+
+# What a role signs: its name, then both ephemeral keys in order.
+make a function called transcript takes role, ea, eb returns t
+  require (list_len(ea) == 32) and (list_len(eb) == 32)
+  let t = cv_cat(cv_cat(text_bytes(role), ea), eb)
+  ensure list_len(t) == str_len(role) + 64
+  return t
+end
+
+make a function called signed_by takes who, role, ea, eb returns sig
+  require type_of(who) == "string"
+  let sig = ed25519_sign(seed_of("identity " + who), transcript(role, ea, eb))
+  ensure list_len(sig) == 64
+  return sig
+end
+
+make a function called identity_of takes who returns pub
+  require type_of(who) == "string"
+  let pub = ed25519_public(seed_of("identity " + who))
+  ensure list_len(pub) == 32
+  return pub
+end
+
+# The shared secret from my ephemeral label and the peer's public key, or ""
+# when it is all zeros: a peer key of small order forces that value, whoever
+# I am, so it would be a key the attacker knows.
+make a function called shared_hex takes label, peer returns hex
+  require list_len(peer) == 32
+  let hex = cv_hex(x25519(seed_of(label), peer))
+  if hex == "0000000000000000000000000000000000000000000000000000000000000000" then
+    let hex = ""
+  end
+  ensure (hex == "") or (str_len(hex) == 64)
+  return hex
+end
+
+make a function called yes_no takes b returns text
+  require value_class(b) == 1
+  let text = "refused"
+  if b then
+    let text = "accepted"
+  end
+  ensure str_len(text) > 0
+  return text
+end
+
+let alice_id = identity_of("alice")
+let bob_id = identity_of("bob")
+let mallory_id = identity_of("mallory")
+
+print("-- an honest handshake --")
+let ea = eph_public("alice 1")
+let eb = eph_public("bob 1")
+let sb = signed_by("bob", "bob", ea, eb)
+let sa = signed_by("alice", "alice", ea, eb)
+print("Alice checks Bob's signature: " + yes_no(ed25519_verify(bob_id, transcript("bob", ea, eb), sb)))
+print("Bob checks Alice's signature: " + yes_no(ed25519_verify(alice_id, transcript("alice", ea, eb), sa)))
+let ka = shared_hex("alice 1", eb)
+let kb = shared_hex("bob 1", ea)
+print("Alice's key " + ka)
+print("Bob's key   " + kb)
+print("same: " + to_s(ka == kb))
+
+print("")
+print("-- 1. a man in the middle, with no signatures --")
+let em = eph_public("mallory 1")
+let ka1 = shared_hex("alice 1", em)
+let kb1 = shared_hex("bob 1", em)
+print("Mallory gives each her own key in place of the other's")
+print("Alice's key   " + ka1)
+print("Mallory's key with Alice " + shared_hex("mallory 1", ea))
+print("Bob's key     " + kb1)
+print("Mallory's key with Bob   " + shared_hex("mallory 1", eb))
+print("Mallory holds both keys and relays every message, read and changed")
+
+print("")
+print("-- 2. the same man in the middle, with signatures --")
+let sb_m = signed_by("bob", "bob", em, eb)
+print("Bob signs what he saw (em, eb); Alice saw (ea, em)")
+print("Alice checks Bob's signature: " + yes_no(ed25519_verify(bob_id, transcript("bob", ea, em), sb_m)))
+let sm = signed_by("mallory", "bob", ea, em)
+print("Mallory signs (ea, em) herself; Alice checks it against Bob's pinned key: " + yes_no(ed25519_verify(bob_id, transcript("bob", ea, em), sm)))
+
+print("")
+print("-- 3. replaying Bob's reply from an earlier handshake --")
+let ea2 = eph_public("alice 2")
+print("Alice starts again with a fresh ea; Mallory answers with the old eb and signature")
+print("Alice checks it: " + yes_no(ed25519_verify(bob_id, transcript("bob", ea2, eb), sb)))
+print("(the old signature covers the old ea)")
+
+print("")
+print("-- 4. reflecting Alice's own message back to her as Bob's --")
+print("against Bob's key: " + yes_no(ed25519_verify(bob_id, transcript("bob", ea, eb), sa)))
+print("even against Alice's own key, as the reply: " + yes_no(ed25519_verify(alice_id, transcript("bob", ea, eb), sa)))
+print("(the role name in the transcript tells a reply from a request)")
+
+print("")
+print("-- 5. a public key of small order --")
+let zero = cv_hex_bytes("0000000000000000000000000000000000000000000000000000000000000000")
+let one = cv_hex_bytes("0100000000000000000000000000000000000000000000000000000000000000")
+let order8 = cv_hex_bytes("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")
+print("raw X25519 with u = 0:      " + cv_hex(x25519(seed_of("alice 1"), zero)))
+print("raw X25519 with u = 1:      " + cv_hex(x25519(seed_of("alice 1"), one)))
+print("raw X25519 with an order-8 point: " + cv_hex(x25519(seed_of("alice 1"), order8)))
+print("every secret key gives zeros, so Mallory knows the key; Alice refuses it: " + to_s(shared_hex("alice 1", order8) == ""))
+
+print("")
+print("-- 6. an outsider without the group's bootstrap secret --")
+# The ensemble's handshake mixes a 256-bit secret every member was given into
+# the key, and each side proves it holds the result before trusting the
+# channel. Eve does an honest exchange with Alice, but never had the secret.
+let psk = sha256_string("the group's bootstrap secret")
+let guess = sha256_string("a guess at it")
+let ee = eph_public("eve 1")
+let k_alice = hex_to_bytes(shared_hex("alice 1", ee))
+let k_eve = hex_to_bytes(shared_hex("eve 1", ea))
+let confirm = utf8_encode("confirm")
+let alice_tag = hmac_sha256_hex(hmac_sha256(psk, k_alice), confirm)
+let eve_tag = hmac_sha256_hex(hmac_sha256(guess, k_eve), confirm)
+print("Alice and Eve share an X25519 key: " + to_s(bytes_to_hex(k_alice) == bytes_to_hex(k_eve)))
+print("Alice's confirmation " + alice_tag)
+print("Eve's confirmation   " + eve_tag)
+print("Alice accepts Eve: " + to_s(alice_tag == eve_tag))
