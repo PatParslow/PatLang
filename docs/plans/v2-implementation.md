@@ -252,8 +252,33 @@ milestone 11). What they needed beyond this plan's first draft:
   feature failed before and passes on both engines (19/19), as do bounded_memory (22/22) and
   the language feature (16/16 interpreted and compiled). The gates pass (2026-11-10):
   part 1 147/147 on both engines, engines agree 62/62, part 2 111/111, language 286/286 on both
-  engines, match 26/26, block model 211/211. The second increment is constant-time routines with v2's check for value-dependent
-  branches, the third X25519 and Ed25519 against RFC 7748/8032 and Wycheproof.
+  engines, match 26/26, block model 211/211. The third increment is X25519 and Ed25519
+  against RFC 7748/8032 and Wycheproof.
+- **Constant-time modints and the check (#251, second increment).** As the project owner
+  decided on 2026-11-10: every modint operation's time depends on n alone, `pow` also on the
+  exponent's sign and size; inversion is inside that promise for every n; and the check is a
+  compiler mode, `compile.patlang SRC --constant-time` (spec 1.14, 2.7). The runtime keeps a
+  residue as 32-bit limbs in its block, after a header computed from n: Montgomery
+  multiplication for an odd n, masking for 2^k, and a fixed shift-and-subtract reduction
+  otherwise. Every choice is a mask. Inversion is Möller's binary algorithm (GMP's
+  `mpn_sec_invert`) in 2 * bits(n) steps for an odd n, Newton's iteration for 2^k, and the two
+  joined by the Chinese remainder theorem for any other even n; `pow` is a ladder over the
+  exponent's limbs. `self_hosting/v2/ct.patlang` follows the IR before ownership, with a
+  state per slot (secrecy as pointer depth, possible classes, small known values, type-word
+  classes) and summaries keyed by a coarse form of the argument states, joined within a key.
+  Three unit primitives, `ct_secret`, `ct_public` and `ct_reveal`, mark what the IR cannot
+  show, in every backend and both Python readers. On the way: the first form, without class
+  tracking, followed string code from inside `op_add_quiet` for a modint; keyed by exact
+  states it made a summary for every intermediate state; values read from lists could be
+  modints, until a value with no secret behind it is known not to be one; and a freed scratch
+  block made the allocator's lists secret, until freeing marks its pointer public.
+  `constant_time.feature` (four scenarios): a program using every operation is reported
+  clean, and a branch on `a == b`, arithmetic and an address from a residue's word, and
+  `mod_value` are each reported. The modint features pass natively on the new runtime, with
+  new cases for each inverse; the check takes about 150 s a program, most of it following the
+  runtime's public code. Gates pass: part 1 156/156 on each engine,
+  engines agree 62/62, part 2 111/111, language 286/286 on each engine,
+  match 26/26, block model 211/211.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

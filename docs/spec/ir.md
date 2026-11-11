@@ -138,6 +138,7 @@ A word result is an int.
 | `float_add` `float_sub` `float_mul` `float_div` | IEEE double arithmetic on the bits. |
 | `float_lt` | A 0 or 1 int, ordered. |
 | `float_eq` | A 0 or 1 int, ordered. |
+| `ct_secret`, `ct_public`, `ct_reveal` | Unit, and nothing else. They mark, for the constant-time check (`docs/spec/values-and-memory.md` 2.7), memory holding a secret, a value computed from public data alone, and a secret leaving the modint class. |
 
 ## The executable
 

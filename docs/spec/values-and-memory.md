@@ -276,9 +276,19 @@ fixed when it is made, and no operation changes it.
 - Two modints are equal when their moduli and their residues are; an integer equals a modint
   when it reduces to it. `<` and its relatives, and `%`, stop the program.
 - When n is 2^k, for k from 1 to 62, a modint is a k-bit word: `band`, `bor` and `bxor` act on
-  the words, an integer operand counting as the word it reduces to, `bnot` complements all k bits, `shl` and `shr` shift by an `int` count from 0 to
-  k, the bits shifted out lost and zeros shifted in, and `rotl(m, s)` and `rotr(m, s)` rotate
-  by `s` from 0 to k. For any other n these stop the program.
+  the words, an integer operand counting as the word it reduces to, `bnot` complements all k
+  bits, `shl` and `shr` shift by an `int` count from 0 to k, the bits shifted out lost and zeros
+  shifted in, and `rotl(m, s)` and `rotr(m, s)` rotate by `s` from 0 to k. For any other n
+  these stop the program.
+- **Time.** A modint's residue is secret, and its modulus is not. `+`, `-`, `*`, `/`, unary
+  `-`, `==`, `!=`, the bit operators, `rotl` and `rotr` on modints of modulus n take time that
+  depends on n alone, never on the residues, and the inverse behind `/` is found in a number of
+  steps fixed by n. `pow(m, k)` takes time that depends on n, on the sign of k and on the size
+  of its representation (64 bits for an `int`, its number of limbs for a `bigint`), never on
+  its bits. An integer operand is reduced as `mod_make` reduces it. Whether the program stops
+  (no inverse, a count out of range) depends on the values. `mod_make`, `mod_value` and
+  printing convert between modints and other values, and their time may depend on the values
+  converted. The constant-time check (2.7) is how this is tested.
 
 ## Part 2: the new version's runtime and compiler
 
@@ -399,3 +409,32 @@ summary (2.5) and stated as the function's contract (2.4).
 - Each thread and each fibre runs on a Worker of its own, sharing one
   memory. A fibre is still a fibre (1.8): one runs at a time on its thread,
   and it uses the per-thread context of the thread that resumed it.
+
+### 2.7 The constant-time check
+
+`compile.patlang SRC --constant-time` builds nothing. It follows every function the program can
+reach, the runtime's included, as the IR is before the ownership stage, and reports each place
+where the time taken can depend on a modint's residue (1.14):
+
+- **What is secret.** A modint's residue. A word read from a modint's block, or from any block
+  a secret was stored in, is secret, and so is a value computed from a secret. The modulus, and
+  what the runtime computes from the modulus alone, is not. A call is followed with its
+  arguments' secrecy, so a function is reported only where a secret reaches it.
+- **What is followed.** The check knows, for each value, the classes it may have and, for a
+  bool or a small int, the values it may hold, and follows only the instructions those allow:
+  a test of a modint's class does not lead it into the string or list code beside it. A
+  modint's block always holds a secret, so a value that points to none is not a modint. The
+  runtime marks what the IR cannot show itself: where a modint's block is made, what is
+  computed from the modulus, a residue leaving the class, and memory being freed, which reads
+  only the block's size.
+- **What is reported.** A branch (`if`, `while`, `and`, `or`, `match`) deciding on a secret,
+  except one whose one side stops the program; an address computed from a secret, as a list,
+  string or memory index; `+`, `-`, `*`, `/`, `%` or unary `-` on a secret integer, whose time
+  depends on whether the result leaves the `int` class; the machine's division on a secret; a
+  secret passed to a closure call or an external function, which the check cannot follow; and
+  `mod_value` or printing of a modint, where the residue leaves the class.
+- Each place is one line naming the function and what it does with the secret. With none it
+  prints `v2: no value-dependent branch or access` and exits 0; with any it exits 1. While it
+  runs, `self_hosting/build/v2_constant_time.progress` says how far it has got.
+- The interpreter runs the same runtime routines, so the check of a program's modint
+  operations covers both engines.

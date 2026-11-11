@@ -1,0 +1,1114 @@
+# v2's constant-time check (docs/spec/values-and-memory.md 2.7): every place in
+# a program, the runtime's functions included, where the time taken can depend
+# on a modint's residue (spec 1.14).
+#
+# It reads the IR before the ownership stage, and follows only the
+# instructions a function can reach, given what is known of its slots. Each
+# slot has a state, one int of four fields, each a set that only grows:
+#   bits 0 to 5, its secrecy. Bit 0: it may be a secret word. Bit k, for k
+#     from 1 to 5: it may point to memory holding what bit k - 1 describes;
+#     bit 5 also stands for anything deeper.
+#   bits 8 to 25, the classes it may have: 0 to 15 the runtime's own, 16 a
+#     class a program declares.
+#   bits 26 to 43, the values it may hold when it is a unit, a bool or an
+#     int: 0 to 15 themselves, 16 any int above 15, 17 any int below 0.
+#   bits 44 to 61, for an int used as a type word, the classes it may name.
+# The runtime marks what the IR cannot show with three primitives that do
+# nothing when run: ct_secret(p), the memory at p holds a secret (a modint's
+# residue); ct_public(x), x is computed from the modulus alone; ct_reveal(x), a
+# residue leaves the modint class here, reported, and x is public after it.
+#
+# A function is followed once for each list of its arguments' states it is
+# called with; its summary is the state of what it returns and, for each
+# parameter, the secrecy it stores into the memory that parameter points to.
+# The states only grow, so following the calls again until no summary changes
+# ends.
+
+make a function called ct_all returns m
+  return 262143
+end
+
+make a function called ct_secrecy takes s returns t
+  require value_class(s) == 2
+  let t = word_and(s, 63)
+  ensure (t >= 0) and (t < 64)
+  return t
+end
+
+# A modint's block always holds a secret (ct_secret), so a value that does
+# not point to one is not a modint.
+make a function called ct_classes takes s returns c
+  require value_class(s) == 2
+  let c = word_and(word_shr(s, 8), ct_all())
+  if word_and(s, 2) == 0 then
+    let c = word_and(c, word_xor(ct_all(), ct_bit(15)))
+  end
+  ensure (c >= 0) and (c <= ct_all())
+  return c
+end
+
+make a function called ct_known takes s returns k
+  require value_class(s) == 2
+  let k = word_and(word_shr(s, 26), ct_all())
+  ensure (k >= 0) and (k <= ct_all())
+  return k
+end
+
+make a function called ct_tclasses takes s returns c
+  require value_class(s) == 2
+  let c = word_and(word_shr(s, 44), ct_all())
+  ensure (c >= 0) and (c <= ct_all())
+  return c
+end
+
+make a function called ct_state_of takes secrecy, classes, known, tclasses returns s
+  require (secrecy >= 0) and (secrecy < 64) and (classes >= 0) and (known >= 0) and (tclasses >= 0)
+  let s = word_or(word_or(secrecy, word_shl(classes, 8)), word_or(word_shl(known, 26), word_shl(tclasses, 44)))
+  ensure (ct_secrecy(s) == secrecy) and (word_and(word_shr(s, 8), ct_all()) == classes)
+  return s
+end
+
+# One class, or the one value of a unit, bool or small int, as a set.
+make a function called ct_bit takes k returns m
+  require (k >= 0) and (k < 18)
+  let m = word_shl(1, k)
+  ensure m > 0
+  return m
+end
+
+# What an int's value may be, as the set of bits 26 to 43 uses.
+make a function called ct_value_set takes v returns k
+  require value_live(v)
+  if not rt_is_integer(v) then
+    let k = ct_all()
+    ensure k > 0
+    return k
+  end
+  if v < 0 then
+    let k = ct_bit(17)
+  elif v > 15 then
+    let k = ct_bit(16)
+  else
+    let k = ct_bit(v)
+  end
+  ensure k > 0
+  return k
+end
+
+# The classes a type word may name: a small one names itself, and one with the
+# heap bit names its low 32 bits.
+make a function called ct_type_set takes v returns c
+  require value_live(v)
+  let c = ct_all()
+  if rt_is_integer(v) then
+    if (v >= 0) and (v < 16) then
+      let c = ct_bit(v)
+    elif (v >= 4294967296) and (v < 4294967312) then
+      let c = ct_bit(v - 4294967296)
+    end
+  end
+  ensure c > 0
+  return c
+end
+
+# The state of value_class(x): an int, its value one of x's classes.
+make a function called ct_class_values takes classes returns k
+  require (classes >= 0) and (classes <= ct_all())
+  let k = word_and(classes, 65535)
+  if word_and(classes, ct_bit(16)) != 0 then
+    let k = word_or(k, ct_bit(16))
+  end
+  ensure k >= 0
+  return k
+end
+
+# The secrecy of a pointer to memory holding something of secrecy t.
+make a function called ct_up takes t returns u
+  require (value_class(t) == 2) and (t >= 0) and (t < 64)
+  let u = word_and(word_shl(t, 1), 63)
+  if word_and(t, 32) != 0 then
+    let u = word_or(u, 32)
+  end
+  ensure (u >= 0) and (u < 64)
+  return u
+end
+
+# The secrecy of a word read through a pointer of secrecy t.
+make a function called ct_down takes t returns d
+  require (value_class(t) == 2) and (t >= 0) and (t < 64)
+  let d = word_shr(word_and(t, 62), 1)
+  if word_and(t, 32) != 0 then
+    let d = word_or(d, 32)
+  end
+  ensure (d >= 0) and (d < 64)
+  return d
+end
+
+# Where a value from the sets bits 26 to 43 use lies: 0 to 15 themselves, 16
+# above them all, 17 below them all.
+make a function called ct_rank takes e returns r
+  require (e >= 0) and (e < 18)
+  let r = e
+  if e == 16 then
+    let r = 100
+  elif e == 17 then
+    let r = 0 - 100
+  end
+  ensure (r >= 0 - 100) and (r <= 100)
+  return r
+end
+
+# The bools a comparison can give, for operands with values in ka and kb.
+make a function called ct_compare takes op, ka, kb returns k
+  require (value_class(op) == 8) and (ka >= 0) and (kb >= 0)
+  let k = 0
+  let i = 0
+  while i < 18 do
+    if word_and(ka, ct_bit(i)) != 0 then
+      let j = 0
+      while j < 18 do
+        if word_and(kb, ct_bit(j)) != 0 then
+          if (i == j) and (i >= 16) then
+            let k = word_or(ct_bit(0), ct_bit(1))
+          else
+            let ri = ct_rank(i)
+            let rj = ct_rank(j)
+            let yes = false
+            if op == "==" then
+              let yes = ri == rj
+            elif op == "!=" then
+              let yes = ri != rj
+            elif op == "<" then
+              let yes = ri < rj
+            elif op == ">" then
+              let yes = ri > rj
+            elif op == "<=" then
+              let yes = ri <= rj
+            else
+              let yes = ri >= rj
+            end
+            if yes then
+              let k = word_or(k, ct_bit(1))
+            else
+              let k = word_or(k, ct_bit(0))
+            end
+          end
+        end
+        let j = j + 1
+      end
+    end
+    let i = i + 1
+  end
+  ensure (k >= 0) and (k <= 3)
+  return k
+end
+
+make a function called ct_is_compare takes op returns yes
+  let yes = (op == "==") or (op == "!=") or (op == "<") or (op == ">") or (op == "<=") or (op == ">=")
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called ct_is_arith takes op returns yes
+  let yes = (op == "+") or (op == "q+") or (op == "a+") or (op == "-") or (op == "*") or (op == "%") or (op == "/")
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The check's state: [fns, the index of fns by name, the summaries' index by
+# key (1024 buckets), and vecs indexed by summary: function index, argument
+# states, returned state, stored secrecy per parameter, reports, the summaries
+# whose functions call it; the work queue and whether each summary is queued;
+# per function whether it stops the program (-1 not yet known); and the
+# caller pairs already recorded, by hash].
+make a function called ct_state takes fns returns st
+  require value_class(fns) == 9
+  let keys = vec_new()
+  let i = 0
+  while i < 1024 do
+    vec_push(keys, [])
+    let i = i + 1
+  end
+  let stops = vec_new()
+  let i = 0
+  while i < list_len(fns) do
+    vec_push(stops, 0 - 1)
+    let i = i + 1
+  end
+  let pairs = vec_new()
+  let i = 0
+  while i < 4096 do
+    vec_push(pairs, [])
+    let i = i + 1
+  end
+  let st = [fns, v2_index_table(fns), keys, vec_new(), vec_new(), vec_new(), vec_new(), vec_new(), vec_new(), vec_new(), vec_new(), stops, pairs]
+  ensure list_len(st) == 13
+  return st
+end
+
+# The members of a set.
+make a function called ct_members takes m returns n
+  require (m >= 0) and (m <= ct_all())
+  let n = 0
+  let rest = m
+  while rest != 0 do
+    let rest = word_and(rest, rest - 1)
+    let n = n + 1
+  end
+  ensure (n >= 0) and (n <= 18)
+  return n
+end
+
+# A summary's key: the function and, for each argument, its secrecy, its
+# classes when there are at most two of them, and its value and the class it
+# names as a type word when each is the only one. Calls whose arguments have
+# the same key share one summary, followed with their states joined.
+make a function called ct_key takes name, sig returns key
+  require (value_class(name) == 8) and (value_class(sig) == 9)
+  let b = sb_new()
+  sb_push(b, name)
+  let i = 0
+  while i < list_len(sig) do
+    let c = ct_classes(sig[i])
+    if ct_members(c) > 2 then
+      let c = ct_all()
+    end
+    let k = ct_known(sig[i])
+    if ct_members(k) != 1 then
+      let k = 0
+    end
+    let t = ct_tclasses(sig[i])
+    if ct_members(t) != 1 then
+      let t = 0
+    end
+    sb_push(b, "|" + ct_secrecy(sig[i]) + "." + c + "." + k + "." + t)
+    let i = i + 1
+  end
+  let key = sb_str(b)
+  ensure str_len(key) >= str_len(name)
+  return key
+end
+
+make a function called ct_enqueue takes st, idx returns done
+  require (list_len(st) == 13) and (idx >= 0)
+  if not vec_get(st[10], idx) then
+    vec_set(st[10], idx, true)
+    vec_push(st[9], idx)
+  end
+  let done = true
+  ensure done
+  return done
+end
+
+# Records that summary caller calls summary idx, once.
+make a function called ct_add_caller takes st, idx, caller returns done
+  require (list_len(st) == 13) and (idx >= 0) and (caller >= 0)
+  let pair = idx * 1048576 + caller
+  let bucket = pair % 4096
+  let entries = vec_get(st[12], bucket)
+  if not v2_contains(entries, pair) then
+    vec_set(st[12], bucket, list_push(entries, pair))
+    vec_set(st[8], idx, list_push(vec_get(st[8], idx), caller))
+  end
+  let done = true
+  ensure done
+  return done
+end
+
+# The summary of name called with sig, made and queued when new; caller
+# (a summary, or -1) is followed again whenever it changes. -1 when no
+# function has that name.
+make a function called ct_summary takes st, name, sig, caller returns idx
+  require (list_len(st) == 13) and (value_class(name) == 8) and (value_class(sig) == 9)
+  let k = v2_index_of(st[1], name)
+  if k < 0 then
+    let idx = 0 - 1
+    ensure idx == 0 - 1
+    return idx
+  end
+  let key = ct_key(name, sig)
+  let bucket = jb_bucket(key)
+  let entries = vec_get(st[2], bucket)
+  let idx = 0 - 1
+  let i = 0
+  while (i < list_len(entries)) and (idx < 0) do
+    if entries[i][0] == key then
+      let idx = entries[i][1]
+    end
+    let i = i + 1
+  end
+  if idx >= 0 then
+    # the same key: the argument states joined, followed again when they grow
+    let old = vec_get(st[4], idx)
+    let joined = []
+    let grew = false
+    let i = 0
+    while i < list_len(sig) do
+      let j = word_or(old[i], sig[i])
+      if j != old[i] then
+        let grew = true
+      end
+      let joined = list_push(joined, j)
+      let i = i + 1
+    end
+    if grew then
+      vec_set(st[4], idx, joined)
+      ct_enqueue(st, idx)
+    end
+  else
+    let idx = vec_len(st[3])
+    vec_set(st[2], bucket, list_push(entries, [key, idx]))
+    vec_push(st[3], k)
+    vec_push(st[4], sig)
+    vec_push(st[5], 0)
+    let eff = []
+    let i = 0
+    while i < list_len(sig) do
+      let eff = list_push(eff, 0)
+      let i = i + 1
+    end
+    vec_push(st[6], eff)
+    vec_push(st[7], [])
+    vec_push(st[8], [])
+    vec_push(st[10], false)
+    ct_enqueue(st, idx)
+  end
+  if caller >= 0 then
+    ct_add_caller(st, idx, caller)
+  end
+  ensure idx >= 0
+  return idx
+end
+
+# Each label's instruction index.
+make a function called ct_labels takes instrs returns labels
+  require value_class(instrs) == 9
+  let labels = vec_new()
+  let i = 0
+  while i < list_len(instrs) do
+    if instrs[i][0] == "label" then
+      while vec_len(labels) <= instrs[i][1] do
+        vec_push(labels, 0 - 1)
+      end
+      vec_set(labels, instrs[i][1], i)
+    end
+    let i = i + 1
+  end
+  ensure value_class(labels) == 12
+  return labels
+end
+
+# Whether the instruction ends the program: a call of ExitProcess, or of a
+# function that always stops.
+make a function called ct_ins_stops takes st, ins returns yes
+  require (list_len(st) == 13) and (value_class(ins) == 9)
+  let yes = false
+  if (ins[0] == "extern") and (ins[3] == "ExitProcess") then
+    let yes = true
+  elif ins[0] == "call" then
+    let yes = ct_stops(st, ins[2])
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Whether every path from instruction at stops the program before it returns.
+make a function called ct_path_stops takes st, instrs, labels, at returns yes
+  require (list_len(st) == 13) and (value_class(instrs) == 9) and (at >= 0)
+  let seen = vec_new()
+  let i = 0
+  while i < list_len(instrs) do
+    vec_push(seen, false)
+    let i = i + 1
+  end
+  let work = vec_new()
+  vec_push(work, at)
+  let k = 0
+  while k < vec_len(work) do
+    let i = vec_get(work, k)
+    let k = k + 1
+    if i >= list_len(instrs) then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    if not vec_get(seen, i) then
+      vec_set(seen, i, true)
+      let ins = instrs[i]
+      if ins[0] == "return" then
+        let yes = false
+        ensure value_class(yes) == 1
+        return yes
+      end
+      if not ct_ins_stops(st, ins) then
+        if ins[0] == "jump" then
+          vec_push(work, vec_get(labels, ins[1]))
+        elif ins[0] == "branch" then
+          vec_push(work, vec_get(labels, ins[2]))
+          vec_push(work, vec_get(labels, ins[3]))
+        else
+          vec_push(work, i + 1)
+        end
+      end
+    end
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Whether the function always stops the program; a function that calls itself
+# on every path counts as one that returns.
+make a function called ct_stops takes st, name returns yes
+  require (list_len(st) == 13) and (value_class(name) == 8)
+  let k = v2_index_of(st[1], name)
+  if k < 0 then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let known = vec_get(st[11], k)
+  if known >= 0 then
+    let yes = known == 1
+    ensure value_class(yes) == 1
+    return yes
+  end
+  vec_set(st[11], k, 0)
+  let instrs = ir_fn_instrs(st[0][k])
+  let yes = ct_path_stops(st, instrs, ct_labels(instrs), 0)
+  if yes then
+    vec_set(st[11], k, 1)
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# For each slot, the slots its value is computed from as an address is:
+# copies, word arithmetic and value_data/value_make. A secret stored through a
+# slot is stored through these too.
+make a function called ct_sources takes instrs, nslots returns src
+  require (value_class(instrs) == 9) and (nslots >= 0)
+  let src = vec_new()
+  let i = 0
+  while i < nslots do
+    vec_push(src, [])
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    let d = 0 - 1
+    let from = []
+    if (op == "copy") or (op == "move") or (op == "take") then
+      let d = ins[1]
+      let from = [ins[2]]
+    elif (op == "op") and ((ins[2] == "+") or (ins[2] == "q+") or (ins[2] == "-")) then
+      let d = ins[1]
+      let from = [ins[3], ins[4]]
+    elif op == "prim" then
+      let name = ins[2]
+      if (name == "word_add") or (name == "word_sub") or (name == "word_and") or (name == "word_or") or (name == "value_data") then
+        let d = ins[1]
+        let from = ins[3]
+      elif name == "value_make" then
+        let d = ins[1]
+        let from = [ins[3][1]]
+      end
+    end
+    if d >= 0 then
+      vec_set(src, d, v2_list_concat(vec_get(src, d), from))
+    end
+    let i = i + 1
+  end
+  ensure vec_len(src) == nslots
+  return src
+end
+
+# One function's slots while it is followed: [states, the secrecy each would
+# have had where a ct_public or ct_reveal forces it public, which slots are
+# forced, the sources, the stored secrecy per parameter, the returned state,
+# the summary].
+make a function called ct_frame takes func, sig, sidx returns fr
+  require (value_class(sig) == 9) and (list_len(sig) == ir_fn_nparams(func))
+  let n = ir_fn_nslots(func)
+  let s = vec_new()
+  let raw = vec_new()
+  let forced = vec_new()
+  let i = 0
+  while i < n do
+    let v = 0
+    if i < list_len(sig) then
+      let v = sig[i]
+    end
+    vec_push(s, v)
+    vec_push(raw, ct_secrecy(v))
+    vec_push(forced, false)
+    let i = i + 1
+  end
+  let instrs = ir_fn_instrs(func)
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    if (ins[0] == "prim") and ((ins[2] == "ct_public") or (ins[2] == "ct_reveal")) then
+      let x = ins[3][0]
+      vec_set(forced, x, true)
+      vec_set(s, x, word_xor(vec_get(s, x), ct_secrecy(vec_get(s, x))))
+    end
+    let i = i + 1
+  end
+  let eff = vec_new()
+  let i = 0
+  while i < list_len(sig) do
+    vec_push(eff, 0)
+    let i = i + 1
+  end
+  let ret = vec_new()
+  vec_push(ret, 0)
+  let fr = [s, raw, forced, ct_sources(instrs, n), eff, ret, sidx]
+  ensure list_len(fr) == 7
+  return fr
+end
+
+# Adds a state to a slot's; a forced slot keeps no secrecy. Whether it changed.
+make a function called ct_raise takes fr, slot, bits returns changed
+  require (list_len(fr) == 7) and (slot >= 0) and (value_class(bits) == 2)
+  vec_set(fr[1], slot, word_or(vec_get(fr[1], slot), ct_secrecy(bits)))
+  let add = bits
+  if vec_get(fr[2], slot) then
+    let add = word_xor(bits, ct_secrecy(bits))
+  end
+  let old = vec_get(fr[0], slot)
+  let new = word_or(old, add)
+  let changed = new != old
+  if changed then
+    vec_set(fr[0], slot, new)
+  end
+  ensure value_class(changed) == 1
+  return changed
+end
+
+# Something of secrecy t stored through the address in slot: that slot and
+# the slots it was computed from now point to it, and so does a parameter.
+make a function called ct_store takes fr, slot, t returns changed
+  require (list_len(fr) == 7) and (slot >= 0) and (t >= 0) and (t < 64)
+  let changed = false
+  if t == 0 then
+    ensure value_class(changed) == 1
+    return changed
+  end
+  let seen = []
+  let work = vec_new()
+  vec_push(work, slot)
+  let k = 0
+  while k < vec_len(work) do
+    let x = vec_get(work, k)
+    let k = k + 1
+    if not v2_contains(seen, x) then
+      let seen = list_push(seen, x)
+      if ct_raise(fr, x, t) then
+        let changed = true
+      end
+      if x < vec_len(fr[4]) then
+        let e = vec_get(fr[4], x)
+        if word_or(e, t) != e then
+          vec_set(fr[4], x, word_or(e, t))
+          let changed = true
+        end
+      end
+      let from = vec_get(fr[3], x)
+      let j = 0
+      while j < list_len(from) do
+        vec_push(work, from[j])
+        let j = j + 1
+      end
+    end
+  end
+  ensure value_class(changed) == 1
+  return changed
+end
+
+make a function called ct_join takes fr, slots returns t
+  require (list_len(fr) == 7) and (value_class(slots) == 9)
+  let t = 0
+  let i = 0
+  while i < list_len(slots) do
+    let t = word_or(t, ct_secrecy(vec_get(fr[0], slots[i])))
+    let i = i + 1
+  end
+  ensure (t >= 0) and (t < 64)
+  return t
+end
+
+make a function called ct_sig takes fr, slots returns sig
+  require (list_len(fr) == 7) and (value_class(slots) == 9)
+  let sig = []
+  let i = 0
+  while i < list_len(slots) do
+    let sig = list_push(sig, vec_get(fr[0], slots[i]))
+    let i = i + 1
+  end
+  ensure list_len(sig) == list_len(slots)
+  return sig
+end
+
+# A slot's state is still empty: nothing that reaches it has given it a value.
+make a function called ct_unset takes fr, slot returns yes
+  require (list_len(fr) == 7) and (slot >= 0)
+  let yes = ct_classes(vec_get(fr[0], slot)) == 0
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A call of name with the given argument slots: its result into d, and what
+# it stores through its parameters into the arguments. Not made until every
+# argument has a state.
+make a function called ct_call takes st, fr, d, name, args returns changed
+  require (list_len(st) == 13) and (list_len(fr) == 7) and (value_class(args) == 9)
+  let changed = false
+  let i = 0
+  while i < list_len(args) do
+    if ct_unset(fr, args[i]) then
+      ensure value_class(changed) == 1
+      return changed
+    end
+    let i = i + 1
+  end
+  if ct_stops(st, name) then
+    ensure value_class(changed) == 1
+    return changed
+  end
+  let idx = ct_summary(st, name, ct_sig(fr, args), fr[6])
+  if idx < 0 then
+    let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, args), ct_all(), ct_all(), ct_all()))
+    ensure value_class(changed) == 1
+    return changed
+  end
+  if ct_raise(fr, d, vec_get(st[5], idx)) then
+    let changed = true
+  end
+  let eff = vec_get(st[6], idx)
+  let i = 0
+  while i < list_len(args) do
+    if (eff[i] != 0) and ct_store(fr, args[i], eff[i]) then
+      let changed = true
+    end
+    let i = i + 1
+  end
+  ensure value_class(changed) == 1
+  return changed
+end
+
+# Which of a branch's two ways its condition's state allows: [true, false].
+make a function called ct_ways takes s returns ways
+  require value_class(s) == 2
+  let c = ct_classes(s)
+  let k = ct_known(s)
+  if c == 0 then
+    let ways = [false, false]
+    ensure list_len(ways) == 2
+    return ways
+  end
+  if word_and(c, word_xor(ct_all(), 7)) != 0 then
+    let ways = [true, true]
+    ensure list_len(ways) == 2
+    return ways
+  end
+  let ways = [word_and(k, word_xor(ct_all(), 1)) != 0, word_and(k, 1) != 0]
+  ensure list_len(ways) == 2
+  return ways
+end
+
+# The instructions a function can reach from its start, given its slots'
+# states: a branch goes only the ways its condition allows, and nothing
+# follows an instruction that stops the program.
+make a function called ct_reach takes st, fr, instrs, labels returns reach
+  require (list_len(st) == 13) and (list_len(fr) == 7) and (value_class(instrs) == 9)
+  let reach = vec_new()
+  let i = 0
+  while i < list_len(instrs) do
+    vec_push(reach, false)
+    let i = i + 1
+  end
+  let work = vec_new()
+  vec_push(work, 0)
+  let k = 0
+  while k < vec_len(work) do
+    let i = vec_get(work, k)
+    let k = k + 1
+    if (i < list_len(instrs)) and (not vec_get(reach, i)) then
+      vec_set(reach, i, true)
+      let ins = instrs[i]
+      if ins[0] == "jump" then
+        vec_push(work, vec_get(labels, ins[1]))
+      elif ins[0] == "branch" then
+        let ways = ct_ways(vec_get(fr[0], ins[1]))
+        if ways[0] then
+          vec_push(work, vec_get(labels, ins[2]))
+        end
+        if ways[1] then
+          vec_push(work, vec_get(labels, ins[3]))
+        end
+      elif (ins[0] != "return") and (not ct_ins_stops(st, ins)) then
+        vec_push(work, i + 1)
+      end
+    end
+  end
+  ensure vec_len(reach) == list_len(instrs)
+  return reach
+end
+
+# One instruction. With reports a vec, each place it finds goes into it as
+# text; otherwise the frame's states grow. Whether any changed.
+make a function called ct_step takes st, fr, fname, ins, labels, instrs, reports returns changed
+  require (list_len(st) == 13) and (list_len(fr) == 7) and (value_class(ins) == 9)
+  let op = ins[0]
+  let all = ct_all()
+  let int_state = ct_state_of(0, ct_bit(2), all, all)
+  let changed = false
+  let found = ""
+  if op == "const" then
+    let kind = ins[2]
+    if kind == "str" then
+      let s = ct_state_of(0, ct_bit(8), all, all)
+    elif kind == "float" then
+      let s = ct_state_of(0, ct_bit(3), all, all)
+    elif kind == "unit" then
+      let s = ct_state_of(0, ct_bit(0), ct_bit(0), all)
+    elif kind == "bool" then
+      let b = 0
+      if (ins[3] == "true") or (ins[3] == "1") then
+        let b = 1
+      end
+      let s = ct_state_of(0, ct_bit(1), ct_bit(b), all)
+    else
+      let v = to_num(ins[3])
+      let s = ct_state_of(0, ct_bit(2), ct_value_set(v), ct_type_set(v))
+    end
+    let changed = ct_raise(fr, ins[1], s)
+  elif (op == "copy") or (op == "move") or (op == "take") then
+    if not ct_unset(fr, ins[2]) then
+      let changed = ct_raise(fr, ins[1], vec_get(fr[0], ins[2]))
+    end
+  elif op == "call" then
+    let changed = ct_call(st, fr, ins[1], ins[2], ins[3])
+  elif op == "callv" then
+    let t = ct_join(fr, ins[2])
+    if t != 0 then
+      let found = "a secret is passed to a closure call, which the check cannot follow"
+    end
+    let changed = ct_raise(fr, ins[1], ct_state_of(t, all, all, all))
+  elif (op == "extern") or (op == "externf") then
+    if (ins[3] != "ExitProcess") and (ct_join(fr, ins[4]) != 0) then
+      let found = "a secret is passed to " + ins[2] + "!" + ins[3] + ", which the check cannot follow"
+    end
+    let changed = ct_raise(fr, ins[1], int_state)
+  elif op == "op" then
+    let r = ct_op(st, fr, ins)
+    let changed = r[0]
+    let found = r[1]
+  elif op == "un" then
+    let r = ct_un(st, fr, ins)
+    let changed = r[0]
+    let found = r[1]
+  elif op == "prim" then
+    let r = ct_prim(st, fr, ins)
+    let changed = r[0]
+    let found = r[1]
+  elif op == "branch" then
+    let s = vec_get(fr[0], ins[1])
+    let ways = ct_ways(s)
+    if (word_and(ct_secrecy(s), 1) != 0) and ways[0] and ways[1] and (reports != false) then
+      let t_at = vec_get(labels, ins[2])
+      let f_at = vec_get(labels, ins[3])
+      if (not ct_path_stops(st, instrs, labels, t_at)) and (not ct_path_stops(st, instrs, labels, f_at)) then
+        let found = "a branch decides on a secret"
+      end
+    end
+  elif op == "return" then
+    let old = vec_get(fr[5], 0)
+    let new = word_or(old, vec_get(fr[0], ins[1]))
+    if new != old then
+      vec_set(fr[5], 0, new)
+      let changed = true
+    end
+  elif op == "list" then
+    let changed = ct_raise(fr, ins[1], ct_state_of(ct_up(ct_join(fr, ins[2])), ct_bit(9), all, all))
+  elif op == "closure" then
+    let changed = ct_raise(fr, ins[1], ct_state_of(ct_up(ct_join(fr, ins[3])), ct_bit(10), all, all))
+  end
+  if (reports != false) and (found != "") then
+    let line = lw_source_name(fname) + ": " + found
+    if not v2_contains(vec_to_list(reports), line) then
+      vec_push(reports, line)
+    end
+  end
+  ensure value_class(changed) == 1
+  return changed
+end
+
+# A binary operator: computed inline when both operands are ints, and by its
+# runtime function when either may be anything else. [changed, report].
+make a function called ct_op takes st, fr, ins returns r
+  require (list_len(fr) == 7) and (ins[0] == "op")
+  let o = ins[2]
+  let d = ins[1]
+  let all = ct_all()
+  let found = ""
+  let changed = false
+  if ct_unset(fr, ins[3]) or ct_unset(fr, ins[4]) then
+    let r = [changed, found]
+    ensure list_len(r) == 2
+    return r
+  end
+  let sa = vec_get(fr[0], ins[3])
+  let sb = vec_get(fr[0], ins[4])
+  let t = word_or(ct_secrecy(sa), ct_secrecy(sb))
+  let ints = ct_bit(2)
+  let both_ints = (word_and(ct_classes(sa), ints) != 0) and (word_and(ct_classes(sb), ints) != 0)
+  let other = (word_and(ct_classes(sa), word_xor(all, ints)) != 0) or (word_and(ct_classes(sb), word_xor(all, ints)) != 0)
+  if both_ints and (o != "/") then
+    if ct_is_arith(o) and (word_and(t, 1) != 0) then
+      let found = "arithmetic on a secret integer, whose time depends on whether it stays an int"
+    end
+    if ct_is_compare(o) then
+      let s = ct_state_of(word_and(t, 1), ct_bit(1), ct_compare(o, ct_known(sa), ct_known(sb)), all)
+    elif ct_is_arith(o) then
+      let s = ct_state_of(word_and(t, 1), word_or(ints, ct_bit(4)), all, all)
+    else
+      let s = ct_state_of(word_and(t, 1), ints, all, all)
+    end
+    if ct_raise(fr, d, s) then
+      let changed = true
+    end
+  end
+  if other or (o == "/") then
+    if ct_call(st, fr, d, xv_op_fn(o), [ins[3], ins[4]]) then
+      let changed = true
+    end
+  end
+  let r = [changed, found]
+  ensure list_len(r) == 2
+  return r
+end
+
+make a function called ct_un takes st, fr, ins returns r
+  require (list_len(fr) == 7) and (ins[0] == "un")
+  let o = ins[2]
+  let d = ins[1]
+  let all = ct_all()
+  let found = ""
+  let changed = false
+  if ct_unset(fr, ins[3]) then
+    let r = [changed, found]
+    ensure list_len(r) == 2
+    return r
+  end
+  let sa = vec_get(fr[0], ins[3])
+  let t = word_and(ct_secrecy(sa), 1)
+  let c = ct_classes(sa)
+  let fast = ct_bit(2)
+  if o == "not" then
+    let fast = ct_bit(1)
+  end
+  if word_and(c, fast) != 0 then
+    if o == "not" then
+      let k = ct_known(sa)
+      let nk = 0
+      if word_and(k, ct_bit(0)) != 0 then
+        let nk = word_or(nk, ct_bit(1))
+      end
+      if word_and(k, word_xor(all, ct_bit(0))) != 0 then
+        let nk = word_or(nk, ct_bit(0))
+      end
+      let s = ct_state_of(t, ct_bit(1), nk, all)
+    elif o == "-" then
+      if t != 0 then
+        let found = "arithmetic on a secret integer, whose time depends on whether it stays an int"
+      end
+      let s = ct_state_of(t, word_or(ct_bit(2), ct_bit(4)), all, all)
+    else
+      let s = ct_state_of(t, ct_bit(2), all, all)
+    end
+    if ct_raise(fr, d, s) then
+      let changed = true
+    end
+  end
+  if word_and(c, word_xor(all, fast)) != 0 then
+    let name = "op_not"
+    if o == "-" then
+      let name = "op_neg"
+    elif o == "bnot" then
+      let name = "op_bnot"
+    end
+    if ct_call(st, fr, d, name, [ins[3]]) then
+      let changed = true
+    end
+  end
+  let r = [changed, found]
+  ensure list_len(r) == 2
+  return r
+end
+
+# A primitive: [whether a state changed, what it reports or ""].
+make a function called ct_prim takes st, fr, ins returns r
+  require (list_len(fr) == 7) and (ins[0] == "prim")
+  let name = ins[2]
+  let a = ins[3]
+  let d = ins[1]
+  let all = ct_all()
+  let found = ""
+  let changed = false
+  let i = 0
+  while i < list_len(a) do
+    if ct_unset(fr, a[i]) then
+      let r = [changed, found]
+      ensure list_len(r) == 2
+      return r
+    end
+    let i = i + 1
+  end
+  let address = "an address is computed from a secret"
+  if name == "value_class" then
+    let changed = ct_raise(fr, d, ct_state_of(0, ct_bit(2), ct_class_values(ct_classes(vec_get(fr[0], a[0]))), all))
+  elif name == "value_type_word" then
+    let changed = ct_raise(fr, d, ct_state_of(0, ct_bit(2), all, ct_classes(vec_get(fr[0], a[0]))))
+  elif name == "value_live" then
+    let changed = ct_raise(fr, d, ct_state_of(0, ct_bit(1), all, all))
+  elif (name == "runtime_state") or (name == "thread_entry_address") or (name == "ct_public") or (name == "ct_secret") then
+    let changed = ct_raise(fr, d, ct_state_of(0, ct_bit(2), all, all))
+    if (name == "ct_secret") and ct_store(fr, a[0], ct_up(1)) then
+      let changed = true
+    end
+  elif name == "ct_reveal" then
+    if vec_get(fr[1], a[0]) != 0 then
+      let found = "a modint's residue leaves the class"
+    end
+    let changed = ct_raise(fr, d, ct_state_of(0, ct_bit(0), ct_bit(0), all))
+  elif name == "value_data" then
+    let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, a), ct_bit(2), all, all))
+  elif name == "value_make" then
+    let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, [a[1]]), ct_tclasses(vec_get(fr[0], a[0])), all, all))
+  elif (name == "mem_load") or (name == "mem_load_byte") or (name == "mem_load_value") or (name == "mem_take_value") or (name == "atomic_add") then
+    if word_and(ct_join(fr, [a[0], a[1]]), 1) != 0 then
+      let found = address
+    end
+    let c = ct_bit(2)
+    if (name == "mem_load_value") or (name == "mem_take_value") then
+      let c = all
+    end
+    let changed = ct_raise(fr, d, ct_state_of(ct_down(ct_join(fr, [a[0]])), c, all, all))
+  elif (name == "mem_store") or (name == "mem_store_byte") or (name == "mem_store_value") or (name == "mem_init_value") then
+    if word_and(ct_join(fr, [a[0], a[1]]), 1) != 0 then
+      let found = address
+    end
+    let changed = ct_store(fr, a[0], ct_up(ct_join(fr, [a[2]])))
+    if ct_raise(fr, d, ct_state_of(0, ct_bit(0), ct_bit(0), all)) then
+      let changed = true
+    end
+  else
+    if ((name == "word_div") or (name == "word_rem")) and (word_and(ct_join(fr, a), 1) != 0) then
+      let found = "the machine's division on a secret"
+    end
+    let c = ct_bit(2)
+    if (name == "float_lt") or (name == "float_eq") then
+      let c = ct_bit(2)
+    end
+    let changed = ct_raise(fr, d, ct_state_of(word_and(ct_join(fr, a), 1), c, all, all))
+  end
+  let r = [changed, found]
+  ensure list_len(r) == 2
+  return r
+end
+
+# Follows one summary's function with its argument states until its slots
+# stop growing, then once more to collect what it reports. When the summary
+# changes, the summaries of its callers are queued again.
+make a function called ct_follow takes st, idx returns done
+  require (list_len(st) == 13) and (idx >= 0)
+  let func = st[0][vec_get(st[3], idx)]
+  let fname = ir_fn_name(func)
+  let instrs = ir_fn_instrs(func)
+  let labels = ct_labels(instrs)
+  let fr = ct_frame(func, vec_get(st[4], idx), idx)
+  let changed = true
+  let reach = vec_new()
+  while changed do
+    let changed = false
+    let reach = ct_reach(st, fr, instrs, labels)
+    let i = 0
+    while i < list_len(instrs) do
+      if vec_get(reach, i) and ct_step(st, fr, fname, instrs[i], labels, instrs, false) then
+        let changed = true
+      end
+      let i = i + 1
+    end
+  end
+  let reports = vec_new()
+  let i = 0
+  while i < list_len(instrs) do
+    if vec_get(reach, i) then
+      ct_step(st, fr, fname, instrs[i], labels, instrs, reports)
+    end
+    let i = i + 1
+  end
+  vec_set(st[7], idx, vec_to_list(reports))
+  let ret = vec_get(fr[5], 0)
+  let eff = vec_to_list(fr[4])
+  if (ret != vec_get(st[5], idx)) or (eff != vec_get(st[6], idx)) then
+    vec_set(st[5], idx, ret)
+    vec_set(st[6], idx, eff)
+    let deps = vec_get(st[8], idx)
+    let i = 0
+    while i < list_len(deps) do
+      ct_enqueue(st, deps[i])
+      let i = i + 1
+    end
+  end
+  let done = true
+  ensure done
+  return done
+end
+
+# Where the check writes how far it has got.
+make a function called ct_progress_path returns path
+  let path = "self_hosting/build/v2_constant_time.progress"
+  ensure str_len(path) > 0
+  return path
+end
+
+# Every place the program's time can depend on a modint's residue, as lines
+# naming the function; empty when there is none.
+make a function called ct_check takes fns returns lines
+  require value_class(fns) == 9
+  let st = ct_state(fns)
+  ct_summary(st, "__main", [], 0 - 1)
+  ct_summary(st, "__register", [], 0 - 1)
+  let at = 0
+  while at < vec_len(st[9]) do
+    let idx = vec_get(st[9], at)
+    let at = at + 1
+    vec_set(st[10], idx, false)
+    ct_follow(st, idx)
+    if at % 500 == 0 then
+      # progress, where a long check can be watched from outside
+      write_file(ct_progress_path(), at + " functions followed, " + vec_len(st[3]) + " argument lists, " + (vec_len(st[9]) - at) + " queued; last " + ir_fn_name(st[0][vec_get(st[3], idx)]) + chr(10))
+    end
+  end
+  let out = vec_new()
+  let i = 0
+  while i < vec_len(st[7]) do
+    let found = vec_get(st[7], i)
+    let j = 0
+    while j < list_len(found) do
+      if not v2_contains(vec_to_list(out), found[j]) then
+        vec_push(out, found[j])
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  let lines = vec_to_list(out)
+  ensure value_class(lines) == 9
+  return lines
+end

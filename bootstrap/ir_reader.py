@@ -400,6 +400,9 @@ class FnGen:
 
     def prim(self, name, d, args):
         c = self.c
+        if name in ("ct_secret", "ct_public", "ct_reveal"):
+            # marks for the constant-time check, doing nothing
+            return self.store_unit(d)
         if name == "value_live":
             bad, known, good, store = c.new_label(), c.new_label(), c.new_label(), c.new_label()
             self.load_t(RAX, args[0])

@@ -203,8 +203,23 @@ make a function called rt_interval_arith takes op, a, b returns r
 end
 
 # ---- integers modulo n (spec 1.14) ----
-# A modint's block holds its residue, 0 to n - 1, at 16 and its modulus n at 32,
-# each an int or a bigint. Class 15.
+# A modint is class 15. Its block holds, from 16:
+#   16  n, an int or a bigint (a value, counted)
+#   32  L, the number of 32-bit limbs n takes
+#   40  the kind of n: 0 for 2^k, 1 for an odd n, 2 for any other
+#   48  k, the number of bits of n (for 2^k, that k)
+#   56  for an odd n, -1/n modulo 2^32, else 0
+#   64  the residue: L limbs, least significant first, each 32 bits in a word;
+#       for an odd n in Montgomery form, the residue times 2^(32L) modulo n
+#   64 + 8L  n's L limbs
+# The residue is secret (ct_secret), and everything above it depends on n
+# alone (ct_public), so each operation's time depends on n alone (spec 1.14,
+# checked by the constant-time check, 2.7). Every word holding a limb or a
+# value computed from one is changed only by the word primitives, which take
+# the same time for any value, and a choice between two results is a mask.
+#
+# The limb routines below work on arrays given as a block and an offset into
+# it; scratch arrays are blocks of their own (rt_lb_new), limbs from 16.
 
 make a function called rt_modint_heap_type returns t
   let t = 4294967311
@@ -212,7 +227,14 @@ make a function called rt_modint_heap_type returns t
   return t
 end
 
+make a function called rt_mask32 returns m
+  let m = 4294967295
+  ensure m == 4294967295
+  return m
+end
+
 # x modulo n, from 0 to n - 1: int_divmod's remainder takes the dividend's sign.
+# For public integers only: its time depends on x.
 make a function called rt_mod_reduce takes x, n returns r
   require rt_is_integer(x) and rt_is_integer(n) and (n >= 2)
   let r = int_divmod(x, n)[1]
@@ -223,28 +245,524 @@ make a function called rt_mod_reduce takes x, n returns r
   return r
 end
 
-make a function called mod_make takes x, n returns m
-  require rt_is_integer(x) and rt_is_integer(n) and (n >= 2)
-  let block = rt_alloc(32)
-  mem_init_value(block, 16, rt_mod_reduce(x, n))
-  mem_init_value(block, 32, n)
+# ---- scratch limb arrays ----
+
+make a function called rt_lb_new takes count returns block
+  require (value_class(count) == 2) and (count >= 1)
+  let block = rt_alloc(8 * count)
+  let i = 0
+  while i < count do
+    mem_store(block, 16 + 8 * i, 0)
+    let i = i + 1
+  end
+  ensure block != 0
+  return block
+end
+
+# Freeing reads only the block's header, its size, and discards what it held,
+# so the pointer is public here.
+make a function called rt_lb_free takes block returns r
+  require block != 0
+  ct_public(block)
+  let r = rt_free(block)
+  ensure r == 0
+  return r
+end
+
+# ---- limb arithmetic, each the same steps for any limbs ----
+
+make a function called rt_lb_copy takes d, doff, a, aoff, count returns r
+  require (d != 0) and (a != 0) and (count >= 0)
+  let i = 0
+  while i < count do
+    mem_store(d, doff + 8 * i, mem_load(a, aoff + 8 * i))
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_lb_zero takes d, doff, count returns r
+  require (d != 0) and (count >= 0)
+  let i = 0
+  while i < count do
+    mem_store(d, doff + 8 * i, 0)
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# d = a + b over count limbs; the carry out, 0 or 1.
+make a function called rt_lb_add takes d, doff, a, aoff, b, boff, count returns carry
+  require (d != 0) and (a != 0) and (b != 0) and (count >= 1)
+  let m = rt_mask32()
+  let carry = 0
+  let i = 0
+  while i < count do
+    let s = word_add(word_add(mem_load(a, aoff + 8 * i), mem_load(b, boff + 8 * i)), carry)
+    mem_store(d, doff + 8 * i, word_and(s, m))
+    let carry = word_shr(s, 32)
+    let i = i + 1
+  end
+  ensure word_shr(carry, 1) == 0
+  return carry
+end
+
+# d = a - b over count limbs; the borrow out, 0 or 1.
+make a function called rt_lb_sub takes d, doff, a, aoff, b, boff, count returns borrow
+  require (d != 0) and (a != 0) and (b != 0) and (count >= 1)
+  let m = rt_mask32()
+  let borrow = 0
+  let i = 0
+  while i < count do
+    let s = word_sub(word_sub(mem_load(a, aoff + 8 * i), mem_load(b, boff + 8 * i)), borrow)
+    mem_store(d, doff + 8 * i, word_and(s, m))
+    let borrow = word_shr(s, 63)
+    let i = i + 1
+  end
+  ensure word_shr(borrow, 1) == 0
+  return borrow
+end
+
+# d = a when bit is 1, b when it is 0, by a mask.
+make a function called rt_lb_select takes d, doff, a, aoff, b, boff, count, bit returns r
+  require (d != 0) and (a != 0) and (b != 0) and (count >= 0)
+  let keep = word_sub(0, bit)
+  let other = word_xor(keep, 0 - 1)
+  let i = 0
+  while i < count do
+    mem_store(d, doff + 8 * i, word_or(word_and(mem_load(a, aoff + 8 * i), keep), word_and(mem_load(b, boff + 8 * i), other)))
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# a and b exchanged when bit is 1, by a mask.
+make a function called rt_lb_cswap takes a, aoff, b, boff, count, bit returns r
+  require (a != 0) and (b != 0) and (count >= 0)
+  let mask = word_sub(0, bit)
+  let i = 0
+  while i < count do
+    let x = mem_load(a, aoff + 8 * i)
+    let y = mem_load(b, boff + 8 * i)
+    let t = word_and(word_xor(x, y), mask)
+    mem_store(a, aoff + 8 * i, word_xor(x, t))
+    mem_store(b, boff + 8 * i, word_xor(y, t))
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# a shifted right by one bit, in place; top is the bit shifted into the top.
+make a function called rt_lb_half takes a, aoff, count, top returns r
+  require (a != 0) and (count >= 1)
+  let m = rt_mask32()
+  let i = 0
+  while i < count do
+    let next = top
+    if i + 1 < count then
+      let next = mem_load(a, aoff + 8 * (i + 1))
+    end
+    mem_store(a, aoff + 8 * i, word_and(word_or(word_shr(mem_load(a, aoff + 8 * i), 1), word_shl(word_and(next, 1), 31)), m))
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# 1 when the count limbs at a are all zero, else 0.
+make a function called rt_lb_is_zero takes a, aoff, count returns z
+  require (a != 0) and (count >= 1)
+  let acc = 0
+  let i = 0
+  while i < count do
+    let acc = word_or(acc, mem_load(a, aoff + 8 * i))
+    let i = i + 1
+  end
+  # acc is below 2^32: acc - 1 is negative only when acc is 0
+  let z = word_shr(word_sub(acc, 1), 63)
+  ensure word_shr(z, 1) == 0
+  return z
+end
+
+# p, 2 * count limbs, = a * b.
+make a function called rt_lb_mul_full takes p, poff, a, aoff, b, boff, count returns r
+  require (p != 0) and (a != 0) and (b != 0) and (count >= 1)
+  let m = rt_mask32()
+  rt_lb_zero(p, poff, 2 * count)
+  let i = 0
+  while i < count do
+    let bi = mem_load(b, boff + 8 * i)
+    let carry = 0
+    let j = 0
+    while j < count do
+      let at = poff + 8 * (i + j)
+      let x = word_add(word_add(mem_load(p, at), word_mul(mem_load(a, aoff + 8 * j), bi)), carry)
+      mem_store(p, at, word_and(x, m))
+      let carry = word_shr(x, 32)
+      let j = j + 1
+    end
+    mem_store(p, poff + 8 * (i + count), carry)
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# d, count limbs, = the 32 * plen bits at p modulo the count-limb modulus at
+# n, by shifting them in one at a time and subtracting n whenever the
+# remainder reaches it.
+make a function called rt_lb_reduce takes d, doff, p, poff, plen, n, noff, count returns r
+  require (d != 0) and (p != 0) and (n != 0) and (count >= 1) and (plen >= 1)
+  let m = rt_mask32()
+  let rem = rt_lb_new(count + 1)
+  let try = rt_lb_new(count + 1)
+  let bit = 32 * plen - 1
+  while bit >= 0 do
+    # rem = 2 rem + the next bit
+    let carry = word_and(word_shr(mem_load(p, poff + 8 * word_shr(bit, 5)), word_and(bit, 31)), 1)
+    let i = 0
+    while i <= count do
+      let x = mem_load(rem, 16 + 8 * i)
+      mem_store(rem, 16 + 8 * i, word_and(word_or(word_shl(x, 1), carry), m))
+      let carry = word_shr(x, 31)
+      let i = i + 1
+    end
+    # try = rem - n, n's limb above count being 0
+    let borrow = rt_lb_sub(try, 16, rem, 16, n, noff, count)
+    let top = word_sub(mem_load(rem, 16 + 8 * count), borrow)
+    mem_store(try, 16 + 8 * count, word_and(top, m))
+    rt_lb_select(rem, 16, rem, 16, try, 16, count + 1, word_shr(top, 63))
+    let bit = bit - 1
+  end
+  rt_lb_copy(d, doff, rem, 16, count)
+  rt_lb_free(rem)
+  rt_lb_free(try)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# d = a + b modulo the modulus at n, for a and b below it.
+make a function called rt_lb_add_mod takes d, doff, a, aoff, b, boff, n, noff, count returns r
+  require (d != 0) and (a != 0) and (b != 0) and (n != 0) and (count >= 1)
+  let t = rt_lb_new(count)
+  let u = rt_lb_new(count)
+  let carry = rt_lb_add(t, 16, a, aoff, b, boff, count)
+  let borrow = rt_lb_sub(u, 16, t, 16, n, noff, count)
+  # t itself only when the sum did not carry and is below n
+  rt_lb_select(d, doff, t, 16, u, 16, count, word_and(word_xor(carry, 1), borrow))
+  rt_lb_free(t)
+  rt_lb_free(u)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# d = a - b modulo the modulus at n, for a and b below it.
+make a function called rt_lb_sub_mod takes d, doff, a, aoff, b, boff, n, noff, count returns r
+  require (d != 0) and (a != 0) and (b != 0) and (n != 0) and (count >= 1)
+  let t = rt_lb_new(count)
+  let u = rt_lb_new(count)
+  let borrow = rt_lb_sub(t, 16, a, aoff, b, boff, count)
+  rt_lb_add(u, 16, t, 16, n, noff, count)
+  rt_lb_select(d, doff, u, 16, t, 16, count, borrow)
+  rt_lb_free(t)
+  rt_lb_free(u)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# d = a * b modulo the modulus at n, by the full product and rt_lb_reduce.
+make a function called rt_lb_mul_mod takes d, doff, a, aoff, b, boff, n, noff, count returns r
+  require (d != 0) and (a != 0) and (b != 0) and (n != 0) and (count >= 1)
+  let p = rt_lb_new(2 * count)
+  rt_lb_mul_full(p, 16, a, aoff, b, boff, count)
+  rt_lb_reduce(d, doff, p, 16, 2 * count, n, noff, count)
+  rt_lb_free(p)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The count limbs at d keep their low k bits, the rest becoming 0.
+make a function called rt_lb_mask_bits takes d, doff, count, k returns r
+  require (d != 0) and (count >= 1) and (k >= 0)
+  let i = 0
+  while i < count do
+    let low = 32 * i
+    if k <= low then
+      mem_store(d, doff + 8 * i, 0)
+    elif k < low + 32 then
+      mem_store(d, doff + 8 * i, word_and(mem_load(d, doff + 8 * i), word_sub(word_shl(1, k - low), 1)))
+    end
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# A k-bit word's limbs, its bits above k cleared.
+make a function called rt_lb_mask_top takes d, doff, count, k returns r
+  require (d != 0) and (count >= 1) and (k >= 1) and (k <= 32 * count)
+  let r = rt_lb_mask_bits(d, doff, count, k)
+  ensure r == 0
+  return r
+end
+
+# Montgomery multiplication: d = a * b / 2^(32 count) modulo the odd modulus at
+# n, n0 being -1/n modulo 2^32, for a and b below n.
+make a function called rt_lb_mont_mul takes d, doff, a, aoff, b, boff, n, noff, count, n0 returns r
+  require (d != 0) and (a != 0) and (b != 0) and (n != 0) and (count >= 1)
+  let m = rt_mask32()
+  let t = rt_lb_new(count + 2)
+  let i = 0
+  while i < count do
+    let bi = mem_load(b, boff + 8 * i)
+    let carry = 0
+    let j = 0
+    while j < count do
+      let x = word_add(word_add(mem_load(t, 16 + 8 * j), word_mul(mem_load(a, aoff + 8 * j), bi)), carry)
+      mem_store(t, 16 + 8 * j, word_and(x, m))
+      let carry = word_shr(x, 32)
+      let j = j + 1
+    end
+    let x = word_add(mem_load(t, 16 + 8 * count), carry)
+    mem_store(t, 16 + 8 * count, word_and(x, m))
+    mem_store(t, 16 + 8 * (count + 1), word_shr(x, 32))
+    let q = word_and(word_mul(mem_load(t, 16), n0), m)
+    let x = word_add(mem_load(t, 16), word_mul(q, mem_load(n, noff)))
+    let carry = word_shr(x, 32)
+    let j = 1
+    while j < count do
+      let x = word_add(word_add(mem_load(t, 16 + 8 * j), word_mul(q, mem_load(n, noff + 8 * j))), carry)
+      mem_store(t, 16 + 8 * (j - 1), word_and(x, m))
+      let carry = word_shr(x, 32)
+      let j = j + 1
+    end
+    let x = word_add(mem_load(t, 16 + 8 * count), carry)
+    mem_store(t, 16 + 8 * (count - 1), word_and(x, m))
+    mem_store(t, 16 + 8 * count, word_add(mem_load(t, 16 + 8 * (count + 1)), word_shr(x, 32)))
+    let i = i + 1
+  end
+  # t, below 2n, less n unless that borrows past t's top limb
+  let u = rt_lb_new(count)
+  let borrow = rt_lb_sub(u, 16, t, 16, n, noff, count)
+  let keep = word_and(word_xor(mem_load(t, 16 + 8 * count), 1), borrow)
+  rt_lb_select(d, doff, t, 16, u, 16, count, keep)
+  rt_lb_free(t)
+  rt_lb_free(u)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- a modint's header, all of it computed from n ----
+
+make a function called rt_mod_word takes m, off returns w
+  require (value_class(m) == 15) and ((off == 32) or (off == 40) or (off == 48) or (off == 56))
+  let w = mem_load(value_data(m), off)
+  ct_public(w)
+  ensure value_class(w) == 2
+  return w
+end
+
+make a function called rt_mod_limbs takes m returns count
+  require value_class(m) == 15
+  let count = rt_mod_word(m, 32)
+  ensure count >= 1
+  return count
+end
+
+make a function called rt_mod_kind takes m returns kind
+  require value_class(m) == 15
+  let kind = rt_mod_word(m, 40)
+  ensure (kind >= 0) and (kind <= 2)
+  return kind
+end
+
+make a function called mod_modulus takes m returns n
+  require value_class(m) == 15
+  let n = mem_load_value(value_data(m), 16)
+  ct_public(n)
+  ensure rt_is_integer(n) and (n >= 2)
+  return n
+end
+
+# The offset of n's limbs in a modint's block.
+make a function called rt_mod_noff takes m returns off
+  require value_class(m) == 15
+  let off = 64 + 8 * rt_mod_limbs(m)
+  ensure off >= 72
+  return off
+end
+
+# n's limbs, written into d (public integers only).
+make a function called rt_lb_from_int takes d, doff, x, count returns r
+  require (d != 0) and rt_is_integer(x) and (x >= 0) and (count >= 1)
+  let rest = x
+  let i = 0
+  while i < count do
+    let qr = int_divmod(rest, 4294967296)
+    mem_store(d, doff + 8 * i, qr[1])
+    let rest = qr[0]
+    let i = i + 1
+  end
+  let r = 0
+  ensure rest == 0
+  return r
+end
+
+# 2^(64 count) modulo n, as limbs in a new scratch array (n public).
+make a function called rt_mod_r2 takes n, count returns block
+  require rt_is_integer(n) and (n >= 2) and (count >= 1)
+  let block = rt_lb_new(count)
+  rt_lb_from_int(block, 16, rt_mod_reduce(rt_pow_exact(2, 64 * count), n), count)
+  ensure block != 0
+  return block
+end
+
+# A new modint's block with m's modulus and header, its residue still zero.
+make a function called rt_mod_like takes m returns block
+  require value_class(m) == 15
+  let count = rt_mod_limbs(m)
+  let src = value_data(m)
+  let block = rt_alloc(48 + 16 * count)
+  mem_init_value(block, 16, mod_modulus(m))
+  mem_store(block, 32, count)
+  mem_store(block, 40, rt_mod_kind(m))
+  mem_store(block, 48, rt_mod_word(m, 48))
+  mem_store(block, 56, rt_mod_word(m, 56))
+  rt_lb_zero(block, 64, count)
+  rt_lb_copy(block, 64 + 8 * count, src, 64 + 8 * count, count)
+  ct_secret(block)
+  ensure block != 0
+  return block
+end
+
+make a function called rt_mod_wrap takes block returns m
+  require block != 0
   let m = value_make(rt_modint_heap_type(), block)
   ensure value_class(m) == 15
   return m
 end
 
-make a function called mod_value takes m returns v
-  require value_class(m) == 15
-  let v = mem_load_value(value_data(m), 16)
-  ensure rt_is_integer(v) and (v >= 0)
-  return v
+make a function called mod_make takes x, n returns m
+  require rt_is_integer(x) and rt_is_integer(n) and (n >= 2)
+  # n's bits, and whether it is 2^k (n is public: this takes time from n)
+  let k = 0
+  let p = 1
+  while p <= n do
+    let p = p * 2
+    let k = k + 1
+  end
+  let kind = 2
+  if p == n * 2 then
+    # 2^k: a k-bit word, one bit shorter than n
+    let kind = 0
+    let k = k - 1
+  elif int_divmod(n, 2)[1] == 1 then
+    let kind = 1
+  end
+  let count = word_shr(k + 31, 5)
+  let block = rt_alloc(48 + 16 * count)
+  mem_init_value(block, 16, n)
+  mem_store(block, 32, count)
+  mem_store(block, 40, kind)
+  mem_store(block, 48, k)
+  let noff = 64 + 8 * count
+  if kind == 0 then
+    # a word's arithmetic masks to k bits and never reads n's limbs
+    rt_lb_zero(block, noff, count)
+  else
+    rt_lb_from_int(block, noff, n, count)
+  end
+  let n0 = 0
+  if kind == 1 then
+    # -1/n modulo 2^32 by Newton's iteration, from n's lowest limb
+    let low = mem_load(block, noff)
+    let y = 1
+    let i = 0
+    while i < 5 do
+      let y = word_and(word_mul(y, word_sub(2, word_and(word_mul(low, y), rt_mask32()))), rt_mask32())
+      let i = i + 1
+    end
+    let n0 = word_and(word_sub(0, y), rt_mask32())
+  end
+  mem_store(block, 56, n0)
+  rt_lb_from_int(block, 64, rt_mod_reduce(x, n), count)
+  if kind == 1 then
+    let r2 = rt_mod_r2(n, count)
+    rt_lb_mont_mul(block, 64, block, 64, r2, 16, block, noff, count, n0)
+    rt_lb_free(r2)
+  end
+  ct_secret(block)
+  let m = rt_mod_wrap(block)
+  ensure (value_class(m) == 15) and (mod_modulus(m) == n)
+  return m
 end
 
-make a function called mod_modulus takes m returns n
+# m's residue as limbs in a new scratch array, out of Montgomery form.
+make a function called rt_mod_plain takes m returns block
   require value_class(m) == 15
-  let n = mem_load_value(value_data(m), 32)
-  ensure rt_is_integer(n) and (n >= 2)
-  return n
+  let count = rt_mod_limbs(m)
+  let src = value_data(m)
+  let block = rt_lb_new(count)
+  if rt_mod_kind(m) == 1 then
+    let one = rt_lb_new(count)
+    mem_store(one, 16, 1)
+    rt_lb_mont_mul(block, 16, src, 64, one, 16, src, rt_mod_noff(m), count, rt_mod_word(m, 56))
+    rt_lb_free(one)
+  else
+    rt_lb_copy(block, 16, src, 64, count)
+  end
+  ensure block != 0
+  return block
+end
+
+# Plain limbs, below n, as m's kind keeps a residue, into d.
+make a function called rt_mod_store_plain takes m, d, doff, plain, poff returns r
+  require (value_class(m) == 15) and (d != 0) and (plain != 0)
+  let count = rt_mod_limbs(m)
+  if rt_mod_kind(m) == 1 then
+    let src = value_data(m)
+    let r2 = rt_mod_r2(mod_modulus(m), count)
+    rt_lb_mont_mul(d, doff, plain, poff, r2, 16, src, rt_mod_noff(m), count, rt_mod_word(m, 56))
+    rt_lb_free(r2)
+  else
+    rt_lb_copy(d, doff, plain, poff, count)
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The residue, from 0 to n - 1: here it leaves the class.
+make a function called mod_value takes m returns v
+  require value_class(m) == 15
+  let count = rt_mod_limbs(m)
+  let plain = rt_mod_plain(m)
+  ct_reveal(plain)
+  let v = 0
+  let i = count - 1
+  while i >= 0 do
+    let v = v * 4294967296 + mem_load(plain, 16 + 8 * i)
+    let i = i - 1
+  end
+  rt_lb_free(plain)
+  ensure rt_is_integer(v) and (v >= 0) and (v < mod_modulus(m))
+  return v
 end
 
 make a function called rt_modint_to_s takes m returns s
@@ -253,6 +771,8 @@ make a function called rt_modint_to_s takes m returns s
   ensure value_class(s) == 8
   return s
 end
+
+# ---- the operations ----
 
 # The modulus of whichever operand is a modint, a's when both are.
 make a function called rt_mod_modulus_of takes a, b returns n
@@ -267,31 +787,126 @@ make a function called rt_mod_modulus_of takes a, b returns n
   return n
 end
 
-# v's residue modulo n: a modint of that modulus, or an integer reduced. Any
-# other operand stops the program, naming the modint class.
-make a function called rt_mod_operand takes v, n returns r
+# v as a modint modulo n: itself when it is one with that modulus, an integer
+# reduced (spec 1.14). Anything else stops the program, naming the class.
+make a function called rt_mod_operand takes v, n returns m
   require value_live(v) and rt_is_integer(n) and (n >= 2)
   if value_class(v) == 15 then
     if mod_modulus(v) != n then
       rt_fail_class(15)
     end
-    let r = mod_value(v)
-    ensure rt_is_integer(r) and (r >= 0) and (r < n)
-    return r
+    let m = v
+    ensure value_class(m) == 15
+    return m
   end
   if not rt_is_integer(v) then
     rt_fail_class(15)
   end
-  let r = rt_mod_reduce(v, n)
-  ensure rt_is_integer(r) and (r >= 0) and (r < n)
+  let m = mod_make(v, n)
+  ensure value_class(m) == 15
+  return m
+end
+
+# a * b for modints of one modulus, into d's residue.
+make a function called rt_mod_mul_into takes d, a, b returns r
+  require (d != 0) and (value_class(a) == 15) and (value_class(b) == 15)
+  let count = rt_mod_limbs(a)
+  let pa = value_data(a)
+  let pb = value_data(b)
+  let noff = rt_mod_noff(a)
+  let kind = rt_mod_kind(a)
+  if kind == 1 then
+    rt_lb_mont_mul(d, 64, pa, 64, pb, 64, pa, noff, count, rt_mod_word(a, 56))
+  elif kind == 0 then
+    let p = rt_lb_new(2 * count)
+    rt_lb_mul_full(p, 16, pa, 64, pb, 64, count)
+    rt_lb_copy(d, 64, p, 16, count)
+    rt_lb_mask_top(d, 64, count, rt_mod_word(a, 48))
+    rt_lb_free(p)
+  else
+    rt_lb_mul_mod(d, 64, pa, 64, pb, 64, pa, noff, count)
+  end
+  let r = 0
+  ensure r == 0
   return r
 end
 
-# y's inverse modulo n by the extended Euclidean algorithm; a y sharing a factor
-# with n has none, and stops the program.
-make a function called rt_mod_inverse takes y, n returns inv
-  require rt_is_integer(y) and rt_is_integer(n) and (y >= 0) and (y < n)
-  let old_r = y
+make a function called rt_modint_arith takes op, a, b returns r
+  require (op >= 0) and (op <= 3) and ((value_class(a) == 15) or (value_class(b) == 15))
+  let n = rt_mod_modulus_of(a, b)
+  let x = rt_mod_operand(a, n)
+  let y = rt_mod_operand(b, n)
+  if op == 3 then
+    let y = rt_mod_inverse(y)
+  end
+  let count = rt_mod_limbs(x)
+  let px = value_data(x)
+  let py = value_data(y)
+  let block = rt_mod_like(x)
+  if op == 0 then
+    if rt_mod_kind(x) == 0 then
+      rt_lb_add(block, 64, px, 64, py, 64, count)
+      rt_lb_mask_top(block, 64, count, rt_mod_word(x, 48))
+    else
+      rt_lb_add_mod(block, 64, px, 64, py, 64, px, rt_mod_noff(x), count)
+    end
+  elif op == 1 then
+    if rt_mod_kind(x) == 0 then
+      rt_lb_sub(block, 64, px, 64, py, 64, count)
+      rt_lb_mask_top(block, 64, count, rt_mod_word(x, 48))
+    else
+      rt_lb_sub_mod(block, 64, px, 64, py, 64, px, rt_mod_noff(x), count)
+    end
+  else
+    rt_mod_mul_into(block, x, y)
+  end
+  let r = rt_mod_wrap(block)
+  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+make a function called rt_modint_neg takes a returns r
+  require value_class(a) == 15
+  let count = rt_mod_limbs(a)
+  let pa = value_data(a)
+  let block = rt_mod_like(a)
+  # block's residue is zero: 0 - a
+  if rt_mod_kind(a) == 0 then
+    rt_lb_sub(block, 64, block, 64, pa, 64, count)
+    rt_lb_mask_top(block, 64, count, rt_mod_word(a, 48))
+  else
+    rt_lb_sub_mod(block, 64, block, 64, pa, 64, pa, rt_mod_noff(a), count)
+  end
+  let r = rt_mod_wrap(block)
+  ensure (value_class(r) == 15) and (mod_modulus(r) == mod_modulus(a))
+  return r
+end
+
+# Two modints of one modulus are equal when their residues are: a bool, from
+# every limb.
+make a function called rt_modint_eq takes a, b returns yes
+  require (value_class(a) == 15) and (value_class(b) == 15)
+  let count = rt_mod_limbs(a)
+  let pa = value_data(a)
+  let pb = value_data(b)
+  let acc = 0
+  let i = 0
+  while i < count do
+    let acc = word_or(acc, word_xor(mem_load(pa, 64 + 8 * i), mem_load(pb, 64 + 8 * i)))
+    let i = i + 1
+  end
+  let yes = acc == 0
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# ---- inverses: steps fixed by n ----
+
+# 1/a modulo n by the extended Euclidean algorithm, for public a and n only:
+# its time depends on them. a must have an inverse.
+make a function called rt_int_inverse_public takes a, n returns inv
+  require rt_is_integer(a) and rt_is_integer(n) and (a >= 0) and (a < n)
+  let old_r = a
   let r = n
   let old_s = 1
   let s = 0
@@ -304,73 +919,313 @@ make a function called rt_mod_inverse takes y, n returns inv
     let old_s = s
     let s = next_s
   end
-  if old_r != 1 then
-    rt_fail_class(15)
-  end
   let inv = rt_mod_reduce(old_s, n)
-  ensure rt_is_integer(inv) and (rt_mod_reduce(inv * y, n) == 1)
+  ensure (old_r == 1) and (rt_mod_reduce(inv * a, n) == 1)
   return inv
 end
 
-make a function called rt_modint_arith takes op, a, b returns r
-  require (op >= 0) and (op <= 3) and ((value_class(a) == 15) or (value_class(b) == 15))
-  let n = rt_mod_modulus_of(a, b)
-  let x = rt_mod_operand(a, n)
-  let y = rt_mod_operand(b, n)
-  if op == 0 then
-    let r = mod_make(x + y, n)
-  elif op == 1 then
-    let r = mod_make(x - y, n)
-  elif op == 2 then
-    let r = mod_make(x * y, n)
-  else
-    let r = mod_make(x * rt_mod_inverse(y, n), n)
+# Möller's binary inversion modulo an odd modulus (as GMP's mpn_sec_invert):
+# v = 1/x modulo the count-limb odd n at noff, x below n, in 2 * bits steps.
+# 1 when x has an inverse, else 0.
+make a function called rt_lb_invert_odd takes v, voff, x, xoff, n, noff, count, bits returns ok
+  require (v != 0) and (x != 0) and (n != 0) and (count >= 1) and (bits >= 1)
+  let a = rt_lb_new(count)
+  let b = rt_lb_new(count)
+  let u = rt_lb_new(count)
+  let w = rt_lb_new(count)
+  let diff = rt_lb_new(count)
+  rt_lb_copy(a, 16, x, xoff, count)
+  rt_lb_copy(b, 16, n, noff, count)
+  mem_store(u, 16, 1)
+  let step = 0
+  while step < 2 * bits do
+    let odd = word_and(mem_load(a, 16), 1)
+    # when a is odd and below b, exchange a with b and u with w
+    let below = rt_lb_sub(diff, 16, a, 16, b, 16, count)
+    let swap = word_and(odd, below)
+    rt_lb_cswap(a, 16, b, 16, count, swap)
+    rt_lb_cswap(u, 16, w, 16, count, swap)
+    # when a is odd, a = a - b and u = u - w modulo n
+    rt_lb_sub(diff, 16, a, 16, b, 16, count)
+    rt_lb_select(a, 16, diff, 16, a, 16, count, odd)
+    rt_lb_sub_mod(diff, 16, u, 16, w, 16, n, noff, count)
+    rt_lb_select(u, 16, diff, 16, u, 16, count, odd)
+    # a = a / 2, and u = u / 2 modulo n: u + n first when u is odd
+    rt_lb_half(a, 16, count, 0)
+    let uodd = word_and(mem_load(u, 16), 1)
+    let carry = rt_lb_add(diff, 16, u, 16, n, noff, count)
+    rt_lb_select(u, 16, diff, 16, u, 16, count, uodd)
+    rt_lb_half(u, 16, count, word_and(carry, uodd))
+    let step = step + 1
   end
+  # b is now the gcd; w the inverse when it is 1
+  let ok = rt_lb_is_zero(a, 16, count)
+  mem_store(b, 16, word_xor(mem_load(b, 16), 1))
+  let ok = word_and(ok, rt_lb_is_zero(b, 16, count))
+  rt_lb_copy(v, voff, w, 16, count)
+  rt_lb_free(a)
+  rt_lb_free(b)
+  rt_lb_free(u)
+  rt_lb_free(w)
+  rt_lb_free(diff)
+  ensure word_shr(ok, 1) == 0
+  return ok
+end
+
+# y = 1/x modulo 2^k by Newton's iteration, y = y (2 - x y), each step
+# doubling the bits that are right; x odd. count limbs.
+make a function called rt_lb_invert_pow2 takes y, yoff, x, xoff, count, k returns r
+  require (y != 0) and (x != 0) and (count >= 1) and (k >= 1)
+  let t = rt_lb_new(count)
+  let p = rt_lb_new(2 * count)
+  let two = rt_lb_new(count)
+  mem_store(two, 16, 2)
+  rt_lb_copy(y, yoff, x, xoff, count)
+  # an odd x is its own inverse modulo 8
+  let good = 3
+  while good < k do
+    rt_lb_mul_full(p, 16, x, xoff, y, yoff, count)
+    rt_lb_sub(t, 16, two, 16, p, 16, count)
+    rt_lb_mul_full(p, 16, y, yoff, t, 16, count)
+    rt_lb_copy(y, yoff, p, 16, count)
+    let good = good * 2
+  end
+  rt_lb_mask_bits(y, yoff, count, k)
+  rt_lb_free(t)
+  rt_lb_free(p)
+  rt_lb_free(two)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The inverse of m: for an odd n by rt_lb_invert_odd; for 2^k by Newton's
+# iteration; for 2^s times an odd part q above 1, the two combined by the
+# Chinese remainder theorem. No inverse stops the program.
+make a function called rt_mod_inverse takes m returns r
+  require value_class(m) == 15
+  let count = rt_mod_limbs(m)
+  let kind = rt_mod_kind(m)
+  let k = rt_mod_word(m, 48)
+  let n = mod_modulus(m)
+  let pm = value_data(m)
+  let plain = rt_mod_plain(m)
+  let inv = rt_lb_new(count)
+  let ok = 0
+  if kind == 1 then
+    let ok = rt_lb_invert_odd(inv, 16, plain, 16, pm, rt_mod_noff(m), count, k)
+  elif kind == 0 then
+    let ok = word_and(mem_load(plain, 16), 1)
+    rt_lb_invert_pow2(inv, 16, plain, 16, count, k)
+  else
+    let ok = rt_mod_inverse_split(inv, plain, n, count)
+  end
+  if ok == 0 then
+    rt_fail_class(15)
+  end
+  let block = rt_mod_like(m)
+  rt_mod_store_plain(m, block, 64, inv, 16)
+  rt_lb_free(plain)
+  rt_lb_free(inv)
+  let r = rt_mod_wrap(block)
   ensure (value_class(r) == 15) and (mod_modulus(r) == n)
   return r
 end
 
-# m to the integer power k: square and multiply, the inverse's power for k < 0.
-make a function called rt_modint_pow takes m, k returns r
-  require (value_class(m) == 15) and value_live(k)
-  if not rt_is_integer(k) then
+# For n = 2^s q, q odd and above 1: inv = 1/x modulo n, from y = 1/x modulo 2^s
+# and z = 1/x modulo q, as y + 2^s ((z - y) / 2^s modulo q). 1 when x has an
+# inverse, else 0. s, q and 1/2^s modulo q come from n alone.
+make a function called rt_mod_inverse_split takes inv, x, n, count returns ok
+  require (inv != 0) and (x != 0) and rt_is_integer(n) and (count >= 1)
+  let s = 0
+  let q = n
+  while int_divmod(q, 2)[1] == 0 do
+    let q = int_divmod(q, 2)[0]
+    let s = s + 1
+  end
+  let c = rt_int_inverse_public(rt_mod_reduce(rt_pow_exact(2, s), q), q)
+  # q's limbs, with count of them (the upper ones zero)
+  let qb = rt_lb_new(count)
+  rt_lb_from_int(qb, 16, q, count)
+  let qbits = 0
+  let p = 1
+  while p <= q do
+    let p = p * 2
+    let qbits = qbits + 1
+  end
+  let cb = rt_lb_new(count)
+  rt_lb_from_int(cb, 16, c, count)
+  # y = 1/x modulo 2^s
+  let x2 = rt_lb_new(count)
+  rt_lb_copy(x2, 16, x, 16, count)
+  rt_lb_mask_bits(x2, 16, count, s)
+  let y = rt_lb_new(count)
+  rt_lb_invert_pow2(y, 16, x2, 16, count, s)
+  let ok = word_and(mem_load(x, 16), 1)
+  # z = 1/x modulo q
+  let xq = rt_lb_new(count)
+  rt_lb_reduce(xq, 16, x, 16, count, qb, 16, count)
+  let z = rt_lb_new(count)
+  let ok = word_and(ok, rt_lb_invert_odd(z, 16, xq, 16, qb, 16, count, qbits))
+  # t = (z - y) c modulo q
+  let yq = rt_lb_new(count)
+  rt_lb_reduce(yq, 16, y, 16, count, qb, 16, count)
+  let t = rt_lb_new(count)
+  rt_lb_sub_mod(t, 16, z, 16, yq, 16, qb, 16, count)
+  rt_lb_mul_mod(t, 16, t, 16, cb, 16, qb, 16, count)
+  # inv = y + t 2^s, below n
+  let shifted = rt_lb_new(2 * count)
+  let pow = rt_lb_new(count)
+  rt_lb_from_int(pow, 16, rt_pow_exact(2, s), count)
+  rt_lb_mul_full(shifted, 16, t, 16, pow, 16, count)
+  rt_lb_add(inv, 16, shifted, 16, y, 16, count)
+  rt_lb_free(qb)
+  rt_lb_free(cb)
+  rt_lb_free(x2)
+  rt_lb_free(y)
+  rt_lb_free(xq)
+  rt_lb_free(z)
+  rt_lb_free(yq)
+  rt_lb_free(t)
+  rt_lb_free(shifted)
+  rt_lb_free(pow)
+  ensure word_shr(ok, 1) == 0
+  return ok
+end
+
+# ---- powers: a ladder, the same steps for every exponent of one size ----
+
+# How many 32-bit limbs rt_exponent_bits gives for e: 2 for an int, and for a
+# bigint enough for its base-10^9 limbs. It depends on e's size alone.
+make a function called rt_exponent_limbs takes e returns count
+  require rt_is_integer(e)
+  if value_class(e) == 2 then
+    let count = 2
+    ensure count == 2
+    return count
+  end
+  let count = word_shr(30 * list_len(mem_load_value(value_data(e), 24)), 5) + 2
+  ensure count >= 2
+  return count
+end
+
+# The bits of an integer's magnitude as rt_exponent_limbs(e) 32-bit limbs in a
+# new scratch array, built by the same steps for any integer of that size.
+make a function called rt_exponent_bits takes e returns block
+  require rt_is_integer(e)
+  let count = rt_exponent_limbs(e)
+  if value_class(e) == 2 then
+    let mag = e
+    if e < 0 then
+      let mag = word_sub(0, e)
+    end
+    let block = rt_lb_new(count)
+    mem_store(block, 16, word_and(mag, rt_mask32()))
+    mem_store(block, 24, word_shr(mag, 32))
+    ensure block != 0
+    return block
+  end
+  let digits = mem_load_value(value_data(e), 24)
+  let nd = list_len(digits)
+  let block = rt_lb_new(count)
+  let i = nd - 1
+  while i >= 0 do
+    # block = block * 10^9 + digits[i]
+    let carry = digits[i]
+    let j = 0
+    while j < count do
+      let x = word_add(word_mul(mem_load(block, 16 + 8 * j), 1000000000), carry)
+      mem_store(block, 16 + 8 * j, word_and(x, rt_mask32()))
+      let carry = word_shr(x, 32)
+      let j = j + 1
+    end
+    let i = i - 1
+  end
+  ensure block != 0
+  return block
+end
+
+# m to the integer power e (spec 1.14): the inverse's power for e below 0.
+make a function called rt_modint_pow takes m, e returns r
+  require (value_class(m) == 15) and value_live(e)
+  if not rt_is_integer(e) then
     rt_fail_class(15)
   end
-  let n = mod_modulus(m)
-  let b = mod_value(m)
-  let e = k
-  if k < 0 then
-    let b = rt_mod_inverse(b, n)
-    let e = 0 - k
+  let base = m
+  if e < 0 then
+    let base = rt_mod_inverse(m)
   end
-  let acc = rt_mod_reduce(1, n)
-  while e > 0 do
-    let qr = int_divmod(e, 2)
-    if qr[1] == 1 then
-      let acc = rt_mod_reduce(acc * b, n)
-    end
-    let b = rt_mod_reduce(b * b, n)
-    let e = qr[0]
+  let eb = rt_exponent_bits(e)
+  let ecount = rt_exponent_limbs(e)
+  let r0 = mod_make(1, mod_modulus(m))
+  let r1 = base
+  let i = 32 * ecount - 1
+  while i >= 0 do
+    let bit = word_and(word_shr(mem_load(eb, 16 + 8 * word_shr(i, 5)), word_and(i, 31)), 1)
+    let count = rt_mod_limbs(m)
+    let p0 = value_data(r0)
+    let p1 = value_data(r1)
+    # the ladder step on copies, exchanged when the bit is 1
+    let a0 = rt_mod_like(m)
+    let a1 = rt_mod_like(m)
+    rt_lb_copy(a0, 64, p0, 64, count)
+    rt_lb_copy(a1, 64, p1, 64, count)
+    rt_lb_cswap(a0, 64, a1, 64, count, bit)
+    let x0 = rt_mod_wrap(a0)
+    let x1 = rt_mod_wrap(a1)
+    let n1 = rt_mod_like(m)
+    let n0 = rt_mod_like(m)
+    rt_mod_mul_into(n1, x0, x1)
+    rt_mod_mul_into(n0, x0, x0)
+    rt_lb_cswap(n0, 64, n1, 64, count, bit)
+    let r0 = rt_mod_wrap(n0)
+    let r1 = rt_mod_wrap(n1)
+    let i = i - 1
   end
-  let r = mod_make(acc, n)
-  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  rt_lb_free(eb)
+  let r = r0
+  ensure (value_class(r) == 15) and (mod_modulus(r) == mod_modulus(m))
   return r
 end
+
+# ---- words: n = 2^k, k up to 62 ----
 
 # k when m's modulus is 2^k, for k from 1 to 62; any other modulus stops the
 # program, naming the modint class.
 make a function called rt_mod_bits takes m returns k
   require value_class(m) == 15
-  let n = mod_modulus(m)
-  if (value_class(n) != 2) or (n > 4611686018427387904) or (word_and(n, n - 1) != 0) then
+  let k = rt_mod_word(m, 48)
+  if (rt_mod_kind(m) != 0) or (k > 62) then
     rt_fail_class(15)
   end
-  let k = 1
-  while word_shl(1, k) < n do
-    let k = k + 1
-  end
-  ensure (k >= 1) and (k <= 62) and (word_shl(1, k) == n)
+  ensure (k >= 1) and (k <= 62)
   return k
+end
+
+# The word of a k-bit modint, k up to 62, as one machine word.
+make a function called rt_mod_word_of takes m returns w
+  require value_class(m) == 15
+  let p = value_data(m)
+  let w = mem_load(p, 64)
+  if rt_mod_limbs(m) > 1 then
+    let w = word_or(w, word_shl(mem_load(p, 72), 32))
+  end
+  ensure value_class(w) == 2
+  return w
+end
+
+# A modint like m holding the k-bit word w.
+make a function called rt_mod_of_word takes m, w returns r
+  require (value_class(m) == 15) and (value_class(w) == 2)
+  let block = rt_mod_like(m)
+  mem_store(block, 64, word_and(w, rt_mask32()))
+  if rt_mod_limbs(m) > 1 then
+    mem_store(block, 72, word_shr(w, 32))
+  end
+  rt_lb_mask_top(block, 64, rt_mod_limbs(m), rt_mod_word(m, 48))
+  let r = rt_mod_wrap(block)
+  ensure value_class(r) == 15
+  return r
 end
 
 # band, bor and bxor (op 0, 1, 2) of two k-bit words.
@@ -379,19 +1234,26 @@ make a function called rt_modint_bitwise takes op, a, b returns r
   let n = rt_mod_modulus_of(a, b)
   let x = rt_mod_operand(a, n)
   let y = rt_mod_operand(b, n)
-  if value_class(a) == 15 then
-    rt_mod_bits(a)
-  else
-    rt_mod_bits(b)
-  end
+  rt_mod_bits(x)
+  let wx = rt_mod_word_of(x)
+  let wy = rt_mod_word_of(y)
   if op == 0 then
-    let r = mod_make(word_and(x, y), n)
+    let w = word_and(wx, wy)
   elif op == 1 then
-    let r = mod_make(word_or(x, y), n)
+    let w = word_or(wx, wy)
   else
-    let r = mod_make(word_xor(x, y), n)
+    let w = word_xor(wx, wy)
   end
+  let r = rt_mod_of_word(x, w)
   ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  return r
+end
+
+make a function called rt_modint_bnot takes a returns r
+  require value_class(a) == 15
+  let k = rt_mod_bits(a)
+  let r = rt_mod_of_word(a, word_xor(rt_mod_word_of(a), word_sub(word_shl(1, k), 1)))
+  ensure (value_class(r) == 15) and (mod_modulus(r) == mod_modulus(a))
   return r
 end
 
@@ -413,23 +1275,21 @@ make a function called rt_modint_shift takes op, m, s returns r
     rt_fail_class(15)
   end
   rt_mod_count(m, s)
-  let n = mod_modulus(m)
   if op == 0 then
-    let r = mod_make(word_and(word_shl(mod_value(m), s), n - 1), n)
+    let r = rt_mod_of_word(m, word_shl(rt_mod_word_of(m), s))
   else
-    let r = mod_make(word_shr(mod_value(m), s), n)
+    let r = rt_mod_of_word(m, word_shr(rt_mod_word_of(m), s))
   end
-  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  ensure (value_class(r) == 15) and (mod_modulus(r) == mod_modulus(m))
   return r
 end
 
 make a function called rotl takes m, s returns r
   require (value_class(m) == 15) and value_live(s)
   let k = rt_mod_count(m, s)
-  let n = mod_modulus(m)
-  let v = mod_value(m)
-  let r = mod_make(word_and(word_or(word_shl(v, s), word_shr(v, k - s)), n - 1), n)
-  ensure (value_class(r) == 15) and (mod_modulus(r) == n)
+  let w = rt_mod_word_of(m)
+  let r = rt_mod_of_word(m, word_or(word_shl(w, s), word_shr(w, k - s)))
+  ensure (value_class(r) == 15) and (mod_modulus(r) == mod_modulus(m))
   return r
 end
 
@@ -756,7 +1616,7 @@ make a function called op_neg takes a returns r
     return r
   end
   if c == 15 then
-    let r = mod_make(0 - mod_value(a), mod_modulus(a))
+    let r = rt_modint_neg(a)
     ensure value_live(r)
     return r
   end
@@ -905,18 +1765,14 @@ make a function called op_eq takes a, b returns r
       return r
     end
   end
-  if (ca == 15) and (cb == 15) then
-    let r = (mod_modulus(a) == mod_modulus(b)) and (mod_value(a) == mod_value(b))
-    ensure value_class(r) == 1
-    return r
-  end
-  if (ca == 15) and rt_is_integer(b) then
-    let r = rt_mod_reduce(b, mod_modulus(a)) == mod_value(a)
-    ensure value_class(r) == 1
-    return r
-  end
-  if (cb == 15) and rt_is_integer(a) then
-    let r = rt_mod_reduce(a, mod_modulus(b)) == mod_value(b)
+  if ((ca == 15) and ((cb == 15) or rt_is_integer(b))) or ((cb == 15) and rt_is_integer(a)) then
+    let n = rt_mod_modulus_of(a, b)
+    if ((ca == 15) and (mod_modulus(a) != n)) or ((cb == 15) and (mod_modulus(b) != n)) then
+      let r = false
+      ensure value_class(r) == 1
+      return r
+    end
+    let r = rt_modint_eq(rt_mod_operand(a, n), rt_mod_operand(b, n))
     ensure value_class(r) == 1
     return r
   end
@@ -998,9 +1854,7 @@ end
 make a function called op_bnot takes a returns r
   require value_live(a)
   if value_class(a) == 15 then
-    rt_mod_bits(a)
-    let n = mod_modulus(a)
-    let r = mod_make(word_xor(mod_value(a), n - 1), n)
+    let r = rt_modint_bnot(a)
     ensure value_class(r) == 15
     return r
   end
