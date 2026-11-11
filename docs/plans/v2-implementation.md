@@ -279,6 +279,34 @@ milestone 11). What they needed beyond this plan's first draft:
   runtime's public code. Gates pass: part 1 156/156 on each engine,
   engines agree 62/62, part 2 111/111, language 286/286 on each engine,
   match 26/26, block model 211/211.
+- **X25519 and Ed25519 in PatLang (#251, third increment).** `self_hosting/v2/lib/sha512.patlang`
+  (SHA-512 on words modulo 2^64) and `self_hosting/v2/lib/curve25519.patlang` (X25519 by the
+  Montgomery ladder of RFC 7748, Ed25519 key making, signing and verifying by RFC 8032 in
+  extended coordinates), written on modints with no choice made by a secret: every scalar bit
+  is a modint, and the ladders pick their points by arithmetic on it. For them the runtime
+  gained words up to 2^64, `mod_make` of a modint (its residue reduced modulo the new
+  modulus, in time that depends on the two moduli alone) and of a modint's modulus, which
+  reuses the header already worked out. `self_hosting/v2/tools/curve25519_vectors.py` writes
+  `cv_vectors.patlang` from RFC 7748, RFC 8032 and Wycheproof. `curve25519.feature` (five
+  scenarios): the FIPS 180-4 digests, RFC 7748's outputs and its 1,000-iteration case (the
+  1,000,000-iteration one is not run), all 518 Wycheproof X25519 cases, RFC 8032's keys and
+  signatures, and Wycheproof Ed25519 verification (117 valid accepted, 64 invalid rejected,
+  and the 29 marked acceptable all accepted). Two new scenarios in the language suite's
+  `modular_integers.feature`, and a fifth in `constant_time.feature`: the check finds no
+  value-dependent step in X25519, Ed25519 key making or signing. On the way, the check
+  exploded on these programs into hundreds of reports over an hour, all from values read
+  out of lists. Three changes brought it to about 4 minutes and none: the list code marks
+  a list's length, count, room and type words public; a call whose argument may be of
+  several classes is followed once per kind of class, each with the secrecy that kind can
+  carry, so a callee's `require` prunes the rest; and the libraries read each element
+  through `mod_make(x, shape)`, which settles its class. Tracking what classes each block
+  holds, tried first, gave eight times the summaries and still lost the classes, because
+  the slots a store is traced back to are gathered across the whole function, so a store
+  into a fresh block was charged to an argument; lists of lists of secrets are still
+  reported (spec 2.7). The vector fixtures pass natively and the check passes the curve
+  fixture. The v2 gates on 2026-11-11 pass: compilers a and b byte identical, the bootstrap
+  reader's build and the WASM identical; part1_v2 163/163, part1_interp 163/163, engines_agree
+  62/62, part2 111/111, language 297/297 on both engines, match 26/26, block model 211/211.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

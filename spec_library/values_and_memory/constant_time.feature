@@ -20,3 +20,8 @@ Feature: the constant-time check (spec 1.14 and 2.7)
     Given a program printing mod_value of a modint
     When the constant-time check reads it
     Then it reports the residue leaving the class, and exits 1
+
+  Scenario: X25519, Ed25519 key making and Ed25519 signing have no value-dependent step
+    Given a program that agrees an X25519 secret, makes an Ed25519 key and signs a message, all written in PatLang on modints
+    When the constant-time check reads it
+    Then it reports nothing in them and exits 0

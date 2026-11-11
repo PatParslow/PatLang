@@ -660,6 +660,70 @@ make a function called ct_unset takes fr, slot returns yes
   return yes
 end
 
+# The states a value's state divides into, each followed on its own, by the
+# secrecy each class can carry. Only a modint's block and the raw blocks the
+# runtime keeps limbs in hold secret words (ct_secret), so: a modint points to
+# memory holding a secret word and to nothing deeper (its modulus is public);
+# a list, closure, cell or object holds values, so it never points to secret
+# words directly; a number other than an int, a string, a unit or a bool
+# points to no secret at all; an int may be a raw block, so it keeps all of
+# its secrecy. Each may still be a secret word itself (bit 0).
+make a function called ct_split takes s returns parts
+  require value_class(s) == 2
+  let c = ct_classes(s)
+  let t = ct_secrecy(s)
+  if word_and(t, 62) == 0 then
+    let parts = [s]
+    ensure list_len(parts) == 1
+    return parts
+  end
+  let ints = ct_bit(2)
+  let modint = ct_bit(15)
+  let holders = word_or(word_or(ct_bit(9), ct_bit(10)), word_or(word_or(ct_bit(11), ct_bit(12)), word_or(ct_bit(13), ct_bit(14))))
+  let holders = word_or(holders, word_or(ct_bit(16), ct_bit(17)))
+  let plain = word_xor(ct_all(), word_or(word_or(ints, modint), holders))
+  let groups = [[ints, 63], [modint, 3], [holders, 61], [plain, 1]]
+  let parts = []
+  let g = 0
+  while g < 4 do
+    let cg = word_and(c, groups[g][0])
+    if cg != 0 then
+      let parts = list_push(parts, ct_state_of(word_and(t, groups[g][1]), cg, ct_known(s), ct_tclasses(s)))
+    end
+    let g = g + 1
+  end
+  if list_len(parts) == 0 then
+    let parts = [s]
+  end
+  ensure (list_len(parts) >= 1) and (list_len(parts) <= 4)
+  return parts
+end
+
+# The argument lists a call is followed with: each argument's state divided
+# (ct_split), every combination of the parts.
+make a function called ct_sigs takes sig returns sigs
+  require value_class(sig) == 9
+  let sigs = [[]]
+  let i = 0
+  while i < list_len(sig) do
+    let parts = ct_split(sig[i])
+    let grown = []
+    let j = 0
+    while j < list_len(sigs) do
+      let k = 0
+      while k < list_len(parts) do
+        let grown = list_push(grown, list_push(sigs[j], parts[k]))
+        let k = k + 1
+      end
+      let j = j + 1
+    end
+    let sigs = grown
+    let i = i + 1
+  end
+  ensure list_len(sigs) >= 1
+  return sigs
+end
+
 # A call of name with the given argument slots: its result into d, and what
 # it stores through its parameters into the arguments. Not made until every
 # argument has a state.
@@ -678,22 +742,27 @@ make a function called ct_call takes st, fr, d, name, args returns changed
     ensure value_class(changed) == 1
     return changed
   end
-  let idx = ct_summary(st, name, ct_sig(fr, args), fr[6])
-  if idx < 0 then
-    let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, args), ct_all(), ct_all(), ct_all()))
-    ensure value_class(changed) == 1
-    return changed
-  end
-  if ct_raise(fr, d, vec_get(st[5], idx)) then
-    let changed = true
-  end
-  let eff = vec_get(st[6], idx)
-  let i = 0
-  while i < list_len(args) do
-    if (eff[i] != 0) and ct_store(fr, args[i], eff[i]) then
+  let sigs = ct_sigs(ct_sig(fr, args))
+  let s = 0
+  while s < list_len(sigs) do
+    let idx = ct_summary(st, name, sigs[s], fr[6])
+    if idx < 0 then
+      let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, args), ct_all(), ct_all(), ct_all()))
+      ensure value_class(changed) == 1
+      return changed
+    end
+    if ct_raise(fr, d, vec_get(st[5], idx)) then
       let changed = true
     end
-    let i = i + 1
+    let eff = vec_get(st[6], idx)
+    let i = 0
+    while i < list_len(args) do
+      if (eff[i] != 0) and ct_store(fr, args[i], eff[i]) then
+        let changed = true
+      end
+      let i = i + 1
+    end
+    let s = s + 1
   end
   ensure value_class(changed) == 1
   return changed

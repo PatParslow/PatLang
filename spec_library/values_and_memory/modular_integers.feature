@@ -3,11 +3,11 @@ Feature: integers modulo n (spec 1.14)
 
   Scenario: a modint is an integer modulo n with the arithmetic of residues
     Given modints made with mod_make, with int and bigint moduli
-    When a program prints their class, residues and moduli, their sums, differences, products, quotients, powers and negations, alone and with integers, and compares them
+    When a program prints their class, residues and moduli, their sums, differences, products, quotients, powers and negations, alone and with integers, and compares them, and remakes them modulo other moduli
     Then each prints what the rules of spec 1.14 give
 
   Scenario: a modint modulo 2^k is a k-bit word
-    Given modints modulo 2^8, 2^32 and 2^62
+    Given modints modulo 2^8, 2^32, 2^62 and 2^64
     When a program prints their band, bor, bxor, bnot, shl, shr, rotl and rotr
     Then each prints what the rules of spec 1.14 give for words
 

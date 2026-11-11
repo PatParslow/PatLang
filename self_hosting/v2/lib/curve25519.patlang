@@ -1,0 +1,395 @@
+# X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints (spec 1.14).
+# Keys, scalars, shared secrets, messages and signatures are lists of bytes,
+# each a modint modulo 256. Field elements are modints modulo p = 2^255 - 19
+# and scalars modints modulo the group order L. Key agreement, key making and
+# signing choose nothing by a secret: every scalar bit is a modint, and the
+# ladders pick their points by arithmetic on it. Verifying works on public
+# values and reads them as integers where it decides.
+
+include "sha512.patlang"
+
+make a function called cv_p returns p
+  let p = 57896044618658097711785492504343953926634992332820282019728792003956564819949
+  return p
+end
+
+make a function called cv_l returns l
+  let l = 7237005577332262213973186563042994240857116359379907606001950938285454250989
+  return l
+end
+
+# 1/256 modulo p and modulo L, for taking a residue apart a byte at a time.
+make a function called cv_inv256 takes n returns inv
+  require (n == cv_p()) or (n == cv_l())
+  if n == cv_p() then
+    let inv = 6106223455874096243039876162567526390699784347602139119268271031667293945854
+  else
+    let inv = 763277931984262030379984520320940798840398991028349630320518263022294003034
+  end
+  ensure (inv * 256) % n == 1
+  return inv
+end
+
+make a function called cv_fe takes x returns e
+  let e = mod_make(x, cv_p())
+  ensure mod_modulus(e) == cv_p()
+  return e
+end
+
+make a function called cv_byte takes x returns b
+  let b = mod_make(x, 256)
+  ensure mod_modulus(b) == 256
+  return b
+end
+
+# The little-endian number the bytes spell, modulo n.
+make a function called cv_from_bytes takes bytes, n returns e
+  require (type_of(bytes) == "list") and (n >= 2)
+  let e = mod_make(0, n)
+  let weight = mod_make(1, e)
+  let step = mod_make(256, e)
+  let i = 0
+  while i < list_len(bytes) do
+    let e = e + mod_make(bytes[i], weight) * weight
+    let weight = weight * step
+    let i = i + 1
+  end
+  ensure mod_modulus(e) == n
+  return e
+end
+
+# The residue of e, modulo p or L, as 32 little-endian bytes: the low byte
+# taken off and the rest divided by 256, exactly, 32 times.
+make a function called cv_to_bytes takes e returns bytes
+  require type_of(e) == "modint"
+  let inv = mod_make(cv_inv256(mod_modulus(e)), e)
+  let byte = cv_byte(0)
+  let bytes = []
+  let i = 0
+  while i < 32 do
+    let b = mod_make(e, byte)
+    let bytes = list_push(bytes, b)
+    let e = (e - mod_make(b, inv)) * inv
+    let i = i + 1
+  end
+  ensure list_len(bytes) == 32
+  return bytes
+end
+
+# Bit i of the little-endian bytes, 0 or 1 modulo the modulus of shape.
+make a function called cv_bit takes bytes, i, shape returns b
+  require (i >= 0) and (i < 8 * list_len(bytes)) and (type_of(shape) == "modint")
+  let b = mod_make((bytes[i shr 3] shr (i band 7)) band 1, shape)
+  ensure mod_modulus(b) == mod_modulus(shape)
+  return b
+end
+
+make a function called cv_cat takes a, b returns c
+  require (type_of(a) == "list") and (type_of(b) == "list")
+  let c = a
+  let i = 0
+  while i < list_len(b) do
+    let c = list_push(c, b[i])
+    let i = i + 1
+  end
+  ensure list_len(c) == list_len(a) + list_len(b)
+  return c
+end
+
+make a function called cv_slice takes a, from, upto returns c
+  require (from >= 0) and (from <= upto) and (upto <= list_len(a))
+  let c = []
+  let i = from
+  while i < upto do
+    let c = list_push(c, a[i])
+    let i = i + 1
+  end
+  ensure list_len(c) == upto - from
+  return c
+end
+
+# ---- X25519 ----
+
+# The Montgomery ladder of RFC 7748 section 5 on the clamped scalar k and the
+# u-coordinate u, 32 bytes each, giving 32 bytes.
+make a function called x25519 takes k, u returns out
+  require (list_len(k) == 32) and (list_len(u) == 32)
+  let kc = cv_cat(cv_cat([k[0] band 248], cv_slice(k, 1, 31)), [(k[31] band 127) bor 64])
+  let x1 = cv_from_bytes(cv_cat(cv_slice(u, 0, 31), [u[31] band 127]), cv_p())
+  let x2 = cv_fe(1)
+  let z2 = cv_fe(0)
+  let x3 = x1
+  let z3 = cv_fe(1)
+  let swap = cv_byte(0)
+  let a24 = cv_fe(121665)
+  let t = 254
+  while t >= 0 do
+    let kt = (kc[t shr 3] shr (t band 7)) band 1
+    let s = mod_make(swap bxor kt, x1)
+    let dx = s * (x2 - x3)
+    let x2 = x2 - dx
+    let x3 = x3 + dx
+    let dz = s * (z2 - z3)
+    let z2 = z2 - dz
+    let z3 = z3 + dz
+    let swap = kt
+    let a = x2 + z2
+    let aa = a * a
+    let b = x2 - z2
+    let bb = b * b
+    let e = aa - bb
+    let c = x3 + z3
+    let d = x3 - z3
+    let da = d * a
+    let cb = c * b
+    let x3 = (da + cb) * (da + cb)
+    let z3 = x1 * (da - cb) * (da - cb)
+    let x2 = aa * bb
+    let z2 = e * (aa + e * a24)
+    let t = t - 1
+  end
+  let s = mod_make(swap, x1)
+  let dx = s * (x2 - x3)
+  let x2 = x2 - dx
+  let dz = s * (z2 - z3)
+  let z2 = z2 - dz
+  let out = cv_to_bytes(x2 * pow(z2, cv_p() - 2))
+  ensure list_len(out) == 32
+  return out
+end
+
+# ---- Ed25519 ----
+
+# A point in extended coordinates [X, Y, Z, T], x = X/Z, y = Y/Z, xy = T/Z.
+make a function called ed_point takes x, y returns pt
+  let pt = [cv_fe(x), cv_fe(y), cv_fe(1), cv_fe(x) * y]
+  ensure list_len(pt) == 4
+  return pt
+end
+
+make a function called ed_base returns pt
+  let pt = ed_point(15112221349535400772501151409588531511454012693041857206046113283949847762202, 46316835694926478169428394003475163141307993866256225615783033603165251855960)
+  ensure list_len(pt) == 4
+  return pt
+end
+
+# Coordinate i of a point, made a field element modulo the modulus of shape:
+# the check knows a list's element only as some value, and mod_make settles
+# that it is a modint before any arithmetic picks an operation by its class.
+make a function called ed_coord takes pt, i, shape returns e
+  require (list_len(pt) == 4) and (i >= 0) and (i < 4) and (type_of(shape) == "modint")
+  let e = mod_make(pt[i], shape)
+  ensure mod_modulus(e) == mod_modulus(shape)
+  return e
+end
+
+# 2d, d = -121665/121666 being the curve's constant.
+make a function called ed_d2 returns d2
+  let d2 = cv_fe(16295367250680780974490674513165176452449235426866156013048779062215315747161)
+  ensure mod_modulus(d2) == cv_p()
+  return d2
+end
+
+# Addition, RFC 8032 section 5.1.4, d2 being ed_d2(): complete, so it also
+# doubles.
+make a function called ed_add takes p1, p2, d2 returns pt
+  require (list_len(p1) == 4) and (list_len(p2) == 4)
+  let x1 = ed_coord(p1, 0, d2)
+  let y1 = ed_coord(p1, 1, d2)
+  let x2 = ed_coord(p2, 0, d2)
+  let y2 = ed_coord(p2, 1, d2)
+  let a = (y1 - x1) * (y2 - x2)
+  let b = (y1 + x1) * (y2 + x2)
+  let c = ed_coord(p1, 3, d2) * d2 * ed_coord(p2, 3, d2)
+  let z = ed_coord(p1, 2, d2) * ed_coord(p2, 2, d2)
+  let d = z + z
+  let e = b - a
+  let f = d - c
+  let g = d + c
+  let h = b + a
+  let pt = [e * f, g * h, f * g, e * h]
+  ensure list_len(pt) == 4
+  return pt
+end
+
+# p1 when the field bit is 0, p2 when it is 1.
+make a function called ed_select takes bit, p1, p2 returns pt
+  require (list_len(p1) == 4) and (list_len(p2) == 4)
+  let pt = []
+  let i = 0
+  while i < 4 do
+    let a = ed_coord(p1, i, bit)
+    let pt = list_push(pt, a + bit * (ed_coord(p2, i, bit) - a))
+    let i = i + 1
+  end
+  ensure list_len(pt) == 4
+  return pt
+end
+
+# The point times the number in the low nbits bits of the bytes: double, add,
+# and keep the sum or not by the bit.
+make a function called ed_mul takes bytes, nbits, pt returns q
+  require (list_len(pt) == 4) and (nbits >= 1) and (nbits <= 8 * list_len(bytes))
+  let d2 = ed_d2()
+  let q = [cv_fe(0), cv_fe(1), cv_fe(1), cv_fe(0)]
+  let i = nbits - 1
+  while i >= 0 do
+    let q = ed_add(q, q, d2)
+    let q = ed_select(cv_bit(bytes, i, d2), q, ed_add(q, pt, d2))
+    let i = i - 1
+  end
+  ensure list_len(q) == 4
+  return q
+end
+
+# y's 32 bytes with x's low bit in the top bit.
+make a function called ed_encode takes pt returns bytes
+  require list_len(pt) == 4
+  let shape = cv_fe(0)
+  let zi = pow(ed_coord(pt, 2, shape), cv_p() - 2)
+  let x = ed_coord(pt, 0, shape) * zi
+  let ys = cv_to_bytes(ed_coord(pt, 1, shape) * zi)
+  let bytes = cv_cat(cv_slice(ys, 0, 31), [ys[31] bor ((mod_make(x, 256) band 1) shl 7)])
+  ensure list_len(bytes) == 32
+  return bytes
+end
+
+# The clamped secret scalar from a seed's hash.
+make a function called ed_scalar takes h returns a
+  require list_len(h) == 64
+  let a = cv_cat(cv_cat([h[0] band 248], cv_slice(h, 1, 31)), [(h[31] band 127) bor 64])
+  ensure list_len(a) == 32
+  return a
+end
+
+make a function called ed25519_public takes seed returns pk
+  require list_len(seed) == 32
+  let pk = ed_encode(ed_mul(ed_scalar(sha512(seed)), 255, ed_base()))
+  ensure list_len(pk) == 32
+  return pk
+end
+
+make a function called ed25519_sign takes seed, msg returns sig
+  require (list_len(seed) == 32) and (type_of(msg) == "list")
+  let h = sha512(seed)
+  let a = ed_scalar(h)
+  let pk = ed_encode(ed_mul(a, 255, ed_base()))
+  let r = cv_from_bytes(sha512(cv_cat(cv_slice(h, 32, 64), msg)), cv_l())
+  let rb = ed_encode(ed_mul(cv_to_bytes(r), 253, ed_base()))
+  let k = cv_from_bytes(sha512(cv_cat(cv_cat(rb, pk), msg)), cv_l())
+  let s = r + k * cv_from_bytes(a, cv_l())
+  let sig = cv_cat(rb, cv_to_bytes(s))
+  ensure list_len(sig) == 64
+  return sig
+end
+
+# ---- verifying, on public values ----
+
+make a function called cv_int takes bytes returns v
+  require type_of(bytes) == "list"
+  let v = 0
+  let i = list_len(bytes) - 1
+  while i >= 0 do
+    let v = v * 256 + mod_value(bytes[i])
+    let i = i - 1
+  end
+  ensure v >= 0
+  return v
+end
+
+# The point the 32 bytes encode, or [] when they encode none (RFC 8032
+# section 5.1.3).
+make a function called ed_decode takes bytes returns pt
+  require list_len(bytes) == 32
+  let top = mod_value(bytes[31])
+  let sign = top shr 7
+  let y0 = cv_int(cv_cat(cv_slice(bytes, 0, 31), [cv_byte(top band 127)]))
+  if y0 >= cv_p() then
+    return []
+  end
+  let y = cv_fe(y0)
+  let u = y * y - 1
+  let v = y * y * 37095705934669439343138083508754565189542113879843219016388785533085940283555 + 1
+  let v3 = v * v * v
+  let x = u * v3 * pow(u * v3 * v3 * v, 7237005577332262213973186563042994240829374041602535252466099000494570602493)
+  let vxx = v * x * x
+  if vxx == -u then
+    let x = x * 19681161376707505956807079304988542015446066515923890162744021073123829784752
+  elif vxx != u then
+    return []
+  end
+  let xv = mod_value(x)
+  if (xv == 0) and (sign == 1) then
+    return []
+  end
+  if xv % 2 != sign then
+    let x = -x
+  end
+  let pt = [x, y, cv_fe(1), x * y]
+  ensure list_len(pt) == 4
+  return pt
+end
+
+make a function called ed25519_verify takes pk, msg, sig returns ok
+  require (type_of(pk) == "list") and (type_of(msg) == "list") and (type_of(sig) == "list")
+  if (list_len(pk) != 32) or (list_len(sig) != 64) then
+    return false
+  end
+  let a = ed_decode(pk)
+  if list_len(a) == 0 then
+    return false
+  end
+  let rb = cv_slice(sig, 0, 32)
+  let sb = cv_slice(sig, 32, 64)
+  if cv_int(sb) >= cv_l() then
+    return false
+  end
+  let k = cv_from_bytes(sha512(cv_cat(cv_cat(rb, pk), msg)), cv_l())
+  let neg = [-a[0], a[1], a[2], -a[3]]
+  let q = ed_add(ed_mul(sb, 253, ed_base()), ed_mul(cv_to_bytes(k), 253, neg), ed_d2())
+  let ok = cv_int(ed_encode(q)) == cv_int(rb)
+  return ok
+end
+
+# ---- hexadecimal, for tests ----
+
+make a function called cv_hex_digit takes c returns v
+  require ((c >= 48) and (c <= 57)) or ((c >= 97) and (c <= 102))
+  if c >= 97 then
+    let v = c - 87
+  else
+    let v = c - 48
+  end
+  ensure (v >= 0) and (v <= 15)
+  return v
+end
+
+make a function called cv_hex_bytes takes text returns bytes
+  require (type_of(text) == "string") and (str_len(text) % 2 == 0)
+  let bytes = []
+  let i = 0
+  while i < str_len(text) do
+    let hi = cv_hex_digit(char_code(text, i))
+    let lo = cv_hex_digit(char_code(text, i + 1))
+    let bytes = list_push(bytes, cv_byte(hi * 16 + lo))
+    let i = i + 2
+  end
+  ensure list_len(bytes) * 2 == str_len(text)
+  return bytes
+end
+
+make a function called cv_hex takes bytes returns text
+  require type_of(bytes) == "list"
+  let digits = "0123456789abcdef"
+  let b = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    let v = mod_value(bytes[i])
+    sb_push(b, digits[v shr 4])
+    sb_push(b, digits[v band 15])
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  ensure str_len(text) == 2 * list_len(bytes)
+  return text
+end

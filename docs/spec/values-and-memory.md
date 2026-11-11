@@ -265,7 +265,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 least 2; any other call stops the program at its `require`. `mod_value(m)` gives the residue,
 from 0 to n - 1, and `mod_modulus(m)` gives n, each an `int` or a `bigint` (1.3). A modint
 prints as `3 mod 7`, and `type_of` and `numeric_kind` give `modint`. A modint's modulus is
-fixed when it is made, and no operation changes it.
+fixed when it is made, and no operation changes it. `mod_make(m, n)` of a modint `m` gives
+m's residue reduced modulo n: the way a value moves from one modulus to another, such as a
+byte into a field or a field element's low byte out of it.
 
 - `+`, `-`, `*` and unary `-` give the modint with the same modulus. An integer operand counts
   as the modint it reduces to. Two modints with different moduli, or an operand of any other
@@ -275,7 +277,7 @@ fixed when it is made, and no operation changes it.
   for a negative `k` the inverse's power; `pow(m, 0)` is 1 modulo n.
 - Two modints are equal when their moduli and their residues are; an integer equals a modint
   when it reduces to it. `<` and its relatives, and `%`, stop the program.
-- When n is 2^k, for k from 1 to 62, a modint is a k-bit word: `band`, `bor` and `bxor` act on
+- When n is 2^k, for k from 1 to 64, a modint is a k-bit word: `band`, `bor` and `bxor` act on
   the words, an integer operand counting as the word it reduces to, `bnot` complements all k
   bits, `shl` and `shr` shift by an `int` count from 0 to k, the bits shifted out lost and zeros
   shifted in, and `rotl(m, s)` and `rotr(m, s)` rotate by `s` from 0 to k. For any other n
@@ -285,8 +287,9 @@ fixed when it is made, and no operation changes it.
   depends on n alone, never on the residues, and the inverse behind `/` is found in a number of
   steps fixed by n. `pow(m, k)` takes time that depends on n, on the sign of k and on the size
   of its representation (64 bits for an `int`, its number of limbs for a `bigint`), never on
-  its bits. An integer operand is reduced as `mod_make` reduces it. Whether the program stops
-  (no inverse, a count out of range) depends on the values. `mod_make`, `mod_value` and
+  its bits. `mod_make` of a modint takes time that depends on the two moduli alone. An
+  integer operand is reduced as `mod_make` reduces it. Whether the program stops (no inverse,
+  a count out of range) depends on the values. `mod_make` of an integer, `mod_value` and
   printing convert between modints and other values, and their time may depend on the values
   converted. The constant-time check (2.7) is how this is tested.
 
@@ -426,7 +429,17 @@ where the time taken can depend on a modint's residue (1.14):
   modint's block always holds a secret, so a value that points to none is not a modint. The
   runtime marks what the IR cannot show itself: where a modint's block is made, what is
   computed from the modulus, a residue leaving the class, and memory being freed, which reads
-  only the block's size.
+  only the block's size. A list's length, count and room, and an element's type word, are
+  public too: they depend on how the list was used and on its elements' classes, never on
+  what a residue is. A call whose argument may be of several classes is followed once for
+  each kind (an int, a modint, a value that holds values, anything else), each with the
+  secrecy that kind can carry, so a callee's `require` rules out the kinds it does not take.
+- **What is not known.** An element read from a list, a vec or another cell is known only as
+  some value, of any class. Arithmetic on it may be string or list arithmetic as far as the
+  check can tell, and a secret reaching that code is reported. A program settles an
+  element's class by reading it through `mod_make(x, shape)`, whose `require` admits only
+  integers and modints, as `self_hosting/v2/lib/sha512.patlang` and `curve25519.patlang`
+  do.
 - **What is reported.** A branch (`if`, `while`, `and`, `or`, `match`) deciding on a secret,
   except one whose one side stops the program; an address computed from a secret, as a list,
   string or memory index; `+`, `-`, `*`, `/`, `%` or unary `-` on a secret integer, whose time
