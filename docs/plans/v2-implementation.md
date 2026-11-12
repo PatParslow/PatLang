@@ -310,6 +310,17 @@ milestone 11). What they needed beyond this plan's first draft:
   fixture. The v2 gates on 2026-11-11 pass: compilers a and b byte identical, the bootstrap
   reader's build and the WASM identical; part1_v2 163/163, part1_interp 163/163, engines_agree
   62/62, part2 111/111, language 297/297 on both engines, match 26/26, block model 211/211.
+  Measured on 2026-11-12, most of a modint operation's time was the check that its operands
+  share a modulus: two values each made by `mod_make(x, n)` hold separate bigints for n, and
+  comparing bigints took about 13 of the 24 microseconds an addition modulo 2^255 - 19 took.
+  `rt_mod_same_modulus` now compares the limb count, kind, bit count and n's limbs already in
+  the two blocks; `rt_mod_like` copies the modulus value without `mod_modulus`'s comparison
+  with 2; `rt_mod_set_int` skips the bit-by-bit reduction for an integer of fewer limbs than
+  n, which is already below n; and modular addition and subtraction use one scratch array,
+  not two. An addition went from 24 to about 7.5 microseconds, a multiplication from 27 to
+  about 11, `mod_make` of a small integer from 55 to about 12, and one X25519 from 174 to
+  about 95 ms. What is left is mostly the generated code's own cost, about 15 ns a word
+  operation. The gates on 2026-11-12 pass, with the same counts as above.
 - **`extern_call_float`**, for C functions taking and returning doubles.
 - **Intervals** came last, as spec 1.12 (`intervals.feature`): class 7, in `runtime/numbers.patlang`,
   freed by the same `rt_finalize` branch as rationals and complex numbers. They were missing

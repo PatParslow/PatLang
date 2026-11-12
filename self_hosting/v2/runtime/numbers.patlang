@@ -454,31 +454,30 @@ make a function called rt_lb_reduce takes d, doff, p, poff, plen, n, noff, count
   return r
 end
 
-# d = a + b modulo the modulus at n, for a and b below it.
+# d = a + b modulo the modulus at n, for a and b below it. d may be a or b,
+# at the same offset, but not n: the sum goes into d, limb by limb after each
+# limb is read, and one scratch array holds the sum less n.
 make a function called rt_lb_add_mod takes d, doff, a, aoff, b, boff, n, noff, count returns r
   require (d != 0) and (a != 0) and (b != 0) and (n != 0) and (count >= 1)
-  let t = rt_lb_new(count)
   let u = rt_lb_new(count)
-  let carry = rt_lb_add(t, 16, a, aoff, b, boff, count)
-  let borrow = rt_lb_sub(u, 16, t, 16, n, noff, count)
-  # t itself only when the sum did not carry and is below n
-  rt_lb_select(d, doff, t, 16, u, 16, count, word_and(word_xor(carry, 1), borrow))
-  rt_lb_free(t)
+  let carry = rt_lb_add(d, doff, a, aoff, b, boff, count)
+  let borrow = rt_lb_sub(u, 16, d, doff, n, noff, count)
+  # the sum itself only when it did not carry and is below n
+  rt_lb_select(d, doff, d, doff, u, 16, count, word_and(word_xor(carry, 1), borrow))
   rt_lb_free(u)
   let r = 0
   ensure r == 0
   return r
 end
 
-# d = a - b modulo the modulus at n, for a and b below it.
+# d = a - b modulo the modulus at n, for a and b below it. d may be a or b, as
+# for rt_lb_add_mod.
 make a function called rt_lb_sub_mod takes d, doff, a, aoff, b, boff, n, noff, count returns r
   require (d != 0) and (a != 0) and (b != 0) and (n != 0) and (count >= 1)
-  let t = rt_lb_new(count)
   let u = rt_lb_new(count)
-  let borrow = rt_lb_sub(t, 16, a, aoff, b, boff, count)
-  rt_lb_add(u, 16, t, 16, n, noff, count)
-  rt_lb_select(d, doff, u, 16, t, 16, count, borrow)
-  rt_lb_free(t)
+  let borrow = rt_lb_sub(d, doff, a, aoff, b, boff, count)
+  rt_lb_add(u, 16, d, doff, n, noff, count)
+  rt_lb_select(d, doff, u, 16, d, doff, count, borrow)
   rt_lb_free(u)
   let r = 0
   ensure r == 0
@@ -590,13 +589,34 @@ make a function called rt_mod_header takes block, off returns w
 end
 
 # Whether two modints have one modulus: at once when their modulus slots hold
-# the same value word (one int, or one bigint shared), else by comparing.
+# the same value word (one int, or one bigint shared), else from the blocks'
+# headers and n's limbs, which n alone decides: the limb count, the kind, the
+# bit count k, and the limbs, which are zeros for 2^k since k gives that n.
+# Comparing these needs no bigint arithmetic. n is public, so the steps may
+# depend on it.
 make a function called rt_mod_same_modulus takes a, b returns same
   require (value_class(a) == 15) and (value_class(b) == 15)
   if (rt_mod_word(a, 16) == rt_mod_word(b, 16)) and (rt_mod_word(a, 24) == rt_mod_word(b, 24)) then
     let same = true
+  elif (rt_mod_word(a, 32) != rt_mod_word(b, 32)) or (rt_mod_word(a, 40) != rt_mod_word(b, 40)) or (rt_mod_word(a, 48) != rt_mod_word(b, 48)) then
+    let same = false
   else
-    let same = mod_modulus(a) == mod_modulus(b)
+    let count = rt_mod_limbs(a)
+    let noff = rt_mod_noff(a)
+    let pa = value_data(a)
+    let pb = value_data(b)
+    let same = true
+    let i = 0
+    while i < count do
+      let wa = mem_load(pa, noff + 8 * i)
+      let wb = mem_load(pb, noff + 8 * i)
+      ct_public(wa)
+      ct_public(wb)
+      if wa != wb then
+        let same = false
+      end
+      let i = i + 1
+    end
   end
   ensure value_class(same) == 1
   return same
@@ -662,7 +682,9 @@ make a function called rt_mod_like takes m returns block
   let count = rt_mod_limbs(m)
   let src = value_data(m)
   let block = rt_alloc(48 + 24 * count)
-  mem_init_value(block, 16, mod_modulus(m))
+  # m's modulus value as it is, counted again: mod_modulus would also compare
+  # it with 2, which for a bigint costs more than the arithmetic
+  mem_init_value(block, 16, mem_load_value(src, 16))
   mem_store(block, 32, count)
   mem_store(block, 40, rt_mod_kind(m))
   mem_store(block, 48, rt_mod_word(m, 48))
@@ -785,7 +807,14 @@ make a function called rt_mod_set_int takes block, x returns r
     end
     rt_lb_mask_top(block, 64, count, rt_mod_header(block, 48))
   else
-    rt_lb_reduce(block, 64, xb, 16, xc, block, noff, count)
+    if xc < count then
+      # n has more than 32 (count - 1) bits and x at most 32 xc, so x is
+      # already below n
+      rt_lb_zero(block, 64, count)
+      rt_lb_copy(block, 64, xb, 16, xc)
+    else
+      rt_lb_reduce(block, 64, xb, 16, xc, block, noff, count)
+    end
     if kind == 1 then
       rt_lb_mont_mul(block, 64, block, 64, block, noff + 8 * count, block, noff, count, rt_mod_header(block, 56))
     end
