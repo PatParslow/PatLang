@@ -2,8 +2,8 @@
 #
 # An isolate is a compiled program plus a private VFS namespace. Execution is
 # in run-to-completion TURNS: isolate_step runs the program once, from the top,
-# in a clean interpreter (world_run); when it ends, its VFS is merged back and
-# the world is discarded. Everything else -- variables, facts, handles -- resets
+# in a world of its own (interp_run.patlang's world backend, spec 1.15); when it
+# ends, its VFS is merged back and the world is given back. Everything else -- variables, facts, handles -- resets
 # every turn, so anything an isolate needs later goes in its VFS. This is the
 # one model that behaves identically native and in the browser, where there are
 # no threads or processes to run an isolate concurrently.
@@ -23,16 +23,11 @@
 # nothing it wrote is kept and its inbox is untouched, so the messages are seen
 # again on the next turn (at-least-once).
 #
-# Needs a runtime with "world_swap" OR "subprocess" (see host_caps);
-# isolate_caps() says which. "world_swap" hosts (the interpreter, the
-# compiled runtime, the browser playground) run a turn in-process via
-# world_run. Hosts with only "subprocess" + "fs" (native x64's actual
-# host_caps -- it has neither world_swap nor an in-process way to compile
-# and run arbitrary source) run a turn by spawning a genuine, separate
-# pat.exe --ir-run OS process instead: see isolate_process.patlang for the
-# marshalling protocol. Both report as "turns" vs "process" rather than one
-# shared name because they do NOT behave identically -- the process backend
-# has no step-count budget (max_steps is a world-only option; use
+# A turn runs in-process, on the v2 interpreter in a world ("turns"), or, when
+# asked for with ["backend", "process"], in a separate interpreter process:
+# see isolate_process.patlang for the marshalling protocol. They report as
+# "turns" vs "process" because they do not behave identically -- the process
+# backend has no step-count budget (max_steps is a world-only option; use
 # timeout_ms instead), only a wall-clock one.
 
 include "context.patlang"
@@ -41,28 +36,19 @@ include "mailbox.patlang"
 include "isolate_process.patlang"
 
 make a function called isolate_caps returns caps
-  if iri_has_cap("world_swap") then
-    return ["turns"]
-  end
   if iri_has_cap("subprocess") and file_exists(interp_pat_path([])) then
-    return ["process"]
+    return ["turns", "process"]
   end
-  return []
+  return ["turns"]
 end
 
 # Per-call backend choice: opts can force one explicitly (["backend",
 # "world"] or ["backend", "process"], mirroring interp_run.patlang's own
-# "backend" option) -- mainly so a selftest can exercise the process
-# backend under the interpreter (where world_swap is normally available)
-# without needing a native x64 compile for every iteration. Auto-detection
-# otherwise matches isolate_caps() exactly.
+# "backend" option). Without one, a turn runs in a world.
 make a function called iso_backend_for takes opts returns name
   let want = iri_opt(opts, "backend", "auto")
   if want == "process" then return "process" end
-  if want == "world" then return "turns" end
-  if iri_has_cap("world_swap") then return "turns" end
-  if iri_has_cap("subprocess") and file_exists(interp_pat_path(opts)) then return "process" end
-  return ""
+  return "turns"
 end
 
 make a function called iso_ns takes id returns ns
@@ -79,9 +65,9 @@ end
 # max_steps (per turn).
 make a function called isolate_start takes ctx, source, opts returns handle
   if iso_backend_for(opts) == "" then
-    return ["", "isolate_start: this runtime has neither world_swap nor subprocess+pat.exe"]
+    return ["", "isolate_start: no backend for these options"]
   end
-  let c = interp_compile(source)
+  let c = interp_compile(ctx, source)
   if c[0] == "err" then
     return ["", c[1]]
   end
@@ -139,8 +125,8 @@ make a function called iso_commit takes id, entries returns done
 end
 
 # isolate_step(handle) -> [ok, stdout, stderr]. Runs one turn, via whichever
-# backend iso_backend_for(handle's opts) picks -- in-process world_run
-# ("turns") or a spawned pat.exe subprocess ("process"); see isolate.patlang's
+# backend iso_backend_for(handle's opts) picks -- in a world ("turns") or a
+# spawned interpreter process ("process"); see isolate.patlang's
 # header and isolate_process.patlang for what differs between them.
 make a function called isolate_step takes ctx, handle returns result
   if isolate_ok(handle) == false then
@@ -160,7 +146,7 @@ make a function called isolate_step takes ctx, handle returns result
   elif backend == "process" then
     let r = isolate_step_process(ctx, handle)
   else
-    return [false, "", "isolate_step: no usable backend (world_swap or subprocess) on this host"]
+    return [false, "", "isolate_step: no usable backend on this host"]
   end
   if r[2] == false then
     return [false, r[0], r[1]]

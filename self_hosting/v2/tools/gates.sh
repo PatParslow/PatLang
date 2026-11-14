@@ -92,4 +92,11 @@ $B/v2.exe self_hosting/tools/run_language_spec_suite.patlang $B/v2_language_suit
 st "language suite build: exit $?"
 run language_v2 $B/v2_language_suite.exe
 run block_model_interp $I self_hosting/block_model/run_block_model_spec_suite.patlang
+# Programs run in worlds, in-process on the interpreter (spec 1.15), and in a
+# separate interpreter process: interp_run, and isolates built on it.
+for t in interp_run_selftest isolate_selftest; do
+  $B/v2.exe self_hosting/$t.patlang $B/$t.exe --workers 8 > "$D/${t}_build.log" 2>&1
+  st "$t build: exit $?"
+  run $t $B/$t.exe
+done
 st "all done"

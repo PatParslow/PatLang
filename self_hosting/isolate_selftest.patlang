@@ -1,11 +1,11 @@
 # Selftest for self_hosting/lib/mailbox.patlang and lib/isolate.patlang.
 #
-# Run from the repo root:
-#   rust-runtime/target/release/pat.exe --ir-run self_hosting/isolate_selftest.patlang
+# Run from the repo root, built by v2:
+#   self_hosting/build/v2.exe self_hosting/isolate_selftest.patlang self_hosting/build/isolate_selftest.exe
+#   self_hosting/build/isolate_selftest.exe
 #
-# Needs a runtime with world_swap in host_caps() (the interpreter, the compiled
-# runtime, the browser playground); a native x64 program has none, and
-# queue_signals_vfs_selftest.patlang covers the refusal there.
+# An isolate's turn runs in a world of its own (docs/spec/values-and-memory.md
+# 1.15), in-process, on any v2 program.
 
 include "lib/includes.patlang"
 include "lib/gherkin.patlang"
@@ -14,13 +14,14 @@ include "lib/isolate.patlang"
 let nl = chr(10)
 
 make a function called ist_src takes lines returns text
-  let out = ""
+  let b = sb_new()
   let i = 0
   while i < list_len(lines) do
-    let out = out + lines[i] + chr(10)
+    sb_push(b, lines[i])
+    sb_push(b, chr(10))
     let i = i + 1
   end
-  return out
+  return sb_str(b)
 end
 
 let ctx = ctx_new()
@@ -47,31 +48,10 @@ let e = mbox_put("box", "alice", "later")
 expect(ctx, "ids are never reused after a box empties", e != a and e != b and e != c, true)
 expect(ctx, "boxes are independent", mbox_count("other"), 0)
 
-# --- isolate: needs world_swap OR subprocess (host_caps). A native x64
-# program has no world_swap (x64_runtime.patlang's own host_caps lists no
-# "world_swap" -- a native program is not an interpreter host, so a real
-# swap-and-run cannot be built there, by design, not by omission) but DOES
-# have "subprocess"+"fs", so isolate_caps() there reports "process", not
-# empty -- isolate_process.patlang's spawned-pat.exe turns cover it (see
-# the forced-["backend","process"] block further down, which exercises
-# that path for real here and is what actually runs natively on x64).
-# This block is specifically the WORLD/"turns" behavioral suite, so it only
-# runs when that backend auto-detects; a truly capability-less host (the
-# only remaining "refused" case) falls to the else below. isolate_start
-# already checks this itself and refuses cleanly before doing anything
-# else -- but every check below assumes isolate_start SUCCEEDED, so
-# running them unguarded against a refused (id == "") handle chases
-# nonsense derived from that empty id instead (iso_ns("") == "/iso/",
-# so isolate_turns/isolate_state's own vfs_read calls land on paths
-# like "/iso//__iso__/turn" -- the doubled slash is a direct, expected
-# symptom of this missing guard, not a separate bug in its own right).
+# --- isolate: a turn runs in a world ("turns"), in-process, on any v2
+# program; the process backend is there too when an interpreter is.
 let top_caps = isolate_caps()
-if list_len(top_caps) > 0 and top_caps[0] == "process" then
-  expect(ctx, "isolate_caps lists process-based isolates (no world_swap, has subprocess)", top_caps[0], "process")
-elif list_len(top_caps) == 0 then
-  expect(ctx, "without world_swap or subprocess an isolate is refused, not half-run", isolate_ok(isolate_start(ctx, "print(1)", [])), false)
-  expect(ctx, "the refusal names the missing capabilities", contains_text(isolate_start(ctx, "print(1)", [])[1], "world_swap"), true)
-else
+if top_caps[0] == "turns" then
   # --- a stateful ping-pong across turns ---
   let worker = ist_src([
     "include \"lib/mailbox.patlang\"",
@@ -143,7 +123,7 @@ else
   let spin = isolate_start(ctx, ist_src(["while true do", "end"]), [["max_steps", 3000]])
   let rs = isolate_step(ctx, spin)
   expect(ctx, "an isolate that never returns is stopped by its budget", rs[0], false)
-  expect(ctx, "the budget error is reported", contains_text(rs[2], "step budget exhausted"), true)
+  expect(ctx, "the budget's stop is reported", contains_text(rs[1], "step budget of 3000 exhausted"), true)
 
   # --- run_until_idle ---
   let hi = isolate_start(ctx, expanded, [])
@@ -156,22 +136,16 @@ else
   # --- a bad program is reported, not fatal ---
   let bad = isolate_start(ctx, "print(1", [])
   expect(ctx, "a source that does not compile gives no isolate", isolate_ok(bad), false)
-  expect(ctx, "the compile error is reported", starts_with(bad[1], "parse error"), true)
+  expect(ctx, "the compile error is reported as the interpreter reports it", starts_with(bad[1], "error: "), true)
 
   expect(ctx, "isolate_caps lists turn-based isolates", isolate_caps()[0], "turns")
 end
 
 # --- process backend: the same isolate semantics, but each turn runs by
-# spawning a genuine, separate pat.exe --ir-run subprocess instead of an
-# in-process world_run swap (self_hosting/lib/isolate_process.patlang). This
-# is native x64's own real path (host_caps has "subprocess"+"fs" but never
-# "world_swap" there), but forcing it here with ["backend", "process"]
-# exercises it under the interpreter too -- which has world_swap and would
-# otherwise never pick this path on its own -- for a fast RED/GREEN loop
-# before the slower native --x64 compile-and-run confirmation. Needs the
-# same "subprocess" + a real pat.exe that isolate_caps() itself checks for;
-# skip cleanly if neither is available (mirrors the world-backend guard
-# above).
+# spawning a separate interpreter process instead of in a world
+# (self_hosting/lib/isolate_process.patlang), forced with ["backend",
+# "process"]. Needs "subprocess" and the interpreter; skipped cleanly
+# without them.
 if (iri_has_cap("subprocess") == false) or (file_exists(interp_pat_path([])) == false) then
   expect(ctx, "process backend skipped: no subprocess capability or pat.exe", true, true)
 else
@@ -256,5 +230,16 @@ else
   expect(ctx, "process backend: run_until_idle stops when the inbox is empty", pidle[1], true)
   expect(ctx, "process backend: one turn was enough to drain both", pidle[0], 1)
 end
+
+# --- a signal into an isolate: the parent sends, the child polls in its turn ---
+let sig_child = ist_src(["signal_use_driver(\"vfs\")", "when ping do", "  signal_reply(\"pong from the isolate\")", "end", "signal_poll(9601, 0)"])
+let sig_src = expand_includes("include \"lib/signals.patlang\"" + nl + sig_child, "self_hosting")
+let sh = isolate_start(ctx, sig_src, [])
+expect(ctx, "the signalled isolate compiles", isolate_ok(sh), true)
+let smid = mbox_put_ns("/iso/" + sh[0], "sig/9601", "parent", "ping" + nl + "hello")
+let sturn = isolate_step(ctx, sh)
+expect(ctx, "the signalled isolate's turn succeeded", sturn[0], true)
+expect(ctx, "the isolate took the signal from its box", mbox_count_ns("/iso/" + sh[0], "sig/9601"), 0)
+expect(ctx, "the reply is in the isolate's namespace", vfs_read("/iso/" + sh[0] + "/sig/9601/reply/" + smid), "pong from the isolate")
 
 ctx_report(ctx)

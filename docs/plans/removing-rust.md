@@ -94,6 +94,35 @@ Made by the project owner on 2026-11-05:
      parameters, and the call passed arguments. A call of such a name now passes none, and
      the scenario "a call with arguments to a name nothing declares stops there in a
      WebAssembly build too" covers it.
+   - **Worlds** ([#256](https://github.com/PatParslow/PatLang/issues/256), spec 1.15). `pat`'s
+     host `world_run` ran a program in-process by swapping every global store for an empty one.
+     v2 has worlds instead, each an object holding a program's state: its named objects,
+     classes, handlers, functions reached by name, logic stores, contract facts and virtual
+     files (`runtime/worlds.patlang`):
+     - `world_call(w, f)` runs a closure in a world, on a fiber. A stop there ends the call, not
+       the program, and what the world prints stays in it.
+     - A fiber runs in the world it was made in and a thread in the world that started it.
+       Worlds nest, and a world can have a step budget, which the interpreter spends.
+     - Nothing is swapped. The runtime finds the world through the thread's context.
+
+     `lib/interp_run.patlang`'s world backend compiles a program's text with the compiler's
+     front end and runs it in a fresh world on the v2 interpreter, which is now a library
+     (`v2/interpreter.patlang`) as well as a command (`v2/interp.patlang`). The world backend
+     and the process backend therefore run the same interpreter and print the same.
+     Isolates' turns run in worlds too. The interpreter lowers a program against the runtime's
+     declarations alone, since it calls the runtime's compiled functions, which takes its start
+     from 3.9 s to 1.7 s. A run in a world costs about 100 ms. `interp_run_selftest` (54
+     tests) and `isolate_selftest` (65) are in the gates now. The gates' first run with worlds
+     passed everything except `queue_signals_vfs_selftest` under block-model: its isolate
+     section brought in the v2 interpreter, which block-model's IR interpreter cannot run, and
+     interpreting a program that asks for every runtime function by name overflowed the stack
+     (the program's own registrations hid the runtime's; fixed in `iv_table`). That section
+     is now in `isolate_selftest`. After the fix the affected suites were re-run on their own,
+     since the full gates take about five and a half hours: part1 on the interpreter 174/174,
+     the worlds feature 11/11 on both engines, the language suite 297/297 interpreted,
+     `queue_signals_vfs_selftest` 28/28 under block-model and the interpreter alike,
+     `isolate_selftest` 65/65 compiled and interpreted, `interp_run_selftest` 54/54
+     compiled and interpreted.
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical. Done, and
@@ -276,7 +305,7 @@ them were seen working on `pat`. `friendly_cli` compiled with 3 failures on the 
 on v2.
 
 Expected differences, needing no fix in v2: `set_var` is gone, as decided
-(`closure_stored`, `x64_to_s_and_rational_mod`). `world_run` belongs to the old route. 9 files fail on
+(`closure_stored`, `x64_to_s_and_rational_mod`). `world_run` belongs to the old route; v2's worlds (spec 1.15) do what it did. 9 files fail on
 an include path that doesn't exist; the one checked, `family_tree_main`, fails on `pat` too.
 
 ### Speed

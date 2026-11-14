@@ -1,0 +1,436 @@
+# v2 runtime: worlds (docs/spec/values-and-memory.md 1.15).
+#
+# A world is where a program's state lives. Its state has one layout wherever it
+# is: offsets 2048 to 4560 from the world's base. The program's own world has
+# runtime_state() as its base; any other world is a block of its own, its base
+# 2048 bytes before the block's payload, so that base + offset lands in it.
+#
+# The state a world holds, by offset (objects.patlang, logic.patlang,
+# vfs.patlang and threads.patlang say what each holds):
+#   2048 to 4096 the classes' event flags   4096 event handlers
+#   4128 which classes' methods raise which events   4144 the classes
+#   4160 the named objects' table   4176 the next class id
+#   4192, 4200 the named table's lock   4208 the functions reached by name
+#   4240 actions   4256 what each action runs   4272 named goals
+#   4368 the virtual files   4384 to 4400 the clauses that have held
+#   4464 the named rule stores
+# and, here:
+#   4480 what the world printed, a string builder (unit in the program's world)
+#   4496 the steps left, -1 for no budget   4504 the budget given
+#   4512 the code the world stopped with   4520 the job of the fiber world_call
+#   runs it on, 0 when no call is running   4528 the context of the thread that
+#   call runs on   4536, 4544 the output's ticket lock   4552 1 once a stop has
+#   ended the call
+#
+# What belongs to the engine and not to any world stays in runtime_state():
+# fibers' jobs (4112), the counter for renaming a rule's variables (4288),
+# processes, sockets, the progress status, and here:
+#   4560 the worlds: a list of [id, base]   4576 the last id given
+#   4584 1 once a world has been made   4592, 4600 the list's ticket lock
+#
+# A thread context holds, at 2680, the base of the world its code runs in, 0
+# for the program's own; a fiber's job holds the base of the world it was made
+# in at 264 (fibers.patlang), and fiber_resume swaps it in.
+quiet_operators()
+
+# The program's world's slots, and the engine's, set once at start.
+make a function called rt_worlds_init returns r
+  let st = runtime_state()
+  mem_store(st, 4480, 0)
+  mem_store(st, 4488, 0)
+  mem_store(st, 4496, 0 - 1)
+  mem_store(st, 4504, 0)
+  mem_store(st, 4512, 0)
+  mem_store(st, 4520, 0)
+  mem_store(st, 4528, 0)
+  mem_store(st, 4536, 0)
+  mem_store(st, 4544, 0)
+  mem_store(st, 4552, 0)
+  mem_store(st, 4560, 0)
+  mem_store(st, 4568, 0)
+  mem_init_value(st, 4560, [])
+  mem_store(st, 4576, 0)
+  mem_store(st, 4584, 0)
+  mem_store(st, 4592, 0)
+  mem_store(st, 4600, 0)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_world_bytes returns n
+  let n = 2512
+  ensure n == 4560 - 2048
+  return n
+end
+
+# The base of the world the running code is in. Until a world has been made
+# every thread's is the program's, and the thread's context is not read.
+make a function called rt_world_base returns b
+  let st = runtime_state()
+  let b = st
+  if mem_load(st, 4584) != 0 then
+    let w = mem_load(rt_context(), 2680)
+    if w != 0 then
+      let b = w
+    end
+  end
+  ensure b != 0
+  return b
+end
+
+make a function called rt_engine_get takes off returns v
+  require ((off == 4112) or (off == 4304) or (off == 4320) or (off == 4336) or (off == 4448) or (off == 4560))
+  let v = mem_load_value(runtime_state(), off)
+  ensure value_live(v)
+  return v
+end
+
+make a function called rt_engine_set takes off, v returns r
+  require ((off == 4112) or (off == 4304) or (off == 4320) or (off == 4336) or (off == 4448) or (off == 4560)) and value_live(v)
+  let r = mem_store_value(runtime_state(), off, v)
+  ensure value_class(r) == 0
+  return r
+end
+
+make a function called rt_ticket_lock takes addr returns r
+  require addr != 0
+  let mine = atomic_add(addr, 1)
+  while mem_load(addr, 8) != mine do
+    let spin = 0
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_ticket_unlock takes addr returns r
+  require addr != 0
+  atomic_add(addr + 8, 1)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- making and freeing ----
+
+make a function called world_new returns id
+  let block = rt_alloc(rt_world_bytes())
+  let k = 0
+  while k < rt_world_bytes() do
+    mem_store(block, 16 + k, 0)
+    let k = k + 8
+  end
+  let b = block + 16 - 2048
+  let st = runtime_state()
+  mem_store(st, 4584, 1)
+  # the functions reached by name of the world making it
+  let by_name = rt_global_get(4208)
+  let ctx = rt_context()
+  let saved = mem_load(ctx, 2680)
+  mem_store(ctx, 2680, b)
+  rt_world_state_init(by_name)
+  mem_store(ctx, 2680, saved)
+  rt_ticket_lock(st + 4592)
+  let id = mem_load(st, 4576) + 1
+  mem_store(st, 4576, id)
+  rt_engine_set(4560, list_push(rt_engine_get(4560), [id, b]))
+  rt_ticket_unlock(st + 4592)
+  ensure id > 0
+  return id
+end
+
+# A new world's slots, the world being the one the code runs in.
+make a function called rt_world_state_init takes by_name returns r
+  require value_class(by_name) == 9
+  rt_objects_init()
+  rt_logic_state_init()
+  rt_vfs_init()
+  let b = rt_world_base()
+  mem_init_value(b, 4208, by_name)
+  mem_init_value(b, 4480, sb_new())
+  mem_store(b, 4496, 0 - 1)
+  mem_store(b, 4504, 0)
+  mem_store(b, 4512, 0)
+  mem_store(b, 4520, 0)
+  mem_store(b, 4528, 0)
+  mem_store(b, 4536, 0)
+  mem_store(b, 4544, 0)
+  mem_store(b, 4552, 0)
+  let r = 0
+  ensure (r == 0) and (b != runtime_state())
+  return r
+end
+
+# The base of world id, stopping when there is no such world.
+make a function called rt_world_of takes id returns b
+  require value_class(id) == 2
+  let st = runtime_state()
+  rt_ticket_lock(st + 4592)
+  let worlds = rt_engine_get(4560)
+  rt_ticket_unlock(st + 4592)
+  let i = rt_pairs_index(worlds, id)
+  if i < 0 then
+    print("no world " + id + ": never made, or freed")
+    let b = rt_stop(77)
+    ensure b != 0
+    return b
+  end
+  let b = worlds[i][1]
+  ensure b != 0
+  return b
+end
+
+make a function called world_free takes id returns done
+  require value_class(id) == 2
+  let b = rt_world_of(id)
+  if mem_load(b, 4520) != 0 then
+    print("world_free: code is running in world " + id)
+    rt_stop(77)
+  end
+  rt_world_check_threads(b, id)
+  rt_world_end_fibers(b)
+  let st = runtime_state()
+  rt_ticket_lock(st + 4592)
+  let worlds = rt_engine_get(4560)
+  let kept = []
+  let k = 0
+  while k < list_len(worlds) do
+    if worlds[k][0] != id then
+      let kept = list_push(kept, worlds[k])
+    end
+    let k = k + 1
+  end
+  rt_engine_set(4560, kept)
+  rt_ticket_unlock(st + 4592)
+  let offs = [4096, 4128, 4144, 4176, 4208, 4240, 4256, 4272, 4368, 4464, 4480]
+  let k = 0
+  while k < list_len(offs) do
+    rt_release_value_at(b, offs[k])
+    let k = k + 1
+  end
+  let table = mem_load(b, 4160)
+  let cap = mem_load(table, 24)
+  let i = 0
+  while i < cap do
+    rt_release_value_at(table, 32 + 16 * i)
+    let i = i + 1
+  end
+  rt_free(table)
+  rt_free(mem_load(b, 4384))
+  rt_free(b + 2048 - 16)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# A thread started in the world must have ended before the world goes.
+make a function called rt_world_check_threads takes b, id returns r
+  require (b != 0) and (value_class(id) == 2)
+  rt_jobs_lock()
+  let jobs = rt_engine_get(4112)
+  rt_jobs_unlock()
+  let k = 0
+  while k < list_len(jobs) do
+    let job = jobs[k][1]
+    let tctx = mem_load(job, 64)
+    if tctx != 0 then
+      if (mem_load(tctx, 2680) == b) and (mem_load(job, 88) != 1) then
+        print("world_free: a thread started in world " + id + " is still running")
+        rt_stop(77)
+      end
+    end
+    let k = k + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The world's fibers that have not finished are given back with it.
+make a function called rt_world_end_fibers takes b returns r
+  require b != 0
+  rt_jobs_lock()
+  let jobs = rt_engine_get(4112)
+  rt_jobs_unlock()
+  let k = 0
+  while k < list_len(jobs) do
+    let job = jobs[k][1]
+    if (mem_load(job, 64) == 0) and (mem_load(job, 264) == b) then
+      rt_fiber_abandon(jobs[k][0])
+    end
+    let k = k + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- running code in a world ----
+
+make a function called world_call takes id, f returns result
+  require (value_class(id) == 2) and (value_class(f) == 10)
+  let b = rt_world_of(id)
+  if mem_load(b, 4520) != 0 then
+    print("world_call: code is already running in world " + id)
+    rt_stop(77)
+  end
+  let ctx = rt_context()
+  let saved = mem_load(ctx, 2680)
+  mem_store(ctx, 2680, b)
+  # f is called as a closure through a variable is, its arguments checked (spec 1.13)
+  let fid = rt_fiber_start(|resumed| { return f() })
+  mem_store(ctx, 2680, saved)
+  mem_store(b, 4520, rt_fiber_job(fid))
+  mem_store(b, 4528, ctx)
+  mem_store(b, 4552, 0)
+  let value = fiber_resume(fid, value_make(0, 0))
+  mem_store(b, 4520, 0)
+  mem_store(b, 4528, 0)
+  if mem_load(b, 4552) == 1 then
+    rt_world_end_stopped(fid)
+    let result = ["stopped", mem_load(b, 4512)]
+    ensure list_len(result) == 2
+    return result
+  end
+  let result = ["done", value]
+  ensure list_len(result) == 2
+  return result
+end
+
+# After a stop: the fibers the stop left part-way through, the call's own and
+# every fiber between it and the one that stopped, are never resumed again.
+make a function called rt_world_end_stopped takes fid returns r
+  require value_class(fid) == 2
+  if fiber_alive(fid) then
+    rt_fiber_abandon(fid)
+  end
+  rt_jobs_lock()
+  let jobs = rt_engine_get(4112)
+  rt_jobs_unlock()
+  let k = 0
+  while k < list_len(jobs) do
+    let job = jobs[k][1]
+    if (mem_load(job, 64) == 0) and (mem_load(job, 88) == 2) then
+      rt_fiber_abandon(jobs[k][0])
+    end
+    let k = k + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# A stop: inside a world_call, it ends the call. Gives back only when the code
+# runs in no world_call, and the program then stops.
+make a function called rt_world_stop takes code returns r
+  require value_class(code) == 2
+  let r = 0
+  let st = runtime_state()
+  if mem_load(st, 4584) != 0 then
+    let ctx = rt_context()
+    let b = mem_load(ctx, 2680)
+    if b != 0 then
+      let root = mem_load(b, 4520)
+      if root != 0 then
+        mem_store(b, 4512, code)
+        mem_store(b, 4552, 1)
+        if ctx != mem_load(b, 4528) then
+          # a thread started in the world: it ends here
+          extern_call("KERNEL32.DLL", "ExitThread", code)
+        end
+        # the fibers between this one and the call's own are left part-way
+        let job = mem_load(ctx, 2592)
+        while (job != 0) and (job != root) do
+          mem_store(job, 88, 2)
+          let job = rt_job_by_handle(mem_load(job, 80))
+        end
+        extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(root, 80))
+      end
+    end
+  end
+  ensure r == 0
+  return r
+end
+
+# The job of the fiber with this handle, 0 for none (a thread's own fiber).
+make a function called rt_job_by_handle takes h returns job
+  rt_jobs_lock()
+  let jobs = rt_engine_get(4112)
+  rt_jobs_unlock()
+  let job = 0
+  let k = 0
+  while k < list_len(jobs) do
+    let j = jobs[k][1]
+    if (mem_load(j, 64) == 0) and (mem_load(j, 72) == h) then
+      let job = j
+    end
+    let k = k + 1
+  end
+  ensure value_class(job) == 2
+  return job
+end
+
+# ---- what a world printed ----
+
+# Bytes printed by code in a world other than the program's.
+make a function called rt_world_write takes b, addr, len returns r
+  require (b != 0) and (len >= 0)
+  rt_ticket_lock(b + 4536)
+  let block = value_data(mem_load_value(b, 4480))
+  let have = mem_load(block, 16)
+  rt_sb_reserve(block, have + len)
+  rt_copy_bytes(mem_load(block, 32) + 16 + have, addr, len)
+  mem_store(block, 16, have + len)
+  rt_ticket_unlock(b + 4536)
+  let r = len
+  ensure r == len
+  return r
+end
+
+make a function called world_output takes id returns text
+  require value_class(id) == 2
+  let b = rt_world_of(id)
+  rt_ticket_lock(b + 4536)
+  let text = sb_str(mem_load_value(b, 4480))
+  rt_ticket_unlock(b + 4536)
+  ensure value_class(text) == 8
+  return text
+end
+
+# ---- step budgets ----
+
+make a function called world_steps takes id, n returns done
+  require (value_class(id) == 2) and (value_class(n) == 2) and (n >= 0)
+  let b = rt_world_of(id)
+  mem_store(b, 4496, n)
+  mem_store(b, 4504, n)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# Whether the world the code runs in has a budget.
+make a function called rt_world_counting returns yes
+  let yes = false
+  if mem_load(runtime_state(), 4584) != 0 then
+    let yes = mem_load(rt_world_base(), 4496) >= 0
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called world_step returns done
+  let b = rt_world_base()
+  let left = mem_load(b, 4496)
+  if left == 0 then
+    print("step budget of " + mem_load(b, 4504) + " exhausted")
+    rt_stop(78)
+  end
+  if left > 0 then
+    mem_store(b, 4496, left - 1)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end

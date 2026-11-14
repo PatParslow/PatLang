@@ -296,6 +296,48 @@ byte into a field or a field element's low byte out of it.
   printing convert between modints and other values, and their time may depend on the values
   converted. The constant-time check (2.7) is how this is tested.
 
+### 1.15 Worlds
+
+A world is where a program's state lives: its named objects, its classes, the handlers
+registered for events, the functions reached by name, its logic stores, actions and goals, the
+contract facts recorded, and its virtual files. A program starts in a world of its own. A
+program can make more, and run code in one, which then sees that world's state and none of
+the caller's.
+
+- `world_new()` gives a new world, an `int`. It holds what a program that has just started
+  holds: the built-in classes and nothing else, apart from the functions reached by name of the
+  world that made it. A program run in the world registers its own there (1.13), and they
+  reach it alone.
+- `world_call(w, f)` calls the closure `f`, which takes no arguments, in world `w`, on a fiber
+  of its own, and gives `["done", value]`, `value` being what `f` returned. What `f` adds,
+  declares, registers or writes is added to `w`, and none of it to the caller's world.
+- What code in a world other than the program's own prints goes to the world, and nothing goes
+  to standard output; `world_output(w)` gives everything printed in `w` so far.
+- When code running in `world_call` stops (a failed contract, `exit_with`, a call to a name
+  nothing declares, any stop), the stop ends the call and not the program: `world_call` gives
+  `["stopped", code]`, `code` being the exit code the program would have stopped with, and its
+  caller goes on. What the stop said is in the world's output. The frames the stop leaves are
+  not unwound, so what they held is not given back.
+- A fiber runs in the world it was made in, whoever resumes it, and a thread in the world of
+  the code that started it. A stop on a thread other than the one `world_call` runs on ends
+  that thread; `world_call` gives `["stopped", code]` when `f` returns.
+- `world_call` may run inside a world: worlds nest, each with its own state.
+- `world_steps(w, n)` gives world `w` a budget of `n` steps, and `world_step()` spends one step
+  of the budget of the world the code runs in. When a step is spent with none left, the world
+  stops with `step budget of N exhausted`, code 78. A world has no budget until it is given
+  one; the program's own world has none. The interpreter spends a step at each call and at
+  each jump back to an earlier instruction, so a budget bounds what a program interpreted in
+  the world can do; compiled code spends none.
+- A call of a runtime function in a program the interpreter runs reaches the function as the
+  interpreter has it, whatever the program registers under that name when it starts. So a
+  program that asks for every runtime function by name, as one that runs source in a world
+  through the interpreter does, runs the same interpreted as compiled.
+- `world_free(w)` gives back everything `w` holds, and `w` then names no world. Freeing a world
+  that code is running in stops the program.
+- A value `f` returns is an ordinary value in the caller's world, except an object of a class
+  the world declared: its class is the world's, so it is taken out of a world as plain data
+  (its fields' values) and never as the object.
+
 ## Part 2: the new version's runtime and compiler
 
 ### 2.1 Representation

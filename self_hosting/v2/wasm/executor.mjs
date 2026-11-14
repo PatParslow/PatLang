@@ -17,6 +17,8 @@ if (isNode) {
 }
 
 class Exit extends Error {}
+// a thread ending itself (ExitThread): a stop in a world on a thread of its own
+class ThreadExit extends Error {}
 
 function start(init) {
   const { module, memory, ctl, out, me, kind } = init;
@@ -77,6 +79,7 @@ function start(init) {
       }
       throw new Exit();
     },
+    ExitThread(code) { throw new ThreadExit(); },
     GetStdHandle(n) {
       const k = Number(BigInt.asIntN(32, n));
       return k === -10 ? STD_IN : k === -11 ? STD_OUT : k === -12 ? STD_ERR : -1;
@@ -252,7 +255,11 @@ function start(init) {
       u8().set(new TextEncoder().encode(init.cmdline + "\0"), HOST_AREA);
       x.main();
     } else if (kind === "thread") {
-      x.table.get(init.start)(init.param);
+      try {
+        x.table.get(init.start)(init.param);
+      } catch (e) {
+        if (!(e instanceof ThreadExit)) throw e;
+      }
       Atomics.store(C, L.THREADS + init.thread, 1);
       Atomics.notify(C, L.THREADS + init.thread);
       post({ t: "done", e: me });

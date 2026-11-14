@@ -2,17 +2,18 @@
 # (docs/spec/values-and-memory.md 1.1, 1.2, 1.4, 1.5, 1.6).
 quiet_operators()
 
-# The runtime's values live in its state area (rt_global_get/set):
-#   4096 event handlers: a list of [event name, closure]
-#   4112 fibers.patlang's jobs by id (the events whose handlers are running
-#        are each thread's: memory.patlang's thread context, rt_active_events)
+# The program's values live in the state of the world it runs in
+# (worlds.patlang; rt_global_get/set):
+#   4096 event handlers: a list of [event name, closure] (the events whose
+#        handlers are running are each thread's: memory.patlang's thread
+#        context, rt_active_events)
 #   4128 which classes' methods raise which events: [class id, event]
 #   4144 the classes: a list of class records (rt_class_*)
 #   4160 named objects: the address of their table (rt_named_*), not a value
 #   4176 the next class id for a declared class
 #   4192, 4200 the named table's ticket lock: next ticket, ticket being served
 # (4208 is threads.patlang's functions by name, 4464 logic.patlang's named
-# rule stores)
+# rule stores; 4112, fibers.patlang's jobs, is the engine's: rt_engine_get)
 # and, at 2048 + 8 * class id (ids below 256), each class's event flag:
 # nonzero once a handler is registered for an event its methods raise.
 #
@@ -24,27 +25,29 @@ quiet_operators()
 # word is its class id with the heap bit, so value_class gives the class.
 
 make a function called rt_global_get takes off returns v
-  require (off >= 4096) and (off < 4480) and (word_and(off, 7) == 0)
-  let v = mem_load_value(runtime_state(), off)
+  require (off >= 4096) and (off < 4560) and (word_and(off, 7) == 0) and (off != 4112)
+  let v = mem_load_value(rt_world_base(), off)
   ensure value_live(v)
   return v
 end
 
 make a function called rt_global_set takes off, v returns r
-  require (off >= 4096) and (off < 4480) and (word_and(off, 7) == 0) and value_live(v)
-  let r = mem_store_value(runtime_state(), off, v)
+  require (off >= 4096) and (off < 4560) and (word_and(off, 7) == 0) and (off != 4112) and value_live(v)
+  let r = mem_store_value(rt_world_base(), off, v)
   ensure value_class(r) == 0
   return r
 end
 
+# The world's objects, classes and events, in the world the code runs in.
 make a function called rt_objects_init returns r
-  let st = runtime_state()
-  let off = 4096
-  while off <= 4144 do
-    mem_store(st, off, 0)
-    mem_store(st, word_add(off, 8), 0)
-    mem_init_value(st, off, [])
-    let off = word_add(off, 16)
+  let st = rt_world_base()
+  let offs = [4096, 4128, 4144]
+  let k = 0
+  while k < 3 do
+    mem_store(st, offs[k], 0)
+    mem_store(st, word_add(offs[k], 8), 0)
+    mem_init_value(st, offs[k], [])
+    let k = word_add(k, 1)
   end
   mem_store(st, 4192, 0)
   mem_store(st, 4200, 0)
@@ -245,7 +248,7 @@ end
 # the earliest object of a name first. The lock lets any thread find or add one.
 
 make a function called rt_named_lock returns r
-  let st = runtime_state()
+  let st = rt_world_base()
   let mine = atomic_add(st + 4192, 1)
   while mem_load(st, 4200) != mine do
     let spin = 0
@@ -256,7 +259,7 @@ make a function called rt_named_lock returns r
 end
 
 make a function called rt_named_unlock returns r
-  atomic_add(runtime_state() + 4200, 1)
+  atomic_add(rt_world_base() + 4200, 1)
   let r = 0
   ensure r == 0
   return r
@@ -301,7 +304,7 @@ end
 # The table moved to twice the capacity, each name's objects in their order. The
 # caller holds the lock, so nothing is reading the old table when it is freed.
 make a function called rt_named_grow returns r
-  let st = runtime_state()
+  let st = rt_world_base()
   let old = mem_load(st, 4160)
   let cap = mem_load(old, 24)
   let block = rt_named_table_new(2 * cap)
@@ -327,10 +330,10 @@ end
 make a function called rt_named_add takes name, o returns r
   require (value_class(name) == 8) and value_live(o)
   rt_named_lock()
-  let block = mem_load(runtime_state(), 4160)
+  let block = mem_load(rt_world_base(), 4160)
   if mem_load(block, 16) >= mem_load(block, 24) then
     rt_named_grow()
-    let block = mem_load(runtime_state(), 4160)
+    let block = mem_load(rt_world_base(), 4160)
   end
   rt_named_insert(block, [name, o])
   rt_named_unlock()
@@ -343,7 +346,7 @@ end
 make a function called rt_named_find takes name returns o
   require value_class(name) == 8
   rt_named_lock()
-  let block = mem_load(runtime_state(), 4160)
+  let block = mem_load(rt_world_base(), 4160)
   let bucket = mem_load_value(block, rt_named_slot(block, name))
   let i = rt_pairs_index(bucket, name)
   let o = false
@@ -358,7 +361,7 @@ end
 make a function called rt_named_remove takes name, o returns r
   require (value_class(name) == 8) and value_live(o)
   rt_named_lock()
-  let block = mem_load(runtime_state(), 4160)
+  let block = mem_load(rt_world_base(), 4160)
   let off = rt_named_slot(block, name)
   let bucket = mem_load_value(block, off)
   let kept = []
@@ -381,7 +384,7 @@ make a function called new takes class_name, rest returns o
   require (value_class(class_name) == 8) and (value_class(rest) == 9) and ((list_len(rest) == 0) or (value_class(rest[0]) == 8))
   if list_len(rest) > 1 then
     print("new takes a class and a name; a class declaration says what it inherits")
-    let o = extern_call("KERNEL32.DLL", "ExitProcess", 75)
+    let o = rt_stop(75)
     ensure rt_is_object(o) and (type_of(o) == class_name)
     return o
   end
@@ -517,7 +520,7 @@ make a function called send takes v, m, rest returns r
   let f = rt_find_method(rt_class_by_id(value_class(o)), m)
   if f == false then
     print("no method " + m + " for " + type_of(o))
-    let r = extern_call("KERNEL32.DLL", "ExitProcess", 75)
+    let r = rt_stop(75)
     ensure value_live(r)
     return r
   end
@@ -659,7 +662,7 @@ make a function called rt_on takes event, handler returns r
     if raises[k][1] == event then
       let cid = raises[k][0]
       if cid < 256 then
-        mem_store(runtime_state(), word_add(2048, word_mul(8, cid)), 1)
+        mem_store(rt_world_base(), word_add(2048, word_mul(8, cid)), 1)
       end
     end
     let k = word_add(k, 1)
@@ -676,7 +679,7 @@ make a function called rt_event_flag takes cid returns on
     ensure value_class(on) == 1
     return on
   end
-  let on = mem_load(runtime_state(), word_add(2048, word_mul(8, cid))) != 0
+  let on = mem_load(rt_world_base(), word_add(2048, word_mul(8, cid))) != 0
   ensure value_class(on) == 1
   return on
 end

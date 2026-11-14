@@ -2,46 +2,47 @@
 # output back as a value: [stdout, stderr, ok].
 #
 # Two backends behind one API:
-#   "world"   in-process: compile with lexer/parser/lower, then the world_run
-#             host (every global store swapped for an empty one, print
-#             captured, caller's world restored afterwards). Works wherever
-#             host_caps() lists "world_swap" -- native pat.exe, the compiled
-#             runtime and the browser playground -- and needs no subprocess.
+#   "world"   in-process: the v2 interpreter (v2/interpreter.patlang) compiles
+#             the program with the compiler's own front end and runs it in a
+#             world of its own (docs/spec/values-and-memory.md 1.15), which
+#             holds everything the program adds, declares or writes and none
+#             of the caller's state. What it prints, and a stop, stay in the
+#             world. Needs no subprocess.
 #   "process" a fresh interpreter child via exec_capture_io: the v2
 #             interpreter (self_hosting/build/v2_interp.exe), or a pat.exe
 #             run with --quiet --ir-run. Needs "subprocess" in host_caps()
 #             and that executable; honours a wall-clock timeout_ms and stdin.
 #
+# Both run the program on the same interpreter, so they print the same: a
+# program that does not compile prints its errors on stdout ("error: ..."),
+# as the interpreter's command line does, and so does a stop. stderr is the
+# child process's and is empty on the world backend.
+#
 # Options are a list of [key, value] pairs (all optional):
 #   backend      "auto" (default) | "world" | "process"
-#   max_steps    world only: loop-iteration/call budget; exhausted => ok=false
+#   max_steps    world only: a step budget, spent at each call and each jump
+#                back; exhausted => ok=false
 #   timeout_ms   process only: wall-clock limit; expiry => ok=false
 #   stdin        process only: text fed to the child's stdin
 #   base_dir     resolve `include` lines in the source relative to this
-#                directory before running (both backends; without it an
-#                include line is left for the child to fail on)
+#                directory before running (both backends)
 #   pat_path     path to the child interpreter (else $PATLANG_PAT, else
 #                self_hosting/build/v2_interp.exe)
-#   vfs_in       world only: [[path, content], ...] preloaded into the child
-#   vfs_out_prefix  world only: only VFS paths under this prefix come back
+#   vfs_in       world only: [[path, content], ...] written into the world's
+#                virtual files before the program runs
+#   vfs_out_prefix  world only: the world's virtual files under this prefix
+#                come back, as [[path, content], ...]
 #
-# "auto" picks the world backend when it exists (a spawn costs orders of
-# magnitude more than a swap), and the process backend when the caller asks
-# for something only it can do (timeout_ms, stdin) or the world backend is
-# missing (a native x64 program).
+# "auto" picks the world backend (a spawn costs far more than a world), and
+# the process backend when the caller asks for something only it can do
+# (timeout_ms, stdin). The world backend refuses stdin.
 #
-# Not supported by the world backend: reading stdin (world_run rejects it
-# outright; interp_backend already routes to the process backend whenever
-# stdin is given). `syntax { ... }` DSL blocks ARE supported on both
-# backends -- interp_compile expands them before compiling.
+# The runtime's declarations the world backend compiles with are read once,
+# and kept in the caller's context (lib/context.patlang).
 
 include "context.patlang"
 include "includes.patlang"
-include "lexer.patlang"
-include "parser.patlang"
-include "lower.patlang"
-include "regex_dsl.patlang"
-include "syntax_dsl.patlang"
+include "../v2/interpreter.patlang"
 
 make a function called iri_opt takes opts, key, fallback returns value
   let i = 0
@@ -64,22 +65,31 @@ make a function called iri_has_cap takes name returns found
   return false
 end
 
-# Source -> ["ok", ir] or ["err", message]. Expands `syntax NAME { ... }`
-# DSL blocks first (self-hosted mirror of the native parser's own built-in
-# syntax_dsl.rs support -- the self-hosted lexer/parser used here has no
-# knowledge of that grammar at all, so without this a world-backend compile
-# of any such program fails immediately with a generic parse error, while
-# the process backend's spawned real pat.exe succeeds (it gets the native
-# preprocessing for free). A program with no `syntax` blocks is unaffected
-# -- expand_syntax_dsls is a no-op pass-through when it finds none.
-make a function called interp_compile takes src returns result
-  let expanded = expand_syntax_dsls(src)
-  let ast = parse_program(tokenize(expanded))
-  let e = parse_find_error(ast[1])
-  if e[0] != "" then
-    return ["err", "parse error (line " + e[1] + "): " + e[0]]
+# The runtime's declarations (v2/front.patlang), read the first time.
+make a function called iri_runtime takes ctx returns rt
+  if ctx_has(ctx, "__interp_run_runtime") then
+    return ctx_get(ctx, "__interp_run_runtime")
   end
-  return ["ok", lower_program(ast)]
+  let rt = iv_runtime("")
+  ctx_set(ctx, "__interp_run_runtime", rt)
+  return rt
+end
+
+# Source -> ["ok", program] or ["err", what the interpreter prints for it], the
+# program being what interp_run_ir runs. `syntax` definitions are expanded and
+# includes resolved as the interpreter's command line does.
+make a function called interp_compile takes ctx, src returns result
+  let c = iv_compile(iri_runtime(ctx), "_interp_run.patlang", src)
+  if c[0] == "ok" then
+    return c
+  end
+  let b = sb_new()
+  let i = 0
+  while i < list_len(c[1]) do
+    sb_push(b, "error: " + c[1][i] + chr(10))
+    let i = i + 1
+  end
+  return ["err", sb_str(b)]
 end
 
 make a function called interp_pat_path takes opts returns path
@@ -111,21 +121,15 @@ end
 # "world" or "process" for these options on this runtime, "" if neither can run.
 make a function called interp_backend takes opts returns name
   let want = iri_opt(opts, "backend", "auto")
-  let has_world = iri_has_cap("world_swap")
   let has_proc = iri_has_cap("subprocess") and file_exists(interp_pat_path(opts))
-  if want == "world" then
-    if has_world then return "world" end
-    return ""
-  end
+  if want == "world" then return "world" end
   if want == "process" then
     if has_proc then return "process" end
     return ""
   end
   let needs_proc = iri_opt(opts, "timeout_ms", 0) > 0 or iri_opt(opts, "stdin", "") != ""
   if needs_proc and has_proc then return "process" end
-  if has_world then return "world" end
-  if has_proc then return "process" end
-  return ""
+  return "world"
 end
 
 make a function called iri_failed takes message returns result
@@ -133,7 +137,7 @@ make a function called iri_failed takes message returns result
 end
 
 # Does this pat.exe understand --quiet (drops the echo of the final value)?
-# Probed once per pat_path and cached in a var.
+# Probed once per pat_path and cached in the context.
 make a function called iri_quiet_supported takes ctx, pat returns yes
   let key = "__interp_run_quiet_" + pat
   let cached = ctx_text(ctx, key)
@@ -184,8 +188,8 @@ make a function called interp_run_full takes ctx, src, opts returns result
   if iri_opt(opts, "stdin", "") != "" then
     return iri_failed("interp_run: stdin needs the process backend")
   end
-  let c = interp_compile(src)
-  if c[0] == "err" then return iri_failed(c[1]) end
+  let c = interp_compile(ctx, src)
+  if c[0] == "err" then return [c[1], "", false, []] end
   return interp_run_ir(c[1], opts)
 end
 
@@ -195,13 +199,39 @@ make a function called interp_run takes ctx, src, opts returns result
   return [r[0], r[1], r[2]]
 end
 
-# World backend on an already-lowered IR shape (skips compile: run the same
-# program many times, or build IR directly).
-make a function called interp_run_ir takes ir, opts returns result
-  if iri_has_cap("world_swap") == false then
-    return iri_failed("interp_run_ir: this runtime has no world_swap")
+# The world backend on a program interp_compile gave (compile once, run many
+# times): a new world for each run, given back after it.
+make a function called interp_run_ir takes program, opts returns result
+  let w = world_new()
+  let steps = iri_opt(opts, "max_steps", 0)
+  if steps > 0 then world_steps(w, steps) end
+  let vin = iri_opt(opts, "vfs_in", [])
+  world_call(w, || {
+    let i = 0
+    while i < list_len(vin) do
+      vfs_write(vin[i][0], vin[i][1])
+      let i = i + 1
+    end
+    return true
+  })
+  let r = iv_world_run(w, program)
+  let out = world_output(w)
+  let prefix = iri_opt(opts, "vfs_out_prefix", "")
+  let vout = []
+  if prefix != "" then
+    let vout = world_call(w, || {
+      let paths = vfs_list(prefix)
+      let got = []
+      let i = 0
+      while i < list_len(paths) do
+        let got = list_push(got, [paths[i], vfs_read(paths[i])])
+        let i = i + 1
+      end
+      return got
+    })[1]
   end
-  return world_run(ir, opts)
+  world_free(w)
+  return [out, "", r[0] == "done", vout]
 end
 
 # Runs src on both backends and compares stdout, ok and the first line of

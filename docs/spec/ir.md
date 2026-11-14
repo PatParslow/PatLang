@@ -284,6 +284,8 @@ which posts back the output and the exit code. A page of your own can serve `ind
   Output therefore keeps the order in which the threads wrote it, and the launcher writes it out.
 - **The exit.** `ExitProcess` records the exit code. The launcher then writes the remaining output
   and stops every Worker. A trap in any executor gives exit code 101, after a line naming the trap.
+  `ExitThread` ends the thread calling it as its returning would, which is how a stop in a world
+  ends a thread started in the world (values-and-memory.md 1.15).
 - **What a browser has none of.** There are no files, processes or sockets, so each of those calls
   fails as Windows reports a file that is not there. `GetEnvironmentVariableA` finds only what the
   launcher is given, which by default is nothing, and the standard input is empty.

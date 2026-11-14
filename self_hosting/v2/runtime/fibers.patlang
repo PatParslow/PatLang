@@ -13,7 +13,9 @@
 # 88 1 once it has finished; for a fiber, 96 its deadline in ms or -1, 104 the
 # last budget check or -1, 112 how many durations are held, 120 up to 16 of them,
 # 248 the events whose handlers are running on it while another runs (the
-# running one's are in the thread context at 2576).
+# running one's are in the thread context at 2576), 264 the base of the world
+# it was made in, 0 for the program's (worlds.patlang). 88 is 2 for a fiber a
+# stop in a world left part-way, never to be resumed.
 #
 # A thread context holds the job of the fiber it is running at 2592, 0 for
 # none, and at 2600 the thread's own fiber once it has resumed one.
@@ -21,6 +23,9 @@ quiet_operators()
 
 make a function called rt_fibers_init returns r
   let st = runtime_state()
+  mem_store(st, 4112, 0)
+  mem_store(st, 4120, 0)
+  mem_init_value(st, 4112, [])
   mem_store(st, 4416, 0)
   mem_store(st, 4424, 0)
   mem_store(st, 4432, 0)
@@ -55,7 +60,7 @@ make a function called rt_job_add takes job returns id
   let st = runtime_state()
   let id = mem_load(st, 4432) + 1
   mem_store(st, 4432, id)
-  rt_global_set(4112, list_push(rt_global_get(4112), [id, job]))
+  rt_engine_set(4112, list_push(rt_engine_get(4112), [id, job]))
   rt_jobs_unlock()
   ensure id > 0
   return id
@@ -64,7 +69,7 @@ end
 # The job of an id, or 0.
 make a function called rt_job_of takes id returns job
   rt_jobs_lock()
-  let jobs = rt_global_get(4112)
+  let jobs = rt_engine_get(4112)
   rt_jobs_unlock()
   let job = 0
   if value_class(id) == 2 then
@@ -86,7 +91,7 @@ end
 make a function called rt_job_remove takes id returns r
   require value_class(id) == 2
   rt_jobs_lock()
-  let jobs = rt_global_get(4112)
+  let jobs = rt_engine_get(4112)
   let kept = []
   let n = list_len(jobs)
   let k = 0
@@ -97,7 +102,7 @@ make a function called rt_job_remove takes id returns r
     end
     let k = k + 1
   end
-  rt_global_set(4112, kept)
+  rt_engine_set(4112, kept)
   rt_jobs_unlock()
   let r = 0
   ensure r == 0
@@ -119,8 +124,10 @@ end
 
 make a function called rt_fiber_start takes f returns id
   require value_class(f) == 10
-  let job = rt_job_new(248)
+  let job = rt_job_new(256)
   mem_init_value(job, 16, f)
+  # a fiber runs in the world it was made in
+  mem_store(job, 264, mem_load(rt_context(), 2680))
   mem_store(job, 96, 0 - 1)
   mem_store(job, 104, 0 - 1)
   let h = extern_call("KERNEL32.DLL", "CreateFiber", 0, thread_entry_address(), job)
@@ -157,12 +164,15 @@ make a function called fiber_resume takes id, arg returns value
   end
   mem_init_value(job, 32, arg)
   mem_store(ctx, 2592, job)
-  # the fiber runs with its own list of running events (spec 1.4)
+  # the fiber runs with its own list of running events (spec 1.4), in its world
   let mine = mem_take_value(ctx, 2576)
   mem_init_value(ctx, 2576, mem_take_value(job, 248))
+  let my_world = mem_load(ctx, 2680)
+  mem_store(ctx, 2680, mem_load(job, 264))
   extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(job, 72))
   # this fiber may have been resumed on another thread since
   let back = rt_context()
+  mem_store(back, 2680, my_world)
   mem_store(back, 2592, running)
   mem_init_value(job, 248, mem_take_value(back, 2576))
   mem_init_value(back, 2576, mine)
@@ -188,6 +198,24 @@ make a function called fiber_yield takes value returns delivered
   let delivered = mem_take_value(job, 32)
   ensure value_live(delivered)
   return delivered
+end
+
+# A fiber that will never be resumed, given back with all it holds but what
+# its frames hold.
+make a function called rt_fiber_abandon takes id returns r
+  require value_class(id) == 2
+  let job = rt_fiber_job(id)
+  if job != 0 then
+    extern_call("KERNEL32.DLL", "DeleteFiber", mem_load(job, 72))
+    rt_job_remove(id)
+    rt_release_value_at(job, 16)
+    rt_release_value_at(job, 32)
+    rt_release_value_at(job, 248)
+    rt_free(job)
+  end
+  let r = 0
+  ensure r == 0
+  return r
 end
 
 make a function called fiber_alive takes id returns yes
