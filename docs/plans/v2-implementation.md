@@ -612,6 +612,19 @@ sources described under "Removing the globals".
   extended with a list keeps its order, and a list taken from it before keeps its value", passes;
   peak memory stays at 5.4 MB from 500 to 4,000 rounds of extending and dropping vecs. Gates
   pass (below).
+- **The interpreter's slots and the compiler's inline slots (GitHub #238), 2026-11-14.** The
+  translated code now holds each operand as its byte offset in the frame, and each jump as the
+  byte offset of its target, so the loop no longer multiplies a slot number on every read. The
+  x64 code generator also works out, per function, which slots only ever hold inline values
+  (every write a literal, a machine word or a copy of another such slot) and emits no heap-bit
+  test for their retains and releases (spec 2.2, rule 5). The interpreter's heap-bit tests fell
+  from 118,089 to 76,699. Measured on the same machine: `bench_fib` 8.9 s, where it took 15.7 s;
+  `bench_manycalls` 14.6 s (24.3 s); `bench_sumloop` 15.4 s (31.5 s); `bench_strconcat` 2.8 s
+  (4.2 s). The new scenario "a slot that only ever holds an inline value is never tested for a
+  heap block" failed before the change (RED) and passes. Gates pass (below).
+- **v2 gates on 2026-11-14, after the inline slots:** fixpoint byte identical, bootstrap and WASM
+  identical; part1_v2 163/163, part1_interp 163/163, engines_agree 62/62, part2 114/114,
+  language 297/297 on both engines, match 26/26, block model 211/211.
 - **v2 gates on 2026-11-08, after the keys and `vec_extend`:** fixpoint byte identical, bootstrap
   and WASM identical; part1_v2 100/100, part1_interp 100/100, engines_agree 62/62, part2 104/104,
   language 250/250 on both engines, match 26/26, block model 211/211.

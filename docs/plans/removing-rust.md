@@ -244,8 +244,13 @@ an include path that doesn't exist; the one checked, `family_tree_main`, fails o
   translated code is now one list of ints, its frames come from one block, and two ints add
   directly: `bench_fib` 14.8 s, `bench_manycalls` 26.1 s, `bench_sumloop` 32.1 s and
   `bench_strconcat` 3.2 s, measured while other programs were running, so 1.6-10 times
-  slower than `pat`. Most of what remains is the compiled code itself: every temporary goes to
-  the stack, every reference count is an atomic add, and contracts are checked as it runs.
+  slower than `pat`. On 2026-11-14 the translated code began holding byte offsets in place of
+  slot numbers, and the compiler stopped testing the heap bit of slots that only ever hold
+  inline values: `bench_fib` 8.9 s (`pat` 2.1 s), `bench_manycalls` 14.6 s (2.9 s),
+  `bench_sumloop` 15.4 s (3.4 s) and `bench_strconcat` 2.8 s (6.9 s), so 4-5 times slower than
+  `pat` on the first three and faster on the fourth. Most of what remains is the compiled code
+  itself: every temporary goes to the stack, every reference count is an atomic add, and
+  contracts are checked as it runs.
 - **The native compiler** takes 103 s on a tiny program where the same compiler on `pat` takes 30 s,
   81 s of it linking ([#239](https://github.com/PatParslow/PatLang/issues/239)). Half of the link
   was `let xs = list_push(xs, f(xs))` copying the list on each push; with that fixed, the

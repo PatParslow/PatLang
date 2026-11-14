@@ -328,7 +328,9 @@ requires. It is invisible to programs. The rules:
    releases what it holds.
 5. A value in the data word with no heap block (`int`, `float`, `bool`,
    `unit`) has nothing to count. The type word says so; no test of the
-   data word is needed.
+   data word is needed. Where the compiler can see that a slot only ever
+   holds such a value (every write to it is a literal, a machine word or
+   another such slot), it does not test the type word either.
 
 There are no other rules. Each function's ownership behaviour follows
 from its PatLang source by these rules. It is recorded per function as a

@@ -301,7 +301,7 @@ make a function called xv_un takes b, op, d, a, n returns done
 end
 
 # Machine primitives (ir_prim_arity). A word result is an int.
-make a function called xv_prim takes b, name, d, args, n returns done
+make a function called xv_prim takes b, name, d, args, n, inline returns done
   if (name == "ct_secret") or (name == "ct_public") or (name == "ct_reveal") then
     # marks for the constant-time check, doing nothing
     xv_line(b, "mov rax, 0")
@@ -408,7 +408,7 @@ make a function called xv_prim takes b, name, d, args, n returns done
   if (name == "mem_store_value") or (name == "mem_init_value") then
     # the memory takes a reference to the value (rule 3); mem_store_value
     # releases the value it overwrites, read into d first
-    xv_count(b, "rt_retain", args[2], "ms" + n)
+    xv_count_unless_inline(b, "rt_retain", args[2], "ms" + n, inline)
     if name == "mem_store_value" then
       xv_line(b, "mov rax, " + xv_d(args[0]))
       xv_line(b, "mov rcx, " + xv_d(args[1]))
@@ -661,7 +661,7 @@ end
 
 # A list literal: rt_list_alloc(n), then each element, with a reference of
 # its own (rule 3), written at block + 32 + 16k.
-make a function called xv_list takes b, d, slots, n returns done
+make a function called xv_list takes b, d, slots, n, inline returns done
   let count = list_len(slots)
   xv_line(b, "mov rax, " + count)
   xv_line(b, "push rax")
@@ -672,7 +672,7 @@ make a function called xv_list takes b, d, slots, n returns done
   xv_store_result(b, d)
   let k = 0
   while k < count do
-    xv_count(b, "rt_retain", slots[k], "li" + n + "_" + k)
+    xv_count_unless_inline(b, "rt_retain", slots[k], "li" + n + "_" + k, inline)
     xv_line(b, "mov rax, " + xv_d(d))
     xv_line(b, "mov rcx, " + xv_t(slots[k]))
     xv_line(b, "mov [rax+" + (32 + 16 * k) + "], rcx")
@@ -687,7 +687,7 @@ end
 # of parameters it takes at block + 32, 1 at block + 40 when the last is named
 # rest, then each captured value, with a reference of its own, at
 # block + 48 + 16k (runtime/closures.patlang).
-make a function called xv_closure takes b, d, fname, slots, nparams, takes_rest, n returns done
+make a function called xv_closure takes b, d, fname, slots, nparams, takes_rest, n, inline returns done
   let count = list_len(slots)
   xv_line(b, "mov rax, " + count)
   xv_line(b, "push rax")
@@ -705,7 +705,7 @@ make a function called xv_closure takes b, d, fname, slots, nparams, takes_rest,
   xv_line(b, "mov [rcx+40], rax")
   let k = 0
   while k < count do
-    xv_count(b, "rt_retain", slots[k], "cl" + n + "_" + k)
+    xv_count_unless_inline(b, "rt_retain", slots[k], "cl" + n + "_" + k, inline)
     xv_line(b, "mov rax, " + xv_d(d))
     xv_line(b, "mov rcx, " + xv_t(slots[k]))
     xv_line(b, "mov [rax+" + (48 + 16 * k) + "], rcx")
@@ -812,6 +812,89 @@ make a function called xv_facts_used takes facts returns used
   return [v2_contains(facts[0], "added") or v2_contains(facts[0], "added_to")]
 end
 
+# Whether an instruction's result is always an inline value, whatever its
+# operands hold: a literal (a string literal's heap bit is clear), a machine
+# primitive's word or bool, an extern's word, or a cleared slot. Three
+# primitives give a value from memory or from two words, which may be counted.
+make a function called xv_writes_inline takes ins returns yes
+  let op = ins[0]
+  if (op == "const") or (op == "extern") or (op == "externf") or (op == "clear") then
+    return true
+  end
+  if op == "prim" then
+    let name = ins[2]
+    return (name != "value_make") and (name != "mem_load_value") and (name != "mem_take_value")
+  end
+  return false
+end
+
+# For each slot, whether it only ever holds an inline value (spec 2.2, rule 5):
+# it is written, every write to it is inline (xv_writes_inline) or a copy or
+# move from such a slot, and it is no parameter, which its caller wrote. Its
+# retains and releases then do nothing, so none is emitted. Order does not
+# matter: a slot is inline only if each of its writes is.
+make a function called xv_inline_slots takes func returns inline
+  require ir_well_formed(func, true)
+  let nslots = ir_fn_nslots(func)
+  let written = vec_new()
+  let bad = vec_new()
+  let k = 0
+  while k < nslots do
+    vec_push(written, false)
+    vec_push(bad, k < ir_fn_nparams(func))
+    let k = k + 1
+  end
+  let from = vec_new()
+  let into = vec_new()
+  let instrs = ir_fn_instrs(func)
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    let writes = (op != "label") and (op != "jump") and (op != "branch") and (op != "return") and (op != "retain") and (op != "release")
+    if writes then
+      let d = ins[1]
+      vec_set(written, d, true)
+      if (op == "copy") or (op == "move") then
+        vec_push(from, ins[2])
+        vec_push(into, d)
+      elif not xv_writes_inline(ins) then
+        vec_set(bad, d, true)
+      end
+    end
+    let i = i + 1
+  end
+  # a copy of a slot that may hold a counted value may hold one too
+  let changed = true
+  while changed do
+    let changed = false
+    let e = 0
+    while e < vec_len(from) do
+      if vec_get(bad, vec_get(from, e)) and (not vec_get(bad, vec_get(into, e))) then
+        vec_set(bad, vec_get(into, e), true)
+        let changed = true
+      end
+      let e = e + 1
+    end
+  end
+  let inline = vec_new()
+  let k = 0
+  while k < nslots do
+    vec_push(inline, vec_get(written, k) and (not vec_get(bad, k)))
+    let k = k + 1
+  end
+  ensure vec_len(inline) == nslots
+  return inline
+end
+
+# A retain or release of slot s, unless s only ever holds an inline value.
+make a function called xv_count_unless_inline takes b, which, s, n, inline returns done
+  if vec_get(inline, s) then
+    return true
+  end
+  return xv_count(b, which, s, n)
+end
+
 # facts: the program facts.
 make a function called xv_fn_asm takes func, facts returns asm
   require ir_well_formed(func, true)
@@ -847,6 +930,7 @@ make a function called xv_fn_asm takes func, facts returns asm
     let p = p + 1
   end
   let data = sb_new()
+  let inline = xv_inline_slots(func)
   let instrs = ir_fn_instrs(func)
   let i = 0
   while i < list_len(instrs) do
@@ -866,7 +950,7 @@ make a function called xv_fn_asm takes func, facts returns asm
     elif op == "un" then
       xv_un(b, ins[2], ins[1], ins[3], i)
     elif op == "prim" then
-      xv_prim(b, ins[2], ins[1], ins[3], i)
+      xv_prim(b, ins[2], ins[1], ins[3], i, inline)
     elif op == "extern" then
       xv_extern(b, ins[3], ins[1], ins[4], frame_bytes, false)
     elif op == "externf" then
@@ -899,16 +983,16 @@ make a function called xv_fn_asm takes func, facts returns asm
       xv_line(b, "leave")
       xv_line(b, "ret")
     elif op == "retain" then
-      xv_count(b, "rt_retain", ins[1], i)
+      xv_count_unless_inline(b, "rt_retain", ins[1], i, inline)
     elif op == "release" then
-      xv_count(b, "rt_release", ins[1], i)
+      xv_count_unless_inline(b, "rt_release", ins[1], i, inline)
     elif op == "clear" then
       xv_line(b, "mov rax, 0")
       xv_line(b, "mov " + xv_t(ins[1]) + ", rax")
     elif op == "list" then
-      xv_list(b, ins[1], ins[2], i)
+      xv_list(b, ins[1], ins[2], i, inline)
     elif op == "closure" then
-      xv_closure(b, ins[1], ins[2], ins[3], ins[4], ins[5], i)
+      xv_closure(b, ins[1], ins[2], ins[3], ins[4], ins[5], i, inline)
     elif op == "callv" then
       xv_callv(b, ins[1], ins[2], ir_callv_unchecked(ins), i)
     elif op == "move" then

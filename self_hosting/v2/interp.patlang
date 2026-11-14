@@ -29,9 +29,15 @@ include "front.patlang"
 
 make a function called iv_slot takes vars, s returns code
   if v2_contains(vars, s) then
-    return s
+    return iv_off(s)
   end
-  return 0 - 1 - s
+  return 0 - iv_off(s)
+end
+
+# Where slot or aux entry k's value is in a frame or list: its type word's
+# offset, never 0, so a temporary's code can be its negative.
+make a function called iv_off takes k returns off
+  return 32 + 16 * k
 end
 
 make a function called iv_slots takes vars, slots returns codes
@@ -85,7 +91,10 @@ end
 #   9 take d t        10 list d n s...  11 closure d name n s...
 #   12 closure call d n s...            14 needs the compiler
 #   15 a+ d t s (t's value moved into +)
-# cell, name and k are indexes into aux; d and t are slots, s a slot code.
+# cell, name and k are indexes into aux; d and t are slots, s a slot code. Each is
+# the offset it reads (iv_off), worked out here once so running it adds nothing:
+# a variable's code is its offset and a temporary's the negative of its offset.
+# Every position, pc included, is its word's offset in the code list's block.
 make a function called iv_unary_code takes op returns code
   if op == "-" then
     return 0
@@ -144,26 +153,26 @@ make a function called iv_translate takes func returns tr
       end
       vec_set(labels, ins[1], list_len(code))
     elif op == "const" then
-      let code = iv_put3(code, 0, ins[1], list_len(aux))
+      let code = iv_put3(code, 0, iv_off(ins[1]), iv_off(list_len(aux)))
       let aux = list_push(aux, iv_const_value(ins))
     elif op == "copy" then
-      let code = iv_put3(code, 1, ins[1], iv_slot(vars, ins[2]))
+      let code = iv_put3(code, 1, iv_off(ins[1]), iv_slot(vars, ins[2]))
     elif op == "call" then
       # the function itself is found at the first call; its cell keeps it
-      let code = iv_put4(code, 2, ins[1], list_len(aux), list_len(aux) + 1)
+      let code = iv_put4(code, 2, iv_off(ins[1]), iv_off(list_len(aux)), iv_off(list_len(aux) + 1))
       let aux = list_push(aux, iv_cell_new())
       let aux = list_push(aux, ins[2])
       let code = iv_push_slots(code, vars, ins[3])
     elif (op == "op") and (ins[2] == "a+") then
-      let code = iv_put4(code, 15, ins[1], ins[3], iv_slot(vars, ins[4]))
+      let code = iv_put4(code, 15, iv_off(ins[1]), iv_off(ins[3]), iv_slot(vars, ins[4]))
     elif op == "op" then
-      let code = iv_put3(code, 3, ins[1], iv_op_code(ins[2]))
+      let code = iv_put3(code, 3, iv_off(ins[1]), iv_op_code(ins[2]))
       let code = iv_put2(code, iv_slot(vars, ins[3]), iv_slot(vars, ins[4]))
     elif op == "un" then
-      let code = iv_put3(code, 4, ins[1], iv_unary_code(ins[2]))
+      let code = iv_put3(code, 4, iv_off(ins[1]), iv_unary_code(ins[2]))
       let code = list_push(code, iv_slot(vars, ins[3]))
     elif op == "prim" then
-      let code = iv_put3(code, 5, ins[1], list_len(aux))
+      let code = iv_put3(code, 5, iv_off(ins[1]), iv_off(list_len(aux)))
       let aux = list_push(aux, ins[2])
       let code = iv_push_slots(code, vars, ins[3])
     elif op == "jump" then
@@ -176,12 +185,12 @@ make a function called iv_translate takes func returns tr
     elif op == "return" then
       let code = iv_put2(code, 8, iv_slot(vars, ins[1]))
     elif op == "take" then
-      let code = iv_put3(code, 9, ins[1], ins[2])
+      let code = iv_put3(code, 9, iv_off(ins[1]), iv_off(ins[2]))
     elif op == "list" then
-      let code = iv_put2(code, 10, ins[1])
+      let code = iv_put2(code, 10, iv_off(ins[1]))
       let code = iv_push_slots(code, vars, ins[2])
     elif op == "closure" then
-      let code = iv_put3(code, 11, ins[1], list_len(aux))
+      let code = iv_put3(code, 11, iv_off(ins[1]), iv_off(list_len(aux)))
       let aux = list_push(aux, [ins[2], ins[5]])
       let code = iv_push_slots(code, vars, ins[3])
     elif op == "callv" then
@@ -190,7 +199,7 @@ make a function called iv_translate takes func returns tr
       if ir_callv_unchecked(ins) == 1 then
         let kind = 16
       end
-      let code = iv_put2(code, kind, ins[1])
+      let code = iv_put2(code, kind, iv_off(ins[1]))
       let code = iv_push_slots(code, vars, ins[2])
     else
       print("interpreter: " + op + " needs the compiler")
@@ -200,7 +209,7 @@ make a function called iv_translate takes func returns tr
   end
   let i = 0
   while i < list_len(fixups) do
-    let code = list_set(code, fixups[i][0], vec_get(labels, fixups[i][1]))
+    let code = list_set(code, fixups[i][0], iv_off(vec_get(labels, fixups[i][1])) + 8)
     let i = i + 1
   end
   return [code, aux, ir_fn_nslots(func)]
@@ -331,9 +340,9 @@ end
 # A slot read: a variable's value stays, a temporary's moves out.
 make a function called iv_read takes block, s returns v
   if s >= 0 then
-    return mem_load_value(block, 32 + 16 * s)
+    return mem_load_value(block, s)
   end
-  return mem_take_value(block, 32 + 16 * (0 - 1 - s))
+  return mem_take_value(block, 0 - s)
 end
 
 # The values of n slot codes, the first code's word at w.
@@ -373,23 +382,23 @@ end
 make a function called iv_loop takes table, code, aux, block, sk returns result
   let cb = value_data(code)
   let ab = value_data(aux)
-  let n = mem_load(cb, 16)
-  let pc = 0
-  while pc < n do
-    let at = cb + 40 + 16 * pc
+  let end_pc = iv_off(mem_load(cb, 16)) + 8
+  let pc = 40
+  while pc < end_pc do
+    let at = cb + pc
     let kind = mem_load(at, 0)
     if kind == 3 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_op(mem_load(at, 32), iv_read(block, mem_load(at, 48)), iv_read(block, mem_load(at, 64))))
-      let pc = pc + 5
+      mem_store_value(block, mem_load(at, 16), iv_op(mem_load(at, 32), iv_read(block, mem_load(at, 48)), iv_read(block, mem_load(at, 64))))
+      let pc = pc + 80
     elif kind == 2 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_call(table, ab, at, block, sk))
-      let pc = pc + 5 + mem_load(at, 64)
+      mem_store_value(block, mem_load(at, 16), iv_call(table, ab, at, block, sk))
+      let pc = pc + 80 + 16 * mem_load(at, 64)
     elif kind == 1 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_read(block, mem_load(at, 32)))
-      let pc = pc + 3
+      mem_store_value(block, mem_load(at, 16), iv_read(block, mem_load(at, 32)))
+      let pc = pc + 48
     elif kind == 0 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), mem_load_value(ab, 32 + 16 * mem_load(at, 32)))
-      let pc = pc + 3
+      mem_store_value(block, mem_load(at, 16), mem_load_value(ab, mem_load(at, 32)))
+      let pc = pc + 48
     elif kind == 7 then
       if iv_read(block, mem_load(at, 16)) then
         let pc = mem_load(at, 32)
@@ -401,13 +410,13 @@ make a function called iv_loop takes table, code, aux, block, sk returns result
     elif kind == 8 then
       return iv_read(block, mem_load(at, 16))
     elif kind == 9 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), mem_take_value(block, 32 + 16 * mem_load(at, 32)))
-      let pc = pc + 3
+      mem_store_value(block, mem_load(at, 16), mem_take_value(block, mem_load(at, 32)))
+      let pc = pc + 48
     elif kind == 15 then
       # The taken value goes straight into the call, so op_add_taken holds its only
       # reference and can append in place; a let would keep a second one.
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), op_add_taken(mem_take_value(block, 32 + 16 * mem_load(at, 32)), iv_read(block, mem_load(at, 48))))
-      let pc = pc + 4
+      mem_store_value(block, mem_load(at, 16), op_add_taken(mem_take_value(block, mem_load(at, 32)), iv_read(block, mem_load(at, 48))))
+      let pc = pc + 64
     else
       let pc = iv_rare(table, ab, at, block, kind, pc)
     end
@@ -420,31 +429,31 @@ end
 # next instruction's position.
 make a function called iv_rare takes table, ab, at, block, kind, pc returns next
   if kind == 10 then
-    mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_read_words(block, at + 48, mem_load(at, 32)))
-    let pc = pc + 3 + mem_load(at, 32)
+    mem_store_value(block, mem_load(at, 16), iv_read_words(block, at + 48, mem_load(at, 32)))
+    let pc = pc + 48 + 16 * mem_load(at, 32)
   elif kind == 4 then
     let u = mem_load(at, 32)
     let v = iv_read(block, mem_load(at, 48))
     if u == 0 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), -v)
+      mem_store_value(block, mem_load(at, 16), -v)
     elif u == 1 then
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), bnot v)
+      mem_store_value(block, mem_load(at, 16), bnot v)
     else
-      mem_store_value(block, 32 + 16 * mem_load(at, 16), not v)
+      mem_store_value(block, mem_load(at, 16), not v)
     end
-    let pc = pc + 4
+    let pc = pc + 64
   elif kind == 5 then
     let vals = iv_read_words(block, at + 64, mem_load(at, 48))
-    mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_prim(mem_load_value(ab, 32 + 16 * mem_load(at, 32)), vals))
-    let pc = pc + 4 + mem_load(at, 48)
+    mem_store_value(block, mem_load(at, 16), iv_prim(mem_load_value(ab, mem_load(at, 32)), vals))
+    let pc = pc + 64 + 16 * mem_load(at, 48)
   elif kind == 11 then
     let vals = iv_read_words(block, at + 64, mem_load(at, 48))
-    mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_closure(table, mem_load_value(ab, 32 + 16 * mem_load(at, 32)), vals))
-    let pc = pc + 4 + mem_load(at, 48)
+    mem_store_value(block, mem_load(at, 16), iv_closure(table, mem_load_value(ab, mem_load(at, 32)), vals))
+    let pc = pc + 64 + 16 * mem_load(at, 48)
   elif (kind == 12) or (kind == 16) then
     let vals = iv_read_words(block, at + 48, mem_load(at, 32))
-    mem_store_value(block, 32 + 16 * mem_load(at, 16), iv_call_closure(vals, kind == 16))
-    let pc = pc + 3 + mem_load(at, 32)
+    mem_store_value(block, mem_load(at, 16), iv_call_closure(vals, kind == 16))
+    let pc = pc + 48 + 16 * mem_load(at, 32)
   else
     return extern_call("KERNEL32.DLL", "ExitProcess", 80)
   end
@@ -507,12 +516,12 @@ end
 # function's translated code, a list, or the closure. The arguments go straight
 # into the callee's frame, in order, a temporary's value moved there.
 make a function called iv_call takes table, ab, at, block, sk returns r
-  let cell = mem_load_value(ab, 32 + 16 * mem_load(at, 32))
+  let cell = mem_load_value(ab, mem_load(at, 32))
   let target = false
   if iv_cell_ready(cell) then
     let target = iv_cell_value(cell)
   else
-    let target = iv_cell_fill(cell, iv_call_target(table, mem_load_value(ab, 32 + 16 * mem_load(at, 48))))
+    let target = iv_cell_fill(cell, iv_call_target(table, mem_load_value(ab, mem_load(at, 48))))
   end
   let n = mem_load(at, 64)
   if value_class(target) == 9 then

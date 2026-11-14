@@ -26,6 +26,11 @@ Feature: five ownership rules, and no others (spec 2.2)
     When each is retained and released ten times
     Then no heap block is touched and no count changes
 
+  Scenario: a slot that only ever holds an inline value is never tested for a heap block
+    Given a function whose locals only ever hold machine words, and one whose local once holds a string
+    When their generated code is inspected
+    Then the first tests no type word's heap bit, the second still does, and they print 342 and 4
+
   Scenario: every ownership fact the compiler uses comes from these rules
     Given the compiler's source
     When it is searched for lists of runtime function names
