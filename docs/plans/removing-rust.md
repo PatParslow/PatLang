@@ -19,6 +19,9 @@ Made by the project owner on 2026-11-05:
 ## Order
 
 1. **Close the gaps the survey found.** This shows whether v2 is viable as the everyday route.
+   Done: [#245](https://github.com/PatParslow/PatLang/issues/245) and
+   [#233](https://github.com/PatParslow/PatLang/issues/233) were closed on 2026-11-14 after
+   checking them against the current v2. The gaps left are speed, under step 2.
 2. **Move tooling off `pat --ir-run`** ([#246](https://github.com/PatParslow/PatLang/issues/246)).
    The compiler, suite runners and portfolio build run on the native v2 compiler and the v2
    interpreter.
@@ -43,7 +46,8 @@ Made by the project owner on 2026-11-05:
      (they test the old engine), and the portfolio build.
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
-   the IR, that compiler builds itself, and the generations must be byte identical.
+   the IR, that compiler builds itself, and the generations must be byte identical. Done, and
+   the issue was closed on 2026-11-14; `gates.sh` checks the chain on every run.
 
    Progress, 2026-11-07:
    - The IR is specified in `docs/spec/ir.md`, and `compile.patlang ... --ir` writes it. The
