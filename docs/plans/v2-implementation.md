@@ -292,7 +292,11 @@ milestone 11). What they needed beyond this plan's first draft:
   1,000,000-iteration one runs outside the suite, at about 167 ms an iteration, with
   self_hosting/v2/tools/x25519_million.patlang, which saves a checkpoint every 1,000
   iterations and resumes from it; a run stopped at 2,000 and resumed reaches the same k at
-  3,000 as one run straight through; started 2026-11-11, not yet finished), all 518 Wycheproof X25519 cases, RFC 8032's keys and
+  3,000 as one run straight through; the full run, started 2026-11-11 and resumed once from
+  its checkpoint at 10,000, finished on 2026-11-14 with k =
+  `7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424`, RFC 7748 section
+  5.2's value, its last 990,000 iterations taking 179,845 s at 181 ms each on the runtime
+  before the modint speed-up below), all 518 Wycheproof X25519 cases, RFC 8032's keys and
   signatures, and Wycheproof Ed25519 verification (117 valid accepted, 64 invalid rejected,
   and the 29 marked acceptable all accepted). Two new scenarios in the language suite's
   `modular_integers.feature`, and a fifth in `constant_time.feature`: the check finds no
