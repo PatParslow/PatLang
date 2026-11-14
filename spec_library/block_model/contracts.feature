@@ -49,4 +49,4 @@ Feature: design by contract (Phase 12 of the full-language expansion)
   Scenario: passing contracts are recorded as queryable facts, as in the real engine
     Given a function with one passing require and one passing ensure, called once, then a solve over contract_holds for that function
     When it runs through bm_lower_program/bi_run
-    Then solve finds two facts, as pat --ir-run does for the identical source
+    Then solve finds two facts, as the v2 interpreter does for the identical source

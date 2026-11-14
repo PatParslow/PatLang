@@ -20,7 +20,7 @@ Feature: top-level statements, script-style programs (GitHub issue #155)
   Scenario: a script-style program's own top-level body runs, calling its declared functions
     Given a program whose main body is top-level let, calls, an if and a while, with its only function declared first
     When it runs through bm_lower_program/bi_run
-    Then every printed value of the script matches exactly what pat --ir-run produces for the identical source
+    Then every printed value of the script matches exactly what the v2 interpreter produces for the identical source
 
   Scenario: a program with only function declarations still enters at its first function
     Given a program with three functions and no top-level statements

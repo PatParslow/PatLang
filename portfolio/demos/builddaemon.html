@@ -26,8 +26,8 @@
 #   let port_id = signal_claim(9401)
 #   if port_id &gt;= 0 then
 #     # primary: hold the port, poll it inside your own event loop
-#     when quit do set_var(&quot;should_stop&quot;, &quot;1&quot;) end
-#     when status do signal_reply(&quot;uptime: &quot; + get(&quot;__vars&quot;, &quot;uptime&quot;)) end
+#     when quit do vfs_write(&quot;/app/should_stop&quot;, &quot;1&quot;) end
+#     when status do signal_reply(&quot;uptime: &quot; + vfs_read(&quot;/app/uptime&quot;)) end
 #     while running do
 #       ... your own work ...
 #       signal_poll(port_id, 20)   # cheap, non-blocking; fires when/emit
@@ -107,9 +107,9 @@ make a function called signal_poll takes port_id, timeout_ms returns name
     let sig_name = substr(msg, 0, nl)
     let payload = substr(msg, nl + 1, msg.length - nl - 1)
   end
-  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  signal_reply(&quot;&quot;)
   emit(sig_name, payload)
-  tcp_write(conn, get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  tcp_write(conn, vfs_read(signal_reply_key()))
   tcp_close(conn)
   return sig_name
 end
@@ -120,8 +120,18 @@ end
 # instead (fire-and-forget senders never read a reply anyway) or if this is
 # called outside of a signal-triggered handler at all.
 make a function called signal_reply takes text returns done
-  set_var(&quot;__signal_reply&quot;, text)
+  vfs_write(signal_reply_key(), &quot;&quot; + text)
   return true
+end
+
+# Where a handler's reply waits, and the forced driver: named in-memory files,
+# since a `when` handler takes only its event's name and data.
+make a function called signal_reply_key returns key
+  return &quot;/signal_state/reply&quot;
+end
+
+make a function called signal_driver_key returns key
+  return &quot;/signal_state/driver&quot;
 end
 
 # signal_send(port, name, payload) -&gt; true once delivered, discarding any
@@ -174,8 +184,7 @@ end
 # registered in the same world.
 
 make a function called signal_driver returns name
-  let forced = &quot;&quot; + get(&quot;__vars&quot;, &quot;__signal_driver&quot;)
-  if forced != &quot;&quot; then return forced end
+  if vfs_exists(signal_driver_key()) == &quot;1&quot; then return vfs_read(signal_driver_key()) end
   let caps = host_caps()
   let i = 0
   while i &lt; list_len(caps) do
@@ -186,7 +195,7 @@ make a function called signal_driver returns name
 end
 
 make a function called signal_use_driver takes name returns done
-  set_var(&quot;__signal_driver&quot;, name)
+  vfs_write(signal_driver_key(), name)
   return true
 end
 
@@ -223,9 +232,9 @@ make a function called sigv_poll takes port returns name
     let sig_name = substr(msg, 0, nl)
     let payload = substr(msg, nl + 1, msg.length - nl - 1)
   end
-  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  signal_reply(&quot;&quot;)
   emit(sig_name, payload)
-  vfs_write(&quot;/sig/&quot; + port + &quot;/reply/&quot; + m[0], get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  vfs_write(&quot;/sig/&quot; + port + &quot;/reply/&quot; + m[0], vfs_read(signal_reply_key()))
   return sig_name
 end
 
@@ -314,25 +323,85 @@ make a function called str_starts_with takes s, prefix returns matches
   return substr(s, 0, prefix.length) == prefix
 end
 
+# str_ends_with(s, suffix) -&gt; bool
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length &gt; s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
 # split_lines(s) -&gt; list of lines, split on \n (a trailing \r on each line,
 # from CRLF source files, is stripped too).
+#
+# char_code and substr each check is_ascii() over their WHOLE string
+# argument on every call (hosts.rs and codegen.rs's runtime alike), so a
+# per-character loop over `s` itself is O(n^2). That made assembling one
+# 6 MB function (x64_assemble_chunk splits its whole asm text here) take
+# ~20 minutes. Instead `s` is first cut into pieces of at most 1024
+# characters by repeated halving (each level of halving costs O(n), so
+# O(n log n) overall), and only the short pieces are scanned character by
+# character. A line spanning pieces is carried as a list of segments and
+# joined in a string builder only then (builders are never freed, so one
+# per line would leak; this is at most one per 1024 characters).
+# Checked by self_hosting/tools/split_lines_check.patlang.
 make a function called split_lines takes s returns lines
+  let pieces = split_lines_pieces(s, [])
   let out = []
-  let n = s.length
-  let start = 0
-  let i = 0
-  while i &lt; n do
-    if char_code(s, i) == 10 then
-      let raw = substr(s, start, i - start)
-      let out = list_push(out, strip_trailing_cr(raw))
-      let start = i + 1
+  let carry = []
+  let pi = 0
+  let pn = list_len(pieces)
+  while pi &lt; pn do
+    let piece = list_get(pieces, pi)
+    let m = piece.length
+    let start = 0
+    let i = 0
+    while i &lt; m do
+      if char_code(piece, i) == 10 then
+        let seg = substr(piece, start, i - start)
+        if list_len(carry) &gt; 0 then
+          let seg = split_lines_join(list_push(carry, seg))
+          let carry = []
+        end
+        let out = list_push(out, strip_trailing_cr(seg))
+        let start = i + 1
+      end
+      let i = i + 1
     end
-    let i = i + 1
+    if start &lt; m then
+      let carry = list_push(carry, substr(piece, start, m - start))
+    end
+    let pi = pi + 1
   end
-  if start &lt; n then
-    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  if list_len(carry) &gt; 0 then
+    let out = list_push(out, strip_trailing_cr(split_lines_join(carry)))
   end
   return out
+end
+
+make a function called split_lines_join takes segs returns joined
+  let b = sb_new()
+  let i = 0
+  while i &lt; list_len(segs) do
+    sb_push(b, list_get(segs, i))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Appends `s` to `out` as consecutive pieces of at most 1024 characters,
+# splitting at the largest power-of-two multiple of 1024 below its length.
+make a function called split_lines_pieces takes s, out returns out2
+  let n = s.length
+  if n &lt;= 1024 then
+    return list_push(out, s)
+  end
+  let p = 1024
+  while (p + p) &lt; n do
+    let p = p + p
+  end
+  let out = split_lines_pieces(substr(s, 0, p), out)
+  return split_lines_pieces(substr(s, p, n - p), out)
 end
 
 make a function called strip_trailing_cr takes line returns stripped
@@ -439,7 +508,114 @@ make a function called expand_includes takes source, base_dir returns expanded
   return expand_includes_at_depth(source, base_dir, 0)
 end
 
+# expand_includes with each file once, however many files include it, as a compiler
+# reads them (docs/spec/values-and-memory.md 1.13).
+make a function called expand_includes_once takes source, base_dir returns expanded
+  return expand_includes_once_with(source, base_dir, vec_new())
+end
+
+make a function called expand_includes_once_with takes source, base_dir, seen returns expanded
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  while i &lt; list_len(lines) do
+    let t = str_trim(lines[i])
+    if str_starts_with(t, &quot;include &quot;) then
+      let path = path_join(base_dir, strip_quotes(str_trim(substr(t, 8, t.length - 8))))
+      let key = path_normalize(path)
+      let known = false
+      let k = 0
+      while k &lt; vec_len(seen) do
+        if vec_get(seen, k) == key then
+          let known = true
+        end
+        let k = k + 1
+      end
+      if not known then
+        vec_push(seen, key)
+        sb_push(out, expand_includes_once_with(read_file(path), path_dirname(path), seen))
+      end
+    else
+      sb_push(out, lines[i])
+    end
+    sb_push(out, chr(10))
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# expand_includes for a native (--x64) build: an include of a source the
+# runtime already has compiled into x64_runtime.obj (x64_runtime_bundled_
+# source) is dropped, so its functions resolve to the runtime's own copy.
+# A second compiled copy of block_model/heap.patlang ran the same allocator
+# over the same heap and the same lock word: its lock, holding the lock,
+# allocated its own return value through the runtime's bm_alloc, which
+# waited on that lock for ever (the mut_parameters native fixtures).
+make a function called expand_includes_native takes source, base_dir returns expanded
+  return expand_includes_at_depth_opts(source, base_dir, 0, true)
+end
+
+# self_hosting/build_x64_runtime.patlang compiles heap.patlang into the runtime.
+make a function called x64_runtime_bundled_source takes path returns yes
+  let p = path_normalize(path)
+  return (path_basename(p) == &quot;heap.patlang&quot;) and (path_basename(path_dirname(p)) == &quot;block_model&quot;)
+end
+
+# path with &quot;.&quot; segments dropped and each &quot;seg/..&quot; pair removed, &quot;/&quot; between
+# segments (&quot;a/b/../c&quot; -&gt; &quot;a/c&quot;; a leading &quot;..&quot; that has nothing to cancel is
+# kept), so an include reached as &quot;spec_fixtures/../heap.patlang&quot; names its
+# real directory.
+make a function called path_normalize takes path returns out
+  let segs = []
+  let cur = sb_new()
+  let n = path.length
+  let i = 0
+  while i &lt;= n do
+    let c = 47
+    if i &lt; n then
+      let c = char_code(path, i)
+    end
+    if (c == 47) or (c == 92) then
+      let seg = sb_str(cur)
+      let cur = sb_new()
+      if seg == &quot;..&quot; then
+        let k = list_len(segs)
+        if (k &gt; 0) and (segs[k - 1] != &quot;..&quot;) and (segs[k - 1] != &quot;&quot;) then
+          let kept = []
+          let j = 0
+          while j &lt; k - 1 do
+            let kept = list_push(kept, segs[j])
+            let j = j + 1
+          end
+          let segs = kept
+        else
+          let segs = list_push(segs, seg)
+        end
+      elif (seg != &quot;.&quot;) and ((seg != &quot;&quot;) or (list_len(segs) == 0)) then
+        let segs = list_push(segs, seg)
+      end
+    else
+      sb_push(cur, chr(c))
+    end
+    let i = i + 1
+  end
+  let b = sb_new()
+  let k = 0
+  while k &lt; list_len(segs) do
+    if k &gt; 0 then
+      sb_push(b, &quot;/&quot;)
+    end
+    sb_push(b, segs[k])
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
 make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  return expand_includes_at_depth_opts(source, base_dir, depth, false)
+end
+
+make a function called expand_includes_at_depth_opts takes source, base_dir, depth, native returns expanded
   if depth &gt; 16 then
     print(&quot;include: nesting deeper than 16 levels (cycle?)&quot;)
     return source
@@ -455,10 +631,14 @@ make a function called expand_includes_at_depth takes source, base_dir, depth re
       let rel = str_trim(substr(t, 8, t.length - 8))
       let rel = strip_quotes(rel)
       let path = path_join(base_dir, rel)
-      let inner = read_file(path)
-      let inner_base = path_dirname(path)
-      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
-      sb_push(out, chr(10))
+      if native and x64_runtime_bundled_source(path) then
+        sb_push(out, chr(10))
+      else
+        let inner = read_file(path)
+        let inner_base = path_dirname(path)
+        sb_push(out, expand_includes_at_depth_opts(inner, inner_base, depth + 1, native))
+        sb_push(out, chr(10))
+      end
     else
       sb_push(out, line)
       sb_push(out, chr(10))
@@ -518,6 +698,7 @@ end
 # everywhere rather than risk it working under --ir-run/--patc and
 # silently breaking under patc1.exe.
 
+include &quot;context.patlang&quot;
 
 
 
@@ -649,13 +830,13 @@ end
 # predicate names with the current cycle number, so each cycle gets a
 # fresh, disjoint set of facts; &quot;dep&quot; stays untagged since the dependency
 # graph itself never changes between cycles.
-make a function called bd_cycle_tag returns tag
-  let n = get(&quot;__vars&quot;, &quot;bd_cycle_num&quot;)
+make a function called bd_cycle_tag takes ctx returns tag
+  let n = ctx_get(ctx, &quot;bd_cycle_num&quot;)
   return &quot;&quot; + n
 end
 
-make a function called bd_register_graph returns done
-  if get(&quot;__vars&quot;, &quot;bd_graph_registered&quot;) == &quot;1&quot; then
+make a function called bd_register_graph takes ctx returns done
+  if ctx_get(ctx, &quot;bd_graph_registered&quot;) == &quot;1&quot; then
     return true
   end
   let targets = bd_targets()
@@ -673,7 +854,7 @@ make a function called bd_register_graph returns done
     end
     let i = i + 1
   end
-  set_var(&quot;bd_graph_registered&quot;, &quot;1&quot;)
+  ctx_set(ctx, &quot;bd_graph_registered&quot;, &quot;1&quot;)
   return true
 end
 
@@ -718,10 +899,10 @@ end
 
 # ---- one build cycle: derive staleness, plan, execute, persist timing ----
 # Returns the number of targets actually rebuilt.
-make a function called bd_run_cycle returns rebuilt_count
-  set_var(&quot;bd_cycle_num&quot;, get(&quot;__vars&quot;, &quot;bd_cycle_num&quot;) + 1)
-  let tag = bd_cycle_tag()
-  bd_register_graph()
+make a function called bd_run_cycle takes ctx returns rebuilt_count
+  ctx_set(ctx, &quot;bd_cycle_num&quot;, ctx_num(ctx, &quot;bd_cycle_num&quot;) + 1)
+  let tag = bd_cycle_tag(ctx)
+  bd_register_graph(ctx)
   bd_register_stale_rule(tag)
   let targets = bd_targets()
   let history = bd_load_history()
@@ -788,9 +969,9 @@ make a function called bd_run_cycle returns rebuilt_count
     let eta_total = eta_total + est
     let i = i + 1
   end
-  set_var(&quot;bd_plan_len&quot;, plan_len)
-  set_var(&quot;bd_eta_total_ms&quot;, eta_total)
-  set_var(&quot;bd_done_count&quot;, 0)
+  ctx_set(ctx, &quot;bd_plan_len&quot;, plan_len)
+  ctx_set(ctx, &quot;bd_eta_total_ms&quot;, eta_total)
+  ctx_set(ctx, &quot;bd_done_count&quot;, 0)
 
   let i = 0
   while i &lt; plan_len do
@@ -805,7 +986,7 @@ make a function called bd_run_cycle returns rebuilt_count
     let actual = now_ms() - t0
     rule_add(&quot;built&quot; + tag, [target], [])
     let history = bd_history_record(history, target, actual)
-    set_var(&quot;bd_done_count&quot;, get(&quot;__vars&quot;, &quot;bd_done_count&quot;) + 1)
+    ctx_set(ctx, &quot;bd_done_count&quot;, ctx_num(ctx, &quot;bd_done_count&quot;) + 1)
     emit(&quot;bd_job_finished&quot;, target + &quot;:&quot; + actual)
     let i = i + 1
   end
@@ -834,55 +1015,64 @@ end
 # demo that hit this and self_hosting/lib/build_daemon.patlang's own
 # header comment for the related (broader) patc1.exe-specific version.
 
+include &quot;../lib/context.patlang&quot;
 
+
+let ctx = context_new()
+context_hold(ctx)
 
 when bd_job_started do
+  let ctx = context_held()
   let colon = find_substr_signals(event_data, &quot;:&quot;)
   let target = substr(event_data, 0, colon)
   let est = substr(event_data, colon + 1, event_data.length - colon - 1)
-  let done = get(&quot;__vars&quot;, &quot;bd_done_count&quot;)
-  let total = get(&quot;__vars&quot;, &quot;bd_plan_len&quot;)
+  let done = ctx_get(ctx, &quot;bd_done_count&quot;)
+  let total = ctx_get(ctx, &quot;bd_plan_len&quot;)
   print(&quot;PRIMARY: [&quot; + (done + 1) + &quot;/&quot; + total + &quot;] &quot; + target + &quot;: building (est. &quot; + est + &quot;ms)&quot;)
 end
 
 when bd_job_finished do
+  let ctx = context_held()
   let colon = find_substr_signals(event_data, &quot;:&quot;)
   let target = substr(event_data, 0, colon)
   let actual = substr(event_data, colon + 1, event_data.length - colon - 1)
-  let done = get(&quot;__vars&quot;, &quot;bd_done_count&quot;)
-  let total = get(&quot;__vars&quot;, &quot;bd_plan_len&quot;)
+  let done = ctx_get(ctx, &quot;bd_done_count&quot;)
+  let total = ctx_get(ctx, &quot;bd_plan_len&quot;)
   print(&quot;PRIMARY: [&quot; + done + &quot;/&quot; + total + &quot;] &quot; + target + &quot;: done (&quot; + actual + &quot;ms actual)&quot;)
 end
 
 when status do
-  let total = get(&quot;__vars&quot;, &quot;bd_plan_len&quot;)
-  let done = get(&quot;__vars&quot;, &quot;bd_done_count&quot;)
-  let eta = get(&quot;__vars&quot;, &quot;bd_eta_total_ms&quot;)
+  let ctx = context_held()
+  let total = ctx_get(ctx, &quot;bd_plan_len&quot;)
+  let done = ctx_get(ctx, &quot;bd_done_count&quot;)
+  let eta = ctx_get(ctx, &quot;bd_eta_total_ms&quot;)
   signal_reply(&quot;build daemon: last cycle rebuilt &quot; + done + &quot;/&quot; + total + &quot; target(s), estimated &quot; + eta + &quot;ms total&quot;)
 end
 
 when rebuild do
+  let ctx = context_held()
   print(&quot;PRIMARY: rebuild requested&quot;)
-  set_var(&quot;bd_rebuild_requested&quot;, &quot;1&quot;)
+  ctx_set(ctx, &quot;bd_rebuild_requested&quot;, &quot;1&quot;)
 end
 
 when quit do
+  let ctx = context_held()
   print(&quot;PRIMARY: quit requested, shutting down&quot;)
-  set_var(&quot;bd_should_stop&quot;, &quot;1&quot;)
+  ctx_set(ctx, &quot;bd_should_stop&quot;, &quot;1&quot;)
 end
 
-make a function called run_primary takes unused returns done
+make a function called run_primary takes ctx, unused returns done
   let port_id = signal_claim(9411)
   print(&quot;PRIMARY: holding port 9411, running initial build cycle&quot;)
-  bd_run_cycle()
+  bd_run_cycle(ctx)
   print(&quot;PRIMARY: initial cycle done, watching for signals&quot;)
-  set_var(&quot;bd_should_stop&quot;, &quot;0&quot;)
-  set_var(&quot;bd_rebuild_requested&quot;, &quot;0&quot;)
-  while get(&quot;__vars&quot;, &quot;bd_should_stop&quot;) == &quot;0&quot; do
+  ctx_set(ctx, &quot;bd_should_stop&quot;, &quot;0&quot;)
+  ctx_set(ctx, &quot;bd_rebuild_requested&quot;, &quot;0&quot;)
+  while ctx_get(ctx, &quot;bd_should_stop&quot;) == &quot;0&quot; do
     signal_poll(port_id, 50)
-    if get(&quot;__vars&quot;, &quot;bd_rebuild_requested&quot;) == &quot;1&quot; then
-      set_var(&quot;bd_rebuild_requested&quot;, &quot;0&quot;)
-      bd_run_cycle()
+    if ctx_get(ctx, &quot;bd_rebuild_requested&quot;) == &quot;1&quot; then
+      ctx_set(ctx, &quot;bd_rebuild_requested&quot;, &quot;0&quot;)
+      bd_run_cycle(ctx)
     end
   end
   print(&quot;PRIMARY: exiting&quot;)
@@ -912,9 +1102,11 @@ make a function called run_secondary takes unused returns done
   return true
 end
 
+# parallel_map gives each worker its item; the primary's context is the one
+# the program holds, as its signal handlers find it
 make a function called run_thread takes kind returns done
   if kind == &quot;primary&quot; then
-    return run_primary(0)
+    return run_primary(context_held(), 0)
   else
     return run_secondary(0)
   end
@@ -925,40 +1117,31 @@ parallel_map([&quot;primary&quot;, &quot;secondary&quot;], &quot;run_thread&quot
 print(&quot;DONE&quot;)
 </pre></details><p class='label'>Native run on the build machine:</p><pre class='out native'>before parallel_map
 PRIMARY: holding port 9411, running initial build cycle
-PRIMARY: [1/6] parse: building (est. 180ms)
-PRIMARY: [1/6] parse: done (180ms actual)
+PRIMARY: [1/6] parse: building (est. 181ms)
+PRIMARY: [1/6] parse: done (188ms actual)
 PRIMARY: [2/6] docs: building (est. 150ms)
-PRIMARY: [2/6] docs: done (151ms actual)
-PRIMARY: [3/6] typecheck: building (est. 260ms)
-PRIMARY: [3/6] typecheck: done (260ms actual)
-PRIMARY: [4/6] compile_stdlib: building (est. 300ms)
-PRIMARY: [4/6] compile_stdlib: done (300ms actual)
+PRIMARY: [2/6] docs: done (157ms actual)
+PRIMARY: [3/6] typecheck: building (est. 261ms)
+PRIMARY: [3/6] typecheck: done (262ms actual)
+PRIMARY: [4/6] compile_stdlib: building (est. 306ms)
+PRIMARY: [4/6] compile_stdlib: done (312ms actual)
 PRIMARY: [5/6] compile_core: building (est. 340ms)
-PRIMARY: [5/6] compile_core: done (340ms actual)
-PRIMARY: [6/6] link: building (est. 420ms)
-PRIMARY: [6/6] link: done (420ms actual)
+PRIMARY: [5/6] compile_core: done (343ms actual)
+PRIMARY: [6/6] link: building (est. 429ms)
+PRIMARY: [6/6] link: done (437ms actual)
 PRIMARY: initial cycle done, watching for signals
 SECONDARY: querying status
-SECONDARY: build daemon: last cycle rebuilt 6/6 target(s), estimated 1650ms total
+SECONDARY: build daemon: last cycle rebuilt 6/6 target(s), estimated 1667ms total
 SECONDARY: requesting rebuild
 PRIMARY: rebuild requested
-PRIMARY: [1/6] parse: building (est. 180ms)
-PRIMARY: [1/6] parse: done (180ms actual)
-PRIMARY: [2/6] docs: building (est. 150ms)
+PRIMARY: [1/2] compile_core: building (est. 343ms)
 SECONDARY: querying status again
-PRIMARY: [2/6] docs: done (150ms actual)
-PRIMARY: [3/6] typecheck: building (est. 260ms)
-PRIMARY: [3/6] typecheck: done (260ms actual)
-PRIMARY: [4/6] compile_stdlib: building (est. 300ms)
-PRIMARY: [4/6] compile_stdlib: done (300ms actual)
-PRIMARY: [5/6] compile_core: building (est. 340ms)
-PRIMARY: [5/6] compile_core: done (340ms actual)
-PRIMARY: [6/6] link: building (est. 420ms)
-PRIMARY: [6/6] link: done (421ms actual)
-SECONDARY: build daemon: last cycle rebuilt 6/6 target(s), estimated 1650ms total
+PRIMARY: [1/2] compile_core: done (347ms actual)
+PRIMARY: [2/2] link: building (est. 437ms)
+PRIMARY: [2/2] link: done (449ms actual)
+SECONDARY: build daemon: last cycle rebuilt 2/2 target(s), estimated 780ms total
 SECONDARY: sending quit
 PRIMARY: quit requested, shutting down
 PRIMARY: exiting
 DONE
-
 </pre>

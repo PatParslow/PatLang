@@ -13,17 +13,17 @@ Feature: the named-object contract (GitHub issue #178)
   `get`, `send` and a named `new` outright as a guard against reaching that
   registry by accident. Now that the registry is a stated part of the contract,
   the guard is replaced by a scenario proving the calls reach it and behave as in
-  the real engine, including `get("__vars", key)` and `set_var`, which are the
-  same registry under the reserved name `__vars`.
+  the real engine. (`set_var` and `get("__vars", key)` were the same registry
+  under the reserved name `__vars`; v2 has no `set_var`, so they are not here.)
 
   The engine's own bookkeeping uses `__vars` keys prefixed `bm_`; a program that
   sets one of those names deliberately can disturb the engine, which is the same
   exposure the real engine's library code already has.
 
-  Scenario: named objects and set_var/get behave exactly as under the real engine
-    Given a function that creates two named objects, sets and reads their properties, uses set_var and get("__vars", key), and reads an unset property
+  Scenario: named objects behave exactly as under the real engine
+    Given a function that creates two named objects, sets and reads their properties, and reads an unset property
     When it runs through bm_lower_program/bi_run
-    Then it prints the same five values as pat --ir-run does for the identical source
+    Then it prints the same four values as the v2 interpreter does for the identical source
 
   `object_delete(name)` is a real host function the shared host table does not
   serve, so it joins the block-model host extension table (#159). zs_explore's
@@ -33,4 +33,4 @@ Feature: the named-object contract (GitHub issue #178)
   Scenario: object_delete drops a named object exactly as under the real engine
     Given a function that creates a named Dict, sets a key, reads it, deletes the object and reads the key again
     When it runs through bm_lower_program/bi_run
-    Then it prints 1, an empty line and unit, as pat --ir-run does for the identical source
+    Then it prints 1, true and bool, as the v2 interpreter does for the identical source

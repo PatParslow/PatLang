@@ -19,4 +19,4 @@ Feature: parallel_map over real threads (GitHub issue #176, threads half)
   Scenario: parallel_map over integers, strings and an empty list matches the real engine
     Given a function mapping square over five integers, measure over three strings, and square over an empty list
     When it runs through bm_lower_program/bi_run
-    Then it prints the three results exactly as pat --ir-run does for the identical source
+    Then it prints the three results exactly as the v2 interpreter does for the identical source

@@ -50,4 +50,4 @@ Feature: logic programming facts (Phase 15 of the full-language expansion)
   Scenario: rule and goal declarations, then solve and pursue, match the real engine
     Given a program declaring a rule and a goal in the language's own syntax, asserting base facts as body-less rules, then calling solve and pursue
     When it runs through bm_lower_program/bi_run
-    Then the number of solutions, the bound value and the length of the found plan match exactly what pat --ir-run produces for the identical source
+    Then the number of solutions, the bound value and the length of the found plan match exactly what the v2 interpreter produces for the identical source

@@ -22,7 +22,7 @@ Feature: classes with methods, inheritance and traits on named objects (GitHub #
   Scenario: methods dispatch through own class, trait and parent, matching the real engine
     Given classes Animal (fields, speak, describe), Dog inheriting Animal with its own sound, Loud with a speak method, and Puppy inheriting Dog with `traits Loud`
     When objects of each class are created and their methods called with send and with a variable receiver
-    Then it prints the same nine lines as pat --ir-run does for the identical source
+    Then it prints the same nine lines as the v2 interpreter does for the identical source
 
   Member syntax on named objects. `obj.field` and `obj.field = value` used to
   take only the Box+Handler path, which needs the native heap and cannot even run
@@ -37,7 +37,7 @@ Feature: classes with methods, inheritance and traits on named objects (GitHub #
   Scenario: field reads and writes on named objects, inside methods and outside, match the real engine
     Given a Counter class whose methods write self.n through send and through member assignment, and code that reads and writes the same object's fields through a variable holding its name
     When it runs through bm_lower_program/bi_run
-    Then it prints the same eight lines as pat --ir-run does for the identical source
+    Then it prints the same eight lines as the v2 interpreter does for the identical source
 
   Every class is registered with class_def, so `new(class, name)` gives its
   objects their field defaults. Only a class with methods, a parent or traits
@@ -46,7 +46,7 @@ Feature: classes with methods, inheritance and traits on named objects (GitHub #
   Scenario: a class with only fields gives new objects its defaults, matching the real engine
     Given a fields-only class with an int, string, bool, list and float default, and a class with a method, instantiated with new(class, name) at the top level and in a function
     When it runs through bm_lower_program/bi_run
-    Then it prints the same seven lines as pat --ir-run does for the identical source
+    Then it prints the same seven lines as the v2 interpreter does for the identical source
 
   Method-call syntax without a class. `obj.method(args)` is the host
   `send(obj, "method", args...)`. It is now lowered as an expression, and any
@@ -56,6 +56,6 @@ Feature: classes with methods, inheritance and traits on named objects (GitHub #
   fuzz selftest, the router DSL demo and the parser harness.
 
   Scenario: method calls on ad hoc objects and built-in methods work as expressions and as statements
-    Given an ad hoc named object with no class, a set method called for its effect and a to_s method called for its value
+    Given an ad hoc named object with no class, a set method called for its effect and an int's to_s method called for its value
     When it runs through bm_lower_program/bi_run
-    Then it prints the same three lines as pat --ir-run does for the identical source
+    Then it prints the same three lines as the v2 interpreter does for the identical source

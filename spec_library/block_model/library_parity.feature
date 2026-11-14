@@ -29,7 +29,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: a List literal, indexing, and a genuine generic host call all run through the block-model engine
     Given a program that builds a List literal, indexes into it, calls list_len/list_push (never individually recognized by name in lower.patlang), and calls hash_string (a genuine stateless-chunk host function)
     When it runs through bm_lower_program/bi_run
-    Then every value matches exactly what the real interpreter (pat --ir-run) produces for the identical source
+    Then every value matches exactly what the v2 interpreter produces for the identical source
 
   Re-attempting Phase 18's own original checkpoint with this new support
   in place (2026-09-23) finds the REAL next blocker, empirically, not
@@ -69,7 +69,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: a genuine host function called as a bare statement also gets the generic fallback
     Given a program that calls sb_push as a bare statement, its own return value never consumed
     When it runs through bm_lower_program/bi_run
-    Then it produces exactly what pat --ir-run produces for the identical source
+    Then it produces exactly what the v2 interpreter produces for the identical source
 
   A real, previously-missing case, found while re-attempting Phase 18's
   own zs_schema.patlang checkpoint (self_hosting/lib/zs_schema.patlang's
@@ -125,7 +125,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: .length/.len on an ordinary String or List works under the interpreter, distinct from Box+Handler object-field access
     Given a program that takes the .length of a String and of a List, never a Box-wrapped object
     When it runs through bm_lower_program/bi_run under the interpreter
-    Then both lengths match exactly what pat --ir-run produces for the identical source
+    Then both lengths match exactly what the v2 interpreter produces for the identical source
 
   A sixth finding, from the same re-attempt: `and`/`or` were being
   lowered like every other `Bin` op -- eagerly evaluating BOTH sides,
@@ -143,7 +143,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: and/or genuinely short-circuit under block-model, not just avoid the missing-op error
     Given an or whose left side alone determines the result, with a right side that would crash if evaluated
     When it runs through bm_lower_program/bi_run
-    Then the right side never runs, matching exactly what pat --ir-run produces for the identical source
+    Then the right side never runs, matching exactly what the v2 interpreter produces for the identical source
 
   A seventh finding, one level deeper in the same checkpoint:
   `bm_fv_expr` (`self_hosting/block_model/free_vars.patlang`), the
@@ -169,7 +169,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: a loop-body variable referenced only via indexing, or only inside a list literal, is still captured
     Given a function using list_copy's own l[i] idiom and pmap_put's own [key, value] idiom, each inside its own while loop
     When it runs through bm_lower_program/bi_run
-    Then every value matches exactly what pat --ir-run produces for the identical source
+    Then every value matches exactly what the v2 interpreter produces for the identical source
 
   An eighth finding (GitHub issue #154), surfaced the moment the real
   `schema_bdd_selftest.patlang` first ran end to end: `interp.patlang`'s
@@ -184,7 +184,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: a non-boolean value used as an if or while condition has the same truthiness as the real engine
     Given a program using "", 0, [], non-empty values, true and false directly as if conditions, and an empty list as a while condition
     When it runs through bm_lower_program/bi_run
-    Then every branch taken matches exactly what pat --ir-run produces for the identical source
+    Then every branch taken matches exactly what the v2 interpreter produces for the identical source
 
   Phase 18's own checkpoint, finally met: the real, unmodified
   `self_hosting/schema_bdd_selftest.patlang` (the LibraryLoans/BorrowBook
@@ -215,7 +215,7 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   Scenario: a host function the shared dispatcher lacks is served by this engine's own extension table
     Given a program calling sc_substr on an ASCII and on a non-ASCII interned string, and then a host function that exists nowhere
     When it runs through bm_lower_program/bi_run
-    Then the substrings match pat --ir-run exactly and the unknown host function still fails with the unchanged message
+    Then the substrings match the v2 interpreter exactly and the unknown host function still fails with the unchanged message
 
   A correction to an earlier scenario in this same file, found while running
   the full suite against top-level statement support (GitHub issue #155):

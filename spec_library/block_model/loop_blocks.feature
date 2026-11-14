@@ -85,4 +85,4 @@ Feature: loops as back-edge blocks (Block Ownership Model, section 4.1)
   Scenario: a variable referenced only in the loop's own condition, never inside its own body, is still captured
     Given a while loop whose condition alone references a variable set before the loop, never mentioned again inside the body
     When it runs through bm_lower_program/bi_run
-    Then the loop runs to completion, matching exactly what pat --ir-run produces for the identical source
+    Then the loop runs to completion, matching exactly what the v2 interpreter produces for the identical source

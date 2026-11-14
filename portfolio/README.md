@@ -1,17 +1,24 @@
 # PatLang portfolio
 
-`index.html` is a self-contained page (no network needed): each example shows
-its PatLang source, runs the compiled WebAssembly in your browser via an
-inline WASI shim, self-reports timings with `now_ms()`, and displays the
-native transcript captured on the build machine for comparison.
+`index.html` links the demo pages in `demos/`. Each example shows its PatLang
+source, runs its WebAssembly build in your browser on v2's browser host,
+self-reports timings with `now_ms()`, and displays the native transcript
+captured on the build machine for comparison.
 
-Everything on the page is produced by the self-hosted PatLang toolchain —
-including the page itself (`self_hosting/tools/build_portfolio.patlang`).
+Everything here is produced by PatLang: every demo is built by v2, and the
+pages by `self_hosting/tools/build_portfolio.patlang`, itself built by v2.
 
-Regenerate (requires `rustup target add wasm32-wasip1`):
+Regenerate, from the repo root:
 
 ```bash
-rust-runtime/target/release/pat --ir-run self_hosting/tools/build_portfolio.patlang
+self_hosting/build/v2.exe self_hosting/tools/build_portfolio.patlang build_portfolio.exe
+./build_portfolio.exe
 ```
+
+Serve this folder over http(s) to view it. The WebAssembly programs share their
+memory between threads, which a browser allows only on a cross-origin isolated
+page; `coi-sw.js`, a service worker the pages register, makes them so on a host
+that does not send the Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy
+headers itself.
 
 `build/` holds intermediate native/wasm artifacts and is not committed.

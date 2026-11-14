@@ -44,6 +44,56 @@ Made by the project owner on 2026-11-05:
      that announcement.
    - Still on `pat`: the first `v2.exe` when there is none, the block-model suite's own steps
      (they test the old engine), and the portfolio build.
+
+   Progress, 2026-11-14:
+   - **The block-model suite** runs its fixtures and their reference programs on the v2
+     interpreter (`bm_v2_engine` in `spec_steps_block_model.patlang`), and nothing in it starts
+     `pat` or `patc1`. The engine's boxes are on v2's allocator (`block_model/heap_v2.patlang`),
+     and its contract checks, shared with `lib/interp.patlang`, on v2's contract runtime
+     (`lib/contracts_v2.patlang`). It now registers classes with v2's `class_define`, runs a
+     `budgeted` body on v2's `rt_budgeted`, and keeps its own table of action bodies. Where the
+     scenarios asserted what `pat` printed, they now assert what v2 prints:
+     - a program's value is not printed (spec 1.13);
+     - `object_delete` gives `true`;
+     - a missing field reads as `false`;
+     - a named object's `name` field is its name;
+     - `set_var` is gone.
+
+     A parameter named `rest` takes the further arguments as a list (spec 1.13). The engine's
+     own `list_concat_one(first, rest)` collected its arguments that way, and is now
+     `(first, items)`. `lib/interp_run.patlang`'s child interpreter is the v2 interpreter, run
+     on the program's file. In the gates of 2026-11-14 the suite, compiled by v2, passed all
+     210 tests, and every other gate passed (fixpoint, bootstrap reader, WASM, part 1 on
+     both engines 163/163, engines agree 62/62, part 2 117/117, language 297/297 on both
+     engines, match 26/26).
+   - **`build_site`** runs compiled by v2, taking the site's folder as an argument. Run on a
+     copy of the site, it wrote the same files as `pat` running it. It copies the portfolio's
+     current layout, `demos/` and the service worker included. It reads the self-hosting
+     roadmap from `archive/legacy-root-2025/docs/`, where the roadmap went in 9cbdd71, and
+     stops on a document it cannot read rather than writing an empty page.
+   - **`build_portfolio`** runs compiled by v2. It builds every demo with v2, natively for
+     its transcript and as WebAssembly for the page, with no `patc1`, `rustc` or `pat`:
+     - Each page runs its module on v2's browser host (`tools/portfolio_runner.js` over
+       `v2/wasm/`'s layout, launcher and executor), with the executor started from a Blob.
+     - `portfolio/coi-sw.js`, a service worker, makes a page cross-origin isolated on a host
+       that sends no headers.
+     - A demo card runs its own module. The playground, the REPL and the IDE still compile
+       and run the user's source in the page, with `lib/interp.patlang`'s `interpret_ir`
+       where `pat`'s host `run_ir` was.
+     - The build caches on the demo's source and v2's compiler key, and builds four demos at
+       a time.
+     - `patbuild`'s page is gone, since it builds its targets with `rustc`.
+     - The demos that had not followed their libraries' change to `ctx` parameters (maze, pos,
+       pos tests, report, the signals and build-daemon drivers) now pass the context.
+     - The libraries' calls of `goal(...)`, a no-op host function of `pat`'s, are gone.
+
+     In headless Chrome, every demo page ran its program and printed what it should, both with
+     the server sending the isolation headers and, for four of them, with the service worker
+     supplying them. `contracts` ends in the precondition it breaks on purpose.
+   - **A call to a name nothing declares** made a WebAssembly build fail: its stub took no
+     parameters, and the call passed arguments. A call of such a name now passes none, and
+     the scenario "a call with arguments to a name nothing declares stops there in a
+     WebAssembly build too" covers it.
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical. Done, and
@@ -57,7 +107,7 @@ Made by the project owner on 2026-11-05:
    - That compiler built the compiler with `--no-cache` in 6 minutes. Its build is byte identical
      to v2's own build of the compiler, and to the build it then made of itself.
    - `gates.sh` builds its first `v2.exe` this way, from `bootstrap/v2_compiler.ir`, and checks the
-     chain on every run. Only the block-model suite's steps, which test the old engine, still start `pat`.
+     chain on every run. Since 2026-11-14 no step of any suite starts `pat`.
    - The `compiler_structure.feature` scenario builds a program reaching every kind of
      instruction from its IR, and checks that it gives the same output as v2's own build.
 4. **Build the browser WASM backend and host**
@@ -218,8 +268,8 @@ Since the survey, by the project owner's decisions below, with the gates passing
   libraries, and `interp_budget_probe`, then stop on `set_var`, which is gone, and they fail on `pat` too.
   `build_portfolio` read two top-level `let`s inside functions, and these are functions now. It
   defined `q` and `nl` three times, through `codegen`, `html` and `transpile_ruby`, which now
-  share them from `lib/chars.patlang`. It compiles on v2; it has not been run, as it writes the
-  site and calls `patc1` and `rustc`.
+  share them from `lib/chars.patlang`. Since 2026-11-14 it runs on v2 and builds every demo
+  with v2 (step 2 above).
 
 The first two rows count every program with that failure, whether or not it was run, so not all of
 them were seen working on `pat`. `friendly_cli` compiled with 3 failures on the old route and has 26

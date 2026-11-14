@@ -1,21 +1,25 @@
 # =============================================================================
-# Portfolio builder: generates portfolio/index.html — a self-contained page
-# showing PatLang example sources, running them IN THE BROWSER (compiled to
-# wasm32-wasip1, embedded as base64, executed via an inline WASI shim), with
-# self-reported timings compared against native transcripts captured at
-# build time. The builder itself is PatLang, using the self-hosted compiler.
+# Portfolio builder: generates portfolio/index.html and portfolio/demos/ --
+# pages showing PatLang example sources, running them IN THE BROWSER (built
+# by v2 as WebAssembly, embedded as base64, run on v2's own browser host),
+# with self-reported timings compared against native transcripts captured at
+# build time. The builder itself is PatLang, built by v2.
 #
-# Run from the repo root (requires rustup target add wasm32-wasip1):
-#   rust-runtime/target/release/pat --ir-run self_hosting/tools/build_portfolio.patlang
-# Then open portfolio/index.html in a browser.
+# Run from the repo root:
+#   self_hosting/build/v2.exe self_hosting/tools/build_portfolio.patlang build_portfolio.exe
+#   ./build_portfolio.exe
+# Then serve portfolio/ over http(s) and open index.html: the WebAssembly
+# demos need a cross-origin isolated page, which portfolio/coi-sw.js, a
+# service worker, gives on a host that does not send the headers itself.
 # =============================================================================
 
 include "../lib/context.patlang"
 include "../lib/lexer.patlang"
 include "../lib/parser.patlang"
 include "../lib/lower.patlang"
-include "../lib/codegen.patlang"
-include "../lib/runtime_rs.patlang"
+include "../lib/includes.patlang"
+include "../lib/regex_dsl.patlang"
+include "../lib/syntax_dsl.patlang"
 include "../lib/html.patlang"
 include "../lib/maze.patlang"
 include "../lib/template.patlang"
@@ -23,137 +27,16 @@ include "../lib/json.patlang"
 include "../lib/reflect.patlang"
 include "../lib/transpile_ruby.patlang"
 
-# Every demo is compiled by the self-hosted compiler's own COMPILED binary
-# (patc1.exe), not the native Rust codegen.rs pipeline (pat --patc) and not
-# even the self-hosted compiler's own SOURCE re-interpreted per build (what
-# this script used to do, via the included lexer/parser/lower/codegen/
-# runtime_rs libs directly) -- patc1.exe runs the identical self-hosted
-# logic, just already compiled, which the compiler-self-metrics card's own
-# numbers say is roughly two orders of magnitude faster for the front-end
-# stage. rustc is still the unavoidable final native-codegen backend patc1
-# itself shells out to -- see CLAUDE.md for the fuller convention.
-print("ensuring patc1.exe is up to date...")
-exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/build_patc1.patlang")
-
-# Build cache: skip recompiling a demo whose source hasn't changed since the
-# last build. The cache key covers the demo's own source PLUS a fingerprint
-# of only the compiler pieces this demo could plausibly be affected by --
-# NOT one blanket hash of the whole compiler pipeline. The old scheme (hash
-# of lexer+parser+lower+codegen+runtime_rs concatenated) meant ANY compiler
-# change, anywhere, invalidated EVERY cached demo -- e.g. a Logic-chunk-only
-# change (rule_add/solve) forcing a full recompile of the CGA classifier,
-# which never calls fact/query/goal/rule_add and takes ~30+ minutes to
-# recompile through the self-hosted pipeline for no reason.
+# Every demo is compiled by v2 (self_hosting/build/v2.exe), natively for its
+# build-machine transcript and as WebAssembly for the browser.
 #
-# Front-end changes (lexer/parser/lowering) are still treated as universal --
-# shared infrastructure every program goes through, and attributing precise
-# per-construct impact there would need real dataflow analysis, not worth it.
-# But runtime_rs.patlang/codegen.rs's per-chunk PRELUDE_* text (see
-# self_hosting/lib/codegen.patlang's host_chunk_of for the canonical
-# name->chunk table) only gets folded into a demo's fingerprint if that
-# demo's own source actually looks like it uses that chunk.
-#
-# Detection is a plain substring scan over the demo's raw source for the
-# SOURCE-LEVEL syntax each chunk owns (keywords/call names as a demo author
-# actually types them -- contracts in particular are written as `require`/
-# `ensure`/`assert`, never a literal call to the `contract_check` host
-# function they lower to, so the marker has to be the keyword, not the
-# runtime name). Deliberately coarse and biased toward over-inclusion,
-# mirroring codegen.rs's required_chunks' own documented "conservative, not
-# proven" stance for numeric_tower: a false-positive marker match just costs
-# one unnecessary rebuild, never a stale one, so ambiguity always resolves
-# in favor of including a chunk. "core"/"numeric_tower"/"math" are treated as
-# unconditional -- virtually every real demo touches arithmetic or a list/
-# string op, not worth the detection cost.
-#
-# Hand-maintained and parallel to codegen.patlang's host_chunk_of table --
-# if that table gains a new host function, add its source-level spelling
-# here too (same discipline as .claude/skills/mirror-check, just for cache
-# hit-rate correctness rather than compiled-output correctness: getting this
-# wrong only costs an extra rebuild, it can never serve a stale artifact,
-# since the underlying src+frontend hash still gates everything).
-make a function called frontend_fingerprint returns fp
-  return read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/codegen.patlang")
-end
-
-make a function called chunk_markers returns markers
-  return [
-  ["strings_ext", ["char_code(", "substr(", "chr(", "to_num(", "hash_string("]],
-  ["collections_handles", ["vec_new(", "vec_push(", "vec_set(", "vec_get(", "vec_len(", "vec_to_list(", "str_intern(", "sc_len(", "sc_code(", "sc_char(", "sb_new(", "sb_push(", "sb_str("]],
-  ["files", ["read_file(", "write_file(", "touch_file(", "file_exists(", "list_dir(", "rename_file("]],
-  ["io_misc", ["now_ms(", "byte_length(", "read_line(", "argv(", "print("]],
-  ["oo", ["make a class", "new(", "set_var(", "send("]],
-  ["logic", ["fact(", "goal(", "query(", "rule_add(", "solve(", "action_add(", "plan(", "rule ", ":-"]],
-  ["contracts", ["require ", "ensure ", "assert "]],
-  ["networking", ["tcp_listen(", "tcp_connect(", "tcp_accept(", "tcp_read(", "tcp_write(", "tcp_close(", "sleep_ms("]],
-  ["codegen_bootstrap", ["exec_capture(", "compile_shape(", "compile_ir(", "run_ir(", "rustc_build(", "codegen_prelude("]]
-]
-end
-
-make a function called str_contains takes haystack, needle returns found
-  let hlen = len(haystack)
-  let nlen = len(needle)
-  if nlen == 0 then
-    return true
-  end
-  if nlen > hlen then
-    return false
-  end
-  let limit = hlen - nlen
-  let i = 0
-  let found = false
-  while i <= limit do
-    if found == false then
-      if substr(haystack, i, nlen) == needle then
-        let found = true
-      end
-    end
-    let i = i + 1
-  end
-  return found
-end
-
-make a function called required_chunk_names takes src returns names
-  let names = ["core", "numeric_tower", "math"]
-  let table = chunk_markers()
-  let ci = 0
-  while ci < table.length do
-    let entry = table[ci]
-    let chunk = entry[0]
-    let markers = entry[1]
-    let mi = 0
-    let hit = false
-    while mi < markers.length do
-      if hit == false then
-        if str_contains(src, markers[mi]) then
-          let hit = true
-        end
-      end
-      let mi = mi + 1
-    end
-    if hit then
-      if list_contains(names, chunk) == false then
-        let names = list_push(names, chunk)
-      end
-    end
-    let ci = ci + 1
-  end
-  return names
-end
-
-make a function called chunk_fingerprint takes names returns fp
-  let fp = sb_new()
-  let i = 0
-  while i < names.length do
-    sb_push(fp, codegen_prelude_chunk(names[i]))
-    let i = i + 1
-  end
-  return sb_str(fp)
-end
-
+# Build cache: a demo whose source is unchanged since the last build, built
+# by the same compiler, is not rebuilt. The key is the demo's source and v2's
+# own cache key (self_hosting/build/v2.exe.key, the hash of the sources v2
+# was built from), so a rebuilt compiler rebuilds every demo once; v2's own
+# per-function cache then makes that cheap.
 make a function called cache_key takes src returns key
-  let chunks = required_chunk_names(src)
-  return hash_string(src + frontend_fingerprint() + chunk_fingerprint(chunks))
+  return hash_string(src + read_file("self_hosting/build/v2.exe.key"))
 end
 
 make a function called cache_valid takes id, src returns valid
@@ -190,42 +73,75 @@ make a function called test_framework_src returns text
   return strip_include_lines(read_file("self_hosting/lib/includes.patlang")) + chr(10) + strip_include_lines(read_file("self_hosting/lib/context.patlang")) + chr(10) + strip_include_lines(read_file("self_hosting/lib/gherkin_text.patlang")) + chr(10) + strip_include_lines(read_file("self_hosting/lib/gherkin_clauses.patlang")) + chr(10) + strip_include_lines(read_file("self_hosting/lib/step_match.patlang")) + chr(10) + strip_include_lines(read_file("self_hosting/lib/gherkin.patlang"))
 end
 
-# Writes src to a scratch .patlang file and shells out to patc1.exe.
-# "./patc1.exe", not bare "patc1.exe": Windows' CreateProcess excludes the
-# current directory from its search for a bare filename with no path
-# separator (SafeProcessSearchMode) -- silently fails with a misleading
-# "program not found" even though the file is right there and
-# file_exists("patc1.exe") returns true. This was dormant/hidden by the
-# per-demo build cache until the first genuinely-uncached demo exercised
-# it for real.
-make a function called patc1_compile takes src, id, out_path, target returns done
-  let scratch = "portfolio/build/" + id + ".patlang"
-  write_file(scratch, src)
-  if target == "" then
-    exec_capture("./patc1.exe", scratch, out_path)
-  else
-    exec_capture("./patc1.exe", scratch, out_path, target)
+# True when some line of src declares a `syntax` extension, which
+# expand_syntax_dsls (lib/syntax_dsl.patlang) expands before compiling.
+make a function called has_syntax_block takes src returns yes
+  let lines = split_lines(src)
+  let i = 0
+  while i < list_len(lines) do
+    if str_starts_with(str_trim(lines[i]), "syntax ") then
+      return true
+    end
+    let i = i + 1
   end
-  return true
+  return false
 end
 
-# The native and wasm targets for one demo are fully independent compiles
-# (same source, different out_path/target passed to patc1_compile, which
-# shells out to a fresh ./patc1.exe subprocess each time) -- so they run
-# concurrently via parallel_map's real OS threads instead of back-to-back,
-# roughly halving this demo's wall-clock compile time whenever both targets
-# are actually stale. "playground" (the shared WASM module behind every
-# demo_page's "run in this browser" button) is by far the biggest user of
-# compile_both, so this is where it matters most. Both threads write the
-# SAME scratch file (portfolio/build/<id>.patlang, identical content) --
-# harmless: it's the same bytes either way, and each thread only reads
-# ./patc1.exe's own out_path afterward, never the scratch file.
+# A demo's source as one file v2 can compile: its syntax extensions
+# expanded, and its include lines, which name files relative to
+# self_hosting/lib, expanded once each.
+make a function called portfolio_source takes src returns text
+  let text = src
+  if has_syntax_block(text) then
+    let text = expand_syntax_dsls(text)
+  end
+  return expand_includes_once(text, "self_hosting/lib")
+end
+
+# Writes the demo's source to a scratch file and builds it with v2: an
+# executable when target is "", else a WebAssembly module. Gives "" when
+# the build succeeded, else what v2 said, with the demo named.
+make a function called portfolio_try_compile takes src, id, out_path, target returns failure
+  require (value_class(id) == 8) and (value_class(out_path) == 8)
+  let scratch = "portfolio/build/" + id + ".patlang"
+  if target != "" then
+    let scratch = "portfolio/build/" + id + "_wasm.patlang"
+  end
+  write_file(scratch, portfolio_source(src))
+  if target == "" then
+    let said = exec_capture("self_hosting/build/v2.exe", scratch, out_path, "--workers", "2")
+  else
+    let said = exec_capture("self_hosting/build/v2.exe", scratch, out_path, "--wasm", "--workers", "2")
+  end
+  let failure = ""
+  if find_substr(said, "v2: " + out_path) < 0 then
+    let failure = "portfolio: v2 could not build " + id + " (" + out_path + "):" + nl() + said
+  end
+  ensure (failure != "") or file_exists(out_path)
+  return failure
+end
+
+# portfolio_try_compile, a failure stopping the portfolio.
+make a function called portfolio_compile takes src, id, out_path, target returns done
+  let failure = portfolio_try_compile(src, id, out_path, target)
+  if failure != "" then
+    print(failure)
+    exit_with(1)
+  end
+  let done = true
+  ensure file_exists(out_path)
+  return done
+end
+
+# The native and wasm targets for one demo are independent compiles (same
+# source, each with a scratch file of its own, a fresh v2.exe each), so they
+# run concurrently via parallel_map's threads instead of back-to-back.
 make a function called compile_both_target takes job returns done
   let src = job[0]
   let id = job[1]
   let out_path = job[2]
   let target = job[3]
-  patc1_compile(src, id, out_path, target)
+  portfolio_compile(src, id, out_path, target)
   return true
 end
 
@@ -236,7 +152,7 @@ make a function called compile_both takes src, id returns wasmb64
     print("[cache] " + id + " unchanged, skipping rebuild")
     return read_file_b64(wasm_path)
   end
-  let jobs = [[src, id, exe_path, ""], [src, id, wasm_path, "wasm32-wasip1"]]
+  let jobs = [[src, id, exe_path, ""], [src, id, wasm_path, "wasm"]]
   parallel_map(jobs, "compile_both_target")
   save_cache(id, src)
   return read_file_b64(wasm_path)
@@ -248,26 +164,15 @@ make a function called compile_wasm_only takes src, id returns wasmb64
     print("[cache] " + id + " unchanged, skipping rebuild")
     return read_file_b64(wasm_path)
   end
-  patc1_compile(src, id, wasm_path, "wasm32-wasip1")
+  portfolio_compile(src, id, wasm_path, "wasm")
   save_cache(id, src)
   return read_file_b64(wasm_path)
 end
 
+# Every v2 module has threads (docs/spec/ir.md, "The WASM form"), so a demo
+# that runs threads or fibres is built as any other.
 make a function called compile_wasm_threaded_only takes src, id returns wasmb64
-  # Same shape as compile_wasm_only, but targets wasm32-wasip1-threads (real
-  # OS-thread-backed fibers/budgeted(...), via patc1.exe -> rustc_build's
-  # nightly+atomics+shared-memory flags for that one target string) instead
-  # of the ordinary non-threaded wasm32-wasip1 target. Opt-in per demo page
-  # rather than the default, since it needs a nightly toolchain and the
-  # WASI-threads JS shim (wasi_shim_js) to actually run in a browser.
-  let wasm_path = "portfolio/build/" + id + "_threaded.wasm"
-  if cache_valid(id, src) and (file_exists(wasm_path)) then
-    print("[cache] " + id + " (threaded) unchanged, skipping rebuild")
-    return read_file_b64(wasm_path)
-  end
-  patc1_compile(src, id, wasm_path, "wasm32-wasip1-threads")
-  save_cache(id, src)
-  return read_file_b64(wasm_path)
+  return compile_wasm_only(src, id)
 end
 
 make a function called compile_native takes src, id returns exe
@@ -276,24 +181,21 @@ make a function called compile_native takes src, id returns exe
     print("[cache] " + id + " unchanged, skipping rebuild")
     return exe_path
   end
-  patc1_compile(src, id, exe_path, "")
+  portfolio_compile(src, id, exe_path, "")
   save_cache(id, src)
   return exe_path
 end
 
 make a function called out_path_for takes id, target returns path
-  if target == "wasm32-wasip1" then
+  if target != "" then
     return "portfolio/build/" + id + ".wasm"
-  end
-  if target == "wasm32-wasip1-threads" then
-    return "portfolio/build/" + id + "_threaded.wasm"
   end
   return "portfolio/build/" + id + ".exe"
 end
 
 # Cross-demo parallel pre-compile pass: every compile below this point
 # (compile_native/compile_wasm_only/compile_both/compile_wasm_threaded_only)
-# funnels through cache_valid + patc1_compile, and each patc1_compile call
+# funnels through cache_valid + portfolio_compile, and each portfolio_compile call
 # is a fully independent subprocess (own scratch file keyed by id, own
 # out_path) -- so the actual stale-vs-cached compiles across ALL demos can
 # be dispatched together via parallel_map's real OS threads, instead of
@@ -309,74 +211,40 @@ end
 # still compile correctly, just back on the sequential path) -- not a
 # correctness risk, only a missed optimization, so this is a lower-stakes
 # drift than the chunk_markers table above.
-# Each in-flight job is tracked as a real OO object (new/send/get,
-# ChunkId::Oo) rather than a plain value or hand-kept counter -- id/target/
-# status/timestamps live on the object, readable by anything (a `when`
-# handler, a future `status` signal handler) without threading extra
-# parameters through. Safe to mutate from inside a parallel_map worker
-# thread specifically because OBJECTS was moved off thread_local onto a
-# shared Mutex-backed store this session (see hosts.rs/codegen.rs) -- before
-# that fix, each worker thread would have seen its own empty, isolated
-# object store, and every send/get here would have silently gone nowhere.
-make a function called precompile_job takes job returns done
+# A worker builds its demo and writes its cache record, and prints a line as
+# it starts and as it finishes; it gives "" or the build's failure. It writes
+# nothing another worker reads: the workers run at once, and a count or a log
+# they shared would race (CLAUDE.md section 7).
+make a function called precompile_job takes job returns failure
   let src = job[0]
   let id = job[1]
   let target = job[2]
-  let job_name = new("job", id + ":" + target)
-  send(job_name, "set", "id", id)
-  send(job_name, "set", "target", target)
-  send(job_name, "set", "status", "compiling")
-  send(job_name, "set", "started_at", now_ms())
-  emit("job_started", job_name)
-  patc1_compile(src, id, out_path_for(id, target), target)
+  let label = id
+  if target != "" then
+    let label = id + " (" + target + ")"
+  end
+  let t0 = now_ms()
+  print("[precompile] " + label + " starting")
+  let failure = portfolio_try_compile(src, id, out_path_for(id, target), target)
+  if failure != "" then
+    print("[precompile] " + label + " FAILED")
+    return failure
+  end
   # Without this, the artifact exists on disk but its .srchash file doesn't
   # get written, so the ordinary sequential compile_native/etc call further
-  # down the script would see cache_valid == false and recompile it AGAIN,
-  # silently defeating the whole point of this pass. save_cache is a plain
-  # single-file write, safe to call twice for the same id (e.g. playground,
-  # which has two targets/two jobs) -- both writes are identical content.
+  # down the script would see cache_valid == false and recompile it AGAIN.
+  # save_cache is a plain single-file write, safe to call twice for the same
+  # id (e.g. playground, which has two targets/two jobs) -- both writes are
+  # identical content.
   save_cache(id, src)
-  send(job_name, "set", "status", "done")
-  send(job_name, "set", "finished_at", now_ms())
-  emit("job_finished", job_name)
-  return true
+  print("[precompile] " + label + " done in " + (now_ms() - t0) + " ms")
+  return ""
 end
 
-# Live terminal progress, driven by the real `when`/`emit` event mechanism
-# (not a bolted-on print statement) -- already thread-safe across
-# parallel_map workers as of earlier this session (EVENT_HANDLERS is a
-# shared Mutex-backed registry, not thread_local, for exactly this reason).
-# Counters live in the shared __vars object (set_var/get), the same
-# mechanism self_hosting/examples/event_loop_server.patlang uses for its
-# own cross-handler state. Concurrent print() calls from multiple OS
-# threads may interleave at the line level -- acceptable for terminal
-# output, not a correctness issue.
-let ctx = context_new()
-context_hold(ctx)
-
-when job_started do
-  let ctx = context_held()
-  ctx_set(ctx, "running", ctx_num(ctx, "running") + 1)
-  let id = get(event_data, "id")
-  let target = get(event_data, "target")
-  let label = id
-  if target != "" then
-    let label = id + " (" + target + ")"
-  end
-  print("[precompile] " + label + " starting (" + ctx_text(ctx, "running") + " running, " + ctx_text(ctx, "done") + "/" + ctx_text(ctx, "total") + " done)")
-end
-
-when job_finished do
-  let ctx = context_held()
-  ctx_set(ctx, "running", ctx_num(ctx, "running") - 1)
-  ctx_set(ctx, "done", ctx_num(ctx, "done") + 1)
-  let id = get(event_data, "id")
-  let target = get(event_data, "target")
-  let label = id
-  if target != "" then
-    let label = id + " (" + target + ")"
-  end
-  print("[precompile] " + label + " done (" + ctx_text(ctx, "running") + " running, " + ctx_text(ctx, "done") + "/" + ctx_text(ctx, "total") + " done)")
+# How many builds run at once: each is a v2.exe of its own, with its own
+# workers and memory.
+make a function called precompile_batch_size returns n
+  return 4
 end
 
 make a function called add_job takes jobs, id, src, target returns jobs2
@@ -394,10 +262,10 @@ make a function called build_precompile_jobs returns jobs
   let gui_src = read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/gui_demo.patlang")
   let jobs = add_job(jobs, "gui", gui_src, "")
   let gui_wasm_src = read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/gui_wasm_main.patlang")
-  let jobs = add_job(jobs, "guidemo", gui_wasm_src, "wasm32-wasip1")
+  let jobs = add_job(jobs, "guidemo", gui_wasm_src, "wasm")
   let pos_src = read_file("self_hosting/lib/pos.patlang") + chr(10) + read_file("self_hosting/examples/pos_demo.patlang")
   let jobs = add_job(jobs, "pos", pos_src, "")
-  let post_src = test_framework_src() + chr(10) + read_file("self_hosting/lib/pos.patlang") + chr(10) + read_file("self_hosting/examples/pos_tests.patlang")
+  let post_src = test_framework_src() + chr(10) + strip_include_lines(read_file("self_hosting/lib/pos.patlang")) + chr(10) + read_file("self_hosting/examples/pos_tests.patlang")
   let jobs = add_job(jobs, "postests", post_src, "")
   let jobs = add_job(jobs, "contracts", read_file("self_hosting/examples/contracts_demo.patlang"), "")
   let jobs = add_job(jobs, "goaloriented", read_file("self_hosting/examples/goal_oriented_build_demo.patlang"), "")
@@ -429,55 +297,65 @@ make a function called build_precompile_jobs returns jobs
   let bd_src = read_file("self_hosting/lib/signals.patlang") + chr(10) + read_file("self_hosting/lib/includes.patlang") + chr(10) + bd_lib_body + chr(10) + bd_demo_body
   let jobs = add_job(jobs, "builddaemon", bd_src, "")
 
-  # routerdsl needs its DSL-expansion side effect run first (writes
-  # portfolio/build/router_dsl_expanded.patlang), duplicating the same
-  # tokenize/parse_program/lower_program/run_ir pipeline used at its real
-  # call site below -- cheap and idempotent, not the compile bottleneck.
-  let dsl_driver = read_file("self_hosting/lib/regex_dsl.patlang") + chr(10)
-    + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10)
-    + "let raw = read_file(\"self_hosting/examples/router_dsl_demo.patlang\")" + chr(10)
-    + "let expanded = expand_syntax_dsls(raw)" + chr(10)
-    + "write_file(\"portfolio/build/router_dsl_expanded.patlang\", expanded)" + chr(10)
-  run_ir(lower_program(parse_program(tokenize(dsl_driver))))
-  let router_src = read_file("portfolio/build/router_dsl_expanded.patlang")
+  # routerdsl's source is the demo with its DSL expanded
+  let router_src = expand_syntax_dsls(read_file("self_hosting/examples/router_dsl_demo.patlang"))
   let jobs = add_job(jobs, "routerdsl", router_src, "")
 
   let tower_src = read_file("self_hosting/lib/math.patlang") + chr(10) + read_file("self_hosting/examples/numeric_tower_demo.patlang")
   let jobs = add_job(jobs, "towerdemo", tower_src, "")
-  let dynsyntax_src = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/regex_dsl.patlang") + read_file("self_hosting/lib/syntax_dsl.patlang") + read_file("self_hosting/examples/dynamic_syntax_demo.patlang")
+  let dynsyntax_src = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/regex_dsl.patlang") + read_file("self_hosting/lib/syntax_dsl.patlang") + read_file("self_hosting/lib/interp.patlang") + read_file("self_hosting/examples/dynamic_syntax_demo.patlang")
   let jobs = add_job(jobs, "dynsyntaxdemo", dynsyntax_src, "")
   let jobs = add_job(jobs, "threadingdemo", read_file("self_hosting/examples/threading_demo.patlang"), "")
   let report_lib_src = read_file("self_hosting/lib/report.patlang")
   let report_src = report_lib_src + chr(10) + read_file("self_hosting/examples/report_demo.patlang")
   let jobs = add_job(jobs, "report", report_src, "")
   let report_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + report_lib_src + chr(10) + read_file("self_hosting/examples/report_wasm_main.patlang")
-  let jobs = add_job(jobs, "report_timeline", report_wasm_src, "wasm32-wasip1")
-  let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
+  let jobs = add_job(jobs, "report_timeline", report_wasm_src, "wasm")
+  let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/lib/json.patlang") + chr(10) + read_file("self_hosting/lib/interp.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
   let jobs = add_job(jobs, "playground", pg_src, "")
-  let jobs = add_job(jobs, "playground", pg_src, "wasm32-wasip1")
-  # patbuild is deliberately NOT precompiled here for now -- see the real
-  # compile site further down for why (patc1.exe was found to take 45+
-  # minutes on this specific job, a ~40x anomaly vs the interpreter doing
-  # the identical pipeline in ~66s; logged in the backlog, not yet fixed).
+  let jobs = add_job(jobs, "playground", pg_src, "wasm")
   let flow_full = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/tools/flowgraph_main.patlang")
   let jobs = add_job(jobs, "flowgraph", flow_full, "")
   let flowgraph_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/flowgraph_wasm_main.patlang")
-  let jobs = add_job(jobs, "flowgraphdemo", flowgraph_wasm_src, "wasm32-wasip1")
+  let jobs = add_job(jobs, "flowgraphdemo", flowgraph_wasm_src, "wasm")
   let maze_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/maze.patlang") + chr(10) + read_file("self_hosting/examples/maze_wasm_main.patlang")
-  let jobs = add_job(jobs, "maze", maze_wasm_src, "wasm32-wasip1")
-  let jobs = add_job(jobs, "fiber", read_file("self_hosting/examples/fiber_demo.patlang"), "wasm32-wasip1-threads")
-  let jobs = add_job(jobs, "robots", read_file("self_hosting/examples/robots_demo.patlang"), "wasm32-wasip1-threads")
-  let jobs = add_job(jobs, "cga", read_file("self_hosting/examples/cga_classifier.patlang"), "wasm32-wasip1")
+  let jobs = add_job(jobs, "maze", maze_wasm_src, "wasm")
+  let jobs = add_job(jobs, "fiber", read_file("self_hosting/examples/fiber_demo.patlang"), "wasm")
+  let jobs = add_job(jobs, "robots", read_file("self_hosting/examples/robots_demo.patlang"), "wasm")
+  let jobs = add_job(jobs, "cga", read_file("self_hosting/examples/cga_classifier.patlang"), "wasm")
   return jobs
 end
 
 print("scanning for stale demos to precompile in parallel...")
 let precompile_jobs = build_precompile_jobs()
-ctx_set(ctx, "total", precompile_jobs.length)
-ctx_set(ctx, "running", 0)
-ctx_set(ctx, "done", 0)
-print("precompiling " + precompile_jobs.length + " stale target(s) across real OS threads...")
-parallel_map(precompile_jobs, "precompile_job")
+print("precompiling " + precompile_jobs.length + " stale target(s), " + precompile_batch_size() + " at a time...")
+let pj = 0
+let precompile_failures = []
+while pj < precompile_jobs.length do
+  let batch = []
+  while (pj < precompile_jobs.length) and (list_len(batch) < precompile_batch_size()) do
+    let batch = list_push(batch, precompile_jobs[pj])
+    let pj = pj + 1
+  end
+  let results = parallel_map(batch, "precompile_job")
+  let ri = 0
+  while ri < list_len(results) do
+    if results[ri] != "" then
+      let precompile_failures = list_push(precompile_failures, results[ri])
+    end
+    let ri = ri + 1
+  end
+  print("[precompile] " + pj + "/" + precompile_jobs.length + " done")
+end
+if list_len(precompile_failures) > 0 then
+  let fi = 0
+  while fi < list_len(precompile_failures) do
+    print(precompile_failures[fi])
+    let fi = fi + 1
+  end
+  print("portfolio: " + list_len(precompile_failures) + " demo build(s) failed")
+  exit_with(1)
+end
 print("precompile pass done")
 
 # Each demo/native card is now its own fragment-mode page (portfolio/demos/
@@ -503,23 +381,21 @@ make a function called native_page takes slug, title, blurb, src, transcript ret
 end
 
 # demo_page: a demo runnable live in the browser, PLUS its native
-# transcript. Every such card shares the SAME 'playground' wasm module (the
-# self-hosted compiler compiled to wasm once) -- there's no per-demo wasm
-# build; "Compile and run" passes this card's own source text as input to
-# that shared compiler-in-wasm, exactly matching the original demo_card's
-# runCard()/srcText() wiring in wasi_shim_js below. pg_b64 is threaded in as
-# a parameter (PatLang functions don't close over outer `let`s).
-make a function called demo_page takes slug, title, blurb, src, transcript, pg_b64 returns done
+# transcript. The card's program is built by v2 as a WebAssembly module of
+# its own (the same source as the native transcript's), and "Run in this
+# browser" runs that module.
+make a function called demo_page takes slug, title, blurb, src, transcript returns done
+  let card_b64 = compile_wasm_only(src, slug + "_card")
   let sections = [tpl_para(blurb)]
   let sections = list_push(sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src' id='src-" + slug + "'>" + html_escape(src) + "</pre></details>"))
-  let sections = list_push(sections, tpl_raw("<p><button onclick='runCard(" + q() + slug + q() + ")'>Compile and run in this browser</button> <span class='ms' id='ms-" + slug + "'></span></p>"))
+  let sections = list_push(sections, tpl_raw("<p><button onclick='runCard(" + q() + slug + q() + ")'>Run in this browser</button> <span class='ms' id='ms-" + slug + "'></span></p>"))
   let sections = list_push(sections, tpl_raw("<pre class='out' id='out-" + slug + "'>(not run yet)</pre>"))
   let sections = list_push(sections, tpl_raw("<p class='label'>Native run on the build machine:</p>"))
   let sections = list_push(sections, tpl_raw("<pre class='out native'>" + html_escape(transcript) + "</pre>"))
   let js = sb_new()
-  sb_push(js, "const WASMS = { playground: '" + pg_b64 + "' };" + nl())
-  wasi_shim_js(js)
-  sb_push(js, "function runCard(id) { return runWasm(id, 'playground', [srcText(id)]); }" + nl())
+  sb_push(js, "const WASMS = { " + json_quote(slug) + ": '" + card_b64 + "' };" + nl())
+  runwasm_core_js(js)
+  sb_push(js, "function runCard(id) { return runWasm(id, id, []); }" + nl())
   let sections = list_push(sections, tpl_script(sb_str(js)))
   let page = tpl_page(title, "fragment", sections)
   write_file("portfolio/demos/" + slug + ".html", render_page(page))
@@ -1255,175 +1131,40 @@ make a function called coverage_page takes pg_b64, coverage_b64 returns done
   return true
 end
 
-make a function called b64bytes_only_js takes b returns done
-  # Just the base64-decode helper, for pages (like the threaded fiber demo)
-  # that need runWasmThreaded but not the rest of wasi_shim_js's playground/
-  # highlighting machinery (which assumes an #ed editor element that isn't
-  # present on those pages).
-  sb_push(b, "function b64bytes(s) {" + nl())
-  sb_push(b, "  const bin = atob(s);" + nl())
-  sb_push(b, "  const a = new Uint8Array(bin.length);" + nl())
-  sb_push(b, "  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);" + nl())
-  sb_push(b, "  return a;" + nl())
-  sb_push(b, "}" + nl())
-  return true
+# A module's text (self_hosting/v2/wasm/*.mjs) as plain statements: its
+# import lines dropped and `export ` taken off what it exports, so several
+# modules can share one script or one Worker.
+make a function called js_module_body takes text returns out
+  let lines = split_lines(text)
+  let out = sb_new()
+  let i = 0
+  while i < list_len(lines) do
+    if str_starts_with(lines[i], "export ") then
+      sb_push(out, substr(lines[i], 7, lines[i].length - 7))
+      sb_push(out, nl())
+    elif not str_starts_with(lines[i], "import ") then
+      sb_push(out, lines[i])
+      sb_push(out, nl())
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
 end
 
+# The runner every page that runs a WebAssembly demo carries: v2's browser
+# host (layout, launcher, and the executor as a Worker's source), then
+# self_hosting/tools/portfolio_runner.js, which defines runWasm,
+# runWasmThreaded and runWasmText over them.
 make a function called runwasm_core_js takes b returns done
-  # Shared core: b64bytes + a real WASI shim that actually completes
-  # write_file's path_open/fd_write/fd_close sequence (a synthetic single
-  # preopened directory at fd 3, matching what a real `wasmtime run --dir .`
-  # mapping would provide -- without this, Rust's own wasi-libc preopen
-  # scan sees zero preopens and write_file fails with "failed to find a
-  # pre-opened file descriptor" before ever calling path_open at all).
-  # Actual file bytes are captured per-fd (never mixed into `stdout`, unlike
-  # the old stub that ignored fd_write's fd argument entirely and silently
-  # glued any real file content onto the end of stdout, tolerated only
-  # because trailing text after </html> is ignored by HTML parsers). Each
-  # completed write is handed to renderFileFrame, which lazily creates one
-  # iframe per distinct written filename in a "files-<outId>" container
-  # right after the existing output box -- never pre-placed, so a program
-  # that writes nothing leaves no empty iframes behind.
-  sb_push(b, "function b64bytes(s) {" + nl())
-  sb_push(b, "  const bin = atob(s);" + nl())
-  sb_push(b, "  const a = new Uint8Array(bin.length);" + nl())
-  sb_push(b, "  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);" + nl())
-  sb_push(b, "  return a;" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "const MODCACHE = {};" + nl())
-  sb_push(b, "function ensureFilesContainer(outId) {" + nl())
-  sb_push(b, "  let c = document.getElementById('files-' + outId);" + nl())
-  sb_push(b, "  if (!c) {" + nl())
-  sb_push(b, "    c = document.createElement('div');" + nl())
-  sb_push(b, "    c.id = 'files-' + outId;" + nl())
-  sb_push(b, "    const out = document.getElementById('out-' + outId);" + nl())
-  sb_push(b, "    if (out && out.parentNode) out.parentNode.insertBefore(c, out.nextSibling);" + nl())
-  sb_push(b, "    else document.body.appendChild(c);" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "  return c;" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "function renderFileFrame(outId, path, content) {" + nl())
-  sb_push(b, "  const container = ensureFilesContainer(outId);" + nl())
-  sb_push(b, "  const safeId = 'file-' + outId + '-' + path.replace(/[^a-zA-Z0-9_.-]/g, '_');" + nl())
-  sb_push(b, "  const wrap = document.createElement('div');" + nl())
-  sb_push(b, "  wrap.style.marginTop = '0.5rem';" + nl())
-  sb_push(b, "  const label = document.createElement('p');" + nl())
-  sb_push(b, "  label.className = 'label';" + nl())
-  sb_push(b, "  label.textContent = 'Wrote: ' + path;" + nl())
-  sb_push(b, "  wrap.appendChild(label);" + nl())
-  sb_push(b, "  const frame = document.createElement('iframe');" + nl())
-  sb_push(b, "  frame.id = safeId;" + nl())
-  sb_push(b, "  frame.title = path;" + nl())
-  sb_push(b, "  frame.style.cssText = 'width:100%;height:20rem;border:1px solid color-mix(in srgb, currentColor 25%, transparent);border-radius:6px';" + nl())
-  sb_push(b, "  wrap.appendChild(frame);" + nl())
-  sb_push(b, "  container.appendChild(wrap);" + nl())
-  sb_push(b, "  frame.srcdoc = content;" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "async function runWasm(outId, wasmId, extraArgs) {" + nl())
-  sb_push(b, "  const out = document.getElementById('out-' + outId);" + nl())
-  sb_push(b, "  if (out) out.textContent = 'running...';" + nl())
-  sb_push(b, "  const filesContainer = document.getElementById('files-' + outId);" + nl())
-  sb_push(b, "  if (filesContainer) filesContainer.innerHTML = '';" + nl())
-  sb_push(b, "  let stdout = '';" + nl())
-  sb_push(b, "  const dec = new TextDecoder();" + nl())
-  sb_push(b, "  let mem = null;" + nl())
-  sb_push(b, "  const enc = new TextEncoder();" + nl())
-  sb_push(b, "  const eargs = (extraArgs && extraArgs.length) ? ['prog'].concat(extraArgs) : [];" + nl())
-  sb_push(b, "  const abufs = eargs.map(function(a) { return enc.encode(a); });" + nl())
-  sb_push(b, "  let nextFd = 100;" + nl())
-  sb_push(b, "  const openFiles = {};" + nl())
-  sb_push(b, "  const writtenFiles = [];" + nl())
-  sb_push(b, "  const PREOPEN_FD = 3;" + nl())
-  sb_push(b, "  const PREOPEN_NAME = '.';" + nl())
-  sb_push(b, "  const wasi = {" + nl())
-  sb_push(b, "    fd_write(fd, iovs, len, nw) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer); let w = 0; let text = '';" + nl())
-  sb_push(b, "      for (let i = 0; i < len; i++) {" + nl())
-  sb_push(b, "        const p = iovs + 8 * i;" + nl())
-  sb_push(b, "        const ptr = dv.getUint32(p, true), l = dv.getUint32(p + 4, true);" + nl())
-  sb_push(b, "        text += dec.decode(new Uint8Array(mem.buffer, ptr, l)); w += l;" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      if (fd === 1 || fd === 2) stdout += text;" + nl())
-  sb_push(b, "      else if (openFiles[fd]) openFiles[fd].chunks.push(text);" + nl())
-  sb_push(b, "      else stdout += text;" + nl())
-  sb_push(b, "      dv.setUint32(nw, w, true); return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    fd_prestat_get(fd, prestatPtr) {" + nl())
-  sb_push(b, "      if (fd !== PREOPEN_FD) return 8;" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
-  sb_push(b, "      dv.setUint8(prestatPtr, 0);" + nl())
-  sb_push(b, "      dv.setUint32(prestatPtr + 4, enc.encode(PREOPEN_NAME).length, true);" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    fd_prestat_dir_name(fd, pathPtr, pathLen) {" + nl())
-  sb_push(b, "      if (fd !== PREOPEN_FD) return 8;" + nl())
-  sb_push(b, "      const nameBytes = enc.encode(PREOPEN_NAME);" + nl())
-  sb_push(b, "      new Uint8Array(mem.buffer, pathPtr, Math.min(pathLen, nameBytes.length)).set(nameBytes);" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    path_open(dirfd, dirflags, pathPtr, pathLen, oflags, rb, ri, fdflags, fdPtr) {" + nl())
-  sb_push(b, "      const path = dec.decode(new Uint8Array(mem.buffer, pathPtr, pathLen));" + nl())
-  sb_push(b, "      const fd = nextFd++;" + nl())
-  sb_push(b, "      openFiles[fd] = { path, chunks: [] };" + nl())
-  sb_push(b, "      new DataView(mem.buffer).setUint32(fdPtr, fd, true);" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    fd_close(fd) {" + nl())
-  sb_push(b, "      if (openFiles[fd]) {" + nl())
-  sb_push(b, "        writtenFiles.push({ path: openFiles[fd].path, content: openFiles[fd].chunks.join('') });" + nl())
-  sb_push(b, "        delete openFiles[fd];" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    random_get(p, l) { crypto.getRandomValues(new Uint8Array(mem.buffer, p, l)); return 0; }," + nl())
-  sb_push(b, "    clock_time_get(cid, prec, tp) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
-  sb_push(b, "      const ns = BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6));" + nl())
-  sb_push(b, "      dv.setBigUint64(tp, ns, true); return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    args_sizes_get(pc, ps) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
-  sb_push(b, "      let total = 0; for (const a of abufs) total += a.length + 1;" + nl())
-  sb_push(b, "      dv.setUint32(pc, abufs.length, true); dv.setUint32(ps, total, true); return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    args_get(argvP, dataP) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer); let off = dataP;" + nl())
-  sb_push(b, "      for (let i = 0; i < abufs.length; i++) {" + nl())
-  sb_push(b, "        dv.setUint32(argvP + 4 * i, off, true);" + nl())
-  sb_push(b, "        new Uint8Array(mem.buffer, off, abufs[i].length).set(abufs[i]);" + nl())
-  sb_push(b, "        dv.setUint8(off + abufs[i].length, 0); off += abufs[i].length + 1;" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    environ_sizes_get(pc, ps) { const dv = new DataView(mem.buffer); dv.setUint32(pc, 0, true); dv.setUint32(ps, 0, true); return 0; }," + nl())
-  sb_push(b, "    environ_get() { return 0; }," + nl())
-  sb_push(b, "    proc_exit(c) { const e = new Error('exit'); e.exitCode = c; throw e; }," + nl())
-  sb_push(b, "    fd_fdstat_get() { return 0; }, fd_seek() { return 70; }," + nl())
-  sb_push(b, "    fd_read() { return 8; }," + nl())
-  sb_push(b, "    sched_yield() { return 0; }, poll_oneoff() { return 52; }" + nl())
-  sb_push(b, "  };" + nl())
-  sb_push(b, "  // Unknown WASI imports resolve to a stub returning ENOTSUP (58)" + nl())
-  sb_push(b, "  const wasiNs = new Proxy(wasi, { get(t, k) { return k in t ? t[k] : (() => 58); } });" + nl())
-  sb_push(b, "  try {" + nl())
-  sb_push(b, "    const t0 = performance.now();" + nl())
-  sb_push(b, "    if (!MODCACHE[wasmId]) MODCACHE[wasmId] = await WebAssembly.compile(b64bytes(WASMS[wasmId]));" + nl())
-  sb_push(b, "    const mod = MODCACHE[wasmId];" + nl())
-  sb_push(b, "    const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasiNs });" + nl())
-  sb_push(b, "    mem = inst.exports.memory;" + nl())
-  sb_push(b, "    try { inst.exports._start(); } catch (e) { if (!(e && e.exitCode === 0)) throw e; }" + nl())
-  sb_push(b, "    const ms = (performance.now() - t0).toFixed(1);" + nl())
-  sb_push(b, "    if (out) out.textContent = stdout;" + nl())
-  sb_push(b, "    for (const f of writtenFiles) renderFileFrame(outId, f.path, f.content);" + nl())
-  sb_push(b, "    const msEl = document.getElementById('ms-' + outId);" + nl())
-  sb_push(b, "    if (msEl) msEl.textContent = ms + ' ms wall (compile+run, this browser)';" + nl())
-  sb_push(b, "    return stdout;" + nl())
-  sb_push(b, "  } catch (e) {" + nl())
-  sb_push(b, "    const msg = stdout + ' [error: ' + e + ']';" + nl())
-  sb_push(b, "    if (out) out.textContent = msg;" + nl())
-  sb_push(b, "    return msg;" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "}" + nl())
-return true
+  let layout = js_module_body(read_file("self_hosting/v2/wasm/layout.mjs"))
+  let executor = layout + js_module_body(read_file("self_hosting/v2/wasm/executor.mjs"))
+  sb_push(b, "const V2_EXECUTOR_SRC = " + json_quote(executor) + ";" + nl())
+  sb_push(b, "function V2_LAUNCHER() {" + nl())
+  sb_push(b, layout)
+  sb_push(b, js_module_body(read_file("self_hosting/v2/wasm/launcher.mjs")))
+  sb_push(b, "return run;" + nl() + "}" + nl())
+  sb_push(b, read_file("self_hosting/tools/portfolio_runner.js"))
+  return true
 end
 
 make a function called runwasm_only_js takes b returns done
@@ -1454,273 +1195,6 @@ make a function called wasi_shim_js takes b returns done
   sb_push(b, "function runPlayground() { return runWasm('playground', 'playground', [document.getElementById('ed').value]); }" + nl())
   sb_push(b, "function loadExample() { const id = document.getElementById('exsel').value; document.getElementById('ed').value = srcText(id); hlUpdate(); }" + nl())
   sb_push(b, "window.addEventListener('DOMContentLoaded', hlUpdate);" + nl())
-  return true
-end
-
-make a function called wasi_threads_worker_js takes b returns done
-  sb_push(b, "// Generic WASI-threads worker: handles either the program's own entrypoint" + nl())
-  sb_push(b, "// (_start) or a fiber-spawned thread (wasi_thread_start), both against the" + nl())
-  sb_push(b, "// same shared module + shared memory." + nl())
-  sb_push(b, "//" + nl())
-  sb_push(b, "// Key ordering constraint discovered empirically: `thread-spawn` gets called" + nl())
-  sb_push(b, "// SYNCHRONOUSLY from inside a running WASM call stack, and the calling" + nl())
-  sb_push(b, "// thread immediately blocks afterward via Condvar::wait() (a native" + nl())
-  sb_push(b, "// memory.atomic.wait32 instruction) once it hands back the new tid. A" + nl())
-  sb_push(b, "// worker constructed *at that point* (new Worker() issued from inside the" + nl())
-  sb_push(b, "// still-executing host import call) never finishes booting -- its startup" + nl())
-  sb_push(b, "// appears to need the spawning agent to reach an actual JS event-loop turn," + nl())
-  sb_push(b, "// which never happens once parked in a blocking atomic wait." + nl())
-  sb_push(b, "//" + nl())
-  sb_push(b, "// This isn't just an ordering nuance to work around opportunistically: a" + nl())
-  sb_push(b, "// WASM program's execution is ONE continuous synchronous call from" + nl())
-  sb_push(b, "// _start() to completion. The only points where the calling worker's" + nl())
-  sb_push(b, "// thread stops running WASM are real blocking waits (Atomics.wait," + nl())
-  sb_push(b, "// compiled from Condvar::wait()) -- and Atomics.wait does NOT drain the" + nl())
-  sb_push(b, "// microtask queue while parked, it's a genuine OS-level thread freeze. So" + nl())
-  sb_push(b, "// a burst of thread-spawn calls with no intervening blocking wait (e.g." + nl())
-  sb_push(b, "// several fiber_new() calls in a row before any fiber_resume()) gives" + nl())
-  sb_push(b, "// async pool replenishment zero opportunity to run: the pool can only ever" + nl())
-  sb_push(b, "// contain what was pre-warmed *before* _start() began. Verified directly:" + nl())
-  sb_push(b, "// a 20-fiber creation burst against a small pool that tried to grow" + nl())
-  sb_push(b, "// on-demand exhausted the pool by fiber #5 and the synchronous fallback" + nl())
-  sb_push(b, "// spawns for the rest never finished booting in time (same deadlock class" + nl())
-  sb_push(b, "// as the original problem, just delayed) -- because the owning worker was" + nl())
-  sb_push(b, "// itself about to block, or already had, with no event-loop turn free for" + nl())
-  sb_push(b, "// the fallback workers' boot handshake to complete." + nl())
-  sb_push(b, "//" + nl())
-  sb_push(b, "// So the real, honest design: pre-warm a generous fixed ceiling BEFORE" + nl())
-  sb_push(b, "// _start() runs (below), sized to comfortably cover realistic PatLang" + nl())
-  sb_push(b, "// fiber/budgeted usage. Async replenishment (maintainPool, still present" + nl())
-  sb_push(b, "// below) then keeps topping back up toward that ceiling as workers are" + nl())
-  sb_push(b, "// consumed -- genuinely useful for a long-running program with many" + nl())
-  sb_push(b, "// sequential (not all-at-once) fiber operations, since each consumed slot" + nl())
-  sb_push(b, "// gets a chance to refill during the *next* blocking wait's aftermath, not" + nl())
-  sb_push(b, "// useful for surviving a single burst bigger than the ceiling itself." + nl())
-  sb_push(b, "const POOL_CEILING = 64;" + nl())
-  sb_push(b, "let mem = null;" + nl())
-  sb_push(b, "let tidCounter = null;" + nl())
-  sb_push(b, "let pool = [];" + nl())
-  sb_push(b, "let refilling = false;" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "function spawnIdleWorker() {" + nl())
-  sb_push(b, "  return new Promise((resolve) => {" + nl())
-  sb_push(b, "    const w = new Worker(self.location.href);" + nl())
-  sb_push(b, "    w.onmessage = (e) => {" + nl())
-  sb_push(b, "      if (e.data === 'ready') { resolve(w); return; }" + nl())
-  sb_push(b, "      // A job-result message from a worker that was handed a job earlier." + nl())
-  sb_push(b, "      self.postMessage(e.data);" + nl())
-  sb_push(b, "    };" + nl())
-  sb_push(b, "    w.onerror = (e) => self.postMessage({ ok: false, error: '[pool worker error] ' + e.message, type: 'thread' });" + nl())
-  sb_push(b, "    w.postMessage({ type: 'init' });" + nl())
-  sb_push(b, "  });" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "async function fillPool(n) {" + nl())
-  sb_push(b, "  const spawned = await Promise.all(Array.from({ length: n }, spawnIdleWorker));" + nl())
-  sb_push(b, "  pool.push(...spawned);" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "// Fire-and-forget: top the pool back up toward POOL_CEILING as consumed" + nl())
-  sb_push(b, "// slots free up between blocking waits. Can't help a single burst bigger" + nl())
-  sb_push(b, "// than the ceiling (see the note above `POOL_CEILING`), but does mean a" + nl())
-  sb_push(b, "// long-running program recovers its full pre-warmed headroom between" + nl())
-  sb_push(b, "// separate fiber operations rather than only ever getting it once." + nl())
-  sb_push(b, "function maintainPool() {" + nl())
-  sb_push(b, "  if (refilling) return;" + nl())
-  sb_push(b, "  const need = POOL_CEILING - pool.length;" + nl())
-  sb_push(b, "  if (need <= 0) return;" + nl())
-  sb_push(b, "  refilling = true;" + nl())
-  sb_push(b, "  fillPool(need).finally(() => { refilling = false; });" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "function makeImports(moduleForRespawn, args) {" + nl())
-  sb_push(b, "  let stdout = '';" + nl())
-  sb_push(b, "  const dec = new TextDecoder();" + nl())
-  sb_push(b, "  const enc = new TextEncoder();" + nl())
-  sb_push(b, "  // PatLang's own argv() strips slot 0 as the conventional program" + nl())
-  sb_push(b, "  // name (see runtime_rs.patlang's argv host arm) -- prepend a dummy" + nl())
-  sb_push(b, "  // one here, exactly like the plain (non-threaded) runWasm already" + nl())
-  sb_push(b, "  // does with 'prog', so the real args land at argv()[0], argv()[1], ..." + nl())
-  sb_push(b, "  const eargs = (args && args.length) ? [" + q() + "prog" + q() + "].concat(args) : [];" + nl())
-  sb_push(b, "  const abufs = eargs.map((a) => enc.encode(a));" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  const wasi_snapshot_preview1 = {" + nl())
-  sb_push(b, "    fd_write(fd, iovs, len, nw) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
-  sb_push(b, "      let w = 0;" + nl())
-  sb_push(b, "      for (let i = 0; i < len; i++) {" + nl())
-  sb_push(b, "        const p = iovs + 8 * i;" + nl())
-  sb_push(b, "        const ptr = dv.getUint32(p, true), l = dv.getUint32(p + 4, true);" + nl())
-  sb_push(b, "        // TextDecoder, like crypto.getRandomValues, refuses a view backed" + nl())
-  sb_push(b, "        // by SharedArrayBuffer -- copy to a plain buffer first." + nl())
-  sb_push(b, "        stdout += dec.decode(new Uint8Array(mem.buffer, ptr, l).slice());" + nl())
-  sb_push(b, "        w += l;" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      dv.setUint32(nw, w, true);" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    random_get(p, l) {" + nl())
-  sb_push(b, "      // crypto.getRandomValues refuses a view backed by SharedArrayBuffer;" + nl())
-  sb_push(b, "      // fill a plain scratch buffer and copy it in instead." + nl())
-  sb_push(b, "      const tmp = new Uint8Array(l);" + nl())
-  sb_push(b, "      crypto.getRandomValues(tmp);" + nl())
-  sb_push(b, "      new Uint8Array(mem.buffer, p, l).set(tmp);" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    clock_time_get(cid, prec, tp) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
-  sb_push(b, "      const ns = BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6));" + nl())
-  sb_push(b, "      dv.setBigUint64(tp, ns, true);" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    args_sizes_get(pc, ps) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
-  sb_push(b, "      let total = 0; for (const a of abufs) total += a.length + 1;" + nl())
-  sb_push(b, "      dv.setUint32(pc, abufs.length, true); dv.setUint32(ps, total, true); return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    args_get(argvP, dataP) {" + nl())
-  sb_push(b, "      const dv = new DataView(mem.buffer); let off = dataP;" + nl())
-  sb_push(b, "      for (let i = 0; i < abufs.length; i++) {" + nl())
-  sb_push(b, "        dv.setUint32(argvP + 4 * i, off, true);" + nl())
-  sb_push(b, "        new Uint8Array(mem.buffer, off, abufs[i].length).set(abufs[i]);" + nl())
-  sb_push(b, "        dv.setUint8(off + abufs[i].length, 0); off += abufs[i].length + 1;" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      return 0;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "    environ_sizes_get(pc, ps) { const dv = new DataView(mem.buffer); dv.setUint32(pc, 0, true); dv.setUint32(ps, 0, true); return 0; }," + nl())
-  sb_push(b, "    environ_get() { return 0; }," + nl())
-  sb_push(b, "    proc_exit(c) { const e = new Error('exit'); e.exitCode = c; throw e; }," + nl())
-  sb_push(b, "    fd_close() { return 0; }, fd_fdstat_get() { return 0; }, fd_seek() { return 70; }," + nl())
-  sb_push(b, "    fd_read() { return 8; }, fd_prestat_get() { return 8; }, fd_prestat_dir_name() { return 8; }," + nl())
-  sb_push(b, "    path_open() { return 76; }, sched_yield() { return 0; }, poll_oneoff() { return 52; }," + nl())
-  sb_push(b, "  };" + nl())
-  sb_push(b, "  const wasiNs = new Proxy(wasi_snapshot_preview1, { get(t, k) { return k in t ? t[k] : (() => 58); } });" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  const wasi = {" + nl())
-  sb_push(b, "    'thread-spawn': (startArg) => {" + nl())
-  sb_push(b, "      const tid = Atomics.add(tidCounter, 0, 1);" + nl())
-  sb_push(b, "      const w = pool.shift();" + nl())
-  sb_push(b, "      if (!w) {" + nl())
-  sb_push(b, "        // Pool exhausted -- best-effort synchronous spawn (may deadlock if" + nl())
-  sb_push(b, "        // this thread also blocks right after; the pool should be sized" + nl())
-  sb_push(b, "        // generously enough in practice that this path isn't hit)." + nl())
-  sb_push(b, "        console.log('[thread-worker] pool exhausted, spawning synchronously for tid=' + tid);" + nl())
-  sb_push(b, "        const w2 = new Worker(self.location.href);" + nl())
-  sb_push(b, "        w2.onmessage = (e) => { if (e.data !== 'ready') self.postMessage(e.data); };" + nl())
-  sb_push(b, "        w2.postMessage({ type: 'thread', module: moduleForRespawn, memory: mem, tidCounter, tid, startArg });" + nl())
-  sb_push(b, "        return tid;" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      w.onmessage = (e) => self.postMessage(e.data);" + nl())
-  sb_push(b, "      w.postMessage({ type: 'thread', module: moduleForRespawn, memory: mem, tidCounter, tid, startArg });" + nl())
-  sb_push(b, "      // Replenish asynchronously (and grow the target if demand is" + nl())
-  sb_push(b, "      // outpacing it) so later thread-spawn calls still have a ready" + nl())
-  sb_push(b, "      // worker even though this one won't help the current call." + nl())
-  sb_push(b, "      maintainPool();" + nl())
-  sb_push(b, "      return tid;" + nl())
-  sb_push(b, "    }," + nl())
-  sb_push(b, "  };" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  return { env: { memory: mem }, wasi_snapshot_preview1: wasiNs, wasi, getStdout: () => stdout };" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "self.onmessage = async (e) => {" + nl())
-  sb_push(b, "  const msg = e.data;" + nl())
-  sb_push(b, "  if (msg.type === 'init') {" + nl())
-  sb_push(b, "    // This worker is being prepared as an idle pool member -- just report" + nl())
-  sb_push(b, "    // ready and wait for a real job." + nl())
-  sb_push(b, "    self.postMessage('ready');" + nl())
-  sb_push(b, "    return;" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  mem = msg.memory;" + nl())
-  sb_push(b, "  tidCounter = msg.tidCounter;" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  if (msg.type === 'start') {" + nl())
-  sb_push(b, "    await fillPool(POOL_CEILING);" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  const imports = makeImports(msg.module, msg.args);" + nl())
-  sb_push(b, "  const { env, wasi_snapshot_preview1, wasi } = imports;" + nl())
-  sb_push(b, "" + nl())
-  sb_push(b, "  try {" + nl())
-  sb_push(b, "    const instance = await WebAssembly.instantiate(msg.module, { env, wasi_snapshot_preview1, wasi });" + nl())
-  sb_push(b, "    try {" + nl())
-  sb_push(b, "      if (msg.type === 'start') {" + nl())
-  sb_push(b, "        instance.exports._start();" + nl())
-  sb_push(b, "      } else {" + nl())
-  sb_push(b, "        instance.exports.wasi_thread_start(msg.tid, msg.startArg);" + nl())
-  sb_push(b, "      }" + nl())
-  sb_push(b, "      self.postMessage({ ok: true, stdout: imports.getStdout(), type: msg.type, tid: msg.tid });" + nl())
-  sb_push(b, "    } catch (err) {" + nl())
-  sb_push(b, "      const exitCode = (err && typeof err.exitCode === 'number') ? err.exitCode : null;" + nl())
-  sb_push(b, "      self.postMessage({ ok: exitCode === 0, stdout: imports.getStdout(), type: msg.type, tid: msg.tid, error: exitCode === null ? String(err) : null });" + nl())
-  sb_push(b, "    }" + nl())
-  sb_push(b, "  } catch (err) {" + nl())
-  sb_push(b, "    self.postMessage({ ok: false, stdout: " + q() + q() + ", type: msg.type, tid: msg.tid, error: " + q() + "instantiate failed: " + q() + " + err });" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "};" + nl())
-  return true
-end
-
-
-# Real WASI-threads support: a hand-rolled implementation of the WASI
-# threads proposal ABI (env::memory shared import, wasi::thread-spawn
-# import, wasi_thread_start export) -- no wasm-bindgen, matching this
-# project's existing from-scratch WASI shim philosophy. Spike-verified
-# (standalone, headless-browser, single-fiber and 20-fiber-burst cases)
-# before folding in here; see wasi_threads_worker_js below for the pool
-# design and the hard constraint it exists to work around. Requires
-# Cross-Origin-Opener-Policy/Cross-Origin-Embedder-Policy response headers
-# (crossOriginIsolated) to unlock SharedArrayBuffer -- callers must check
-# self.crossOriginIsolated before offering a threaded run button.
-make a function called wasi_threads_worker_tag returns html
-  # The pool-based WASI-threads worker script, embedded as a *non-executing*
-  # <script type="text/plain"> tag rather than inlined into the page's own
-  # executing script -- it must run isolated inside real Worker instances
-  # (its own `self` is a WorkerGlobalScope, not the page's window), not as
-  # top-level statements in the main script's scope. <script> is a raw-text
-  # HTML element regardless of its type attribute, so this is embedded
-  # verbatim, unescaped -- entities do NOT get decoded inside it either.
-  let tw = sb_new()
-  wasi_threads_worker_js(tw)
-  return "<script type=" + q() + "text/plain" + q() + " id=" + q() + "thread-worker-src" + q() + ">" + sb_str(tw) + "</script>"
-end
-
-make a function called wasi_threads_shim_js takes b returns done
-  sb_push(b, "let THREAD_WORKER_URL = null;" + nl())
-  sb_push(b, "function threadWorkerUrl() {" + nl())
-  sb_push(b, "  if (!THREAD_WORKER_URL) {" + nl())
-  sb_push(b, "    THREAD_WORKER_URL = URL.createObjectURL(new Blob([document.getElementById('thread-worker-src').textContent], { type: " + q() + "application/javascript" + q() + " }));" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "  return THREAD_WORKER_URL;" + nl())
-  sb_push(b, "}" + nl())
-  sb_push(b, "async function runWasmThreaded(outId, wasmId, extraArgs) {" + nl())
-  sb_push(b, "  const out = document.getElementById(" + q() + "out-" + q() + " + outId);" + nl())
-  sb_push(b, "  if (!self.crossOriginIsolated) {" + nl())
-  sb_push(b, "    if (out) out.textContent = " + q() + "requires cross-origin isolation (COOP/COEP headers) -- not available on this page load" + q() + ";" + nl())
-  sb_push(b, "    return;" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "  if (out) out.textContent = " + q() + "running (real OS threads via WASI threads proposal)..." + q() + ";" + nl())
-  sb_push(b, "  const t0 = performance.now();" + nl())
-  sb_push(b, "  try {" + nl())
-  sb_push(b, "    const module = await WebAssembly.compile(b64bytes(WASMS[wasmId]));" + nl())
-  sb_push(b, "    const memory = new WebAssembly.Memory({ initial: 64, maximum: 2048, shared: true });" + nl())
-  sb_push(b, "    const tidCounter = new Int32Array(new SharedArrayBuffer(4));" + nl())
-  sb_push(b, "    tidCounter[0] = 1;" + nl())
-  sb_push(b, "    const mainWorker = new Worker(threadWorkerUrl());" + nl())
-  sb_push(b, "    const result = await new Promise((resolve, reject) => {" + nl())
-  sb_push(b, "      mainWorker.onmessage = (e) => resolve(e.data);" + nl())
-  sb_push(b, "      mainWorker.onerror = (e) => reject(new Error(e.message));" + nl())
-  sb_push(b, "      mainWorker.postMessage({ type: " + q() + "start" + q() + ", module, memory, tidCounter, args: extraArgs || [] });" + nl())
-  sb_push(b, "    });" + nl())
-  sb_push(b, "    const ms = (performance.now() - t0).toFixed(1);" + nl())
-  sb_push(b, "    if (out) out.textContent = result.stdout + (result.ok ? " + q() + "" + q() + " : " + q() + " [error: " + q() + " + result.error + " + q() + "]" + q() + ");" + nl())
-  sb_push(b, "    const msEl = document.getElementById(" + q() + "ms-" + q() + " + outId);" + nl())
-  sb_push(b, "    if (msEl) msEl.textContent = ms + " + q() + " ms wall (compile+run, real OS threads, this browser)" + q() + ";" + nl())
-  sb_push(b, "  } catch (e) {" + nl())
-  sb_push(b, "    if (out) out.textContent = " + q() + "error: " + q() + " + e;" + nl())
-  sb_push(b, "  }" + nl())
-  sb_push(b, "}" + nl())
   return true
 end
 
@@ -1755,7 +1229,7 @@ compile_native(pos_src, "pos")
 let pos_native = exec_capture("portfolio/build/pos.exe")
 print("pos done")
 
-let post_src = test_framework_src() + chr(10) + read_file("self_hosting/lib/pos.patlang") + chr(10) + read_file("self_hosting/examples/pos_tests.patlang")
+let post_src = test_framework_src() + chr(10) + strip_include_lines(read_file("self_hosting/lib/pos.patlang")) + chr(10) + read_file("self_hosting/examples/pos_tests.patlang")
 compile_native(post_src, "postests")
 let post_native = exec_capture("portfolio/build/postests.exe")
 print("pos tests done")
@@ -1884,16 +1358,8 @@ print("queue recovery demo done")
 # this file; instead we run them as data through the same tokenize/
 # parse_program/lower_program/run_ir pipeline used for the wasm builds.
 let router_raw = read_file("self_hosting/examples/router_dsl_demo.patlang")
-let dsl_driver = read_file("self_hosting/lib/regex_dsl.patlang") + chr(10)
-  + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10)
-  + "let raw = read_file(\"self_hosting/examples/router_dsl_demo.patlang\")" + chr(10)
-  + "let expanded = expand_syntax_dsls(raw)" + chr(10)
-  + "write_file(\"portfolio/build/router_dsl_expanded.patlang\", expanded)" + chr(10)
-let dsl_toks = tokenize(dsl_driver)
-let dsl_ast = parse_program(dsl_toks)
-let dsl_ir = lower_program(dsl_ast)
-run_ir(dsl_ir)
-let router_src = read_file("portfolio/build/router_dsl_expanded.patlang")
+let router_src = expand_syntax_dsls(router_raw)
+write_file("portfolio/build/router_dsl_expanded.patlang", router_src)
 compile_native(router_src, "routerdsl")
 let router_native = exec_capture("portfolio/build/routerdsl.exe")
 print("router dsl demo done")
@@ -1939,7 +1405,7 @@ let dynsyntax_src1 = read_file("self_hosting/lib/lexer.patlang")
 let dynsyntax_src2 = dynsyntax_src1 + read_file("self_hosting/lib/parser.patlang")
 let dynsyntax_src3 = dynsyntax_src2 + read_file("self_hosting/lib/lower.patlang")
 let dynsyntax_src4 = dynsyntax_src3 + read_file("self_hosting/lib/regex_dsl.patlang")
-let dynsyntax_src5 = dynsyntax_src4 + read_file("self_hosting/lib/syntax_dsl.patlang")
+let dynsyntax_src5 = dynsyntax_src4 + read_file("self_hosting/lib/syntax_dsl.patlang") + read_file("self_hosting/lib/interp.patlang")
 let dynsyntax_src = dynsyntax_src5 + read_file("self_hosting/examples/dynamic_syntax_demo.patlang")
 compile_native(dynsyntax_src, "dynsyntaxdemo")
 let dynsyntax_native = exec_capture("portfolio/build/dynsyntaxdemo.exe")
@@ -1954,12 +1420,9 @@ compile_native(threading_src, "threadingdemo")
 let threading_native = exec_capture("portfolio/build/threadingdemo.exe")
 print("threading demo done")
 
-# Fibers: interpreter-only for now (see ir/fiber.rs's header comment --
-# compiled-native fiber support is a natural follow-up, not yet built), so
-# this transcript is captured via `pat --ir-run` directly rather than
-# compile_native + exec_capture like every other native-only demo.
 let fiber_src = read_file("self_hosting/examples/fiber_demo.patlang")
-let fiber_native = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/examples/fiber_demo.patlang")
+compile_native(fiber_src, "fiber")
+let fiber_native = exec_capture("portfolio/build/fiber.exe")
 print("fiber demo done")
 
 let report_lib_src = read_file("self_hosting/lib/report.patlang")
@@ -1977,21 +1440,14 @@ let report_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + re
 let report_b64 = compile_wasm_only(report_wasm_src, "report_timeline")
 print("report timeline wasm done")
 
-let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
+let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/lib/json.patlang") + chr(10) + read_file("self_hosting/lib/interp.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
 let pg_b64 = compile_both(pg_src, "playground")
 print("playground done")
 
-# Debug-capable playground: the SAME lexer/parser/lower/regex_dsl/
-# syntax_dsl/playground_main pipeline, plus lib/json + lib/interp so
-# playground_main's "debug" mode (dbg_trace_json) is available. Compiled
-# SEPARATELY, to wasm32-wasip1-threads, since dbg_trace's fiber-based
-# pause/resume needs real threads -- the ordinary "run"/"tokens"/"ast"
-# modes stay on the plain wasm32-wasip1 pg_b64 build above (no threading
-# overhead, and no cross-origin-isolation requirement) for everything
-# that doesn't need debugging.
-let pg_debug_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/lib/json.patlang") + chr(10) + read_file("self_hosting/lib/interp.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
-let pg_debug_b64 = compile_wasm_threaded_only(pg_debug_src, "playground_debug")
-print("playground debug wasm done")
+# The playground module carries lib/interp.patlang, which runs programs and
+# gives the "debug" mode's trace (dbg_trace_json), and every v2 module has
+# threads, so the IDE's debugger uses the same module.
+let pg_debug_b64 = pg_b64
 
 # hexrts: a small hex-grid RTS-lite economy sim (self_hosting/lib/
 # hexrts.patlang) -- unlike the REPL/playground, this is a NORMAL compiled
@@ -2050,23 +1506,6 @@ let coverage_b64 = compile_both(coverage_src, "coverage")
 print("coverage done")
 
 # Dev tools: build them with the pipeline, capture their transcripts
-let clibs = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/codegen.patlang") + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
-let patbuild_src = read_file("self_hosting/tools/patbuild_main.patlang")
-# TEMPORARILY skipping recompilation (compile_native call removed, not just
-# cached): patc1.exe was found to take 45+ minutes compiling patbuild's
-# combined source (~385KB in, ~1.9MB of generated Rust out) -- the SAME
-# tokenize/parse/lower/emit_program_rs pipeline run directly under the
-# interpreter finishes in ~66 seconds, a ~40x anomaly, not just expected
-# self-hosted-compiler slowness. Likely O(n^2) string concatenation
-# somewhere in codegen.patlang's Rust-text emission for large outputs
-# specifically -- logged in the backlog for a proper StringBuilder-based
-# fix. Reusing the existing portfolio/build/patbuild.exe (built before
-# today's compiler changes; patbuild_main.patlang itself is unchanged, only
-# the shared lexer/parser/lower/codegen/runtime_rs it was compiled FROM
-# have moved on, which doesn't affect the already-compiled binary's own
-# behavior) so this demo isn't blocked on that fix.
-let patbuild_native = exec_capture("portfolio/build/patbuild.exe", "--native")
-print("patbuild done (compile skipped, reusing existing portfolio/build/patbuild.exe)")
 
 let flow_src = read_file("self_hosting/tools/flowgraph_main.patlang")
 let flow_full = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + flow_src
@@ -2157,7 +1596,7 @@ let maze_b64 = compile_wasm_only(maze_wasm_src, "maze")
 print("maze wasm done")
 
 let maze_body = sb_new()
-sb_push(maze_body, "<p>A grid compiled into logic-programming <code>fact</code>s, solved by a recursive depth-first search driven by <code>query</code>, announced with <code>goal</code>, and reported through a <code>solved</code>/<code>unsolved</code> event - generation and solving both run live in this page (compiled to WASM once, no rustc per maze). Pick a size and seed, generate a maze, then watch it solve one visited cell at a time.</p>" + nl())
+sb_push(maze_body, "<p>A grid compiled into logic-programming <code>fact</code>s, solved by a recursive depth-first search driven by <code>query</code>, and reported through a <code>solved</code>/<code>unsolved</code> event - generation and solving both run live in this page (compiled to WASM once, no rustc per maze). Pick a size and seed, generate a maze, then watch it solve one visited cell at a time.</p>" + nl())
 sb_push(maze_body, maze_css())
 sb_push(maze_body, "<style>" + nl())
 sb_push(maze_body, ".mz-visited{background:#f6b93b}" + nl())
@@ -2294,14 +1733,6 @@ sb_push(ide_js, "  playground: '" + pg_b64 + "'," + nl())
 sb_push(ide_js, "  debugwasm: '" + pg_debug_b64 + "'" + nl())
 sb_push(ide_js, "};" + nl())
 wasi_shim_js(ide_js)
-# wasi_shim_js only defines the plain (non-threaded) runWasm -- the Debug
-# button's ideDebug() needs runWasmThreaded (fiber-based dbg_trace needs
-# real threads), which lives in wasi_threads_shim_js instead, alongside
-# the fiber/robots/threading demos. Safe to layer on top of wasi_shim_js:
-# it doesn't redefine b64bytes/MODCACHE, just adds runWasmThreaded/
-# threadWorkerUrl/THREAD_WORKER_URL, none of which collide with anything
-# wasi_shim_js already emitted.
-wasi_threads_shim_js(ide_js)
 sb_push(ide_js, "function ideSave() { try { localStorage.setItem('patlang_ide_src', document.getElementById('ed').value); } catch (e) {} }" + nl())
 sb_push(ide_js, "function ideReset() { loadExample(); ideSave(); }" + nl())
 sb_push(ide_js, "function ideKey(e) { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); runWasm('ide', 'playground', [document.getElementById('ed').value, 'run']); } }" + nl())
@@ -2370,7 +1801,7 @@ sb_push(ide_js, "  csEl.textContent = ev.call_stack.length ? ev.call_stack.join(
 sb_push(ide_js, "  dbgSelectLine(ev.line);" + nl())
 sb_push(ide_js, "}" + nl())
 
-let ide_sections = [tpl_raw(sb_str(ide_body)), tpl_raw(wasi_threads_worker_tag()), tpl_script(sb_str(ide_js))]
+let ide_sections = [tpl_raw(sb_str(ide_body)), tpl_script(sb_str(ide_js))]
 write_file("portfolio/demos/ide.html", render_page(tpl_page("PatLang IDE", "fragment", ide_sections)))
 print("wrote portfolio/demos/ide.html")
 
@@ -2520,28 +1951,18 @@ let rp_sections = [tpl_raw(sb_str(rp_body)), tpl_script(sb_str(rp_js))]
 write_file("portfolio/demos/report-writer.html", render_page(tpl_page("Project report writer (goal-oriented)", "fragment", rp_sections)))
 print("wrote portfolio/demos/report-writer.html")
 
-# Compiler self-metrics: the PatLang front+middle end processing its own source
-let compiler_src = read_file("self_hosting/lib/lexer.patlang")
-let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/parser.patlang")
-let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/lower.patlang")
-let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/codegen.patlang")
-let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
-let compiler_src = compiler_src + chr(10) + read_file("self_hosting/patc1_main.patlang")
+# Compiler self-metrics: v2 building itself, warm, with the time of each
+# phase it records (the .progress file beside its output).
 let m0 = now_ms()
-let ctoks = tokenize(compiler_src)
-let m1 = now_ms()
-let cast = parse_program(ctoks)
-let m2 = now_ms()
-let cir = lower_program(cast)
-let m3 = now_ms()
-let crs = emit_program_rs(cir)
-let m4 = now_ms()
+let metrics_said = exec_capture("self_hosting/build/v2.exe", "self_hosting/v2/compile.patlang", "portfolio/build/v2_self.exe", "--workers", "8")
+let metrics_ms = now_ms() - m0
+let metrics_phases = split_lines(read_file("portfolio/build/v2_self.exe.progress"))
 print("compiler metrics done")
 
 # ---- one fragment page per example ----
 
-demo_page("feature", "All paradigms in one program", "Recursion, control flow, lists, <strong>events</strong> (when/emit), <strong>logic</strong> (fact/query), <strong>OO</strong> (new/send/get), and <strong>functional</strong> map/filter via <code>apply</code>.", feature_src, feature_native, pg_b64)
-demo_page("bench", "Self-timing benchmark", "fib(27), a 2-million iteration loop, and a 200k-element vector build, each reporting its own elapsed milliseconds.", bench_src, bench_native, pg_b64)
+demo_page("feature", "All paradigms in one program", "Recursion, control flow, lists, <strong>events</strong> (when/emit), <strong>logic</strong> (fact/query), <strong>OO</strong> (new/send/get), and <strong>functional</strong> map/filter via <code>apply</code>.", feature_src, feature_native)
+demo_page("bench", "Self-timing benchmark", "fib(27), a 2-million iteration loop, and a 200k-element vector build, each reporting its own elapsed milliseconds.", bench_src, bench_native)
 
 # Live playground: bespoke content (an editor, not a source/transcript
 # pair), so built directly with template.patlang rather than demo_page.
@@ -2566,21 +1987,21 @@ let pgnd_sections = list_push(pgnd_sections, tpl_script(sb_str(pgnd_js)))
 write_file("portfolio/demos/playground.html", render_page(tpl_page("Live playground: the compiler, in your browser", "fragment", pgnd_sections)))
 print("wrote portfolio/demos/playground.html")
 
-demo_page("pos", "Point of sale (events + OO + logic)", "A checkout session as a stream of <code>scan</code>/<code>pay</code> events: the product catalog lives in the object store, and a <code>dairy</code> fact drives the discount rule.", pos_src, pos_native, pg_b64)
-demo_page("postests", "BDD framework: unit, integration, Gherkin", "PatLang's own self-hosted Gherkin-style BDD framework (<code>lib/test.patlang</code>: <code>t_init</code>/<code>check</code>/<code>step</code>/<code>run_feature_tagged</code>), running against the point of sale: unit assertions, event-driven integration checks, and a Gherkin feature whose steps dispatch through <code>apply</code>. The same framework drives PatLang's own self-hosted regression suites (<code>self_hosting/reflect_transpile_selftest.patlang</code>, <code>self_hosting/examples/pos_tests.patlang</code>), each wired into <code>cargo test</code> via a thin Rust cucumber step that just asserts on this framework's own <code>ALL TESTS PASSED</code> output.", post_src, post_native, pg_b64)
-demo_page("contracts", "Design by contract: require / ensure / assert", "<code>require</code> checks a precondition, <code>ensure</code> a postcondition, and <code>assert</code> is the same primitive used standalone &mdash; all three lower to one <code>contract_check</code> host call, enforced identically whether interpreted, run here via WASM (no rustc at all), or compiled natively. The last line deliberately violates a precondition so you can see enforcement fire.", contracts_src, contracts_native, pg_b64)
+demo_page("pos", "Point of sale (events + OO + logic)", "A checkout session as a stream of <code>scan</code>/<code>pay</code> events: the product catalog lives in the object store, and a <code>dairy</code> fact drives the discount rule.", pos_src, pos_native)
+demo_page("postests", "BDD framework: unit, integration, Gherkin", "PatLang's own self-hosted Gherkin-style BDD framework (<code>lib/test.patlang</code>: <code>t_init</code>/<code>check</code>/<code>step</code>/<code>run_feature_tagged</code>), running against the point of sale: unit assertions, event-driven integration checks, and a Gherkin feature whose steps dispatch through <code>apply</code>. The same framework drives PatLang's own self-hosted regression suites (<code>self_hosting/reflect_transpile_selftest.patlang</code>, <code>self_hosting/examples/pos_tests.patlang</code>), each wired into <code>cargo test</code> via a thin Rust cucumber step that just asserts on this framework's own <code>ALL TESTS PASSED</code> output.", post_src, post_native)
+demo_page("contracts", "Design by contract: require / ensure / assert", "<code>require</code> checks a precondition, <code>ensure</code> a postcondition, and <code>assert</code> is the same primitive used standalone &mdash; all three lower to one <code>contract_check</code> host call, enforced identically whether interpreted, run here via WASM (no rustc at all), or compiled natively. The last line deliberately violates a precondition so you can see enforcement fire.", contracts_src, contracts_native)
 
-demo_page("goaloriented", "Goal-oriented programming: real backward chaining + GOAP planning", "PatLang's goal-oriented paradigm is genuinely real, not a facade: <code>rule_add</code>/<code>solve</code> do actual SLD-style backward-chaining resolution with backtracking (a ground fact is just a rule with an empty body &mdash; the standard Prolog trick), and <code>action_add</code>/<code>plan</code> is a real GOAP planner, doing uniform-cost forward search over actions with preconditions/effects/cost to find the cheapest ordered plan &mdash; not just picking the first path that works. A successful <code>require</code>/<code>ensure</code> check also asserts a <code>contract_holds</code> fact, so design-by-contract checks feed directly into either engine. This demo derives whether a build target is buildable via a genuine multi-hop dependency chain, and separately produces a real 3-step build plan that correctly prefers a cheaper path over a pricier shortcut.", goal_oriented_src, goal_oriented_native, pg_b64)
+demo_page("goaloriented", "Goal-oriented programming: real backward chaining + GOAP planning", "PatLang's goal-oriented paradigm is genuinely real, not a facade: <code>rule_add</code>/<code>solve</code> do actual SLD-style backward-chaining resolution with backtracking (a ground fact is just a rule with an empty body &mdash; the standard Prolog trick), and <code>action_add</code>/<code>plan</code> is a real GOAP planner, doing uniform-cost forward search over actions with preconditions/effects/cost to find the cheapest ordered plan &mdash; not just picking the first path that works. A successful <code>require</code>/<code>ensure</code> check also asserts a <code>contract_holds</code> fact, so design-by-contract checks feed directly into either engine. This demo derives whether a build target is buildable via a genuine multi-hop dependency chain, and separately produces a real 3-step build plan that correctly prefers a cheaper path over a pricier shortcut.", goal_oriented_src, goal_oriented_native)
 
-demo_page("bitwise", "Bitwise operators & bitfields", "Word-form keyword operators &mdash; <code>band</code>/<code>bor</code>/<code>bxor</code>/<code>bnot</code>/<code>shl</code>/<code>shr</code> &mdash; rather than C-style symbols: <code>|</code> and <code>&amp;</code> are already taken by the <code>|&gt;</code> pipeline operator and <code>|params|</code> closure syntax, and PatLang already spells <code>and</code>/<code>or</code>/<code>not</code> as words, so this follows the language's own convention instead of importing symbols that don't fit. Plus four bitfield helpers &mdash; <code>bit_get</code>/<code>bit_set</code>/<code>bit_slice</code>/<code>bit_set_slice</code> &mdash; for packed-integer field access without needing a struct/type system. This demo packs four byte-sized fields into one integer two different ways (via <code>shl</code>/<code>bor</code> directly, and via <code>bit_set_slice</code>) and confirms they agree, then demonstrates flag set/clear/toggle/test.", bitwise_src, bitwise_native, pg_b64)
+demo_page("bitwise", "Bitwise operators & bitfields", "Word-form keyword operators &mdash; <code>band</code>/<code>bor</code>/<code>bxor</code>/<code>bnot</code>/<code>shl</code>/<code>shr</code> &mdash; rather than C-style symbols: <code>|</code> and <code>&amp;</code> are already taken by the <code>|&gt;</code> pipeline operator and <code>|params|</code> closure syntax, and PatLang already spells <code>and</code>/<code>or</code>/<code>not</code> as words, so this follows the language's own convention instead of importing symbols that don't fit. Plus four bitfield helpers &mdash; <code>bit_get</code>/<code>bit_set</code>/<code>bit_slice</code>/<code>bit_set_slice</code> &mdash; for packed-integer field access without needing a struct/type system. This demo packs four byte-sized fields into one integer two different ways (via <code>shl</code>/<code>bor</code> directly, and via <code>bit_set_slice</code>) and confirms they agree, then demonstrates flag set/clear/toggle/test.", bitwise_src, bitwise_native)
 
-demo_page("rulesyntax", "Declarative syntax: rule Head(args) :- Body1, Body2.", "The parser has recognized <code>rule ... :- ...</code> syntax for a long time &mdash; it just silently discarded it as a no-op. This makes it real: pure sugar over the same <code>rule_add</code>/<code>solve</code> backend as the goal-oriented demo above, so <code>rule buildable(X) :- unchanged(X).</code> and <code>rule buildable(X) :- dep(X, Y), buildable(Y).</code> now actually declare rules, not decoration. Verified byte-identical against the hand-written <code>rule_add(...)</code> function-call form it desugars to.", rulesyntax_src, rulesyntax_native, pg_b64)
+demo_page("rulesyntax", "Declarative syntax: rule Head(args) :- Body1, Body2.", "The parser has recognized <code>rule ... :- ...</code> syntax for a long time &mdash; it just silently discarded it as a no-op. This makes it real: pure sugar over the same <code>rule_add</code>/<code>solve</code> backend as the goal-oriented demo above, so <code>rule buildable(X) :- unchanged(X).</code> and <code>rule buildable(X) :- dep(X, Y), buildable(Y).</code> now actually declare rules, not decoration. Verified byte-identical against the hand-written <code>rule_add(...)</code> function-call form it desugars to.", rulesyntax_src, rulesyntax_native)
 
-demo_page("vfsdemo", "Virtual filesystem: works in the browser too", "<code>vfs_read</code>/<code>vfs_write</code>/<code>vfs_exists</code>/<code>vfs_list</code>/<code>vfs_delete</code> are an in-memory filesystem available on every target &mdash; including WASM, unlike <code>read_file</code>/<code>write_file</code>, which are real (native-only) disk I/O. Try the <em>Compile and run in this browser</em> button below: this demo runs entirely inside the WASM sandbox with no real filesystem access at all. A separate, explicit, native-only <code>vfs_flush_to_disk</code> (not exercised here) write-throughs to real files, gated by an allowed-root check.", vfsdemo_src, vfsdemo_native, pg_b64)
+demo_page("vfsdemo", "Virtual filesystem: works in the browser too", "<code>vfs_read</code>/<code>vfs_write</code>/<code>vfs_exists</code>/<code>vfs_list</code>/<code>vfs_delete</code> are an in-memory filesystem available on every target &mdash; including WASM, unlike <code>read_file</code>/<code>write_file</code>, which are real (native-only) disk I/O. Try the <em>Compile and run in this browser</em> button below: this demo runs entirely inside the WASM sandbox with no real filesystem access at all. A separate, explicit, native-only <code>vfs_flush_to_disk</code> (not exercised here) write-throughs to real files, gated by an allowed-root check.", vfsdemo_src, vfsdemo_native)
 
-demo_page("matchdemo", "Pattern matching: match / case", "A <code>match</code>/<code>case</code> construct is pure syntactic sugar &mdash; it desugars entirely to the same <code>if</code>/jump instructions an ordinary <code>if</code>/<code>elif</code> chain already produces, so every backend (this WASM playground included) gets it for free with zero new instructions. Covers literal, comparison-guard (<code>case &gt; 100</code>), tagged-list destructuring (including nesting, e.g. <code>[\"Err\", [\"Timeout\", ms]]</code>), a <code>when</code> guard that can reference its own pattern's binding, and unquoted glob patterns (<code>*.patlang</code>) built on the existing regex engine. There's no dedicated \"match by type\" pattern kind &mdash; a <code>when</code> guard already covers it (and combining criteria across several variables, not just the scrutinee) since it's just an arbitrary boolean expression, free to call <code>type_of()</code>/<code>numeric_kind()</code> and reference any variable in scope. The last case is a deliberate no-match against a pattern with no wildcard arm, so you can see PatLang's real runtime-error behavior fire instead of a silent no-op.", matchdemo_src, matchdemo_native, pg_b64)
-demo_page("towerdemo", "Numeric Tower: BigInt, Rational, Complex", "Ordinary <code>Int</code> arithmetic stays on the fast path until it can't: <code>factorial(30)</code> overflows a 64-bit integer partway through and the runtime silently promotes to an exact, arbitrary-precision <code>BigInt</code> &mdash; no annotation, no wraparound, no lost digits. <code>10 / 3</code> doesn't divide evenly, so instead of quietly rounding to a float it promotes to an exact <code>Rational</code> and prints <code>10/3</code>. <code>sqrt</code> of a negative number produces a <code>Complex</code> value. The last two lines call into <code>self_hosting/lib/math.patlang</code> (<code>hypot</code>, <code>is_prime</code>, <code>mean</code>), a small PatLang-authored library built entirely on top of a handful of <code>Host::</code> primitives (<code>sqrt</code>/<code>floor</code>/<code>abs</code>/<code>numeric_kind</code>) &mdash; the hybrid design that keeps the primitive surface small while still growing a real standard library. This card runs on the exact same in-browser WASM playground engine as the demos above (no rustc needed to try it live); the compiled path's arithmetic is exact because the emitted Rust program carries its own hand-rolled limb-based BigInt/Rational/Complex implementation rather than depending on a crate (compiled programs are single-file <code>rustc</code> invocations with no <code>Cargo.toml</code>), and a cross-implementation test in the Rust test suite verifies that hand-rolled bignum arithmetic is byte-identical, operation for operation, to the interpreter's own <code>num-bigint</code>-crate-based arithmetic &mdash; two independent implementations kept honest against each other.", tower_src, tower_native, pg_b64)
-demo_page("routerdsl", "User-defined DSL: routes { ... }", "A small grammar extension declared entirely in PatLang source (<code>syntax RouterDSL { trigger; tokens { ... }; rule { ... } }</code>), matching HTTP-verb/URL-path tokens with a general-purpose regex engine also written in PatLang (<code>lib/regex_dsl.patlang</code>). A source-to-source preprocessing pass (<code>lib/syntax_dsl.patlang</code>) expands every <code>routes { ... }</code> block into plain <code>register_route(...)</code> calls before the ordinary compiler ever sees them &mdash; run here via the same in-browser WASM playground engine as the demos above (no rustc at all), or compiled natively below.", router_raw, router_native, pg_b64)
+demo_page("matchdemo", "Pattern matching: match / case", "A <code>match</code>/<code>case</code> construct is pure syntactic sugar &mdash; it desugars entirely to the same <code>if</code>/jump instructions an ordinary <code>if</code>/<code>elif</code> chain already produces, so every backend (this WASM playground included) gets it for free with zero new instructions. Covers literal, comparison-guard (<code>case &gt; 100</code>), tagged-list destructuring (including nesting, e.g. <code>[\"Err\", [\"Timeout\", ms]]</code>), a <code>when</code> guard that can reference its own pattern's binding, and unquoted glob patterns (<code>*.patlang</code>) built on the existing regex engine. There's no dedicated \"match by type\" pattern kind &mdash; a <code>when</code> guard already covers it (and combining criteria across several variables, not just the scrutinee) since it's just an arbitrary boolean expression, free to call <code>type_of()</code>/<code>numeric_kind()</code> and reference any variable in scope. The last case is a deliberate no-match against a pattern with no wildcard arm, so you can see PatLang's real runtime-error behavior fire instead of a silent no-op.", matchdemo_src, matchdemo_native)
+demo_page("towerdemo", "Numeric Tower: BigInt, Rational, Complex", "Ordinary <code>Int</code> arithmetic stays on the fast path until it can't: <code>factorial(30)</code> overflows a 64-bit integer partway through and the runtime silently promotes to an exact, arbitrary-precision <code>BigInt</code> &mdash; no annotation, no wraparound, no lost digits. <code>10 / 3</code> doesn't divide evenly, so instead of quietly rounding to a float it promotes to an exact <code>Rational</code> and prints <code>10/3</code>. <code>sqrt</code> of a negative number produces a <code>Complex</code> value. The last two lines call into <code>self_hosting/lib/math.patlang</code> (<code>hypot</code>, <code>is_prime</code>, <code>mean</code>), a small PatLang-authored library built entirely on top of a handful of <code>Host::</code> primitives (<code>sqrt</code>/<code>floor</code>/<code>abs</code>/<code>numeric_kind</code>) &mdash; the hybrid design that keeps the primitive surface small while still growing a real standard library. The numeric tower is v2's runtime, written in PatLang, the same whether this program is built natively or, as for the button here, as WebAssembly.", tower_src, tower_native)
+demo_page("routerdsl", "User-defined DSL: routes { ... }", "A small grammar extension declared entirely in PatLang source (<code>syntax RouterDSL { trigger; tokens { ... }; rule { ... } }</code>), matching HTTP-verb/URL-path tokens with a general-purpose regex engine also written in PatLang (<code>lib/regex_dsl.patlang</code>). A source-to-source preprocessing pass (<code>lib/syntax_dsl.patlang</code>) expands every <code>routes { ... }</code> block into plain <code>register_route(...)</code> calls before the ordinary compiler ever sees them &mdash; run here as the expanded program, built by v2 as WebAssembly, or natively below.", router_raw, router_native)
 language_flavors_page(javaese_raw, javaese_native, cppese_raw, cppese_native, pythonese_raw, pythonese_native, pg_b64)
 # Threading demo: real parallel_map + a purely-illustrative, honestly-
 # labeled in-browser mock. The mock does NOT execute PatLang/wasm at all --
@@ -2598,21 +2019,19 @@ language_flavors_page(javaese_raw, javaese_native, cppese_raw, cppese_native, py
 # code path under the SAME shim, verified working here for the first time
 # rather than assumed to work just because fibers do.
 let threading_wasmb64 = compile_wasm_threaded_only(threading_src, "threadingdemo")
-let threading_sections = [tpl_para("<code>parallel_map(items, " + q() + "func_name" + q() + ")</code> spawns one real OS thread per item (via Rust's <code>std::thread::scope</code>) and runs <code>func_name(item)</code> on each concurrently &mdash; genuine parallelism, mirrored byte-for-byte into the compiled-native runtime (<code>codegen.rs</code> and its self-hosted twin <code>runtime_rs.patlang</code>), so it works whether interpreted, compiled via <code>pat --patc</code>, or compiled via the self-hosted <code>patc1.exe</code>. This demo counts primes below 200,000 by splitting the range into 8 chunks, counting each chunk's primes on its own thread (the MAP step), then summing the per-chunk counts sequentially (the REDUCE step) &mdash; the classic map-reduce shape.")]
+let threading_sections = [tpl_para("<code>parallel_map(items, " + q() + "func_name" + q() + ")</code> spawns one real OS thread per item and runs <code>func_name(item)</code> on each concurrently &mdash; genuine parallelism, from v2's runtime (written in PatLang), the same whether built natively or as WebAssembly. This demo counts primes below 200,000 by splitting the range into 8 chunks, counting each chunk's primes on its own thread (the MAP step), then summing the per-chunk counts sequentially (the REDUCE step) &mdash; the classic map-reduce shape.")]
 let threading_sections = list_push(threading_sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src'>" + html_escape(threading_src) + "</pre></details>"))
-let threading_sections = list_push(threading_sections, tpl_raw("<p class='label'>Native run on the build machine (real OS threads, patc1.exe-compiled):</p><pre class='out native'>" + html_escape(threading_native) + "</pre>"))
-let threading_sections = list_push(threading_sections, tpl_para("<strong>Real \"run in browser\" button</strong> below: this compiles to <code>wasm32-wasip1-threads</code> and runs via the same hand-rolled implementation of the WASI threads proposal the fiber demo uses (real <code>Worker</code>s + <code>SharedArrayBuffer</code>-backed shared memory + a pre-warmed worker pool standing in for real thread creation) &mdash; no wasm-bindgen, no mock. <code>parallel_map</code>'s own thread-spawning (<code>std::thread::scope</code>) is a different code path from fibers' (<code>std::thread::spawn</code>), verified working under this shim rather than assumed. Needs cross-origin isolation; the button reports plainly if that's unavailable on this page load rather than silently doing nothing."))
+let threading_sections = list_push(threading_sections, tpl_raw("<p class='label'>Native run on the build machine (real OS threads, built by v2):</p><pre class='out native'>" + html_escape(threading_native) + "</pre>"))
+let threading_sections = list_push(threading_sections, tpl_para("<strong>Run in browser</strong> below: the same program, built by v2 as WebAssembly and run on v2's browser host, where each thread is a real <code>Worker</code> over one shared memory. It needs a cross-origin isolated page; the button says so if this page load is not."))
 let threading_body = sb_new()
 sb_push(threading_body, "<div class='card'><p class='label'>Live run, real OS threads, compiled to threaded WASM:</p>" + nl())
 sb_push(threading_body, "<p><button onclick=\"runWasmThreaded('threadingdemo','threadingdemo')\">Run in browser</button> <span id='ms-threadingdemo' class='ms'></span></p>" + nl())
 sb_push(threading_body, "<pre id='out-threadingdemo' class='out'></pre>" + nl())
 sb_push(threading_body, "</div>" + nl())
 let threading_sections = list_push(threading_sections, tpl_raw(sb_str(threading_body)))
-let threading_sections = list_push(threading_sections, tpl_raw(wasi_threads_worker_tag()))
 let threading_js = sb_new()
 sb_push(threading_js, "const WASMS = { threadingdemo: '" + threading_wasmb64 + "' };" + nl())
-b64bytes_only_js(threading_js)
-wasi_threads_shim_js(threading_js)
+runwasm_core_js(threading_js)
 let threading_sections = list_push(threading_sections, tpl_script(sb_str(threading_js)))
 write_file("portfolio/demos/threading.html", render_page(tpl_page("Real OS threads: parallel map-reduce", "fragment", threading_sections)))
 print("wrote portfolio/demos/threading.html")
@@ -2624,21 +2043,19 @@ print("wrote portfolio/demos/threading.html")
 # COEP headers; runWasmThreaded checks self.crossOriginIsolated itself and
 # reports plainly if unavailable rather than pretending to run).
 let fiber_wasmb64 = compile_wasm_threaded_only(fiber_src, "fiber")
-let fiber_sections = [tpl_para("Ruby-style cooperative coroutines (<code>fiber_new</code>/<code>fiber_resume</code>/<code>fiber_yield</code>/<code>fiber_alive</code>), implemented on real OS threads under the hood but never actually running concurrently: a mutex+condvar pair (<code>ir/fiber.rs</code>) ensures only one fiber's thread is ever unparked at a time, so control passes back and forth explicitly, deterministic and effectively single-threaded &mdash; distinct from <code>parallel_map</code> above, which IS real parallelism. This demo is a classic fiber use case: a lazy, infinite Fibonacci generator the caller pulls values from one at a time, plus a second, independent fiber running the same generator function to show each fiber keeps its own state.")]
+let fiber_sections = [tpl_para("Ruby-style cooperative coroutines (<code>fiber_new</code>/<code>fiber_resume</code>/<code>fiber_yield</code>/<code>fiber_alive</code>), each with a stack of its own but never running concurrently: v2's runtime switches to one fibre at a time, so control passes back and forth explicitly, deterministic and effectively single-threaded &mdash; distinct from <code>parallel_map</code> above, which IS real parallelism. This demo is a classic fiber use case: a lazy, infinite Fibonacci generator the caller pulls values from one at a time, plus a second, independent fiber running the same generator function to show each fiber keeps its own state.")]
 let fiber_sections = list_push(fiber_sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src'>" + html_escape(fiber_src) + "</pre></details>"))
-let fiber_sections = list_push(fiber_sections, tpl_raw("<p class='label'>Interpreted run on the build machine (<code>pat --ir-run</code>):</p><pre class='out native'>" + html_escape(fiber_native) + "</pre>"))
-let fiber_sections = list_push(fiber_sections, tpl_para("<strong>Real \"run in browser\" button</strong> below: this compiles to <code>wasm32-wasip1-threads</code> and runs via a hand-rolled implementation of the WASI threads proposal (real <code>Worker</code>s + <code>SharedArrayBuffer</code>-backed shared memory + a pre-warmed worker pool standing in for real thread creation) &mdash; no wasm-bindgen, no mock. Needs cross-origin isolation; the button reports plainly if that's unavailable on this page load rather than silently doing nothing."))
+let fiber_sections = list_push(fiber_sections, tpl_raw("<p class='label'>Native run on the build machine (built by v2):</p><pre class='out native'>" + html_escape(fiber_native) + "</pre>"))
+let fiber_sections = list_push(fiber_sections, tpl_para("<strong>Run in browser</strong> below: the same program, built by v2 as WebAssembly and run on v2's browser host, where each fibre is a <code>Worker</code> that waits until it is switched to. It needs a cross-origin isolated page; the button says so if this page load is not."))
 let fiber_body = sb_new()
 sb_push(fiber_body, "<div class='card'><p class='label'>Live run, real OS threads, compiled to threaded WASM:</p>" + nl())
 sb_push(fiber_body, "<p><button onclick=\"runWasmThreaded('fiber','fiber')\">Run in browser</button> <span id='ms-fiber' class='ms'></span></p>" + nl())
 sb_push(fiber_body, "<pre id='out-fiber' class='out'></pre>" + nl())
 sb_push(fiber_body, "</div>" + nl())
 let fiber_sections = list_push(fiber_sections, tpl_raw(sb_str(fiber_body)))
-let fiber_sections = list_push(fiber_sections, tpl_raw(wasi_threads_worker_tag()))
 let fiber_js = sb_new()
 sb_push(fiber_js, "const WASMS = { fiber: '" + fiber_wasmb64 + "' };" + nl())
-b64bytes_only_js(fiber_js)
-wasi_threads_shim_js(fiber_js)
+runwasm_core_js(fiber_js)
 let fiber_sections = list_push(fiber_sections, tpl_script(sb_str(fiber_js)))
 write_file("portfolio/demos/fiber.html", render_page(tpl_page("Fibers: cooperative coroutines", "fragment", fiber_sections)))
 print("wrote portfolio/demos/fiber.html")
@@ -2647,12 +2064,13 @@ print("wrote portfolio/demos/fiber.html")
 # navigate a grid and signal each other via emit() when reaching a
 # waypoint -- a live demonstration of the cross-thread EVENT_HANDLERS fix.
 let robots_src = read_file("self_hosting/examples/robots_demo.patlang")
-let robots_native = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/examples/robots_demo.patlang")
+compile_native(robots_src, "robots")
+let robots_native = exec_capture("portfolio/build/robots.exe")
 let robots_wasmb64 = compile_wasm_threaded_only(robots_src, "robots")
 let robots_sections = [tpl_para("Three robots, each a real fiber, navigate toward two waypoints apiece on a small grid. When a robot reaches a waypoint it calls <code>emit(\"signal\", ...)</code> -- a <code>when signal</code> handler registered on the main thread fires and announces it, even though the emitting code is running on a different real OS thread (or, compiled to threaded WASM, a different real Worker). This is the direct, hands-on demonstration of the cross-thread event fix: previously EVENT_HANDLERS was thread_local, so this exact program's emit() calls would have silently done nothing.")]
 let robots_sections = list_push(robots_sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src'>" + html_escape(robots_src) + "</pre></details>"))
-let robots_sections = list_push(robots_sections, tpl_raw("<p class='label'>Interpreted run on the build machine (<code>pat --ir-run</code>):</p><pre class='out native'>" + html_escape(robots_native) + "</pre>"))
-let robots_sections = list_push(robots_sections, tpl_para("<strong>Real \"run in browser\" button</strong> below: replays the exact step-by-step transcript from a genuine run compiled to <code>wasm32-wasip1-threads</code>, executed live via the hand-rolled WASI-threads shim -- not a hand-authored mock. Real cross-thread synchronization has more overhead in a browser Worker than natively, so this takes roughly 30-60 seconds; the status line explains why rather than leaving you staring at a spinner."))
+let robots_sections = list_push(robots_sections, tpl_raw("<p class='label'>Native run on the build machine (built by v2):</p><pre class='out native'>" + html_escape(robots_native) + "</pre>"))
+let robots_sections = list_push(robots_sections, tpl_para("<strong>Run in browser</strong> below: runs the program, built by v2 as WebAssembly, on v2's browser host, then replays its transcript step by step on the grid -- the moves and signals of a real run, not a hand-authored mock. Starting a fibre costs a Worker, so a run takes a few seconds."))
 let robots_body = sb_new()
 sb_push(robots_body, "<div class='card'><p class='label'>Live run, real OS threads, real cross-thread signaling:</p>" + nl())
 sb_push(robots_body, "<p><button id='robots-run' onclick='runRobotsDemo()'>Run in browser</button> <span id='robots-status' class='ms'></span></p>" + nl())
@@ -2660,12 +2078,10 @@ sb_push(robots_body, "<canvas id='robots-grid' width='400' height='240'></canvas
 sb_push(robots_body, "<pre id='robots-log' class='out'></pre>" + nl())
 sb_push(robots_body, "</div>" + nl())
 let robots_sections = list_push(robots_sections, tpl_raw(sb_str(robots_body)))
-let robots_sections = list_push(robots_sections, tpl_raw(wasi_threads_worker_tag()))
 let robots_sections = list_push(robots_sections, tpl_style("#robots-grid { background: #1b2a1b; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); } #robots-log { white-space: pre-wrap; font: 12px/1.4 monospace; max-height: 200px; overflow-y: auto; }"))
 let robots_js = sb_new()
 sb_push(robots_js, "const WASMS = { robots: '" + robots_wasmb64 + "' };" + nl())
-b64bytes_only_js(robots_js)
-wasi_threads_shim_js(robots_js)
+runwasm_core_js(robots_js)
 sb_push(robots_js, "const GRID_W = 10, GRID_H = 6, CELL = 40;" + nl())
 sb_push(robots_js, "const ROBOTS = {" + nl())
 sb_push(robots_js, "  R0: { color: '#e74c3c', start: [0, 0], waypoints: [[5, 2], [9, 5]] }," + nl())
@@ -2722,39 +2138,21 @@ sb_push(robots_js, "    rstatus.textContent = 'requires cross-origin isolation (
 sb_push(robots_js, "    btn.disabled = false;" + nl())
 sb_push(robots_js, "    return;" + nl())
 sb_push(robots_js, "  }" + nl())
-sb_push(robots_js, "  const module = await WebAssembly.compile(b64bytes(WASMS.robots));" + nl())
-sb_push(robots_js, "  const memory = new WebAssembly.Memory({ initial: 64, maximum: 2048, shared: true });" + nl())
-sb_push(robots_js, "  const tidCounter = new Int32Array(new SharedArrayBuffer(4));" + nl())
-sb_push(robots_js, "  tidCounter[0] = 1;" + nl())
-sb_push(robots_js, "  const mainWorker = new Worker(threadWorkerUrl());" + nl())
-sb_push(robots_js, "  const messages = [];" + nl())
-sb_push(robots_js, "  let startSeen = false;" + nl())
-sb_push(robots_js, "  mainWorker.onmessage = (e) => { messages.push(e.data); if (e.data.type === 'start') startSeen = true; };" + nl())
-sb_push(robots_js, "  mainWorker.onerror = (e) => rlogLine('WORKER ERROR: ' + e.message);" + nl())
-sb_push(robots_js, "  mainWorker.postMessage({ type: 'start', module, memory, tidCounter });" + nl())
-sb_push(robots_js, "  // Real cross-thread synchronization (each fiber_resume crosses a real OS" + nl())
-sb_push(robots_js, "  // thread boundary via Atomics.wait/notify) has genuinely higher overhead" + nl())
-sb_push(robots_js, "  // in a browser Worker than natively -- this takes on the order of a" + nl())
-sb_push(robots_js, "  // minute for 3 robots' worth of resume/yield cycles, not because" + nl())
-sb_push(robots_js, "  // anything is stuck, just because real thread hand-offs aren't free." + nl())
-sb_push(robots_js, "  const t0 = Date.now();" + nl())
-sb_push(robots_js, "  const deadline = t0 + 60000;" + nl())
-sb_push(robots_js, "  while (!startSeen && Date.now() < deadline) {" + nl())
-sb_push(robots_js, "    rstatus.textContent = 'running on real OS threads (~30-60s, genuine cross-thread overhead, not a hang)... ' + Math.round((Date.now() - t0) / 1000) + 's';" + nl())
-sb_push(robots_js, "    await new Promise((r) => setTimeout(r, 500));" + nl())
+sb_push(robots_js, "  // The output keeps the order the threads wrote it in (v2's browser host" + nl())
+sb_push(robots_js, "  // appends it to one buffer under a lock): the main thread's move lines and" + nl())
+sb_push(robots_js, "  // the SIGNAL lines a fibre's emit() handler prints, matched to the" + nl())
+sb_push(robots_js, "  // animation by the (robot, x, y) they report." + nl())
+sb_push(robots_js, "  rstatus.textContent = 'running...';" + nl())
+sb_push(robots_js, "  let allStdout = '';" + nl())
+sb_push(robots_js, "  try {" + nl())
+sb_push(robots_js, "    const r = await runWasmText('robots', []);" + nl())
+sb_push(robots_js, "    allStdout = r.text;" + nl())
+sb_push(robots_js, "    rstatus.textContent = r.code === 0 ? 'ran, replaying its transcript...' : 'FAILED with exit code ' + r.code + ' (see log below)';" + nl())
+sb_push(robots_js, "  } catch (e) {" + nl())
+sb_push(robots_js, "    rstatus.textContent = 'FAILED: ' + (e && e.message || e);" + nl())
 sb_push(robots_js, "  }" + nl())
-sb_push(robots_js, "  await new Promise((r) => setTimeout(r, 3000));" + nl())
-sb_push(robots_js, "  rstatus.textContent = startSeen ? 'ran successfully, replaying real transcript...' : 'FAILED (see log below)';" + nl())
-sb_push(robots_js, "  // The 'start' message's stdout is the main thread's own print() calls --" + nl())
-sb_push(robots_js, "  // every movement step (fiber_resume's return value, printed by the" + nl())
-sb_push(robots_js, "  // resuming/main thread) in exactly the right order. SIGNAL lines are" + nl())
-sb_push(robots_js, "  // printed by whichever fiber thread's emit() handler ran, so they arrive" + nl())
-sb_push(robots_js, "  // in separate messages -- matched to the animation by the (robot, x, y)" + nl())
-sb_push(robots_js, "  // they report reaching, not by cross-thread message arrival order." + nl())
-sb_push(robots_js, "  const startMsg = messages.find((m) => m.type === 'start');" + nl())
-sb_push(robots_js, "  const allStdout = messages.map((m) => m.stdout || '').join('\\n');" + nl())
 sb_push(robots_js, "  rlogLine(allStdout.trim());" + nl())
-sb_push(robots_js, "  const moveLines = (startMsg ? startMsg.stdout : '').split('\\n').filter((l) => /^R\\d,/.test(l));" + nl())
+sb_push(robots_js, "  const moveLines = allStdout.split('\\n').filter((l) => /^R\\d,/.test(l));" + nl())
 sb_push(robots_js, "  const signalMatches = [...allStdout.matchAll(/SIGNAL (R\\d) reached \\((\\d+),(\\d+)\\)/g)]" + nl())
 sb_push(robots_js, "    .map((m) => ({ id: m[1], x: +m[2], y: +m[3] }));" + nl())
 sb_push(robots_js, "  const perRobotMoves = { R0: [], R1: [], R2: [] };" + nl())
@@ -2780,7 +2178,7 @@ sb_push(robots_js, "    }" + nl())
 sb_push(robots_js, "    robotsDrawAll(positions, flash);" + nl())
 sb_push(robots_js, "    await new Promise((r) => setTimeout(r, 220));" + nl())
 sb_push(robots_js, "  }" + nl())
-sb_push(robots_js, "  rstatus.textContent = 'done -- replayed a real cross-thread run (not a mock)';" + nl())
+sb_push(robots_js, "  rstatus.textContent = 'done -- replayed a real run (not a mock)';" + nl())
 sb_push(robots_js, "  btn.disabled = false;" + nl())
 sb_push(robots_js, "}" + nl())
 sb_push(robots_js, "robotsDrawGrid();" + nl())
@@ -2796,12 +2194,13 @@ print("wrote portfolio/demos/robots.html")
 # certification is genuine PatLang computation compiled to WASM, not a
 # JS reimplementation with PatLang just narrating it.
 let cga_src = read_file("self_hosting/examples/cga_classifier.patlang")
-let cga_native = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/examples/cga_classifier.patlang", "xor", "reduced", "12", "250", "250", "160", "1", "cga_sphere")
+compile_native(cga_src, "cga")
+let cga_native = exec_capture("portfolio/build/cga.exe", "xor", "reduced", "12", "250", "250", "160", "1", "cga_sphere")
 let cga_wasmb64 = compile_wasm_only(cga_src, "cga")
 let cga_sections = [tpl_para("A CGA point embeds a 2D location plus an uncertainty radius as an INTERVAL-valued null vector; a CGA sphere is the same components as plain scalars. Their inner product is therefore an interval, not a single number -- a pixel is only certified inside or outside when zero falls strictly outside that interval; when the interval straddles zero, the classifier honestly reports it ambiguous rather than rounding arbitrarily. Every embedded point is also checked against the Minkowski null-cone identity <code>X&sup2; = 0</code>, certifying the embedding itself, not just the classification built on it.")]
 let cga_sections = list_push(cga_sections, tpl_para("The dataset lives in a synthetic 5D sparse space and is projected down to the 2D plane the classifier sees via a structural k-blade (<code>projected = sum(component &times; blade)</code>). Toggle <em>Dimensionality Projection</em> to compare a deliberate blade-guided projection (which cancels most of the hidden dimension's cross-plane noise) against naively summing raw components (which lets that noise bleed straight into the visible plane) -- the same k-blade-instead-of-scalar-tensor idea explored on <a href=" + q() + "k-blade-geometric-algebra-replacement-for-scalar-tensors-in-large-language-models.html" + q() + ">the k-blade page</a>."))
 let cga_sections = list_push(cga_sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src'>" + html_escape(cga_src) + "</pre></details>"))
-let cga_sections = list_push(cga_sections, tpl_raw("<p class='label'>Interpreted run on the build machine (<code>pat --ir-run</code>, dataset=xor):</p><pre class='out native'>" + html_escape(cga_native) + "</pre>"))
+let cga_sections = list_push(cga_sections, tpl_raw("<p class='label'>Native run on the build machine (built by v2, dataset=xor):</p><pre class='out native'>" + html_escape(cga_native) + "</pre>"))
 let cga_body = sb_new()
 sb_push(cga_body, "<div class='card'>" + nl())
 sb_push(cga_body, "<div style='display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start'>" + nl())
@@ -2917,9 +2316,7 @@ let cga_sections = list_push(cga_sections, tpl_script(sb_str(cga_js)))
 write_file("portfolio/demos/cga.html", render_page(tpl_page("CGA Interval Classifier", "fragment", cga_sections)))
 print("wrote portfolio/demos/cga.html")
 
-demo_page("dynsyntax", "Dynamic syntax: grammar extensions as runtime data", "The DSL page above declares its <code>syntax { ... }</code> block as a literal, expanded once before the compiler ever runs &mdash; indistinguishable from a macro. This one instead computes its trigger keyword and rules from data at runtime, calls <code>expand_syntax_dsls_with(src, existing_defs)</code> itself to define the grammar extension, keeps only the returned <code>defs</code> list, then makes a SEPARATE, later call &mdash; on a string containing only the usage line, no syntax declaration anywhere in it &mdash; passing those <code>defs</code> forward. Two independent calls, composing through nothing but an ordinary list value, exactly like passing along any other piece of program state. The assembled result runs through the same <code>tokenize</code>/<code>parse_program</code>/<code>lower_program</code>/<code>run_ir</code> chain that already powers the playground (see <code>self_hosting/examples/playground_main.patlang</code>) &mdash; PatLang's compiler has always been callable from PatLang code; this demo is the first to close the loop and use that to synthesize a language construct that couldn't have existed until the program ran. It runs live in this page: the in-browser compiler tokenizes, parses and lowers the whole ~85KB bundle (the compiler pipeline plus the demo), a nested interpreter runs it, and the running program calls the pipeline again on its own usage line. That takes a couple of seconds; the native run below is the same program compiled to an executable.", dynsyntax_src, dynsyntax_native, pg_b64)
-let manifest_text = read_file("self_hosting/patbuild.manifest")
-native_page("patbuild", "patbuild: a goal-oriented build system", "Driven by a manifest file (<code>self_hosting/patbuild.manifest</code>):<pre class='out'>" + html_escape(manifest_text) + "</pre>Targets are objects, dependencies are walked recursively, finished builds become <code>fact</code>s, progress is reported via events. By default each target is only lowered to IR and checked (no rustc at all, matching the in-browser playground); pass <code>--native</code> to also compile every target to a real executable via rustc &mdash; the transcript below was captured that way. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: unlike the demos above, patbuild genuinely needs real filesystem access it can't get in the WASI sandbox &mdash; it reads the manifest file plus every target's own source file from disk by path, and (with <code>--native</code>) invokes a real <code>rustc</code> subprocess per target, neither of which a browser sandbox can provide. This is a capability limit, not a performance one (compare the dynamic-syntax demo below, which CAN run in-browser, just impractically slowly for now).", patbuild_src, patbuild_native)
+demo_page("dynsyntax", "Dynamic syntax: grammar extensions as runtime data", "The DSL page above declares its <code>syntax { ... }</code> block as a literal, expanded once before the compiler ever runs &mdash; indistinguishable from a macro. This one instead computes its trigger keyword and rules from data at runtime, calls <code>expand_syntax_dsls_with(src, existing_defs)</code> itself to define the grammar extension, keeps only the returned <code>defs</code> list, then makes a SEPARATE, later call &mdash; on a string containing only the usage line, no syntax declaration anywhere in it &mdash; passing those <code>defs</code> forward. Two independent calls, composing through nothing but an ordinary list value, exactly like passing along any other piece of program state. The assembled result runs through the same <code>tokenize</code>/<code>parse_program</code>/<code>lower_program</code> chain, and <code>lib/interp.patlang</code>'s <code>interpret_ir</code>, that already power the playground (see <code>self_hosting/examples/playground_main.patlang</code>) &mdash; PatLang's compiler has always been callable from PatLang code; this demo is the first to close the loop and use that to synthesize a language construct that couldn't have existed until the program ran. It runs live in this page: the program, built by v2 as WebAssembly, carries the compiler pipeline and an interpreter, and calls the pipeline again on its own usage line; the native run below is the same program built as an executable.", dynsyntax_src, dynsyntax_native)
 
 native_page("signalsdemo", "Runtime signals: quit and status from outside the process", "A running PatLang program can receive a named signal + optional payload from OUTSIDE itself &mdash; a second CLI invocation (<code>server.exe --quit</code> sent to an already-running server, not a new one) or a local network call &mdash; dispatched through the same <code>when &lt;name&gt; do ... end</code> / <code>emit(...)</code> mechanism every other event in PatLang already uses, not a new handler concept. <code>signal_claim(port)</code> lets a process become the &quot;primary&quot; holder of a port (a second bind to the same port simply failing IS the &quot;is a primary already running&quot; detector, for free); a process that can't claim it instead calls <code>signal_send(port, name, payload)</code> for fire-and-forget signals like <code>quit</code>, or <code>signal_query(port, name, payload)</code> for request/response signals like <code>status</code>, which waits for and returns whatever the primary's handler passed to <code>signal_reply(text)</code>. This demo's real, live state (an uptime counter and a ping tally, both genuinely tracked while the process runs) is what <code>status</code> actually reports back &mdash; not a canned string. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: this needs real TCP sockets and real separate OS processes, neither available in the WASI sandbox. The transcript below simulates the primary/secondary roles as two real OS threads within one process (build-time transcripts need to run to completion, but a real primary only exits once it receives <code>quit</code>) &mdash; the source shown is the real <code>self_hosting/lib/signals.patlang</code> library plus that thread-based driver; see <code>self_hosting/examples/signals_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself: start it once in the background, then run it again with <code>quit</code>, <code>status</code>, or <code>ping &lt;message&gt;</code> as arguments.", signals_src, signals_native)
 
@@ -2984,14 +2381,18 @@ print("wrote portfolio/demos/gui.html")
 # transcript pair), built directly rather than via demo_page/native_page.
 let metrics_body = sb_new()
 sb_push(metrics_body, "<ul>" + nl())
-sb_push(metrics_body, "<li>tokenize: " + vec_len(ctoks) + " tokens in " + (m1 - m0) + " ms</li>" + nl())
-sb_push(metrics_body, "<li>parse: " + cast[1].length + " top-level statements in " + (m2 - m1) + " ms</li>" + nl())
-sb_push(metrics_body, "<li>lower: " + cir[2].length + " functions in " + (m3 - m2) + " ms</li>" + nl())
-sb_push(metrics_body, "<li>codegen: " + crs.length + " chars of Rust in " + (m4 - m3) + " ms</li>" + nl())
+let mi = 0
+while mi < list_len(metrics_phases) do
+  if metrics_phases[mi] != "" then
+    sb_push(metrics_body, "<li>" + html_escape(metrics_phases[mi]) + " ms</li>" + nl())
+  end
+  let mi = mi + 1
+end
+sb_push(metrics_body, "<li>in all, " + metrics_ms + " ms</li>" + nl())
 sb_push(metrics_body, "</ul>" + nl())
-let metrics_sections = [tpl_para("The self-hosted compiler front+middle end processing its own complete source (" + compiler_src.length + " chars), run under the Stage 0 interpreter while building this page:")]
+let metrics_sections = [tpl_para("v2, the compiler, building itself (<code>self_hosting/v2/compile.patlang</code> and its runtime) while this page was built, with its cache of compiled functions warm, as it is after any small change. The phases are its own: the front end (reading, parsing and lowering every source), the keys that name each function's compiled artefact, the jobs that build the artefacts not already stored, and the link:")]
 let metrics_sections = list_push(metrics_sections, tpl_raw(sb_str(metrics_body)))
-let metrics_sections = list_push(metrics_sections, tpl_para("The natively compiled compiler (patc1) runs the same front end roughly two orders of magnitude faster; rustc then dominates end-to-end compile time."))
+let metrics_sections = list_push(metrics_sections, tpl_para("Every phase, the code generator and the linker included, is written in PatLang; the executable it writes is the compiler that wrote it, byte for byte."))
 write_file("portfolio/demos/compiler-metrics.html", render_page(tpl_page("The compiler, measured on itself", "fragment", metrics_sections)))
 print("wrote portfolio/demos/compiler-metrics.html")
 
@@ -3068,7 +2469,6 @@ let demo_links = [
   ["language-flavors", "Wearing borrowed syntax: Java, C++, and Python-flavored PatLang"],
   ["dynsyntax", "Dynamic syntax: grammar extensions as runtime data"],
   ["report-writer", "Project report writer (goal-oriented)"],
-  ["patbuild", "patbuild: a goal-oriented build system"],
   ["flowgraph-demo", "flowgraph: control-flow graphs from the compiler IR"],
   ["gui", "Browser GUI generator"],
   ["compiler-metrics", "The compiler, measured on itself"],
@@ -3092,11 +2492,17 @@ let idx_sections = list_push(idx_sections, tpl_raw(sb_str(idx_list)))
 write_file("portfolio/index.html", render_page(tpl_page("PatLang portfolio", "standalone", idx_sections)))
 print("wrote portfolio/index.html")
 
-# Canonical copy of the shared WASI-shim/runWasm JS (runwasm_core_js's
-# output), dumped to its own file so tools/site/resync_wasm.py has one
-# fixed ground truth to sync into every parslow-site content page that
-# embeds a copy of this harness -- rather than depending on which
-# portfolio/demos/*.html happens to be freshest.
+# The service worker that makes the pages cross-origin isolated (see
+# self_hosting/tools/portfolio_coi_sw.js), beside the index the demos'
+# pages are in a folder below.
+write_file("portfolio/coi-sw.js", read_file("self_hosting/tools/portfolio_coi_sw.js"))
+print("wrote portfolio/coi-sw.js")
+
+# Canonical copy of the shared runWasm JS (runwasm_core_js's output), dumped
+# to its own file so tools/site/resync_wasm.py has one fixed ground truth to
+# sync into every parslow-site content page that embeds a copy of this
+# harness -- rather than depending on which portfolio/demos/*.html happens to
+# be freshest.
 let core_js = sb_new()
 runwasm_core_js(core_js)
 write_file("portfolio/build/runwasm_core.js", sb_str(core_js))

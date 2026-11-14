@@ -50,54 +50,54 @@ Feature: real library selftests run under block-model with the real engine's own
   Scenario: pset_selftest runs under block-model
     Given self_hosting/pset_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of pset_selftest match what pat --ir-run produces
+    Then the output and counts of pset_selftest match what the v2 interpreter produces
 
   Scenario: pmap_selftest runs under block-model
     Given self_hosting/pmap_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of pmap_selftest match what pat --ir-run produces
+    Then the output and counts of pmap_selftest match what the v2 interpreter produces
 
   Scenario: step_match_selftest runs under block-model
     Given self_hosting/step_match_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of step_match_selftest match what pat --ir-run produces
+    Then the output and counts of step_match_selftest match what the v2 interpreter produces
 
   Scenario: zs_expr_selftest runs under block-model
     Given self_hosting/zs_expr_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of zs_expr_selftest match what pat --ir-run produces
+    Then the output and counts of zs_expr_selftest match what the v2 interpreter produces
 
   Scenario: zs_schema_selftest runs under block-model
     Given self_hosting/zs_schema_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of zs_schema_selftest match what pat --ir-run produces
+    Then the output and counts of zs_schema_selftest match what the v2 interpreter produces
 
   Scenario: schema_bdd_selftest runs under block-model
     Given self_hosting/schema_bdd_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of schema_bdd_selftest match what pat --ir-run produces
+    Then the output and counts of schema_bdd_selftest match what the v2 interpreter produces
 
   Scenario: signal_discovery_selftest runs under block-model
     Given self_hosting/signal_discovery_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of signal_discovery_selftest match what pat --ir-run produces
+    Then the output and counts of signal_discovery_selftest match what the v2 interpreter produces
 
   Scenario: task_registry_selftest runs under block-model
     Given self_hosting/task_registry_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of task_registry_selftest match what pat --ir-run produces
+    Then the output and counts of task_registry_selftest match what the v2 interpreter produces
 
   Scenario: queue_signals_vfs_selftest runs under block-model
     Given self_hosting/queue_signals_vfs_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of queue_signals_vfs_selftest match what pat --ir-run produces
+    Then the output and counts of queue_signals_vfs_selftest match what the v2 interpreter produces
 
   Scenario: zs_explore_selftest runs under block-model
     Given self_hosting/zs_explore_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of zs_explore_selftest match what pat --ir-run produces
+    Then the output and counts of zs_explore_selftest match what the v2 interpreter produces
 
   Scenario: zs_refine_selftest runs under block-model
     Given self_hosting/zs_refine_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
-    Then the output and counts of zs_refine_selftest match what pat --ir-run produces
+    Then the output and counts of zs_refine_selftest match what the v2 interpreter produces

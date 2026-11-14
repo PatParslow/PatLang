@@ -7,9 +7,10 @@
 #             captured, caller's world restored afterwards). Works wherever
 #             host_caps() lists "world_swap" -- native pat.exe, the compiled
 #             runtime and the browser playground -- and needs no subprocess.
-#   "process" a fresh pat.exe --quiet --ir-run child via exec_capture_io.
-#             Needs "subprocess" in host_caps() and a pat.exe; honours a
-#             wall-clock timeout_ms and stdin.
+#   "process" a fresh interpreter child via exec_capture_io: the v2
+#             interpreter (self_hosting/build/v2_interp.exe), or a pat.exe
+#             run with --quiet --ir-run. Needs "subprocess" in host_caps()
+#             and that executable; honours a wall-clock timeout_ms and stdin.
 #
 # Options are a list of [key, value] pairs (all optional):
 #   backend      "auto" (default) | "world" | "process"
@@ -19,8 +20,8 @@
 #   base_dir     resolve `include` lines in the source relative to this
 #                directory before running (both backends; without it an
 #                include line is left for the child to fail on)
-#   pat_path     path to pat.exe (else $PATLANG_PAT, else
-#                rust-runtime/target/release/pat.exe)
+#   pat_path     path to the child interpreter (else $PATLANG_PAT, else
+#                self_hosting/build/v2_interp.exe)
 #   vfs_in       world only: [[path, content], ...] preloaded into the child
 #   vfs_out_prefix  world only: only VFS paths under this prefix come back
 #
@@ -86,7 +87,25 @@ make a function called interp_pat_path takes opts returns path
   if p != "" then return p end
   let e = "" + getenv("PATLANG_PAT")
   if e != "" then return e end
-  return "rust-runtime/target/release/pat.exe"
+  return "self_hosting/build/v2_interp.exe"
+end
+
+# The arguments that run the program at `path` on the interpreter `pat`, and
+# whether the child's output ends with an echo of the program's final value,
+# for the caller to drop. The v2 interpreter takes the file alone and echoes
+# nothing (spec 1.13); a pat.exe needs --ir-run, and echoes the value unless
+# it understands --quiet.
+make a function called iri_engine_command takes ctx, pat, path returns cmd
+  require (value_class(pat) == 8) and (value_class(path) == 8)
+  if not str_ends_with(pat, "pat.exe") then
+    let cmd = [[path], false]
+  elif iri_quiet_supported(ctx, pat) then
+    let cmd = [["--quiet", "--ir-run", path], false]
+  else
+    let cmd = [["--ir-run", path], true]
+  end
+  ensure list_len(cmd) == 2
+  return cmd
 end
 
 # "world" or "process" for these options on this runtime, "" if neither can run.
@@ -138,14 +157,12 @@ make a function called iri_run_process takes ctx, src, opts returns result
   let pat = interp_pat_path(opts)
   let tmp = iri_tmp_path(ctx, opts)
   write_file(tmp, src)
-  let quiet = iri_quiet_supported(ctx, pat)
-  let args = ["--ir-run", tmp]
-  if quiet then let args = ["--quiet", "--ir-run", tmp] end
+  let cmd = iri_engine_command(ctx, pat, tmp)
   let timeout = iri_opt(opts, "timeout_ms", 0)
-  let r = exec_capture_io(pat, args, iri_opt(opts, "stdin", ""), timeout)
+  let r = exec_capture_io(pat, cmd[0], iri_opt(opts, "stdin", ""), timeout)
   remove_file(tmp)
   let out = r[0]
-  if quiet == false and r[2] then
+  if cmd[1] and r[2] then
     # An unpatched pat.exe echoes the program's final value (Unit -> an empty
     # line) after its own output.
     if out.length > 0 then let out = substr(out, 0, out.length - 1) end

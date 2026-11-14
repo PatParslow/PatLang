@@ -34,22 +34,14 @@
 # named plainly).
 #
 # Phase 3 adds Box*/ContractFail (section 3.4/3.5, Fork D wired in for
-# real) via heap.patlang -- and heap.patlang's own functions are, in turn,
-# native-x64-only (they call mem_peek_qword/mem_poke_qword/rt_heap_alloc,
-# none of which self_hosting/lib/interp.patlang or rust-runtime/src/ir/
-# hosts.rs implement, checked directly, same as Phase 1's own finding).
-# `include`-ing heap.patlang here is harmless under --ir-run by itself
-# (just function definitions, never executed unless called); Phase 2's own
-# fixtures (which never use box_new/box_set) keep working unchanged under
-# the interpreter. Only a program that actually uses a Box instruction
-# needs native compilation -- bm_ensure_heap_ready's own lazy init (rather
-# than an unconditional call in bi_run) is what keeps that boundary real
-# instead of accidentally breaking Phase 2's suite the moment this file
-# was extended.
+# real). The boxes live in heap_v2.patlang, on v2's own allocator, so the
+# engine runs on the v2 interpreter and compiled by v2 alike. heap.patlang,
+# the old native runtime's version, stays with that runtime.
 
 include "../lib/context.patlang"
 include "block_ir.patlang"
-include "heap.patlang"
+include "heap_v2.patlang"
+include "../lib/contracts_v2.patlang"
 # Phase 18: reuses self_hosting/lib/interp.patlang's own interp_call_host
 # (name, args) dispatcher AS-IS for BuildList/CallHost's generic host-
 # function calls, rather than reinventing a second one -- checked
@@ -86,6 +78,22 @@ make a function called bi_call_host_extension takes name, args returns result
     # zs_explore's breadth-first search creates a named Dict for its visited set
     # and deletes it on the way out.
     return ["Ok", object_delete(list_get(args, 0))]
+  end
+  if name == "value_class" then
+    # v2's class id of a value (docs/spec/values-and-memory.md 2.1), which
+    # contracts written for v2 test
+    return ["Ok", value_class(list_get(args, 0))]
+  end
+  if name == "remove_file" then
+    return ["Ok", remove_file(list_get(args, 0))]
+  end
+  if name == "getenv" then
+    return ["Ok", getenv(list_get(args, 0))]
+  end
+  if name == "class_define" then
+    # v2's class registration (runtime/objects.patlang), which classes.patlang
+    # emits for each class.
+    return ["Ok", class_define(list_get(args, 0), list_get(args, 1), list_get(args, 2), list_get(args, 3), list_get(args, 4), list_get(args, 5))]
   end
   if name == "sc_substr" then
     return ["Ok", sc_substr(list_get(args, 0), list_get(args, 1), list_get(args, 2))]
@@ -132,15 +140,52 @@ end
 
 # Issue #176: `budgeted(ms, handle) { body }`. args = [ms, closure, existing,
 # globals]; `closure` is the body lowered as a zero-parameter closure value
-# ["__closure", block_name, [captured...]]. Runs it through the REAL
-# budgeted_run host function, whose fiber entry is bi_budget_entry below --
-# a declared function of this very program, since every driver includes this
-# file. Returns ["done", value] or ["paused", handle], the real engine's own
-# shape. On resume (`existing` is a handle) the host ignores the entry
-# argument: the fiber's own call stack is the saved state.
+# ["__closure", block_name, [captured...]]. Runs it through v2's own
+# rt_budgeted (runtime/fibers.patlang), on a fiber whose body calls
+# bi_budget_entry below. Returns ["done", value] or ["paused", handle], the
+# real engine's own shape. On resume (`existing` is a handle) the closure is
+# not run: the fiber's own call stack is the saved state.
 make a function called bi_budgeted_run takes prog, args returns result
   let closure = list_get(args, 1)
-  return budgeted_run(list_get(args, 0), "bi_budget_entry", [prog, list_get(closure, 1), list_get(closure, 2), list_get(args, 3)], list_get(args, 2))
+  let entry_arg = [prog, list_get(closure, 1), list_get(closure, 2), list_get(args, 3)]
+  # a fiber's body takes the value it is first resumed with
+  let body = |resumed| { return bi_budget_entry(entry_arg) }
+  return rt_budgeted(list_get(args, 0), body, list_get(args, 2))
+end
+
+# An action's body is a block-model closure, ["__closure", block, captured],
+# which v2's own action table (runtime/logic.patlang) does not hold: its
+# action_lookup gives only real closures. The engine keeps its own table, a
+# named object as process-wide as that one, and `activate` (lowered by
+# bm_activate_synth) looks bodies up here.
+make a function called bi_action_table returns name
+  let name = "__bm_action_bodies"
+  # get gives false for an object that does not exist yet
+  if get(name, "__made") != true then
+    new("Dict", name)
+    send(name, "set", "__made", true)
+  end
+  ensure value_class(name) == 8
+  return name
+end
+
+make a function called bi_action_bind takes name, body returns done
+  require value_class(name) == 8
+  send(bi_action_table(), "set", name, body)
+  let done = true
+  ensure done == true
+  return done
+end
+
+make a function called bi_action_lookup takes name returns body
+  require value_class(name) == 8
+  let body = get(bi_action_table(), name)
+  if body == false then
+    print("activate: no action bound to '" + name + "' (call action_bind(\"" + name + "\", ...) first)")
+    exit_with(99)
+  end
+  ensure body != false
+  return body
 end
 
 # The fiber body: run the closure block with its captured list and the
@@ -173,7 +218,7 @@ make a function called bi_parallel_map takes prog, args returns result
     let globals = list_get(args, 2)
   end
   if bi_find_block(prog, fname) == false then
-    contract_check("bm_interp", "assert", "parallel_map: no declared function named '" + fname + "'", false)
+    contract_fail_v2("bm_interp", "assert", "parallel_map: no declared function named '" + fname + "'")
   end
   let wrapped = []
   let n = list_len(items)
@@ -333,7 +378,7 @@ make a function called bm_loc_get takes locs, name returns v
   # ONLY what its incoming jump explicitly handed it (bi_run's fresh
   # bm_loc_new() per jump, below), so any other name is a genuine,
   # guaranteed-fail contract violation here, not a silent default.
-  contract_check("bm_interp", "assert", "unbound in this block's own pointer: " + name, false)
+  contract_fail_v2("bm_interp", "assert", "unbound in this block's own pointer: " + name)
   return false
 end
 
@@ -438,7 +483,7 @@ make a function called bm_apply_bin takes op, l, r returns v
     return l shr r
   end
   # Every operator in block_ir.patlang's bm_bin_op_name has a branch above.
-  contract_check("bm_interp", "assert", "unknown Bin op hash: " + op, false)
+  contract_fail_v2("bm_interp", "assert", "unknown Bin op hash: " + op)
   return false
 end
 
@@ -451,7 +496,7 @@ make a function called bm_apply_un takes op, v returns out
     return bnot v
   end
   # Every operator in block_ir.patlang's bm_un_op_name has a branch above.
-  contract_check("bm_interp", "assert", "unknown Un op hash: " + op, false)
+  contract_fail_v2("bm_interp", "assert", "unknown Un op hash: " + op)
   return false
 end
 
@@ -588,7 +633,7 @@ make a function called bi_run_block takes ctx, prog, blk, locs returns outcome
       let stack = bm_st_push(list_get(popped, 1), ptr)
       let pc = pc + 1
     elif op == 296907 then # "ContractFail"
-      contract_check("bm_block", "assert", list_get(instr, 1), false)
+      contract_fail_v2("bm_block", "assert", list_get(instr, 1))
       let pc = pc + 1
     elif op == 695659 then # "GlobalGet"
       let popped_g = bm_st_pop(stack)
@@ -796,6 +841,12 @@ make a function called bi_run_block takes ctx, prog, blk, locs returns outcome
       elif (list_get(instr, 1) == "parallel_map") or (list_get(instr, 1) == "bm_parallel_map") then
         # Issue #176 (threads half): same reason -- see bi_parallel_map.
         let call_result = ["Ok", bi_parallel_map(prog, list_get(popped, 0))]
+      elif list_get(instr, 1) == "action_bind" then
+        let cargs = list_get(popped, 0)
+        let call_result = ["Ok", bi_action_bind(cargs[0], cargs[1])]
+      elif list_get(instr, 1) == "action_lookup" then
+        let cargs = list_get(popped, 0)
+        let call_result = ["Ok", bi_action_lookup(cargs[0])]
       else
         let call_result = interp_call_host(ctx, list_get(instr, 1), list_get(popped, 0))
       end
@@ -810,7 +861,7 @@ make a function called bi_run_block takes ctx, prog, blk, locs returns outcome
         end
       end
       if list_get(call_result, 0) == "Err" then
-        contract_check("bm_interp", "assert", "CallHost '" + list_get(instr, 1) + "' failed: " + list_get(call_result, 1), false)
+        contract_fail_v2("bm_interp", "assert", "CallHost '" + list_get(instr, 1) + "' failed: " + list_get(call_result, 1))
       end
       let stack = bm_st_push(list_get(popped, 1), list_get(call_result, 1))
       let pc = pc + 1
@@ -895,12 +946,12 @@ make a function called bi_run_block takes ctx, prog, blk, locs returns outcome
       let stack = list_get(popped_a, 1)
       let callee_blk = bi_find_block(prog, fname)
       if callee_blk == false then
-        contract_check("bm_interp", "assert", "apply: no declared function named '" + fname + "'", false)
+        contract_fail_v2("bm_interp", "assert", "apply: no declared function named '" + fname + "'")
       end
       let callee_params = bi_block_params(callee_blk)
       let declared_count = list_len(callee_params) - 1
       if n_extra > declared_count then
-        contract_check("bm_interp", "assert", "apply: '" + fname + "' declares " + declared_count + " parameter(s) but was called with " + n_extra + " argument(s)", false)
+        contract_fail_v2("bm_interp", "assert", "apply: '" + fname + "' declares " + declared_count + " parameter(s) but was called with " + n_extra + " argument(s)")
       end
       let callee_locs = bm_loc_set(bm_loc_new(), "__globals", globals_val)
       let bi = 0
@@ -920,12 +971,12 @@ make a function called bi_run_block takes ctx, prog, blk, locs returns outcome
       # so matching that scope boundary means block-model's interpreter
       # does not support it either, rather than inventing a synchronous
       # fallback the real engine has no counterpart for.
-      contract_check("bm_interp", "assert", "thread_spawn is native-x64-only (GitHub #184) -- it has no pat --ir-run/bi_run equivalent in the real engine either, so block-model's interpreter does not support it", false)
+      contract_fail_v2("bm_interp", "assert", "thread_spawn is native-x64-only (GitHub #184) -- it has no pat --ir-run/bi_run equivalent in the real engine either, so block-model's interpreter does not support it")
     else
       # Names WHERE it happened (block, pc, the instruction itself): a bare
       # hash gave no location, and finding which block produced a malformed
       # instruction (#157) needed a separate dump harness.
-      contract_check("bm_interp", "assert", "unknown block-model instruction: " + op + " at pc=" + pc + " in block " + bi_block_name(blk) + " instr=" + instr, false)
+      contract_fail_v2("bm_interp", "assert", "unknown block-model instruction: " + op + " at pc=" + pc + " in block " + bi_block_name(blk) + " instr=" + instr)
     end
   end
   # Phase 10: a 3rd element (this block's own final locs) is appended here

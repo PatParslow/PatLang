@@ -32,7 +32,7 @@ Feature: call-with-return for ordinary functions (Phase 21 of the full-language 
   Scenario: a declared function called as a sub-expression, its result used in further computation
     Given a function that returns a computed value, called from inside a larger expression
     When it runs through bm_lower_program/bi_run
-    Then the result matches exactly what pat --ir-run produces for the identical source
+    Then the result matches exactly what the v2 interpreter produces for the identical source
 
   Scenario: direct recursion works
     Given a recursive function computing a factorial
@@ -65,12 +65,12 @@ Feature: call-with-return for ordinary functions (Phase 21 of the full-language 
   Scenario: a bare-statement call to a declared function is followed by more code, which still runs
     Given a function that calls two other declared functions as bare statements, then prints a value of its own
     When it runs through bm_lower_program/bi_run
-    Then all three effects happen in order, matching exactly what pat --ir-run produces for the identical source
+    Then all three effects happen in order, matching exactly what the v2 interpreter produces for the identical source
 
   Scenario: a bare-statement call inside an ordinary if branch is followed by more code after the whole if
     Given an if branch whose only statement is a bare call to a declared function, followed by a print after the if
     When it runs through bm_lower_program/bi_run
-    Then the print after the if still runs, matching exactly what pat --ir-run produces for the identical source
+    Then the print after the if still runs, matching exactly what the v2 interpreter produces for the identical source
 
   Native x64 codegen for `Call`/`ReturnValue` needed a genuinely different
   design -- each qualifying function compiled as its own separate FuncIR
@@ -99,4 +99,4 @@ Feature: call-with-return for ordinary functions (Phase 21 of the full-language 
   Scenario: a bare-statement call that is the last statement of its function runs and returns control correctly
     Given a function whose final statement is a bare call to another declared function
     When it runs through bm_lower_program/bi_run
-    Then both functions' output appears, matching exactly what pat --ir-run produces for the identical source
+    Then both functions' output appears, matching exactly what the v2 interpreter produces for the identical source

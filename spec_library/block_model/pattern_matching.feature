@@ -53,4 +53,4 @@ Feature: full pattern matching (Phase 11 of the full-language expansion)
   Scenario: list patterns bind elements and fall through exactly as the real engine does
     Given a function matching an empty list, a literal-and-binding list and a literal-and-two-bindings list, with a string and a number that match no list arm
     When it runs through bm_lower_program/bi_run
-    Then it prints the same six lines as pat --ir-run does for the identical source
+    Then it prints the same six lines as the v2 interpreter does for the identical source

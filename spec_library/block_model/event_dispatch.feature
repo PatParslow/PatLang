@@ -75,4 +75,4 @@ Feature: event dispatch (Phase 10 of the full-language expansion)
   Scenario: a when-handler can call declared functions, as a value, as a bare statement, and in tail position
     Given a handler that stores a declared function's result and calls it again as a statement, and a second handler whose only statement is such a call
     When it runs through bm_lower_program/bi_run
-    Then it prints the same lines in the same order as pat --ir-run does for the identical source
+    Then it prints the same lines in the same order as the v2 interpreter does for the identical source

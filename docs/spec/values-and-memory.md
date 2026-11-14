@@ -208,6 +208,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   it prints. (`pat` printed the value of a program's last top-level expression; v2 does not.)
 - The name `unit` in a program is that value, unless the program binds `unit` itself, as a
   parameter or with `let`.
+- A call to a name nothing declares compiles, and stops the program when it is reached, with
+  `host fn 'NAME' not found`, the lines before it having run. This holds in every build,
+  WebAssembly's included, whatever arguments the call passes.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
 - `list_dir(path)` gives a directory's entries, sorted, a subdirectory's name ending in `/`. A
   path with no directory to read gives `[]`, as `read_file` gives `""` for a file it cannot

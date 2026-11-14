@@ -97,6 +97,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     Then the browser prints what v2's own build prints, and stops at the same contract
     And the module is byte for byte what bootstrap/ir_wasm.py builds from v2's IR of the program
 
+  Scenario: a call with arguments to a name nothing declares stops there in a WebAssembly build too (spec 1.13, 2.6)
+    Given a program that prints a line and then calls a name nothing declares with two arguments, and calls it with one elsewhere
+    When v2 builds it natively and as a WebAssembly module
+    Then both print the line and stop at the call with host fn 'no_such_fn' not found
+
   Scenario: slots never live at the same time share a WebAssembly local (spec 2.6)
     Given two programs whose top level runs 100 and 1000 statements, each making temporaries and dropping them
     When v2 builds each as a WebAssembly module

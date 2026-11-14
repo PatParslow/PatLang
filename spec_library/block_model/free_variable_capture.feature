@@ -48,4 +48,4 @@ Feature: real free-variable analysis replaces wholesale loop capture (Block Owne
   Scenario: a variable used only inside a later or an inner while is still captured by the loops around it
     Given two loops in a row where the second alone uses some variables, and an outer loop whose inner loop alone uses another
     When it runs through bm_lower_program/bi_run
-    Then every printed value of both loop shapes matches exactly what pat --ir-run produces for the identical source
+    Then every printed value of both loop shapes matches exactly what the v2 interpreter produces for the identical source

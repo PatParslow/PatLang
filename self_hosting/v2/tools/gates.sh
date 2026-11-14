@@ -6,8 +6,8 @@
 # When there is no self_hosting/build/v2.exe, the first is built from the
 # compiler's IR, bootstrap/v2_compiler.ir, by the IR reader
 # (bootstrap/ir_reader.py, docs/spec/ir.md), which needs only Python. The
-# language and match suites run their programs on these two engines; the
-# block-model suite's steps still start pat, the old engine they test.
+# language, match and block-model suites run their programs on these two
+# engines; no gate starts pat.
 #
 # Each step's result goes to self_hosting/build/v2_gates/status as it
 # finishes, and its output to a log beside it. The previous run's files move

@@ -26,8 +26,8 @@
 #   let port_id = signal_claim(9401)
 #   if port_id &gt;= 0 then
 #     # primary: hold the port, poll it inside your own event loop
-#     when quit do set_var(&quot;should_stop&quot;, &quot;1&quot;) end
-#     when status do signal_reply(&quot;uptime: &quot; + get(&quot;__vars&quot;, &quot;uptime&quot;)) end
+#     when quit do vfs_write(&quot;/app/should_stop&quot;, &quot;1&quot;) end
+#     when status do signal_reply(&quot;uptime: &quot; + vfs_read(&quot;/app/uptime&quot;)) end
 #     while running do
 #       ... your own work ...
 #       signal_poll(port_id, 20)   # cheap, non-blocking; fires when/emit
@@ -107,9 +107,9 @@ make a function called signal_poll takes port_id, timeout_ms returns name
     let sig_name = substr(msg, 0, nl)
     let payload = substr(msg, nl + 1, msg.length - nl - 1)
   end
-  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  signal_reply(&quot;&quot;)
   emit(sig_name, payload)
-  tcp_write(conn, get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  tcp_write(conn, vfs_read(signal_reply_key()))
   tcp_close(conn)
   return sig_name
 end
@@ -120,8 +120,18 @@ end
 # instead (fire-and-forget senders never read a reply anyway) or if this is
 # called outside of a signal-triggered handler at all.
 make a function called signal_reply takes text returns done
-  set_var(&quot;__signal_reply&quot;, text)
+  vfs_write(signal_reply_key(), &quot;&quot; + text)
   return true
+end
+
+# Where a handler's reply waits, and the forced driver: named in-memory files,
+# since a `when` handler takes only its event's name and data.
+make a function called signal_reply_key returns key
+  return &quot;/signal_state/reply&quot;
+end
+
+make a function called signal_driver_key returns key
+  return &quot;/signal_state/driver&quot;
 end
 
 # signal_send(port, name, payload) -&gt; true once delivered, discarding any
@@ -174,8 +184,7 @@ end
 # registered in the same world.
 
 make a function called signal_driver returns name
-  let forced = &quot;&quot; + get(&quot;__vars&quot;, &quot;__signal_driver&quot;)
-  if forced != &quot;&quot; then return forced end
+  if vfs_exists(signal_driver_key()) == &quot;1&quot; then return vfs_read(signal_driver_key()) end
   let caps = host_caps()
   let i = 0
   while i &lt; list_len(caps) do
@@ -186,7 +195,7 @@ make a function called signal_driver returns name
 end
 
 make a function called signal_use_driver takes name returns done
-  set_var(&quot;__signal_driver&quot;, name)
+  vfs_write(signal_driver_key(), name)
   return true
 end
 
@@ -223,9 +232,9 @@ make a function called sigv_poll takes port returns name
     let sig_name = substr(msg, 0, nl)
     let payload = substr(msg, nl + 1, msg.length - nl - 1)
   end
-  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  signal_reply(&quot;&quot;)
   emit(sig_name, payload)
-  vfs_write(&quot;/sig/&quot; + port + &quot;/reply/&quot; + m[0], get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  vfs_write(&quot;/sig/&quot; + port + &quot;/reply/&quot; + m[0], vfs_read(signal_reply_key()))
   return sig_name
 end
 
@@ -273,6 +282,7 @@ end
 # before that fix, this exact demo would have silently gone wrong, each
 # thread seeing its own isolated, empty state.
 
+include &quot;../lib/context.patlang&quot;
 
 
 # The port is inlined as a literal (9402) everywhere below, rather than a
@@ -286,28 +296,34 @@ end
 # just self-hosted compilation. Logged in the backlog for a dedicated fix;
 # this file just avoids the pattern rather than depending on it.
 
+let ctx = context_new()
+context_hold(ctx)
+
 when ping do
-  set_var(&quot;pings_received&quot;, get(&quot;__vars&quot;, &quot;pings_received&quot;) + 1)
+  let ctx = context_held()
+  ctx_set(ctx, &quot;pings_received&quot;, ctx_num(ctx, &quot;pings_received&quot;) + 1)
   print(&quot;PRIMARY: received signal 'ping' with payload: &quot; + event_data)
 end
 
 when status do
-  let uptime_ms = now_ms() - get(&quot;__vars&quot;, &quot;started_at&quot;)
-  signal_reply(&quot;PRIMARY status: alive for &quot; + uptime_ms + &quot;ms, received &quot; + get(&quot;__vars&quot;, &quot;pings_received&quot;) + &quot; ping(s) so far&quot;)
+  let ctx = context_held()
+  let uptime_ms = now_ms() - ctx_num(ctx, &quot;started_at&quot;)
+  signal_reply(&quot;PRIMARY status: alive for &quot; + uptime_ms + &quot;ms, received &quot; + ctx_text(ctx, &quot;pings_received&quot;) + &quot; ping(s) so far&quot;)
 end
 
 when quit do
+  let ctx = context_held()
   print(&quot;PRIMARY: received signal 'quit' -- shutting down&quot;)
-  set_var(&quot;should_stop&quot;, &quot;1&quot;)
+  ctx_set(ctx, &quot;should_stop&quot;, &quot;1&quot;)
 end
 
-make a function called run_primary takes unused returns done
+make a function called run_primary takes ctx, unused returns done
   let port_id = signal_claim(9402)
-  set_var(&quot;pings_received&quot;, 0)
-  set_var(&quot;started_at&quot;, now_ms())
-  set_var(&quot;should_stop&quot;, &quot;0&quot;)
+  ctx_set(ctx, &quot;pings_received&quot;, 0)
+  ctx_set(ctx, &quot;started_at&quot;, now_ms())
+  ctx_set(ctx, &quot;should_stop&quot;, &quot;0&quot;)
   print(&quot;PRIMARY: holding port &quot; + 9402)
-  while get(&quot;__vars&quot;, &quot;should_stop&quot;) == &quot;0&quot; do
+  while ctx_get(ctx, &quot;should_stop&quot;) == &quot;0&quot; do
     signal_poll(port_id, 50)
   end
   print(&quot;PRIMARY: exiting&quot;)
@@ -331,9 +347,11 @@ make a function called run_secondary takes unused returns done
   return true
 end
 
+# parallel_map gives each worker its item; the primary's context is the one
+# the program holds, as its signal handlers find it
 make a function called run_thread takes kind returns done
   if kind == &quot;primary&quot; then
-    return run_primary(0)
+    return run_primary(context_held(), 0)
   else
     return run_secondary(0)
   end
@@ -343,12 +361,11 @@ parallel_map([&quot;primary&quot;, &quot;secondary&quot;], &quot;run_thread&quot
 print(&quot;DONE&quot;)
 </pre></details><p class='label'>Native run on the build machine:</p><pre class='out native'>PRIMARY: holding port 9402
 PRIMARY: received signal 'ping' with payload: hello from a concurrent thread
-SECONDARY: queried status -&gt; PRIMARY status: alive for 254ms, received 1 ping(s) so far
+SECONDARY: queried status -&gt; PRIMARY status: alive for 307ms, received 1 ping(s) so far
 PRIMARY: received signal 'ping' with payload: one more
-SECONDARY: queried status -&gt; PRIMARY status: alive for 361ms, received 2 ping(s) so far
+SECONDARY: queried status -&gt; PRIMARY status: alive for 464ms, received 2 ping(s) so far
 SECONDARY: sending quit
 PRIMARY: received signal 'quit' -- shutting down
 PRIMARY: exiting
 DONE
-
 </pre>

@@ -23,7 +23,7 @@ Feature: apply() dynamic dispatch with arguments (GitHub issue #153)
   Scenario: apply with zero, one, two and three arguments returns the callee's value in value context
     Given a program calling apply with 0, 1, 2 and 3 arguments, in value context and as a bare statement
     When it runs through bm_lower_program/bi_run
-    Then every printed value matches exactly what pat --ir-run produces for the identical source
+    Then every printed value matches exactly what the v2 interpreter produces for the identical source
 
   Two failure paths that must be loud and specific rather than silent:
   more arguments than the callee declares (which would otherwise drop the

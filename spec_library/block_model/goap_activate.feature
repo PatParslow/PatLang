@@ -24,4 +24,4 @@ Feature: activate and action_bind (GitHub issue #177, second slice)
   Scenario: activate runs every bound closure, and stops at a failing step even though the plan is still found
     Given a goal with a three-step plan, every action bound to a closure returning true, then one action re-bound to fail for a specific step
     When it runs through bm_lower_program/bi_run
-    Then activate returns true, then false, matching exactly what pat --ir-run produces for the identical source
+    Then activate returns true, then false, matching exactly what the v2 interpreter produces for the identical source

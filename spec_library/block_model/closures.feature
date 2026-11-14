@@ -40,9 +40,9 @@ Feature: first-class closures (GitHub issue #182)
   Scenario: closures capture, return, pass and call each other, matching the real engine
     Given a program capturing an enclosing local, returning a closure from a function, passing a closure as a parameter, rebinding a captured variable after capture, and calling a closure from a closure
     When it runs through bm_lower_program/bi_run
-    Then every printed value of the closure program matches exactly what pat --ir-run produces for the identical source
+    Then every printed value of the closure program matches exactly what the v2 interpreter produces for the identical source
 
   Scenario: a loop captures a variable used only inside a closure it creates, and a closure used only as a callee
     Given a loop whose body creates a closure over one outer variable and calls another closure held in a local
     When it runs through bm_lower_program/bi_run
-    Then the total matches exactly what pat --ir-run produces for the identical source
+    Then the total matches exactly what the v2 interpreter produces for the identical source
