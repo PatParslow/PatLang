@@ -38,6 +38,7 @@ Current packages:
 | zip     | 0.1.0   | zip archive reader and writer (stored and deflate entries, CRC-checked) |
 | sha256  | 0.1.0   | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104) over bytes, strings and files |
 | resolve | 0.1.0   | manifest reader, version constraints, and dependency resolution through `rule_add`/`solve` (`docs/plans/package-manager.md`, P1) |
+| trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in (`docs/plans/package-trust.md`, T1) |
 
 ## Manifest format (draft)
 
@@ -99,15 +100,17 @@ exits non-zero on any failure. The files are committed with LF line ends
 whatever the platform (`.gitattributes`: `packages/** text eol=lf`), so a
 checkout's bytes are the ones hashed.
 
-## Resolution and installation (planned)
+## Resolution and installation
 
-The plan is in `docs/plans/package-manager.md`. Manifests become facts,
-version constraints become rules over version-order facts computed in
-PatLang, and installation is a GOAP plan whose fetch, verify and install
-actions have each dependency's installation as a precondition. A `pkg`
-tool runs it. None of it is built yet.
+The plan is in `docs/plans/package-manager.md`. Resolution is built
+(`packages/resolve`, P1): manifests become facts, version constraints become
+rules over version-order facts computed in PatLang, and the resolver chooses
+the newest versions that fit, reporting a conflict with its requirers when
+none do. Installation is planned, not built: a GOAP plan whose fetch, verify
+and install actions have each dependency's installation as a precondition,
+run by a `pkg` tool.
 
-## Trust (planned)
+## Trust
 
 Package trust uses the same group model as PatLang networking. The plan is
 in `docs/plans/package-trust.md`. In outline:
@@ -119,8 +122,12 @@ in `docs/plans/package-trust.md`. In outline:
 - verification uses public data only, and trust does not carry from a
   package to its dependencies.
 
-None of it is built yet: a package is trusted because it is in this
-repository, and its `file` hashes pin its content.
+The records and their checks are built (`packages/trust`, T1), and
+`self_hosting/v2/examples/trust_attacks.patlang` runs them with Ed25519
+written in PatLang. The `pkg` tool that signs and certifies releases, the
+operating-system signing calls and the consumer's trust store are not built,
+so today a package is trusted because it is in this repository, and its
+`file` hashes pin its content.
 
 ## Running a package's specs
 

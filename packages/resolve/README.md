@@ -40,8 +40,7 @@ print(rs_result_text(result))      # resolved deflate 0.1.0, zip 0.1.0
   each requirer with its constraints (read back from `pkg_requires`), and the
   versions available.
 
-The rule store is one per process and has no retraction, so a process
-resolves once. `rs_assert_facts` is the one function that calls `rule_add`.
+`rs_assert_facts` is the one function that calls `rule_add`.
 
 ## Specs and benchmark
 
@@ -56,7 +55,11 @@ resolves them with no logic engine, and checks choices and version_order
 facts. `spec/bench.patlang` times one universe per run (`resolve <dir>
 <name>`) and the version_order facts alone (`order <count>`).
 
-Each `solve` goal scans the whole rule store and renames every rule for its
-predicate before unifying, and each `rule_add` copies the store. So resolving
-costs about the number of versions tried times the store size, and asserting
-D known versions costs about D^4.
+Since #252 the logic engine indexes rules by predicate: `rule_add` pushes
+in place, and a goal visits only its own predicate's rules, skipping one whose
+head contradicts a constant in the goal. Asserting D known versions and bounds
+still asserts D^2 `version_order` facts, one for each pair.
+
+The facts go in the process's default rule store, which has no retraction, so
+a process resolves once and the runner starts a child for each resolution.
+Rule stores are now values (#255), so a store per resolution can replace that.
