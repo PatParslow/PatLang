@@ -8,7 +8,7 @@
 #
 # Progress goes to self_hosting/build/check_budgeted_tool.progress.
 cd "$(dirname "$0")/../.."
-TOOL=${TOOL:-"rust-runtime/target/release/pat.exe --ir-run self_hosting/templates/budgeted_tool.patlang"}
+TOOL=${TOOL:-"self_hosting/build/v2_interp.exe self_hosting/templates/budgeted_tool.patlang"}
 UNITS=${UNITS:-3000}
 PROG=self_hosting/build/check_budgeted_tool.progress
 OUT=self_hosting/build/check_budgeted_tool.out

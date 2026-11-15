@@ -1,102 +1,57 @@
 # PatLang: conventions for working in this repo
 
-## Use the self-hosted compiler for ordinary compiles, not the native pipeline
+## v2 is the toolchain
 
-PatLang was deliberately pushed to self-host: the lexer, parser, lowerer, and code generator are all written in PatLang itself (`self_hosting/lib/ {lexer,parser,lower,codegen,runtime_rs}.patlang`), not just as a novelty but so that PatLang programs actually get compiled by a PatLang-authored compiler.
+The compiler (`self_hosting/v2/compile.patlang`, built as `self_hosting/build/v2.exe`),
+the interpreter (`self_hosting/v2/interp.patlang`, built as
+`self_hosting/build/v2_interp.exe`) and the runtime they share
+(`self_hosting/v2/runtime/`) are PatLang. Building, running and testing need no
+Rust: a fresh clone with no `rust-runtime/` and no Rust on the PATH builds itself
+and passes every gate (checked 2026-11-15).
 
-## The pure-PatLang (self-hosted) route is PRIMARY. Rust is legacy, mirrored for correctness checking.
-
-`self_hosting/lib/*.patlang` (lexer/parser/lower/codegen/codegen_x64/x64_asm/
-runtime_rs/...) is the CANONICAL implementation of the compiler's logic.
-`rust-runtime/src/ir/{hosts,codegen}.rs` is a NECESSARY but subordinate
-piece, kept for exactly two reasons, neither of which makes it the place
-to reason about correctness:
-
-1. **Bootstrapping Gen A.** `patc1.exe` must be built the very first time
-   via `rustc` + `codegen.rs`'s native Rust-source emission, because no
-   self-hosted binary exists yet to build it with (an unavoidable
-   chicken-and-egg, not a design preference). Gen B/C (`patc1.exe`
-   compiling `patc1_all.patlang` into `patc2.exe`/`patc3.exe`) goes
-   through the real self-hosted route instead (`emit_program_rs_chunked`,
-   sourcing chunk text from `runtime_rs.patlang`'s `emit_chunk_<name>`
-   functions, NOT from `codegen.rs`'s `PRELUDE_*` constants) -- this is
-   the genuinely-canonical path, and the one that should be trusted and
-   tested as "the compiler," not Gen A's rustc-bootstrapped shortcut.
-2. **Correctness-checking mirror.** `codegen.rs`'s `PRELUDE_*` constants
-   and `hosts.rs`'s host-function bodies exist so `cargo test ... --test
-   selfhost_pipeline -- selfhost_runtime_text_parity` has something
-   independent to check the self-hosted emission against. The mirror
-   being correct does not make it primary -- a mismatch means fix
-   whichever side is wrong, usually by making the Rust side match the
-   self-hosted PatLang logic, not the other way around, unless the
-   self-hosted side itself has the actual bug.
-
-**Consequence for day-to-day work:**
-- When fixing a bug or adding a feature in compiler logic that already
-  has a self-hosted form (lexing, parsing, lowering, x64/WASM codegen,
-  the assembler, the linker), edit the `.patlang` file. Never treat
-  `codegen.rs`/`codegen.patlang`-emitted text as the "real" version to
-  patch around a self-hosted gap.
-- When a genuinely new HOST primitive is needed (something PatLang
-  itself cannot express -- true host-boundary state like thread-local
-  storage, raw TCP, file I/O), it must exist in Rust at the host-function
-  boundary regardless, in **both** `hosts.rs` (interpreter) and wherever
-  the self-hosted compiler's own emission target expects it
-  (`codegen.rs`'s `PRELUDE_*` for Gen A, mirrored into `runtime_rs.
-  patlang`'s matching `emit_chunk_<name>` for Gen B/C). Implement both in
-  the SAME pass, not as a deferred follow-up -- a primitive that exists
-  natively but not in the self-hosted mirror is not "done," it has
-  silently reintroduced a rustc dependency Gen B/C doesn't actually need.
-  Run `selfhost_runtime_text_parity` immediately after touching either
-  side, not at session end -- it catches exactly this class of mistake
-  (confirmed directly, GitHub #197's own follow-up: a new primitive
-  landed in the wrong CHUNK on the self-hosted side, parity caught it in
-  one run, a real Gen B/C self-compile + a --x64 program exercising the
-  primitive then proved the fix genuinely works end-to-end, not just that
-  the text comparison passes).
-- `pat --ir-run` (the interpreter, backed by `hosts.rs`) is NOT legacy --
-  it stays the fast default dev loop for diagnostics and iteration. What
-  is legacy is specifically `codegen.rs`'s native Rust-source-emission
-  path (`pat --patc`) and treating it as a development target in its own
-  right rather than a bootstrap/correctness-check mirror.
+`rust-runtime/` (`pat`) and the earlier compiler (`patc1.exe`,
+`self_hosting/build_patc1*.patlang`, `self_hosting/block_model/`,
+`self_hosting/lib/codegen*.patlang`, `x64_runtime.patlang`) are the old route.
+Don't develop on them or fix their failures unless asked. The block-model suite
+still tests the block-model engine, run on the v2 interpreter.
 
 ---
 
-## 1. Compilers
+## 1. Commands
 
-* **`./patc1.exe`**: Everyday builds/verification. Must use explicit relative path `./` on Windows to avoid `CreateProcess` failures.
+Run from the repository root: `v2.exe` reads the runtime from
+`self_hosting/v2/runtime/` relative to the working directory.
 
-
-* Rebuild stale compiler: `rust-runtime/target/release/pat --ir-run self_hosting/build_patc1.patlang`.
-
-
-
-
-* **`pat --patc`**: Testing native compiler/runtime (`codegen.rs`) only -- legacy/bootstrap/correctness-mirror, per the section above. Do not use for routine builds, and do not treat it as the place to decide what's correct.
-
-
-* **Goal**: Transition from `rustc` bootstrap to pure PatLang-to-native emission.
-
-
+* First compiler, when there is none:
+  `py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe`
+* Compile: `self_hosting/build/v2.exe SRC.patlang OUT.exe [--workers N]`; also
+  `OUT.ir --ir`, `OUT.wasm --wasm`, and `SRC --constant-time`.
+* Interpret: `self_hosting/build/v2_interp.exe SRC.patlang [args...]`
+* Rebuild the interpreter after a runtime or interpreter change:
+  `self_hosting/build/v2.exe self_hosting/v2/interp.patlang self_hosting/build/v2_interp.exe --workers 4`
+* Rebuild the compiler from its sources: let the gates do it. The `compiler` unit
+  builds two generations, checks they are byte identical, and installs the second.
+* WASM: `node self_hosting/v2/wasm/run_node.mjs [--files DIR] PROGRAM.wasm [ARGS...]`,
+  or `self_hosting/v2/wasm/run_browser.py` for headless Chrome.
 
 ---
 
-## 2. Mirror Sync (`self_hosting/` is canonical; `codegen.rs` is the legacy mirror checked against it)
+## 2. Gates
 
-* **Rule**: Update both sides in the SAME pass, not "mirror before session end" -- a primitive or fix that only lands on one side is not done. Run the parity check as part of making the change, not as a final cleanup step.
+`bash self_hosting/v2/tools/gates.sh [--plan] [--all] [--only PREFIX] [--cap N]`
+builds the first compiler from the IR if needed, then the gates tool. It runs every
+stale unit (a build, or one feature file of one suite on one engine) in parallel,
+leaving two cores and 4 GB free.
 
+- Results go to `self_hosting/build/gates/record`, and logs to
+  `self_hosting/build/gates/logs/UNIT.log`.
+- `status` and `quit` signals work on the port named in
+  `self_hosting/build/gates/status`.
+- A unit's inputs are declared in `self_hosting/v2/tools/gates.patlang`. A new
+  suite, runner or fixture directory needs its unit and inputs declared there.
+  See `docs/plans/gates.md`.
 
-* **Workflow**:
-1. Implement/fix the logic in `self_hosting/lib/*.patlang` first -- this is the canonical version.
-2. If it's a host-boundary primitive Rust must also provide, add it to `rust-runtime/src/ir/hosts.rs` AND to the matching `PRELUDE_*`/`emit_chunk_<name>` pair in `codegen.rs`/`runtime_rs.patlang`, same chunk, same text, same position relative to neighboring functions.
-3. Check parity immediately: `cargo test --release --manifest-path rust-runtime/Cargo.toml --test selfhost_pipeline -- selfhost_runtime_text_parity`
-
-4. For anything that changes compile-time behavior (not just adds a primitive), also prove it through the real self-hosted route, not just the text-equality check: rebuild `patc1.exe`, run the Gen B fixpoint (`./patc1.exe self_hosting/build/patc1_all.patlang patc2.exe`), and exercise the change with `patc2.exe`.
-5. Report precise un-mirrored chunk counts if a mismatch is genuinely deferred -- but deferring should be rare now, not the default assumption.
-
-
-
-
+Don't edit files a running gate reads.
 
 ---
 
@@ -113,11 +68,19 @@ to reason about correctness:
 
 4. **Report**: State command, output, and exact spec alignment.
 
-5. **Standing language-spec gate** (GitHub #49): `spec_library/language/*.feature` is executable, not prose — wired via `self_hosting/lib/spec_steps_language.patlang`'s `step()` registrations onto `self_hosting/lib/gherkin.patlang`'s Gherkin runner. Run it with:
-   `rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_language_spec_suite.patlang`
-   Any language-semantics change (new operator, control-flow form, numeric-tower/tagging behavior) needs a scenario added/updated here as part of the change, RED before / GREEN after — not deferred to a one-off investigation. For representation/type invariants (e.g. "this op's result stays `int`, doesn't silently misclassify as `bigint`" — the root pattern behind #24/#46/#48), use `And ensure <var> == <literal>` (`self_hosting/lib/gherkin.patlang`) against a var set from `numeric_kind(x)`/`type_of(x)`; unquoted literal, `==`/`!=` also compare as strings when non-numeric. `spec_library/language/` is fully wired (49 of its 50 `.feature` files by this suite, `match_pattern` by `self_hosting/tools/run_match_spec_suite.patlang`, including two-process/cross-backend specs via `spawn()`/`exec_capture` — see `self_hosting/tools/spec_fixtures/`).
+5. **The suites**:
+   - `spec_library/values_and_memory/`: part 1 on both engines, and part 2 (`@runtime`).
+   - `spec_library/language/`: `self_hosting/tools/run_language_spec_suite.patlang` on
+     both engines, and `match_pattern` by `run_match_spec_suite.patlang`.
+   - `spec_library/block_model/`.
 
+   Step registrations are in `self_hosting/lib/spec_steps_*.patlang`, on the Gherkin
+   runner `self_hosting/lib/gherkin.patlang`. A runner lists its feature files with
+   `--list`, and takes its scratch paths from `PATLANG_SPEC_OUT`.
 
+   Any language-semantics change needs a scenario, RED before and GREEN after. For
+   representation invariants, use `And ensure <var> == <literal>` against
+   `numeric_kind(x)` or `type_of(x)`.
 
 ---
 
@@ -298,6 +261,10 @@ that prompted the program didn't mention it explicitly.
 
 ## 7. Thread safety: `__vars` is one shared namespace across `parallel_map`/`thread_spawn` workers
 
+This section is about the old compiler and `pat`. v2 has no `set_var`, and its
+worlds (spec 1.15) hold a program's state. The three shapes below still apply to
+any shared mutable state a worker can reach.
+
 Found via GitHub #197 (native x64 parallel assembly, already built and
 measured at 10.9x on the mechanism itself, blocked on this): `get("__vars",
 key)`/`set_var(key, val)` reads/writes ONE process-wide table. A
@@ -448,6 +415,8 @@ class of tool.
 ---
 
 ## 9. Dispatch-by-name primitives: a new one must be added to EVERY registry that enumerates them, not just the one you're touching
+
+The instance below is in the old compiler's block-model backend; the rule is general.
 
 Confirmed recurring, not a one-off (GitHub #224): `bm_nc_dispatches_by_name`
 (`self_hosting/block_model/native_codegen.patlang`) is the list of host

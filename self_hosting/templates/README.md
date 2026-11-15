@@ -16,7 +16,7 @@ converters, checkers, daemons.
 - **Signals.** `status`, `pause`, `resume` and `quit` are built in. Running
   a second copy finds the port already taken and passes its argument to
   the running copy:
-  `pat --ir-run budgeted_tool.patlang status`.
+  `self_hosting/build/v2_interp.exe budgeted_tool.patlang status`.
 - **No loose globals.** State lives in objects, one class per concern:
   `ToolSettings`, `ToolControl`, `ToolProgress`, `Workload`, and `Tool`,
   which ties them together and answers signals. Each `when` handler is a
@@ -41,5 +41,6 @@ copy. It checks that:
 - an interrupted run gives the same result as an uninterrupted one;
 - `quit` stops the tool early.
 
-It runs under the interpreter by default. To test a native build, set
-`TOOL=./tool.exe`.
+It runs under the v2 interpreter by default. To test a build of the tool,
+made with `self_hosting/build/v2.exe self_hosting/templates/budgeted_tool.patlang tool.exe`,
+set `TOOL=./tool.exe`.

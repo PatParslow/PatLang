@@ -153,6 +153,13 @@ Made by the project owner on 2026-11-05:
        `gates.sh` builds the first compiler from the IR when there is none, then the gates tool,
        and runs it. With nothing fresh, every suite passed in 2 h 36 min, against 4 h 52 min
        one after another, with the counts above (part2 136 with this session's scenarios).
+     - **A clean clone needs no Rust.** A fresh clone with `rust-runtime/` removed and no
+       Rust on the PATH built its first compiler from the IR and passed all 178 units from
+       nothing in 2 h 46 min, with the same counts. The repository then lost what v2 does
+       not use: the 2025 archive, agent and coverage output, three out-of-scope spec
+       folders, the old bootstrap's scripts and `patc.patlang`. `README.md`, `TUTORIAL.md`
+       and `CLAUDE.md` now describe v2; `rust-runtime/` and the old compiler stay until
+       Rust is retired.
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical. Done, and

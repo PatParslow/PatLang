@@ -1,322 +1,128 @@
 # PatLang
 
-PatLang is a self-hosted programming language: its lexer, parser, lowerer,
-and code generator are written in PatLang itself, not just as a bootstrap
-exercise but as the actual, ongoing way PatLang programs get compiled.
-Alongside the usual imperative/functional core it has a built-in
-goal-oriented/logic-programming layer (facts, rules, `solve`, real
-backward-chaining inference, `action_add`/`plan` GOAP planning) and an
-inductive-synthesis (ILP) engine that can learn rules — and, increasingly,
-whole small programs — from BDD-style example scenarios, verified by
-actually searching for them rather than being told the answer.
+PatLang is a programming language written in itself. Its compiler, v2, and its
+interpreter are PatLang programs, and so is the runtime they share. The compiler
+turns a program into a Windows x64 executable, with its own assembler and
+linker, or into a WebAssembly module for the browser.
 
-Importantly, it is basically an experiment in developing a programming
-language that covers all of the major paradigms of programming: imperative,
-functional, goal-oriented, logic-programming, OO (including real single
-inheritance, composable traits, and method dispatch), design by contract,
-and so on. But it is also an experiment in doing so without writing a single
-line of code, nor any of the formalised BDD specs, by hand — the
-human-in-the-loop designed the concept, directs the development, and
-AI agents developed the code, and the documentation. Part of that
-experiment is treating every claimed result as something to be verified,
-not assumed: several results in this project's history (including some in
-its own synthesis-registry work) were caught as vacuous or outright wrong
-*after* looking correct, and the fix each time was a genuine RED→GREEN
-discipline, not a stricter-sounding claim.
-
-This README describes the system as it exists today. If you're looking at
-one of the many `*_REPORT.md` / `*_PLAN.md` files in the repo root and it
-disagrees with this file, trust this file — most of those documents
-describe an earlier, abandoned Ruby prototype and are kept only as
-historical record.
+PatLang is an experiment in covering the major paradigms of programming in one
+language: imperative and functional code, objects with inheritance and traits,
+events, logic programming with backward chaining, goal-oriented planning,
+design by contract, threads and fibres. It is also an experiment in building a
+language without writing any of its code, or its formal specifications, by
+hand. The project owner designed the concept and directs the work, and AI
+agents wrote the code and the documentation. Every claimed result is checked by
+running it, since several results in the project's history looked correct and
+turned out to be wrong.
 
 ## Requirements
 
-- **Rust, stable, supporting the 2024 edition** (Rust 1.85+; developed
-  against 1.88). `cargo build --release` fetches its own dependencies
-  (`tokio`, `hyper`, `serde`, `uuid`, etc.) from crates.io, so the first
-  build needs network access.
-- **A working system linker** for whatever target you're compiling to —
-  `rustc` (invoked by `pat --patc` and by `patc1.exe`) shells out to the
-  platform linker to turn generated Rust into a real executable (MSVC's
-  `link.exe` on Windows, `cc`/`ld` on Linux/macOS). This is the same
-  linker your Rust toolchain already needs to build anything else.
-- **Python 3**, needed only for `tools/regen_runtime_rs.py` — the script
-  that keeps the self-hosted compiler's own mirror of the Rust runtime's
-  host-function text in sync after a `hosts.rs`/`codegen.rs` change (see
-  `CLAUDE.md`'s "Do not leave the self-hosted mirror behind"). Not needed
-  for ordinary compiling or running PatLang programs.
-- **Optional, for WebAssembly targets**:
-  - `rustup target add wasm32-wasip1` for the ordinary (non-threaded) WASM
-    target.
-  - A **nightly** Rust toolchain (`rustup toolchain install nightly`,
-    `rustup target add wasm32-wasip1-threads --toolchain nightly`) for the
-    threaded WASM target, since real OS-thread-backed fibers/`budgeted(...)`
-    compiled to WASM need atomics/shared-memory support that's only
-    prebuilt against the standard library on nightly.
-  - `wasmtime` (or any WASI-preview1 runtime with threads support), only
-    if you want to run a compiled `.wasm` binary locally outside a
-    browser — the portfolio demos' own "run in browser" buttons don't
-    need it, they run in the browser's own WebAssembly engine via a
-    hand-rolled WASI-threads JS shim.
-
-Nothing else is required for everyday use: `pat --ir-run` (the
-interpreter) needs only the `pat` binary itself once built.
-
-## What actually works
-
-- **A native Rust runtime** (`rust-runtime/`) — a real lexer, parser,
-  interpreter, and native code generator, built as the `pat` binary.
-- **A self-hosted compiler** (`self_hosting/lib/{lexer,parser,lower,codegen,
-  runtime_rs}.patlang`) — the same pipeline, written in PatLang, bootstrapped
-  into a standalone native binary (`patc1.exe`) that compiles ordinary
-  PatLang programs without going through the Rust-native path.
-- **Four execution paths, kept in parity on purpose**: interpreted
-  (`pat --ir-run`), natively compiled via the Rust codegen (`pat --patc`),
-  compiled by the self-hosted compiler (`patc1.exe`), and compiled to
-  WebAssembly (plain `wasm32-wasip1`, or `wasm32-wasip1-threads` for real
-  OS-thread-backed concurrency, including live in a browser). The test
-  suite checks these agree — this cross-checking is how most real bugs in
-  this project get found, including a lexer bug that silently corrupted
-  non-ASCII string literals and a native-compiled-fibers bug that only
-  ever showed up on the compiled path, not the interpreter.
-- **`patc1.exe --x64` now does genuine native code generation**: real x64
-  machine code, assembled and linked by a self-hosted assembler/PE linker
-  (`self_hosting/lib/x64_asm.patlang` + `x64_pe_link.patlang`), with no
-  `rustc`, `nasm`, or `gcc` involved anywhere in that path — the "Block
-  Ownership Model" runtime redesign (block/jump execution as the literal
-  compiled control flow, real refcounting-based ownership, a hybrid
-  static/runtime `mut`-exclusivity check, and real free-variable analysis
-  for closures) closed the ~764x speed gap this backend started with down
-  to roughly parity with the existing pipeline, and is now the default
-  `--x64` behavior. This is a separate, further-along claim than the
-  Performance section below makes for `pat --patc`.
-- **A numeric tower**: Int/Float/BigInt/Rational/Complex, auto-promoting on
-  overflow or inexact operations rather than wrapping or crashing.
-- **A goal-oriented/logic layer with real inference, not just fact lookup**:
-  `rule_add`/`solve` do genuine backward-chaining resolution over declared
-  rules (including recursive ones, with real unification), and
-  `action_add`/`plan` is a real STRIPS-style, uniform-cost-search GOAP
-  planner — both usable from otherwise-imperative code, and both used as
-  the substrate for genuine program synthesis (below), not just toy
-  querying.
-- **An inductive synthesis engine** (`self_hosting/lib/synthesis*.patlang`,
-  plus newer generic search extensions in `friendly_cli/lib/`):
-  least-general-generalization-based rule learning over BDD-authored
-  example scenarios, extended to accumulator-threading and conditional
-  ("toggle") relations found by search rather than hand-specified, and a
-  GOAP-side analogue that composes a single discovered action across
-  multiple simultaneous examples and packages it into a new, reusable,
-  callable action — verified with deliberate decoys and held-back blind
-  cases specifically to catch results that only *look* like discovery.
-- **Real classes, inheritance, and traits**: an optional `class`/`inherits`
-  keyword with single inheritance, real method dispatch via `send`,
-  composable traits (last-listed wins on collision), and an inline form
-  via `new(...)` needing no formal class block at all.
-- **A transaction/backtracking pattern needing no engine changes**: PatLang
-  closures already capture free variables as value copies (confirmed
-  directly in the interpreter), so "try a candidate, keep the result only
-  on success" is the natural shape of an ordinary closure call — a small
-  pure-PatLang library (`friendly_cli/lib/vfs_transaction.patlang`) closes
-  the one real gap (file state) on top of the existing VFS, with named,
-  honest limits (not concurrency-safe for overlapping files; doesn't cover
-  facts/rules, which have no retract yet).
-- **Contracts, a message queue, TCP sockets, non-blocking process spawn,
-  and a signal/task-discovery layer** built on top of the message queue —
-  enough to write small self-orchestrated multi-process demos entirely in
-  PatLang (see `self_hosting/examples/microservices_demo.patlang`).
-- **A real, if informal, test corpus**: 100+ Rust integration tests
-  (`rust-runtime/tests/`), a BDD/cucumber feature suite, and dozens of
-  self-hosted PatLang selftests (`self_hosting/*_selftest.patlang`)
-  exercising the synthesis engine, regex DSL, reflection/transpilation, and
-  more — plus a large, ongoing spec-discovery/verification initiative
-  (`spec_library/`) covering shell commands, PatLang's own standard
-  library, and language features via mechanically-verified Gherkin specs.
-- **A library of working example programs** (`self_hosting/examples/`,
-  `portfolio/demos/`, `friendly_cli/`) — a CSV-backed transactional RDBMS
-  with a SQL console, a hex-grid RTS economy sim, a build daemon, a maze
-  solver, a family-tree/demographic simulator, a combined GOAP-planning +
-  transactional + fiber-based worker demo, and others — each runnable and
-  each built to prove out a real language feature rather than as a toy.
-- **Developer tooling**, all self-hosted (`self_hosting/tools/`):
-  - `parity_main.patlang` — runs a file through all execution paths and
-    diffs the output, to catch a divergence between the native and
-    self-hosted compiler in one command.
-  - `depgraph_main.patlang` — an include-dependency graph over
-    `self_hosting/` with cycle detection, text or `--html` report.
-  - `format_main.patlang` — a line-based re-indenter (deliberately not a
-    full AST pretty-printer, since the lexer discards comments entirely
-    and a parse-rebuild formatter would delete them).
-  - `fuzz_main.patlang` — generates random nested control-flow programs
-    and checks that the native and self-hosted parsers agree on each one.
-  - Runtime errors from `--ir-run` also get a plain-language suggestion
-    line alongside the raw message (`rust-runtime/src/main.rs`'s
-    `suggest_runtime_fix`), mirroring the existing parse-error reasoning.
-
-## Performance: real numbers now exist, and the honest state of them
-
-A real, external comparison (a Ruby-to-PatLang port of a predator-prey
-ecosystem simulation, done in a sibling project) found `pat --patc`
-compiled output running **~21x slower than equivalent Ruby** (24.77s vs
-1.15s on the same workload), and directly profiling it — rather than
-guessing — found the actual cause was not the numeric tower (the first
-hypothesis), but that compiled programs still run as bytecode through a
-shared, embedded interpreter loop, with local variables and function
-calls resolved via string-hashed lookups. Fixing that (caching
-per-function dispatch tables instead of re-hashing names on every access
-— with one attempted intermediate version *causing* a real regression
-before landing on the correct per-function-not-per-call design) brought
-the same benchmark to **~11.4s, roughly a 2x speed-up over the original
-PatLang time** — genuine, measured progress, but still around 10x slower
-than Ruby on this particular workload, not parity. Two of this project's
-own longstanding benchmarks (`bench_sumloop.patlang`, `bench_sort.patlang`)
-came out 29-35% faster from the same fix, with no measurable overhead
-added to trivial programs.
-
-Stated plainly, since this whole project treats an unverified performance
-claim the same as any other unverified claim: **`pat --patc`'s "compiled"
-backend does not yet do genuine native code generation.** It serializes a
-function's IR as data and executes it through a generic bytecode VM
-embedded in the output binary, rather than translating PatLang control
-flow into real Rust control flow. That remaining gap is understood, but a
-real fix for it is a substantially bigger undertaking than the fixes
-already made, and hasn't been started.
-
-This does **not** apply to `patc1.exe --x64` (see above) — that path
-compiles to genuine x64 machine code, not a bytecode VM, and its own
-measured speed-up (the Block Ownership Model's Phase 9 native codegen)
-closed an initial ~764x gap against the existing pipeline down to
-roughly 1x. The two backends are at different points on this question;
-neither claim should be read as covering the other.
-
-## What it doesn't do
-
-- **No package manager or module registry.** `include` is textual file
-  concatenation; there's no versioning or dependency resolution.
-- **No sandboxing.** Host functions give a PatLang program the same
-  privileges as the user running it: arbitrary process execution
-  (`exec_capture`), unrestricted filesystem read/write/delete, and raw TCP.
-  Fine for scripts you wrote yourself; do not run untrusted PatLang source
-  without wrapping it in an external sandbox (container, VM, restricted
-  user account) first.
-- **No editor tooling.** No LSP, no debugger. A basic re-indenter exists
-  (see Developer tooling above) but there's no linter yet and no IDE
-  integration beyond the standalone `tools/vscode-patlang/` syntax
-  highlighter.
-- **`pat --patc` does not yet do genuine native code generation** — see
-  Performance above. It produces a real standalone binary, but its
-  runtime behavior is still bytecode interpretation, not compiled control
-  flow. `patc1.exe --x64` is the exception: it compiles to real x64
-  machine code (see "What actually works" above), not bytecode.
-- **No fact/rule retraction.** `rule_add` is accumulate-only; nothing
-  registered as a fact or GOAP action can currently be un-registered,
-  which limits how far the transaction/backtracking pattern above can
-  reach (file state only, not logic/planning state).
-- **Single-maintainer, no external users yet.** Everything above is
-  proven against its own test suite and example programs, not against
-  outside use.
+- Windows on x64.
+- Python 3, to build the first compiler from its IR (once).
+- Optional: Node.js, to run WebAssembly builds outside a browser.
 
 ## Quick start
 
-You need a Rust toolchain for one bootstrap step only — see Requirements
-above for the exact version and optional extras.
+From the repository root:
 
 ```bash
-cd rust-runtime
-cargo build --release
+py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe
+self_hosting/build/v2.exe self_hosting/v2/interp.patlang self_hosting/build/v2_interp.exe --workers 4
 ```
 
-This produces `pat` (`pat.exe` on Windows) — the runner and compiler
-driver. From the repo root:
-
-```bash
-# Interpret directly (recommended for everyday use)
-rust-runtime/target/release/pat --ir-run hello.patlang
-
-# Compile via the native Rust codegen
-rust-runtime/target/release/pat --patc hello.patlang --out hello.exe
-
-# Compile via the self-hosted compiler (rebuild it first if it's stale)
-rust-runtime/target/release/pat --ir-run self_hosting/build_patc1.patlang
-./patc1.exe hello.patlang hello.exe
-
-# Compile to genuine native x64 machine code (no rustc/nasm/gcc involved) --
-# build the runtime object once, then compile any number of programs against it
-rust-runtime/target/release/pat --ir-run self_hosting/build_x64_runtime.patlang
-./patc1.exe hello.patlang hello.exe --x64
-
-# Compile to WebAssembly -- via the self-hosted compiler with an extra
-# positional target argument (pat --patc itself only ever produces a
-# native binary; WASM output goes through patc1.exe)
-./patc1.exe hello.patlang hello.wasm wasm32-wasip1
-```
-
-`hello.patlang`:
+This builds the compiler, then the interpreter. `hello.patlang`:
 
 ```patlang
 let name = "world"
 print("hello, " + name)
 ```
 
-See [`TUTORIAL.md`](TUTORIAL.md) for a fuller walkthrough of all
-execution paths and the language's main paradigms, and
-[`CLAUDE.md`](CLAUDE.md) for the project's own working conventions
-(when to use `patc1.exe` vs the native pipeline, and the discipline for
-keeping the self-hosted mirror in sync with the Rust runtime).
+```bash
+self_hosting/build/v2_interp.exe hello.patlang           # interpret
+self_hosting/build/v2.exe hello.patlang hello.exe        # compile
+self_hosting/build/v2.exe hello.patlang hello.wasm --wasm
+node self_hosting/v2/wasm/run_node.mjs hello.wasm
+```
 
-## Running the tests
+Run `v2.exe` from the repository root, where it finds the runtime.
+[`TUTORIAL.md`](TUTORIAL.md) walks through the language.
+
+## What it has
+
+- **The compiler** (`self_hosting/v2/`): lowering to an IR, reference counting
+  inserted by an ownership stage, x64 code generation, assembly and linking,
+  each function's build cached by a hash of its inputs and run on parallel
+  workers. It compiles itself, and two generations are byte identical.
+- **The interpreter** (`self_hosting/v2/interpreter.patlang`): the compiler's
+  own front end and runtime, walking the IR, so a program prints the same
+  interpreted and compiled.
+- **A bootstrap from the IR**: `bootstrap/ir_reader.py`, under 1,000 lines
+  of Python, builds the compiler from `bootstrap/v2_compiler.ir`. The IR is
+  specified (`docs/spec/ir.md`), so a reader in another language is a
+  self-contained job.
+- **WebAssembly with threads and fibres**: the host in `self_hosting/v2/wasm/`
+  runs a module in a browser or Node, each thread and fibre a Worker over one
+  shared memory.
+- **Exact numbers**: ints overflow to bigints, dividing ints gives a rational
+  when the result is not whole, and there are floats, complex numbers,
+  intervals, and integers modulo n with a check that code using them takes
+  the same time whatever the secret values (`self_hosting/v2/examples/`).
+- **Logic and planning**: rules solved by backward chaining, in stores a
+  program can make and name; a planner that finds the cheapest sequence of
+  actions to a goal; `goal`, `pursue` and `activate` to run a plan.
+- **Objects and events**: classes with fields, methods, single inheritance and
+  traits; operators as methods; `when`/`emit` handlers; methods that declare the
+  events they raise.
+- **Concurrency**: OS threads, `parallel_map`, fibres, and worlds, each an
+  object holding a program's state, in which another program's text can run.
+- **Contracts, files, processes, TCP, signals and a message queue**: enough for
+  programs that run as several processes and report their progress.
+- **Packages** (`packages/`): deflate, zip, SHA-256, package resolution and
+  trust, each with its own features.
+- **A portfolio** (`portfolio/`): example programs run in the browser, with a
+  playground, a REPL, and an IDE with a debugger.
+
+## Tests
+
+The specification is in Gherkin (`spec_library/`), and every scenario is
+executable. `self_hosting/v2/tools/gates.sh` runs them on both engines, with the
+compiler's self-build, the bootstrap and the WebAssembly writers:
 
 ```bash
-cargo test --release --manifest-path rust-runtime/Cargo.toml
+bash self_hosting/v2/tools/gates.sh           # what has changed since it last passed
+bash self_hosting/v2/tools/gates.sh --plan    # say what would run
+bash self_hosting/v2/tools/gates.sh --all     # everything
 ```
 
-Self-hosted selftests are run directly as PatLang programs, e.g.:
+The gates run only what a change could affect, in parallel, leaving two cores
+and 4 GB of memory free. A full run from a fresh clone takes between two and
+three hours on a 20-core machine (`docs/plans/gates.md`).
 
-```bash
-rust-runtime/target/release/pat --ir-run self_hosting/synthesis_lgg_selftest.patlang
+## What it doesn't do
+
+- **No sandbox.** A program can run processes, read and write any file the user
+  can, and open TCP connections. Run only programs you trust.
+- **Native builds are Windows x64 only.** Other systems can run the WebAssembly
+  builds.
+- **No random source yet**, so programs needing keys or seeds derive them from
+  fixed text.
+
+## Layout
+
+```
+bootstrap/            the IR reader and WebAssembly writer in Python, and the compiler's IR
+docs/spec/            the specifications: values and memory, the IR
+docs/plans/           design and progress notes
+docs/guides/          closures, threads, fibres and worlds; passing parameters
+self_hosting/v2/      the compiler, the interpreter, the runtime and the WASM host
+self_hosting/lib/     libraries: lexer and parser, assembler and linker, signals, Gherkin, ...
+self_hosting/tools/   the suite runners, the portfolio and site builders
+spec_library/         the Gherkin features
+packages/             packages, each with a manifest and features
+portfolio/            the browser portfolio
+friendly_cli/         synthesis and curriculum experiments, GOAP demos, a terminal
+rust-runtime/         the earlier implementation in Rust; nothing above needs it
 ```
 
-## Project layout
-
-```
-/
-├── rust-runtime/          # The native Rust implementation: lexer, parser,
-│                           # interpreter, native codegen, host functions,
-│                           # and the Rust-side integration test suite.
-├── self_hosting/
-│   ├── lib/                # The self-hosted compiler and standard library,
-│   │                        # written in PatLang (lexer/parser/lower/codegen,
-│   │                        # synthesis engine, RDBMS, regex, math, etc.),
-│   │                        # including the x64 backend (codegen_x64.patlang,
-│   │                        # x64_runtime.patlang, x64_asm.patlang,
-│   │                        # x64_pe_link.patlang).
-│   ├── block_model/         # The Block Ownership Model: block/jump execution,
-│   │                        # real refcounted ownership, and the native
-│   │                        # codegen path patc1.exe --x64 now lowers through
-│   │                        # by default.
-│   ├── examples/            # Runnable demo programs.
-│   └── *_selftest.patlang   # Self-hosted test suites.
-├── friendly_cli/           # Curriculum/synthesis experiments, GOAP demos,
-│                           # the VFS transaction pattern, and a self-
-│                           # healing engine that tries known solutions
-│                           # before falling back to an LLM.
-├── spec_library/           # Mechanically-discovered/verified BDD specs
-│                           # (shell commands, PatLang stdlib, language
-│                           # features) plus a genuine synthesis registry,
-│                           # kept structurally separate from anything
-│                           # hand-authored.
-├── portfolio/demos/        # Browser-facing HTML wrappers for demos.
-├── patc1.exe                # The bootstrapped self-hosted compiler binary
-│                            # (rebuild via self_hosting/build_patc1.patlang).
-├── TUTORIAL.md              # Start here for a hands-on introduction.
-└── CLAUDE.md                # Working conventions for this repo.
-```
-
-Most of the other root-level `*.md` files predate the current
-architecture and are kept for historical reference only.
-
----
-
-**PatLang** — a self-hosted language for exploring goal-oriented,
-logic-programming, and genuine program-synthesis constructs alongside an
-ordinary imperative core.
+The repository also holds the earlier compiler (`patc1`, the block-model
+backend and their libraries in `self_hosting/`), which some suites still test.

@@ -1,6 +1,6 @@
 ---
 name: patlang-development
-description: Use whenever doing PatLang development work in this repo -- writing or editing .patlang files, adding a language feature, running pat --ir-run/patc1.exe, compiling to native x64 or WASM, or designing any long-running PatLang program. Covers BDD-first (Gherkin before code, no exceptions), the native-PatLang-before-Rust backend preference order, wasmtime for WASM verification, the full paradigm list PatLang supports, signal-based monitoring/clean-shutdown discipline, verified performance traps, and backend-specific gotchas discovered the hard way.
+description: Use whenever doing PatLang development work in this repo -- writing or editing .patlang files, adding a language feature, running the v2 compiler or interpreter, compiling to native x64 or WASM, or designing any long-running PatLang program. Covers BDD-first (Gherkin before code, no exceptions), the v2 toolchain and its commands, checking WASM builds under the v2 host, the full paradigm list PatLang supports, signal-based monitoring/clean-shutdown discipline, verified performance traps, and backend-specific gotchas discovered the hard way.
 ---
 
 # patlang-development
@@ -38,42 +38,27 @@ registrations, or `gherkin.patlang`'s `ensure` steps for
 representation/type invariants. Run the whole language gate with:
 
 ```
-rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_language_spec_suite.patlang
+bash self_hosting/v2/tools/gates.sh --only language
 ```
 
-## 2. Backend preference: native PatLang first, Rust only as last resort
+## 2. The toolchain is v2
 
-Three real execution/compilation paths exist. Prefer them in this order,
-falling through only when the current one genuinely cannot do the job:
+The compiler (`self_hosting/build/v2.exe`, from `self_hosting/v2/compile.patlang`)
+and the interpreter (`self_hosting/build/v2_interp.exe`, from
+`self_hosting/v2/interp.patlang`) are PatLang, on one runtime
+(`self_hosting/v2/runtime/`). A program prints the same on both, and the gates
+check that. Nothing needs Rust.
 
-1. **`pat --ir-run`** -- the Rust-native interpreter running PatLang source
-   directly. Fastest iteration loop; default for everyday development and
-   diagnostics.
-2. **Self-hosted native x64 backend** -- `./patc1.exe <src> <out> --x64`,
-   using `self_hosting/lib/{lexer,parser,lower,codegen_x64}.patlang`, all
-   PatLang-authored. This produces real machine code with **zero rustc
-   dependency at the final step** -- this is what "native PatLang" means in
-   this repo, and it is the goal path, not `pat --patc`.
-3. **Rust-backed pathways -- last resort only**:
-   - `pat --patc` (Rust-native `codegen.rs`): testing/comparison only, never
-     for routine builds (per project `CLAUDE.md` §1).
-   - `self_hosting/lib/codegen.patlang`'s `emit_program_rs` (a self-hosted
-     MIRROR of `codegen.rs` that emits Rust **source text**, then shells out
-     to `rustc`): today the **only** path to WASM
-     (`rustc --target wasm32-wasip1[-threads]`). Use the
-     `patc1.exe <src> <out> wasm32-wasip1` CLI wrapper for ordinary
-     programs; hand-roll `emit_program_rs` + a raw `rustc` call only when
-     feeding in IR that `lower_program` itself wouldn't produce.
+- Interpret for the quick loop: `self_hosting/build/v2_interp.exe SRC.patlang`.
+- Compile: `self_hosting/build/v2.exe SRC.patlang OUT.exe --workers 4`, run from the
+  repository root.
+- WASM: `v2.exe SRC OUT.wasm --wasm`, then
+  `node self_hosting/v2/wasm/run_node.mjs OUT.wasm`, or
+  `self_hosting/v2/wasm/run_browser.py` in headless Chrome. Compare against the
+  native build's output.
 
-Do not reach for hand-written Rust, or a new Rust runtime primitive, to
-solve something that's expressible in PatLang -- that includes tooling
-*for* PatLang (build scripts, checkers), not just PatLang programs
-themselves.
-
-**wasmtime** is the WASM verification tool: confirmed at
-`/c/Program Files/Wasmtime/bin/wasmtime`. Verify any WASM build with
-`wasmtime run <file>.wasm` and compare output against the same program run
-via `pat --ir-run` and `pat --patc` -- all three must match exactly.
+`pat --ir-run`, `pat --patc`, `patc1.exe` and rustc are the old route. Don't use
+them for new work, and don't add Rust to solve something PatLang can express.
 
 ## 3. Paradigms PatLang actually supports
 
@@ -146,7 +131,8 @@ project `CLAUDE.md` §6 for the canonical statement -- summarized here):
 
 - **String indexing is O(n) per call, not O(1)**: `char_code`, `substr`,
   and `s[i]` each re-check `s.is_ascii()` on the WHOLE string every call
-  (`rust-runtime/src/ir/hosts.rs`). Any character-scanning loop over a
+  (`rust-runtime/src/ir/hosts.rs`; found on `pat`, not yet measured on
+  v2). Any character-scanning loop over a
   PatLang String costs O(length²) overall. Use `List<Int>` (genuinely
   O(1)-indexed) for any parsing/scanning code that could plausibly process
   more than a short, fixed literal. Build a String only for short, final,
@@ -183,7 +169,24 @@ end
 
 Prefer early returns (`if cond then return val end`) over deep nesting.
 
-## 7. Backend-specific quirks discovered the hard way
+## 7. Gotchas
+
+On v2:
+
+- `v2.exe` reads the runtime relative to the working directory: run it from the
+  repository root. The interpreter finds the root from its own path.
+- There is no `**`: use `pow(a, b)`. `/` of ints gives a rational when the result
+  is not whole.
+- `thread_spawn` takes a closure (`thread_spawn(|| do ... end)`), read with
+  `thread_result`. `fiber_new` takes a function's name, and `fiber_resume(id, v)`
+  passes a value in.
+- A `match` default is `case _ then`, not `else`.
+- Rules live in stores (`logic_store_new`, `rule_add_to`, `solve_in`); `rule` and
+  `solve` use the default store. `set_var` and the other globals are gone.
+- `signal_claim` and the rest come from `include`-ing `self_hosting/lib/signals.patlang`.
+
+On the old compiler (`patc1.exe`, kept for reference):
+
 
 - **`print` convention differs by backend.** `codegen_x64.patlang` rejects
   `CallHost "print"` outright ("not a real function and not in the
@@ -242,7 +245,7 @@ Prefer early returns (`if cond then return val end`) over deep nesting.
 ## 8. Windows path handling
 
 - Run local executables with an explicit relative/full path
-  (`./patc1.exe`, `.\patc1.exe`) -- a bare filename can fail with a
+  (`./hello.exe`, `.\hello.exe`) -- a bare filename can fail with a
   `CreateProcess` error in some Windows shells.
 - Path separator direction is tool-dependent, not a style choice: the Bash
   tool (git-bash) can silently swallow unescaped backslashes; `cmd.exe`
@@ -251,14 +254,10 @@ Prefer early returns (`if cond then return val end`) over deep nesting.
   fails mysteriously, try switching separator direction before assuming a
   logic bug.
 
-## 9. Mirror-sync debt is separate from everything above
+## 9. Mirror-sync debt is the old route's
 
-Any change to the Rust runtime (`codegen.rs`, new host functions, new
-keywords/operators) can silently desync the self-hosted compiler mirror.
-This has its own dedicated skill -- invoke **`mirror-check`** rather than
-duplicating its steps here. It covers two independent kinds of debt (host-
-function-body text parity, and lexer/parser/lower/codegen grammar parity)
-that each need checking separately.
+The `mirror-check` skill keeps the old compiler's Rust mirror in step. It does not
+apply to v2, which has no Rust side.
 
 ## 10. Issues and the project board
 
@@ -269,23 +268,22 @@ is easy to lose track of.
 ## 11. Build/test command cheat sheet
 
 ```
-# Everyday interpreted run
-rust-runtime/target/release/pat.exe --ir-run <file>.patlang [args...]
+# The first compiler, when self_hosting/build/v2.exe is missing
+py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe
 
-# Rebuild the self-hosted compiler (only when self_hosting/lib/*.patlang changed)
-rust-runtime/target/release/pat --ir-run self_hosting/build_patc1.patlang
+# Interpret
+self_hosting/build/v2_interp.exe <file>.patlang [args...]
 
-# Native x64 build (native PatLang, zero rustc at final step)
-./patc1.exe <src>.patlang <out>.exe --x64
-./out.exe
+# Compile, from the repository root
+self_hosting/build/v2.exe <file>.patlang <out>.exe --workers 4
 
-# WASM build (last-resort Rust-source path -- currently the only WASM route)
-./patc1.exe <src>.patlang <out>.wasm wasm32-wasip1
-wasmtime run <out>.wasm
+# WASM
+self_hosting/build/v2.exe <file>.patlang <out>.wasm --wasm
+node self_hosting/v2/wasm/run_node.mjs <out>.wasm
 
-# Full language spec gate (Gherkin-backed, every language .feature but match_pattern)
-rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_language_spec_suite.patlang
+# Rebuild the interpreter after a runtime or interpreter change
+self_hosting/build/v2.exe self_hosting/v2/interp.patlang self_hosting/build/v2_interp.exe --workers 4
 
-# Rust<->self-host mirror parity check (see the mirror-check skill for the full workflow)
-cargo test --release --manifest-path rust-runtime/Cargo.toml --test selfhost_pipeline -- selfhost_runtime_text_parity
+# The gates: what changed since it last passed; --plan, --all, --only PREFIX
+bash self_hosting/v2/tools/gates.sh
 ```

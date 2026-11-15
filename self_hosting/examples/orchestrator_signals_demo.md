@@ -1,7 +1,8 @@
 # Orchestrator + workers, coordinated over real signals
 
 This is an executable document (run it with
-`pat --ir-run self_hosting/tools/run_markdown_doc.patlang self_hosting/examples/orchestrator_signals_demo.md`)
+`self_hosting/build/v2_interp.exe self_hosting/tools/run_markdown_doc.patlang self_hosting/examples/orchestrator_signals_demo.md`
+from the repository root)
 — every ` ```patlang ` block below is real PatLang, actually executed, with
 its own output injected back into the document by the doc-runner. It
 demonstrates PatLang's signals mechanism (`self_hosting/lib/signals.patlang`)
@@ -26,7 +27,7 @@ arguments straight through as the child's own CLI args): a worker ID and
 the orchestrator's port. One template file, spawned three times.
 
 ```patlang
-let worker_src = "include \"../self_hosting/lib/signals.patlang\"" + chr(10) +
+let worker_src = "include \"../lib/signals.patlang\"" + chr(10) +
   "let args = argv()" + chr(10) +
   "let worker_id = args[0]" + chr(10) +
   "let port = to_num(args[1])" + chr(10) +
@@ -40,11 +41,11 @@ let worker_src = "include \"../self_hosting/lib/signals.patlang\"" + chr(10) +
   "let payload = \"worker-\" + worker_id + \" computed total=\" + total" + chr(10) +
   "let reply = signal_query(port, \"report\", payload)" + chr(10) +
   "print(\"worker-\" + worker_id + \": orchestrator replied [\" + reply + \"]\")" + chr(10)
-write_file("temp/orch_worker.patlang", worker_src)
-print("wrote temp/orch_worker.patlang")
+write_file("self_hosting/build/orch_worker.patlang", worker_src)
+print("wrote self_hosting/build/orch_worker.patlang")
 ```
 ```stdout
-wrote temp/orch_worker.patlang
+wrote self_hosting/build/orch_worker.patlang
 ```
 
 ## Step 2: the orchestrator program
@@ -54,11 +55,13 @@ The orchestrator claims a signal port (`signal_claim`) and registers a
 `self_hosting/examples/signals_demo.patlang` uses. Each time a worker's
 `signal_query` arrives, `signal_poll` fires that handler once, the handler
 tallies it and calls `signal_reply(...)` so the worker's own call unblocks.
+The tally is a named object, `orch_tally`, so the handler and the main loop
+share one count: a `let` in the handler would give the handler a name of its own.
 The orchestrator keeps polling until it's heard from every worker it's
 expecting (or a safety timeout elapses), *then* it exits.
 
-Because `spawn()` discards a child's stdout/stderr (documented in
-`hosts.rs`'s `host_spawn` — deliberately, so a spawned child's own prints
+Because `spawn()` discards a child's stdout/stderr (`spawn` in
+`self_hosting/v2/runtime/hosts.patlang` — deliberately, so a spawned child's own prints
 don't interleave confusingly into the parent's output), the orchestrator
 narrates its own story into a log file instead of stdout, so this document
 can show it afterward.
@@ -70,17 +73,20 @@ gets registered *before* the claim attempt, unconditionally, and only the
 claim-succeeded/failed branching happens inside the `if`.
 
 ```patlang
-let orch_src = "include \"../self_hosting/lib/signals.patlang\"" + chr(10) +
+let orch_src = "include \"../lib/signals.patlang\"" + chr(10) +
   "let port = 9812" + chr(10) +
   "let expected = 3" + chr(10) +
-  "let log_path = \"temp/orch_log.txt\"" + chr(10) +
+  "let log_path = \"self_hosting/build/orch_log.txt\"" + chr(10) +
   "write_file(log_path, \"orchestrator: starting up, about to claim port \" + port + chr(10))" + chr(10) +
-  "set_var(\"orch_received\", 0)" + chr(10) +
+  "class Tally {" + chr(10) +
+  "  field n = 0" + chr(10) +
+  "}" + chr(10) +
+  "new(\"Tally\", \"orch_tally\")" + chr(10) +
   "when report do" + chr(10) +
-  "  let n = get(\"__vars\", \"orch_received\") + 1" + chr(10) +
-  "  set_var(\"orch_received\", n)" + chr(10) +
-  "  let existing2 = read_file(log_path)" + chr(10) +
-  "  write_file(log_path, existing2 + \"orchestrator: received report #\" + n + \": \" + event_data + chr(10))" + chr(10) +
+  "  let n = get(\"orch_tally\", \"n\") + 1" + chr(10) +
+  "  send(\"orch_tally\", \"set\", \"n\", n)" + chr(10) +
+  "  let existing2 = read_file(\"self_hosting/build/orch_log.txt\")" + chr(10) +
+  "  write_file(\"self_hosting/build/orch_log.txt\", existing2 + \"orchestrator: received report #\" + n + \": \" + event_data + chr(10))" + chr(10) +
   "  signal_reply(\"ack #\" + n)" + chr(10) +
   "end" + chr(10) +
   "let port_id = signal_claim(port)" + chr(10) +
@@ -91,18 +97,18 @@ let orch_src = "include \"../self_hosting/lib/signals.patlang\"" + chr(10) +
   "  let existing = read_file(log_path)" + chr(10) +
   "  write_file(log_path, existing + \"orchestrator: claimed port \" + port_id + \", now waiting for \" + expected + \" worker reports\" + chr(10))" + chr(10) +
   "  let waited = 0" + chr(10) +
-  "  while (get(\"__vars\", \"orch_received\") < expected) and (waited < 10000) do" + chr(10) +
+  "  while (get(\"orch_tally\", \"n\") < expected) and (waited < 10000) do" + chr(10) +
   "    signal_poll(port_id, 100)" + chr(10) +
   "    let waited = waited + 100" + chr(10) +
   "  end" + chr(10) +
   "  let existing3 = read_file(log_path)" + chr(10) +
   "  write_file(log_path, existing3 + \"orchestrator: all \" + expected + \" workers reported -- shutting down now (first one up, last one to close)\" + chr(10))" + chr(10) +
   "end" + chr(10)
-write_file("temp/orch_orchestrator.patlang", orch_src)
-print("wrote temp/orch_orchestrator.patlang")
+write_file("self_hosting/build/orch_orchestrator.patlang", orch_src)
+print("wrote self_hosting/build/orch_orchestrator.patlang")
 ```
 ```stdout
-wrote temp/orch_orchestrator.patlang
+wrote self_hosting/build/orch_orchestrator.patlang
 ```
 
 ## Step 3: fire it all up, in the order that matters
@@ -115,19 +121,19 @@ point: the workers each finish on their own schedule, but the orchestrator
 outlives all three of them, closing only once it's collected every report.
 
 ```patlang
-let pat_exe = "rust-runtime/target/release/pat.exe"
-let log_path = "temp/orch_log.txt"
+let interp = "self_hosting/build/v2_interp.exe"
+let log_path = "self_hosting/build/orch_log.txt"
 write_file(log_path, "")
 
 print("1. firing up the orchestrator (first process started)")
-let orch_pid = spawn(pat_exe, "--ir-run", "temp/orch_orchestrator.patlang")
+let orch_pid = spawn(interp, "self_hosting/build/orch_orchestrator.patlang")
 sleep_ms(400)
 print("   orchestrator pid=" + orch_pid + ", alive=" + is_alive(orch_pid))
 
 print("2. firing up 3 workers")
-let w1 = spawn(pat_exe, "--ir-run", "temp/orch_worker.patlang", "1", "9812")
-let w2 = spawn(pat_exe, "--ir-run", "temp/orch_worker.patlang", "2", "9812")
-let w3 = spawn(pat_exe, "--ir-run", "temp/orch_worker.patlang", "3", "9812")
+let w1 = spawn(interp, "self_hosting/build/orch_worker.patlang", "1", "9812")
+let w2 = spawn(interp, "self_hosting/build/orch_worker.patlang", "2", "9812")
+let w3 = spawn(interp, "self_hosting/build/orch_worker.patlang", "3", "9812")
 print("   worker pids=" + w1 + ", " + w2 + ", " + w3)
 
 print("3. waiting for the orchestrator to finish (it decides when, not us)")
@@ -150,9 +156,9 @@ print(read_file(log_path))
 ```
 ```stdout
 1. firing up the orchestrator (first process started)
-   orchestrator pid=37900, alive=true
+   orchestrator pid=66132, alive=true
 2. firing up 3 workers
-   worker pids=53880, 44144, 3120
+   worker pids=66688, 9984, 78776
 3. waiting for the orchestrator to finish (it decides when, not us)
 
 === final liveness check ===

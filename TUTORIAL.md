@@ -1,36 +1,30 @@
-# Getting Started with PatLang
+# Getting started with PatLang
 
-This tutorial covers the **working** PatLang system: the Rust Stage 0 runtime
-(`rust-runtime/`) and the self-hosted compiler front-end (`self_hosting/`).
-Everything shown here runs today — each section's examples are exercised by
-the test suite.
+PatLang's compiler and interpreter are both written in PatLang. The compiler,
+v2, turns a program into a Windows x64 executable or a WebAssembly module. The
+interpreter runs a program's source directly, on the same runtime the compiled
+program uses, so the two give the same output. Every example below was run both
+ways and printed what is shown.
 
-## 1. Build the runtime
+## 1. Build the compiler
 
-You need a Rust toolchain (`rustc`/`cargo`) for this one step only. This is
-the bootstrap: it builds the `pat` binary once, from `rust-runtime/` source.
-
-```bash
-cd rust-runtime
-cargo build
-```
-
-This produces `rust-runtime/target/debug/pat` (`pat.exe` on Windows) — the
-PatLang runner and compiler driver. The examples below assume you run from the
-repository root; alias it if you like:
+You need Windows on x64 and Python 3. Python is used once, to build the first
+compiler from its intermediate representation (IR), which is checked in as
+`bootstrap/v2_compiler.ir`. From the repository root:
 
 ```bash
-alias pat=./rust-runtime/target/debug/pat
+py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe
+self_hosting/build/v2.exe self_hosting/v2/interp.patlang self_hosting/build/v2_interp.exe --workers 4
 ```
 
-After this one-time build, `rustc` is no longer required for normal PatLang
-development. `pat --ir-run <file>` — the form used throughout this tutorial —
-lexes, parses, lowers, and executes a program directly on the VM (the same
-`run_ir` mechanism the in-browser playground uses), with zero further calls to
-`rustc`. The Rust toolchain only comes back into play if you deliberately ask
-for a standalone native/WASM binary (`pat --patc`, or a tool that calls
-`rustc_build`, like the portfolio builder or `patbuild --native`) — that's an
-opt-in, occasional step, not part of the everyday edit-run loop.
+The first command takes a few seconds and gives `v2.exe`, the compiler. The
+second has the compiler build the interpreter, `v2_interp.exe`, in a few
+minutes. Nothing else is needed: the compiler has its own assembler and linker,
+written in PatLang.
+
+Run `v2.exe` from the repository root, where it finds the runtime it compiles
+into each program (`self_hosting/v2/runtime/`). The interpreter can be run from
+anywhere.
 
 ## 2. Your first program
 
@@ -41,75 +35,89 @@ let name = "world"
 print("hello, " + name)
 ```
 
-Run it with the IR interpreter (the recommended mode):
+Run it with the interpreter:
 
 ```bash
-pat --ir-run hello.patlang
+self_hosting/build/v2_interp.exe hello.patlang
 ```
 
-Compile it to a native executable:
+Or compile it and run the executable:
 
 ```bash
-pat --patc hello.patlang --out hello.exe
+self_hosting/build/v2.exe hello.patlang hello.exe
 ./hello.exe
 ```
 
-Or use the PatLang-hosted compiler driver:
+Both print `hello, world`. Beside `hello.exe` the compiler writes
+`hello.exe.asm` (the assembly it generated), `hello.exe.timing` (how long each
+stage took) and `hello.exe.ledger` (each function, and whether it was built or
+taken from the cache). The first build compiles the runtime as well, which takes
+about half a minute. Each function's build is cached in
+`self_hosting/build/v2_artefacts/` by a hash of what went into it, so a later
+build of a changed program rebuilds only what changed. `--workers N` builds on
+N threads.
+
+The same program as WebAssembly, run under Node:
 
 ```bash
-pat ./patc.patlang hello.patlang --out hello.exe
-```
-
-`--compare` runs both the interpreter and the compiled binary and checks the
-outputs match:
-
-```bash
-pat --compare hello.patlang
+self_hosting/build/v2.exe hello.patlang hello.wasm --wasm
+node self_hosting/v2/wasm/run_node.mjs hello.wasm
 ```
 
 ## 3. Language tour
 
-### Variables and expressions
+### Values and expressions
 
 ```patlang
 let x = 10
-let y = x * 3 + 2          # numbers are 64-bit floats
-let s = "value: " + y      # + concatenates when either side is a string
+let y = x * 3 + 2
+let s = "value: " + y      # + joins when either side is a string
 let ok = (x < 20) and (y != 0)
-print(s)
+print(s)                   # value: 32
+print(ok)                  # true
 ```
 
-Operators: `+ - * / %`, comparisons `== != < <= > >=` (strings compare
-lexicographically), boolean `and` / `or` / `not`, unary `-`. Statements are
-separated by newlines or `;`. Comments start with `#`.
+Statements are separated by newlines, and comments start with `#`. Operators
+are `+ - * / %`, the comparisons `== != < <= > >=` (strings compare
+alphabetically), and `and`, `or`, `not`.
 
-Bitwise operators are word-form keywords, not C-style symbols: `|` and `&`
-are already taken (the `|>` pipeline operator, `|params|` closure syntax),
-and PatLang already spells `and`/`or`/`not` as words rather than
-`&&`/`||`/`!`, so this follows that convention instead of importing symbols
-that don't fit.
+Numbers keep their exact value. An int is 64 bits; a result that does not fit
+becomes a bigint, and a division of ints that does not come out whole gives a
+rational:
+
+```patlang
+print(9223372036854775807 + 1)   # 9223372036854775808
+print(pow(2, 70))                # 1180591620717411303424
+print(6 / 4)                     # 3/2
+print(7 / 7)                     # 1
+print(pow(2, 0 - 2))             # 1/4
+print(1.5 + 1)                   # 2.5
+print(sqrt(2.0))                 # 1.4142135623730951
+print(type_of(6 / 4))            # rational
+```
+
+`type_of` names a value's class: `int`, `bigint`, `rational`, `float`,
+`string`, `list`, `bool`, `closure`, or a class the program declares.
+
+The bitwise operators are words, as `and`, `or` and `not` are: `band`, `bor`,
+`bxor`, `bnot`, `shl`, `shr`.
 
 ```patlang
 let flags = 0
-let flags = flags band bnot 4     # clear bit 2
 let flags = flags bor (1 shl 5)   # set bit 5
+let flags = flags band bnot 4     # clear bit 2
+print(flags)                      # 32
 print(bit_get(flags, 5))          # 1
 ```
-
-`band`/`bor`/`bxor`/`bnot`/`shl`/`shr` operate on integers only. `shl`/`shr`
-bind tighter than `+`/`-` but looser than `*`/`/`/`%`; `band`/`bxor`/`bor`
-share a single combined precedence tier (parenthesize mixed expressions if
-a specific grouping matters). Four bitfield helpers give packed-integer
-field access without a struct/type system: `bit_get(n, pos)`,
-`bit_set(n, pos, val)`, `bit_slice(n, start, width)`,
-`bit_set_slice(n, start, width, val)`. See
-`self_hosting/examples/bitwise_bitfield_demo.patlang`.
 
 ### Control flow
 
 ```patlang
-if x >= 10 then
+let x = 12
+if x >= 20 then
   print("big")
+elif x >= 10 then
+  print("medium")
 else
   print("small")
 end
@@ -117,9 +125,11 @@ end
 let i = 0
 while i < 3 do
   print(i)
-  let i = i + 1        # rebinding uses let again
+  let i = i + 1        # let again gives the name a new value
 end
 ```
+
+Write a chain of conditions with `elif`.
 
 ### Functions
 
@@ -127,34 +137,90 @@ end
 make a function called fib takes n returns r
   if n < 2 then
     return n
-  else
-    return fib(n - 1) + fib(n - 2)
   end
+  return fib(n - 1) + fib(n - 2)
 end
 
-print(fib(10))          # 55 — recursion and forward references both work
+print(fib(20))          # 6765
 ```
+
+A function can call one declared later in the file. A name declared with `let`
+at the top of a file belongs to the file's own statements; a function sees its
+parameters and its own locals, so pass it what it needs.
 
 ### Lists and strings
 
 ```patlang
 let xs = [1, 2, 3, 4]
-print(xs.length)         # 4
-print(xs[2])             # 3 (indexing is zero-based)
-let xs = list_push(xs, 5)     # lists are values; push returns a new list
-let xs = list_set(xs, 0, 99)  # replace an element
+print(list_len(xs))       # 4
+print(xs[2])              # 3 (indexes start at 0)
 
-let s = "hello"
-print(s[0])              # "h" — indexing a string yields a 1-char string
-print(char_code(s, 0))   # 104 — numeric code, handy for character classes
-print(substr(s, 1, 3))   # "ell"
-print(chr(10))           # 1-char string from a code (here: newline)
+let ys = xs
+let ys = list_push(ys, 5)
+let ys = list_set(ys, 0, 99)
+print(xs)                 # [1, 2, 3, 4]
+print(ys)                 # [99, 2, 3, 4, 5]
 ```
+
+Lists are values: changing `ys` leaves `xs` as it was. A list only one name
+holds is changed in place, so building a list in a loop costs no copying.
+
+```patlang
+let s = "hello"
+print(s[0])                            # h
+print(char_code(s, 0))                 # 104
+print(substr(s, 1, 3))                 # ell
+print(str_len(s))                      # 5
+print(str_join(["a", "b", "c"], "-"))  # a-b-c
+```
+
+Strings are values too, and `s = s + x` copies `s` each time. To build a string
+in a loop, use a string builder, which is shared rather than copied:
+
+```patlang
+let b = sb_new()
+let i = 0
+while i < 5 do
+  sb_push(b, to_s(i))
+  let i = i + 1
+end
+print(sb_str(b))          # 01234
+```
+
+`vec_new`, `vec_push`, `vec_get` and `vec_set` give a shared, growable list in
+the same way.
+
+### Pattern matching
+
+```patlang
+make a function called describe takes x returns r
+  match x do
+    case 0 then
+      return "zero"
+    case "hi" then
+      return "a greeting"
+    case ["Ok", v] then
+      return "ok with " + v
+    case n when n > 100 then
+      return "big: " + n
+    case _ then
+      return "something else"
+  end
+end
+
+print(describe(0))         # zero
+print(describe(["Ok", 5])) # ok with 5
+print(describe(250))       # big: 250
+print(describe(7))         # something else
+```
+
+A case can be a literal, a list shape that binds names, a name with a `when`
+guard, or `_` for anything. A match no case takes stops the program.
 
 ### Splitting code across files
 
-`include "relative/path.patlang"` splices another file in place (resolved
-relative to the including file):
+`include "path.patlang"` brings in another file, found relative to the file
+that includes it:
 
 ```patlang
 include "lib/helpers.patlang"
@@ -163,361 +229,193 @@ print(helper_fn(41))
 
 ## 4. The paradigms
 
-These all compile to native code. The complete program combining them is
-`self_hosting/examples/feature_demo.patlang`.
+### Classes and objects
 
-### Event-driven
+```patlang
+class Money {
+  field cents = 0
+  make a function called + takes self, other returns r
+    let m = new("Money")
+    m.cents = self.cents + other.cents
+    return m
+  end
+  make a function called show takes self returns s
+    return "£" + (self.cents / 100.0)
+  end
+}
+
+let a = new("Money")
+a.cents = 150
+let b = new("Money")
+b.cents = 275
+let total = a + b
+print(type_of(total))    # Money
+print(total.cents)       # 425
+print(total.show())      # £4.25
+```
+
+Every value is an object, and an operator is a method of its left operand's
+class: `a + b` calls Money's `+`. Classes can inherit (`class Saver inherits
+Account { ... }`) and compose traits.
+
+An object can also be given a name, and reached by it:
+
+```patlang
+class Widget {
+  field color = "grey"
+}
+new("Widget", "w1")
+send("w1", "set", "color", "red")
+print(get("w1", "color"))   # red
+```
+
+A named object lasts until `object_delete` removes it.
+
+### Events
 
 ```patlang
 when greeting do
   print("event received: " + event_data)
 end
 
-emit("greeting", "hello events")
+emit("greeting", "hello events")   # event received: hello events
 ```
 
-Handlers registered with `when` run whenever `emit(event, payload)` fires;
-inside a handler, `event_name` and `event_data` are bound.
-
-### Logic / goal-oriented
-
-The original `fact`/`query`/`goal` trio is a flat, count-only lookup table
-kept for backward compatibility. The real paradigm is two genuine engines
-underneath, plus design-by-contract feeding into both:
-
-**Backward chaining** (`rule_add`/`solve`) — real SLD-style resolution
-with backtracking, not a lookup. A ground fact is just a rule with an
-empty body (the standard Prolog trick), so any arity is supported:
+A `when` handler runs each time its event is raised, with `event_name` and
+`event_data` bound. A method can declare the events it raises:
 
 ```patlang
-fact("parent", "alice", "bob")
-fact("parent", "alice", "carol")
-print(query("parent", "alice", 0))   # 2 — counts matching facts (legacy trio)
-goal("reunite", "alice")             # records a pending goal (legacy trio, unread)
+class Account {
+  field balance = 0
+  make a function called deposit takes self, n returns r raises deposited
+    self.balance = self.balance + n
+    return self.balance
+  end
+}
 
-# rule_add/solve: the real thing. A rule with an empty body is a fact.
+when deposited do
+  print("new balance " + event_data[2])
+end
+
+let acc = new("Account")
+acc.deposit(5)              # new balance 5
+acc.deposit(3)              # new balance 8
+```
+
+The event's data is the method's arguments and then its result. The built-in
+operators raise events in the same way when a handler is registered for them,
+and a handler cannot change an operator's result.
+
+### Closures and functions as values
+
+```patlang
+make a function called make_adder takes n returns r
+  return |x| do
+    return x + n
+  end
+end
+
+let add_three = make_adder(3)
+print(add_three(7))          # 10
+
+let inc = |x| do
+  return x + 1
+end
+make a function called twice takes f, x returns r
+  return f(f(x))
+end
+print(twice(inc, 10))        # 12
+```
+
+A closure takes a copy of the variables it uses when it is made, so a later
+change to the variable does not reach it:
+
+```patlang
+let n = 1
+let show = || do
+  return n
+end
+let n = 2
+print(show())                # 1
+```
+
+`apply("double", 21)` calls a function by its name.
+
+### Logic programming
+
+Rules are solved by backward chaining, as in Prolog. A name starting with a
+capital letter is a variable:
+
+```patlang
+rule parent(tom, bob).
+rule parent(bob, ann).
+rule grandparent(X, Z) :- parent(X, Y), parent(Y, Z).
+print(solve("grandparent", ["tom", "Who"]))   # [[tom, ann]]
+```
+
+`rule_add` is the same thing as a function call, and a rule with no body is a
+fact:
+
+```patlang
 rule_add("dep", ["a", "b"], [])
 rule_add("dep", ["b", "c"], [])
 rule_add("unchanged", ["c"], [])
 rule_add("buildable", ["X"], [["unchanged", ["X"]]])
 rule_add("buildable", ["X"], [["dep", ["X", "Y"]], ["buildable", ["Y"]]])
-let sols = solve("buildable", ["a"])   # [["a"]] -- resolves through a->b->c
+print(solve("buildable", ["a"]))              # [[a]]
 ```
 
-Real declarative syntax exists too, as pure sugar over the same
-`rule_add`/`solve` calls above:
+Rules live in stores. `rule` and `solve` use the default store, and a program
+can make its own, or name one:
 
 ```patlang
-rule dep(a, b).
-rule dep(b, c).
-rule unchanged(c).
-rule buildable(X) :- unchanged(X).
-rule buildable(X) :- dep(X, Y), buildable(Y).
-let sols = solve("buildable", ["a"])
+let pets = logic_store_new()
+rule_add_to(pets, "owns", ["kim", "cat"], [])
+print(solve_in(pets, "owns", ["Who", "What"]))   # [[kim, cat]]
+print(solve("owns", ["Who", "What"]))            # []
+
+rule likes(sam, tea) in drinks.
+print(solve_in(logic_store_named("drinks"), "likes", ["sam", "D"]))   # [[sam, tea]]
 ```
 
-**GOAP planning** (`action_add`/`plan`) — forward search over actions with
-preconditions/effects/cost, producing a real cost-optimal ordered plan
-(not just the first path that works):
+### Planning
+
+`action_add(name, preconditions, effects, removed, cost)` declares an action,
+and `plan` finds the cheapest sequence of actions that reaches a goal:
 
 ```patlang
 action_add("compile_b", [], [["compiled", ["b"]]], [], 5)
 action_add("compile_a", [["compiled", ["b"]]], [["compiled", ["a"]]], [], 3)
 action_add("link", [["compiled", ["a"]], ["compiled", ["b"]]], [["shipped", []]], [], 2)
-let build_plan = plan([["shipped", []]])   # ["compile_b", "compile_a", "link"]
+print(plan([["shipped", []]]))     # [compile_b, compile_a, link]
 ```
 
-Actions can be parameterized too, using the same `^[A-Z]` variable
-convention as `rule_add`/`solve` — one action template grounds into a
-separate instantiation per matching fact, instead of needing a
-hand-written action per target:
+An action can have variables, which the facts fill in:
 
 ```patlang
 rule_add("ready", ["target_a"], [])
 rule_add("ready", ["target_b"], [])
 action_add("build", [["ready", ["X"]]], [["built", ["X"]]], [], 1)
-let build_plan = plan([["built", ["target_a"]], ["built", ["target_b"]]])
-# ["build(X=target_a)", "build(X=target_b)"] -- one instantiation per target
+print(plan([["built", ["target_a"]], ["built", ["target_b"]]]))
+# [build(X=target_a), build(X=target_b)]
 ```
 
-A successful `require`/`ensure`/`assert` check also asserts a
-`contract_holds` fact automatically, so verified contracts become
-ordinary derivable data usable as a rule-body conjunct or GOAP
-precondition. See `self_hosting/examples/goal_oriented_build_demo.patlang`
-and `self_hosting/examples/rule_syntax_demo.patlang`.
-
-**`goal`/`pursue`/`activate`** — real GOAP surface syntax over the same
-`action_add`/`plan` engine above. `goal NAME { dep1(args), ... }` names a
-target state as a list of fact-terms (sugar over a `goal_def` host call,
-mirroring how `rule Head(...) :- Body.` sugars over `rule_add`). `pursue
-NAME` is an expression that plans against a declared goal (the same
-search `plan(...)` does). `activate PLAN` actually runs the plan: each
-step's action must be bound to a real closure via `action_bind` first
-(receiving that step's bound argument values as a single List, since the
-real arg count is only known once the planner has run); `activate` calls
-each bound closure in order and stops immediately — reporting failure,
-not silently continuing — the moment one returns `false`, since a
-dependency being satisfiable by a function doesn't guarantee that
-function actually succeeds when run:
+A goal names a state to reach. `pursue` plans for it, and `activate` runs the
+plan, calling the closure bound to each action and stopping at the first that
+returns `false`. Continuing the program above:
 
 ```patlang
-rule_add("ready", ["a"], [])
-action_add("build", [["ready", ["X"]]], [["built", ["X"]]], [], 1)
-action_bind("build", |args| {
+action_bind("build", |args| do
   print("building " + args[0])
   return true
-})
-goal need_a { built(a) }
-let p = pursue need_a          # ["build(X=a)"]
-let ok = activate p            # runs build's bound closure, prints "building a"
-```
-
-See `self_hosting/examples/goal_pursue_activate_demo.patlang` for a
-fuller example, including a plan step that fails partway through.
-
-Not yet mirrored into the self-hosted compiler (`patc1.exe` cannot
-compile programs using `goal`/`pursue`/`activate` yet — only the native
-`--ir-run`/`--patc` pipeline understands this syntax so far); `rule_add`/
-`action_add`/`plan`/`action_bind` themselves work everywhere already,
-since they're ordinary function calls, not new syntax.
-
-### Object-oriented
-
-```patlang
-new("Person", "kim")            # create object "kim" of class Person
-send("kim", "set", "age", 42)   # message send: set a property
-print(get("kim", "age"))        # 42
-```
-
-### Functional
-
-Functions are referenced by name and invoked with `apply`, which lets you
-write higher-order code in PatLang itself:
-
-```patlang
-make a function called double takes x returns r
-  return x * 2
-end
-
-make a function called map_list takes xs, fname returns out
-  let out = []
-  let i = 0
-  while i < xs.length do
-    let out = list_push(out, apply(fname, xs[i]))
-    let i = i + 1
-  end
-  return out
-end
-
-print(map_list([1, 2, 3], "double"))   # [2, 4, 6]
-```
-
-`apply` calls a function *by name*; real closures — anonymous functions that
-capture surrounding variables — also exist:
-
-```patlang
-make a function called make_adder takes n returns r
-  return |x| { return x + n }     # captures n from the enclosing call
-end
-
-let add_three = make_adder(3)
-print(add_three(7))               # 10
-
-let inc = |x| { return x + 1 }
-make a function called twice takes f, x returns r
-  return f(f(x))                  # calling a closure held in a variable
-end
-print(twice(inc, 10))             # 12
-```
-
-Captured variables are snapshotted **by value** at the moment the closure is
-created — reassigning the outer variable afterwards does not change what an
-already-created closure sees, consistent with this language's value
-semantics everywhere else (`list_push` returning a new list rather than
-mutating in place, etc). Closures can be returned from functions, stored in
-variables, passed as arguments, and nested (a closure can itself return a
-closure that captures the outer one's variables).
-
-The self-hosted (Stage 1) dialect uses `|params| do ... end` instead of
-Stage 0's `|params| { ... }`, matching the rest of Stage 1's keyword-based
-block syntax (which has no brace-delimited blocks anywhere); it also only
-supports calling a closure through a named variable, not invoking a closure
-literal immediately in place (`(|x| { ... })(5)` — that works in Stage 0,
-not yet in the self-hosted compiler).
-
-### Networking
-
-Blocking TCP built-ins: `tcp_listen(port)` (0 = OS-assigned; returns the
-actual port; binds `127.0.0.1` only, not configurable), `tcp_accept(port)`,
-`tcp_read(conn)`, `tcp_write(conn, data)`, `tcp_close(conn)`. A complete HTTP
-echo server is `self_hosting/examples/echo_server.patlang` — compile it and
-hit it with curl:
-
-```bash
-pat --ir-run self_hosting/pipeline_stage2.patlang   # or compile echo_server directly
-```
-
-`tcp_try_listen(port)` is a non-panicking sibling of `tcp_listen`: returns
-`-1` specifically if the port is already bound elsewhere, instead of
-`tcp_listen`'s fatal-on-any-bind-failure behavior. PatLang has no
-try/catch, so there was no other way for a program to gracefully ask "is
-something already listening here" — any other bind failure (invalid port,
-permission denied) still fails fatally, same as plain `tcp_listen`. This is
-what the runtime signals library below uses to detect whether it's the
-first instance or not.
-
-### Runtime signals
-
-A running program can receive a named signal + optional payload from
-*outside itself* — a second CLI invocation (`server.exe --quit` sent to an
-already-running `server.exe`, not a new one) or a local network call —
-without any new dispatch mechanism: `self_hosting/lib/signals.patlang`
-builds entirely on the `when`/`emit` event system covered below, so a
-signal is just another event as far as your handlers are concerned.
-
-```patlang
-include "lib/signals.patlang"
-
-when quit do
-  set_var("should_stop", "1")
-end
-when status do
-  signal_reply("uptime: " + get("__vars", "uptime"))
-end
-
-let port_id = signal_claim(9401)
-if port_id >= 0 then
-  # this process is the primary -- hold the port, poll it in your loop
-  while get("__vars", "should_stop") == "0" do
-    # ... your own work ...
-    signal_poll(port_id, 20)
-  end
-else
-  # someone else already owns this port
-  signal_send(9401, "quit", "")               # fire-and-forget
-  print(signal_query(9401, "status", ""))     # request/response
-end
-```
-
-Two flavors: `signal_send` (fire-and-forget, e.g. `quit`) delivers and
-returns immediately without waiting for a reply; `signal_query`
-(request/response, e.g. `status`) blocks until the primary's handler calls
-`signal_reply(text)`, so a program can report genuine live state back to
-whoever asked, not just a canned string. `signal_claim(port)` relies on
-`tcp_listen` already being `127.0.0.1`-only and a second bind to the same
-port simply failing — that failure IS the "a primary is already running"
-detector, no separate lockfile or PID file needed (PatLang has neither).
-Localhost-only by construction, so there's no auth story yet — a real
-network-facing signal listener would need one before ever binding beyond
-`127.0.0.1`. See `self_hosting/examples/signals_demo.patlang` for a full
-worked example (run it twice, concurrently) and the [Paradigms
-Guide](https://parslow.net/topics/patlang/patlang-paradigms.html#heading-signals)
-for the fuller design writeup.
-
-### Async: the event loop
-
-Concurrency is event-driven and single-threaded, like JavaScript: a loop
-turns external happenings into events, and `when` handlers consume them.
-`tcp_accept_timeout(port, ms)` is the non-blocking primitive (returns -1 on
-timeout), `sleep_ms(ms)` yields time, and shared state lives in the object
-store via `set_var`/`get`:
-
-```patlang
-when request do
-  # event_data is the connection id
-  let text = tcp_read(event_data)
-  tcp_write(event_data, "...")
-  tcp_close(event_data)
-end
-
-when tick do
-  set_var("ticks", get("__vars", "ticks") + 1)
-end
-
-set_var("ticks", 0)
-let port = tcp_listen(0)
-while running do
-  let conn = tcp_accept_timeout(port, 50)
-  if conn >= 0 then
-    emit("request", conn)
-  else
-    emit("tick", 0)
-  end
-end
-```
-
-The complete program is `self_hosting/examples/event_loop_server.patlang` —
-it compiles natively and serves real HTTP requests while counting idle ticks.
-
-**`lib/event_loop.patlang`** wraps the same primitives in a reusable library
-with closure callbacks instead of named events and a shared `__vars`
-namespace:
-
-```patlang
-let loop = event_loop_new()
-new("Stats", "stats")
-send("stats", "set", "served", 0)
-
-event_loop_on_tick(loop, || do
-  print("idle")
 end)
-
-event_loop_listen(loop, tcp_listen(0), |conn| do
-  let served = get("stats", "served") + 1
-  send("stats", "set", "served", served)
-  tcp_write(conn, "...")
-  tcp_close(conn)
-  if served >= 2 then
-    event_loop_stop(loop)     # called from inside the callback itself
-  end
-end)
-
-print("PORT: " + get(loop, "port"))
-event_loop_run(loop, 50)       # blocks until event_loop_stop
+goal need_a { built(target_a) }
+let p = pursue need_a
+print(p)                  # [build(X=target_a)]
+print(activate p)         # building target_a, then true
 ```
 
-Closures snapshot captured variables by value, so a counter that must
-persist across many calls (like `served` above) lives in the object store
-(a mutable cell) rather than a captured plain variable — the closure
-captures the object's *name*, and mutates through it via `get`/`send`,
-which is visible on every call. `self_hosting/examples/event_loop_demo.patlang`
-is the full version, compiled through the self-hosted pipeline; it serves
-two real requests then stops itself.
-
-### Files
-
-`read_file(path)` returns a file's contents as a string; `write_file`,
-`file_exists`, `list_dir`, `rename_file` round out real disk I/O. These are
-native-only (real `std::fs`) — not excluded from WASM builds outright, but
-not reliably usable there either.
-
-### Virtual filesystem
-
-`vfs_read(path)` / `vfs_write(path, contents)` / `vfs_exists(path)` /
-`vfs_list(prefix)` / `vfs_delete(path)` are an in-memory filesystem
-available on **every** target, including WASM — deliberately different
-function names from `read_file`/`write_file` rather than the same names
-silently switching behavior by target.
-
-```patlang
-vfs_write("notes/todo.txt", "write the vfs demo")
-print(vfs_exists("notes/todo.txt"))   # 1
-print(vfs_read("notes/todo.txt"))     # write the vfs demo
-```
-
-`vfs_flush_to_disk(vfs_path_prefix, real_dir)` is the one explicit,
-native-only write-through to real files — a hard error under WASM, and
-gated by an allowed-root check (`PATLANG_VFS_ALLOWED_ROOT` env var,
-defaulting to the current working directory) so it can't write outside a
-permitted tree. See `self_hosting/examples/vfs_demo.patlang`.
-
-## 5. Design by contract
-
-`require EXPR` checks a precondition, `ensure EXPR` a postcondition, and
-`assert EXPR` is the same primitive usable standalone anywhere (including
-outside any function). All three lower to one `contract_check(func, kind,
-text, ok)` call: if the condition is false, execution aborts with a message
-naming the function, the kind of check, and the condition itself.
+### Design by contract
 
 ```patlang
 make a function called safe_divide takes a, b returns r
@@ -527,278 +425,180 @@ make a function called safe_divide takes a, b returns r
   return r
 end
 
-print(safe_divide(10, 2))   # 5
-assert (1 + 1) == 2         # standalone check, passes silently
-print(safe_divide(1, 0))    # aborts: contract violation: precondition
-                             # failed in safe_divide(): b != 0
+print(safe_divide(10, 4))   # 5/2
+assert (1 + 1) == 2
+print(safe_divide(1, 0))
 ```
 
-`ensure` is checked wherever it's written — typically right before the
-value it names is returned — so functions with multiple exit paths just
-repeat `ensure` before each `return` they want checked; there's no implicit
-"check at every exit" magic.
+`require` checks a precondition, `ensure` a postcondition, and `assert` a
+condition anywhere. A check that fails stops the program with exit code 3:
 
-This is a VM-level semantic, not a codegen concern: it works identically
-whether the program is interpreted, executed via `run_ir` (no rustc — the
-same path the browser playground uses), or compiled natively, because the
-same `contract_check` logic is duplicated verbatim into the codegen
-template. Enforcing contracts costs nothing extra at the rustc step — it's
-one ordinary host call, like any other. See
-`self_hosting/examples/contracts_demo.patlang` (also on the portfolio,
-runnable in-browser) for a fuller example, including a recursive function
-(`factorial`) with both a precondition and a postcondition.
-
-## 6. The self-hosting pipeline
-
-PatLang's compiler is written in PatLang, end to end:
-
-| Component | File | Written in |
-|-----------|------|-----------|
-| Lexer | `self_hosting/lib/lexer.patlang` | PatLang |
-| Parser | `self_hosting/lib/parser.patlang` | PatLang |
-| Lowerer (AST → IR) | `self_hosting/lib/lower.patlang` | PatLang |
-| Codegen (IR → Rust source text) | `self_hosting/lib/codegen.patlang` | PatLang |
-| Runtime prelude text + "write file, run rustc" | `rust-runtime/src/ir/` | Rust (Stage 0 host) |
-
-Watch the whole thing run — PatLang code tokenizes, parses, lowers, and
-generates ~78 KB of Rust source for a PatLang program; the host contributes
-only the fixed runtime prelude string (`codegen_prelude()`) and the dumbest
-possible back end (`rustc_build(source, out)`):
-
-```bash
-pat --ir-run self_hosting/pipeline_stage4.patlang
-./selfhost_stage4_demo.exe
+```
+contract violation: precondition failed in safe_divide(): b != 0
 ```
 
-The interchange formats are plain lists, easy to inspect:
+A check that holds is recorded as a `contract_holds` fact, which rules and plans
+can use.
 
-- Token: `["IDENT", "let", 1]` — type, text, line
-- AST node: `["Bin", "+", ["Var", "x"], ["Num", "1"]]`
-- IR instruction: `["CallHost", "print", 1]`
-- Codegen output: a Rust source string, e.g. `body.push(Instr::CallHost("print".to_string(), 1));`
-
-`pipeline_stage1.patlang` through `pipeline_stage3.patlang` show the earlier
-stages, where the host still did lowering (`compile_shape`) or IR decoding
-(`compile_ir`). Each stage produces byte-identical program output, verified by
-`rust-runtime/tests/selfhost_pipeline.rs`.
-
-### The fixpoint: the compiler compiles itself
-
-PatLang is self-hosting in the strict sense — a natively compiled PatLang
-compiler compiles its own source, and the child compiler is byte-for-byte
-equivalent to its parent:
-
-```bash
-# Generation A: the interpreter runs the PatLang compiler on the compiler's
-# own source, producing a native binary (~4 min — interpreted compilation)
-pat --ir-run self_hosting/build_patc1.patlang        # -> ./patc1.exe
-
-# Generation B: the native compiler compiles a program (~3.5 s)
-./patc1.exe self_hosting/examples/feature_demo.patlang demo.exe
-./demo.exe
-
-# Generation C: the native compiler compiles ITSELF
-./patc1.exe self_hosting/build/patc1_all.patlang patc2.exe
-./patc2.exe self_hosting/examples/feature_demo.patlang demo2.exe
-# demo.exe and demo2.exe produce identical output, and patc1/patc2 emit
-# byte-identical Rust for the same input
-```
-
-`patc1` usage: `patc1 <input.patlang> <output-exe> [prelude.rs]`. It reads the
-runtime prelude from `self_hosting/runtime/prelude.rs` (relative to the
-working directory), so run it from the repo root or pass the path explicitly.
-
-The runtime library embedded in every emitted program is itself PatLang
-source: `self_hosting/lib/runtime_rs.patlang` emits the runtime text
-(parity-checked byte-for-byte against the host template by the test suite),
-so **every byte of an emitted program originates from `.patlang` files
-processed by the PatLang toolchain**. After changing the host template,
-regenerate with:
-
-```bash
-pat --ir-run self_hosting/tools/dump_prelude.patlang
-python self_hosting/tools/transcribe_prelude.py
-```
-
-What remains outside PatLang is the irreducible bootstrap seed:
-
-- **rustc** — the machine-code back end, used the way other compilers use
-  LLVM.
-- **The Stage 0 interpreter** (`pat`) — used once per fresh system for
-  Generation A; after that, patc compiles patc.
-
-The full bootstrap is exercised by the (slow, `#[ignore]`d) test:
-`cargo test --test selfhost_pipeline -- --ignored`.
-
-## 7. WebAssembly
-
-Because the compiler emits portable Rust, targeting WASM is one argument:
+### Threads and fibres
 
 ```patlang
-let wasm = rustc_build(rs, "./program.wasm", "wasm32-wasip1")
+make a function called square takes x returns r
+  return x * x
+end
+print(parallel_map([1, 2, 3, 4], "square"))   # [1, 4, 9, 16]
+
+let t = thread_spawn(|| do
+  return square(9)
+end)
+print(thread_result(t))                       # 81
 ```
 
-Setup (one-time): `rustup target add wasm32-wasip1`. Run the module with any
-WASI runtime — with Node.js:
-
-```js
-// run_wasi.mjs
-import { readFile } from 'node:fs/promises';
-import { WASI } from 'node:wasi';
-import { argv, env } from 'node:process';
-const wasi = new WASI({ version: 'preview1', args: argv.slice(2), env });
-const wasm = await WebAssembly.compile(await readFile(argv[2]));
-const instance = await WebAssembly.instantiate(wasm, wasi.getImportObject());
-wasi.start(instance);
-```
-
-```bash
-node --no-warnings run_wasi.mjs program.wasm
-```
-
-The feature demo (events, logic, OO, functional) runs on WASM with output
-identical to native. Caveat: WASI preview1 has no sockets or subprocesses,
-so the `tcp_*` hosts and `rustc_build` fail at runtime there — compute-,
-event-, and file-oriented programs are the WASM sweet spot.
-
-`rustc_build` auto-detects a `wasm` target and compiles with `-C
-opt-level=z -C strip=symbols` rather than `-O` — around 7x smaller and
-faster to compile, at the cost of somewhat slower *execution* inside the
-WASM VM (size-optimized code, not speed-optimized). For a demo whose whole
-point is running in a browser, smaller and faster-to-build wins; if you're
-compiling to WASM for raw speed rather than portability/size, pass your own
-target and skip `rustc_build`'s auto-detection by invoking `rustc`
-directly with `-O`.
-
-## 8. Browser GUI (HTML + JavaScript output)
-
-`self_hosting/lib/html.patlang` builds well-formed HTML5 pages with embedded
-JavaScript, making the browser PatLang's cross-platform GUI. Two patterns:
-
-**Static page** — PatLang computes data and generates an interactive page
-(`self_hosting/examples/gui_demo.patlang`):
+`parallel_map` runs a function over a list on several threads, and
+`thread_spawn` runs a closure on a thread of its own. A fibre runs until it
+yields, and carries on when it is resumed:
 
 ```patlang
-let page = html_page("My App", build_body(), build_script(data))
-write_file("app.html", page)
+make a function called counter takes start returns r
+  fiber_yield(start + 1)
+  fiber_yield(start + 2)
+  return start + 3
+end
+let f = fiber_new("counter")
+print(fiber_resume(f, 10))   # 11
+print(fiber_resume(f, 0))    # 12
+print(fiber_resume(f, 0))    # 13
+print(fiber_alive(f))        # false
 ```
 
-**Live backend** — a native PatLang server serves the page, and the page's
-JS `fetch`es JSON computed live by the same process
-(`self_hosting/examples/gui_server_demo.patlang`):
+### Files and the virtual filesystem
 
 ```patlang
-let port = tcp_listen(0)
-# GET /      -> html_page(...) via http_ok("text/html", ...)
-# GET /data  -> live JSON via http_ok("application/json", ...)
+write_file("note.txt", "line one")
+print(file_exists("note.txt"))   # true
+print(read_file("note.txt"))     # line one
+remove_file("note.txt")
+print(argv())                    # the program's arguments, as a list
 ```
 
-Tip: single quotes inside embedded JS/CSS/HTML attributes keep pages
-readable (escape-free); `\"` or `q()` both give a double quote where one is
-needed (e.g. JSON keys).
+`vfs_write`, `vfs_read`, `vfs_exists`, `vfs_list` and `vfs_delete` give a
+filesystem in memory, which works the same in a browser:
 
-## 9. The portfolio
+```patlang
+vfs_write("notes/todo.txt", "write the vfs demo")
+print(vfs_read("notes/todo.txt"))   # write the vfs demo
+print(vfs_list("notes/"))           # [notes/todo.txt]
+```
 
-`portfolio/index.html` is a self-contained showcase: every "run in browser"
-button (including the bigger examples) compiles and executes that card's
-own displayed source through one shared engine — `playground.wasm`, the
-self-hosted lexer+parser+lowerer compiled to WASM, executing via `run_ir` —
-so there's a single compiler binary embedded in the page, not one per demo.
-Each card shows its PatLang source, self-reports timings via `now_ms()`,
-and shows the native transcript captured at build time, alongside the
-compiler's own metrics measured on its own source. Bigger examples: a
-point-of-sale (events + OO + logic facts), a test framework (unit,
-event-driven integration, and Gherkin features — `lib/gherkin.patlang`)
-running its whole suite in-browser, a **design-by-contract demo**
-(passing checks then one deliberate violation, to show enforcement fire),
-`patbuild` (a goal-oriented, manifest-driven build system), and
-`flowgraph` (control-flow graphs rendered as SVG from the compiler's own
-IR, one section per program — `portfolio/flowgraph.html`). The live
-**playground** editor has an example-loader dropdown covering all of the
-above. The page is generated by PatLang
-(`self_hosting/tools/build_portfolio.patlang`); regenerate with:
+### Networking and signals
+
+`tcp_listen(0)` listens on a port the system picks and returns it, and
+`tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write` and `tcp_close` do the
+rest. They bind to `127.0.0.1` only.
+
+A running program can answer other programs through signals, from
+`self_hosting/lib/signals.patlang`. A long-running program claims a port,
+polls it in its main loop, and answers `status` with what it is doing. The
+include below is written for a file at the repository root:
+
+```patlang
+include "self_hosting/lib/signals.patlang"
+
+when status do
+  signal_reply("working")
+end
+
+let port_id = signal_claim(0)
+let asker = thread_spawn(|| do
+  return signal_query(port_id, "status", "")
+end)
+let i = 0
+while i < 50 do
+  signal_poll(port_id, 20)    # handle any signal that has come in
+  let i = i + 1
+end
+print(thread_result(asker))   # working
+```
+
+Here a thread of the same program asks. In practice it is another process,
+given the port.
+
+## 5. How the compiler works
+
+`self_hosting/v2/compile.patlang` is the compiler. A build runs these stages:
+
+| Stage | File |
+|---|---|
+| Lexing and parsing | `self_hosting/lib/lexer.patlang`, `parser.patlang` |
+| Lowering each declaration to IR | `self_hosting/v2/lower.patlang` |
+| Inserting the reference counting | `self_hosting/v2/own.patlang` |
+| Generating x64 assembly | `self_hosting/v2/x64.patlang` |
+| Assembling | `self_hosting/lib/x64_asm.patlang` |
+| Linking a Windows executable | `self_hosting/lib/x64_pe_link.patlang` |
+
+The runtime, `self_hosting/v2/runtime/`, is PatLang too, and is compiled with
+each program by the same stages. Each function's code generation and assembly
+is one job, and the jobs run on the workers `--workers` gives.
+
+Other outputs:
+
+- `v2.exe SRC OUT.ir --ir` writes the program's IR (`docs/spec/ir.md`).
+- `v2.exe SRC OUT.wasm --wasm` writes a WebAssembly module, from the same IR.
+- `v2.exe SRC --constant-time` reports every place where a program's timing
+  could depend on a secret value (`self_hosting/v2/examples/README.md`).
+
+The compiler compiles itself:
 
 ```bash
-rust-runtime/target/release/pat --ir-run self_hosting/tools/build_portfolio.patlang
+self_hosting/build/v2.exe self_hosting/v2/compile.patlang next_v2.exe --workers 8
 ```
 
-WASM builds are automatically size-optimized and stripped (`rustc_build`
-detects a `wasm` target and uses `-C opt-level=z -C strip=symbols` instead
-of `-O`) — measured ~7x smaller and faster to compile, with byte-identical
-output, since these modules run through `run_ir` rather than needing raw
-native speed. The builder also **caches** each demo's compiled artifacts,
-keyed on a hash of the demo's own source *and* a fingerprint of the
-compiler pipeline itself (`self_hosting/lib/{lexer,parser,lower,codegen,
-runtime_rs}.patlang`) — so editing one demo only rebuilds that demo, while
-any change to the compiler invalidates every cached artifact and forces a
-full rebuild. Delete `portfolio/build/` to force a clean rebuild regardless.
+Built from the same sources, `next_v2.exe` builds a compiler that is the same
+as itself, byte for byte, and the tests check this. The IR in `bootstrap/` is the compiler's own, written with
+`--ir`, and `bootstrap/ir_reader.py` builds a compiler from it that builds the
+same compiler again. A reader in another language needs only what
+`docs/spec/ir.md` gives.
 
-## 10. Debugging tips
+## 6. In the browser
 
-- `PATLANG_DEBUG=1` enables evaluator/parser debug logs.
-- `pat --emit-rust file.patlang` prints the generated Rust for a program —
-  useful when a compiled binary misbehaves.
-- `pat --compare file.patlang` catches interpreter/compiled divergence.
-- The test suite is the ground truth: `cd rust-runtime && cargo test`.
-- `pat --ir-run self_hosting/tools/parity_main.patlang file.patlang`
-  compares a file's output across all three execution paths at once
-  (interpreted, natively compiled, self-hosted compiled) — the fastest
-  way to confirm the self-hosted compiler agrees with the native one on a
-  given file, and the tool of choice when bisecting a native-vs-self-hosted
-  divergence. `--quiet` for scripting; without it, a mismatch prints all
-  three outputs in full.
-- `pat --ir-run self_hosting/tools/depgraph_main.patlang [--html out.html]`
-  reports the include-dependency graph over `self_hosting/` and flags any
-  cycles.
-- `pat --ir-run self_hosting/tools/format_main.patlang file.patlang [--write]`
-  fixes indentation drift (a line-based re-indenter, not a full AST
-  formatter — the lexer discards comments, so this only ever adjusts
-  leading whitespace on existing lines rather than rebuilding text).
-- `pat --ir-run self_hosting/tools/fuzz_main.patlang [--seed S] [--iterations N]`
-  generates random nested control-flow programs and checks that the
-  native and self-hosted parsers agree on each one — useful after any
-  change to either parser, to catch a divergence before it's found the
-  hard way.
+`self_hosting/v2/wasm/` is the host for a module `--wasm` writes, in a browser
+or in Node. Each thread and each fibre runs in a Worker over one shared memory,
+so a page needs to be cross-origin isolated.
 
-## 11. Current limitations
+The portfolio (`portfolio/`) runs each example program in the page. It has a
+playground, a REPL, and an IDE with a debugger that steps through a recorded
+trace. To build it:
 
-- Functions are not yet first-class closures; pass function names and invoke
-  with `apply(name, ...)`. Lexical closures are the next major IR feature
-  (see `PATLANG_SELF_HOSTING_ROADMAP.md`).
-- `goal name { ... }` declarative block syntax still silently no-ops (unlike
-  `rule`, discussed in section 4, which is now real) — no unambiguous
-  mapping onto the `solve`/`plan` backend has been designed yet.
-- `vfs_flush_to_disk`'s write-through has not been exercised under a live
-  `wasmtime`/browser WASM run — only compile-time verified that the correct
-  target-specific code path is selected.
-- Compiling is fast; *self*-compiling takes minutes because rustc digests the
-  ~1 MB emitted compiler. `patc` output is unoptimized for size (WASM modules
-  ~2 MB); `strip`/`opt-level=s` support is on the roadmap.
-- A function invoked via `parallel_map` (or a fiber) runs on a worker
-  thread with its own fresh interpreter state that jumps straight into
-  that function — it never runs the program's top-level `let` statements
-  first, so a top-level constant referenced from inside such a function
-  silently doesn't resolve. Work around it by inlining literals or passing
-  values as explicit parameters instead of closing over a top-level `let`.
-  Also true, separately, of `patc1.exe`-compiled programs generally (not
-  just `parallel_map`-invoked functions there) — not yet root-caused.
-- `RULES`/`ACTIONS` (the backing stores for `rule_add`/`solve` and
-  `action_add`/`plan`) are still `thread_local!`, unlike `EVENT_HANDLERS`/
-  `OBJECTS`/the virtual filesystem, which were fixed to be cross-thread
-  safe this session — a rule or action registered on one thread isn't
-  visible to `solve`/`plan` called from another. Not yet fixed.
+```bash
+self_hosting/build/v2.exe self_hosting/tools/build_portfolio.patlang build_portfolio.exe
+./build_portfolio.exe
+```
 
-Fixed since earlier versions: string escapes (`\n \t \r \" \\`) now work in
-the Stage 1 dialect, and `and`/`or` short-circuit in Stage-1-compiled code
-exactly as in Stage 0. Real OS threads now exist (fibers, `parallel_map`,
-and threaded WASM via `wasm32-wasip1-threads`) — `EVENT_HANDLERS`, the
-object store (`new`/`get`/`set_var`, backing `send`), and the virtual
-filesystem are all shared across threads now, not silently per-thread
-(see the limitation above for the two stores that still are). `fact`/
-`query`/`goal` are now backed by real backward-chaining (`rule_add`/
-`solve`) and GOAP planning (`action_add`/`plan`), not just a flat lookup
-table (section 4) — and GOAP actions can now be parameterized with the
-same `^[A-Z]` logic-variable convention as `rule_add`/`solve` (e.g.
-`build(X)`), not ground-only. A running program can also now receive
-named signals from outside itself (a second CLI invocation, or a local
-network call) — see the Networking section above.
+Then serve `portfolio/` over HTTP and open `index.html`.
+
+## 7. Tests
+
+The language is specified in Gherkin, in `spec_library/`, and the scenarios
+are executable. `self_hosting/v2/tools/gates.sh` runs them all, on both the
+compiled and interpreted engines, and checks the compiler's self-build and the
+bootstrap:
+
+```bash
+bash self_hosting/v2/tools/gates.sh           # what has changed since it last passed
+bash self_hosting/v2/tools/gates.sh --plan    # say what would run
+bash self_hosting/v2/tools/gates.sh --all     # everything
+```
+
+The gates remember what passed, and run again only what a change could affect,
+in parallel, leaving two cores and 4 GB of memory free for other work. From
+nothing, a full run takes between two and three hours on a 20-core machine.
+`docs/plans/gates.md` describes how.
+
+## 8. Further reading
+
+- `docs/spec/values-and-memory.md`: values, objects and memory, the
+  specification v2 implements.
+- `docs/spec/ir.md`: the IR, for writing a reader.
+- `docs/guides/`: closures, threads, fibres and worlds; passing parameters.
+- `self_hosting/v2/examples/`: integers modulo n, hashing, key exchange and
+  signatures, written in PatLang.

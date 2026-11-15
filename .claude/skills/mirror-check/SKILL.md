@@ -5,6 +5,9 @@ description: Check (and guide fixing) self-hosted compiler mirror parity (runtim
 
 # mirror-check
 
+This is for the old route only: `pat`, `patc1.exe` and their Rust mirror. v2
+(`self_hosting/v2/`) has no Rust side, and nothing here applies to it.
+
 PatLang's self-hosted compiler (`patc1.exe`) has **two separate kinds of
 mirror debt** against the Rust runtime, and a fix for one does not fix the
 other:
