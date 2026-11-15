@@ -111,6 +111,10 @@ def structure(instrs, seg_of, nseg):
             else:
                 need(seg, t)
                 need(seg, f)
+        elif op == "unwound":
+            t = seg_of[ins[2]]
+            if not (last and t == seg + 1):
+                need(seg, t)
     # [kind, start, last, key]
     items = [["loop", j, e, j] for j, e in sorted(loops.items())]
     items += [["block", s, t - 1, t] for t, s in sorted(blocks.items())]
@@ -151,7 +155,7 @@ def slot_access(ins):
         return [ins[1]], []
     if op in ("copy", "move"):
         return [ins[1]], [ins[2]]
-    if op in ("clear", "retain", "release", "return", "branch"):
+    if op in ("clear", "retain", "release", "return", "branch", "unwound"):
         return [], [ins[1]]
     if op in ("call", "prim", "closure"):
         return [ins[1]], ins[3]
@@ -163,7 +167,7 @@ def slot_access(ins):
         return [ins[1]], [ins[3]]
     if op in ("list", "callv"):
         return [ins[1]], ins[2]
-    if op in ("label", "jump"):
+    if op in ("label", "jump", "unwind"):
         return [], []
     raise IRError("unknown instruction " + op)
 
@@ -189,7 +193,7 @@ def slot_locals(nparams, nslots, instrs):
     n = len(instrs)
     starts = [0]
     for k in range(1, n):
-        if instrs[k][0] == "label" or instrs[k - 1][0] in ("jump", "branch", "return"):
+        if instrs[k][0] == "label" or instrs[k - 1][0] in ("jump", "branch", "return", "unwound", "unwind"):
             starts.append(k)
     nb = len(starts)
     ends = [starts[i + 1] - 1 for i in range(nb - 1)] + [n - 1]
@@ -205,7 +209,9 @@ def slot_locals(nparams, nslots, instrs):
             succ = [block_of[last[1]]]
         elif last[0] == "branch":
             succ = [block_of[last[2]], block_of[last[3]]]
-        elif last[0] == "return":
+        elif last[0] == "unwound":
+            succ = [block_of[last[2]]] + ([i + 1] if i + 1 < nb else [])
+        elif last[0] in ("return", "unwind"):
             succ = []
         else:
             succ = [i + 1] if i + 1 < nb else []
@@ -1015,6 +1021,20 @@ class Module:
             b.op(I64_NE)
             b.op(END)
             self.go_if(self.seg_of[ins[2]], self.seg_of[ins[3]])
+        elif op == "unwound":
+            # the unwinding mark, type word 16, goes to the unwind tail
+            b.get(self.T(ins[1]))
+            b.i64(16)
+            b.op(I64_EQ)
+            t = self.seg_of[ins[2]]
+            if self.last and t == self.seg + 1:
+                b.op(DROP)
+            else:
+                b.br_if(self.depth(t))
+        elif op == "unwind":
+            b.i64(16)
+            b.i64(0)
+            b.op(RETURN)
         elif op == "return":
             self.push(ins[1])
             b.op(RETURN)

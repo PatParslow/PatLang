@@ -316,11 +316,14 @@ the caller's.
 - When code running in `world_call` stops (a failed contract, `exit_with`, a call to a name
   nothing declares, any stop), the stop ends the call and not the program: `world_call` gives
   `["stopped", code]`, `code` being the exit code the program would have stopped with, and its
-  caller goes on. What the stop said is in the world's output. The frames the stop leaves are
-  not unwound, so what they held is not given back.
+  caller goes on. What the stop said is in the world's output. The frames between the stop and
+  the call are unwound, and what they held is given back (2.2). That includes the frames of
+  fibers that code in the call resumed.
 - A fiber runs in the world it was made in, whoever resumes it, and a thread in the world of
   the code that started it. A stop on a thread other than the one `world_call` runs on ends
-  that thread; `world_call` gives `["stopped", code]` when `f` returns.
+  that thread: its frames are unwound, and it finishes as any thread does, so `thread_poll`
+  gives `true` and `thread_result` gives unit. `world_call` gives `["stopped", code]` when `f`
+  returns, `code` being the first stop's.
 - `world_call` may run inside a world: worlds nest, each with its own state.
 - `world_steps(w, n)` gives world `w` a budget of `n` steps, and `world_step()` spends one step
   of the budget of the world the code runs in. When a step is spent with none left, the world
@@ -332,8 +335,9 @@ the caller's.
   interpreter has it, whatever the program registers under that name when it starts. So a
   program that asks for every runtime function by name, as one that runs source in a world
   through the interpreter does, runs the same interpreted as compiled.
-- `world_free(w)` gives back everything `w` holds, and `w` then names no world. Freeing a world
-  that code is running in stops the program.
+- `world_free(w)` gives back everything `w` holds, and `w` then names no world. A fiber made in
+  `w` that is paused is unwound, as a stop would unwind it, and what its frames held is given
+  back. Freeing a world that code is running in stops the program.
 - A value `f` returns is an ordinary value in the caller's world, except an object of a class
   the world declared: its class is the world's, so it is taken out of a world as plain data
   (its fields' values) and never as the object.
@@ -380,6 +384,30 @@ requires. It is invisible to programs. The rules:
 There are no other rules. Each function's ownership behaviour follows
 from its PatLang source by these rules. It is recorded per function as a
 summary (2.5) and stated as the function's contract (2.4).
+
+**Unwinding.** A stop inside a `world_call` (1.15) ends the frames between it
+and the call, and those frames release what they own, by these same rules:
+
+- The stop returns the **unwinding mark**, a value whose type word is 16.
+  That is a class no value has, so a program never holds it.
+- After each call, and each operator, list or closure that may run program
+  code, the compiled code tests the result. On the mark, the function
+  releases every slot it owns at that point and returns the mark in turn.
+  The slots it releases are its variables and the temporaries still holding
+  a value. Each one starts as unit when the function is entered, so each
+  holds a value of its own or unit.
+- The mark stops at a call written `caught(f(...))`, which gives it as its
+  value. Only the runtime writes `caught`, in a file declaring
+  `quiet_operators()`. It does so where a world call, a fiber or a thread
+  begins, and where the interpreter gives back an interpreted frame.
+- The calls the compiled code makes for a `branch` and a `release`
+  (`rt_truthy`, `rt_release_last`) reach no program code. Only a failed
+  contract of the runtime itself could stop there. Such a stop is still
+  recorded, and the world call gives `stopped`, but the code runs on to its
+  next test or its return.
+
+A test costs a compare of the result's type word. A function that makes no
+call that may give the mark has no unwind code.
 
 ### 2.3 Memory manager
 

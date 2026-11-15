@@ -85,6 +85,13 @@ Slots are named `d` (the slot written), `a`, `b` and `s` below.
 | `["release" s]` | When `s`'s heap bit is set, subtracts 1 atomically. If the count before was 1 or less, calls `rt_release_last(type, block, count_before)`, each argument as an int. |
 | `["list" d [s ...]]` | `d` = `rt_list_alloc(n)`. Then for each `k`: retain the `k`th slot, and store its two words at the block + 32 + 16k. |
 | `["closure" d FN [s ...]]` | `d` = `rt_closure_alloc(n)`, with `FN`'s code address stored at the block + 16. The captured slots are stored as for `list`. |
+| `["unwound" s N]` | When `s`'s type word is 16, the unwinding mark (values-and-memory.md 2.2), goes to label `N`. Otherwise it does nothing. |
+| `["unwind"]` | Returns the unwinding mark: type word 16, data word 0. |
+
+The ownership stage puts an `unwound` after each instruction whose result may be the mark, and
+ends the function with its unwind tail: a label, a `release` of each slot the function may own
+there, and `unwind`. A reader may test only where a call was made, since nothing else gives the
+mark, and may leave out the test of a slot that only ever holds an inline value.
 
 #### Operators
 
@@ -284,8 +291,15 @@ which posts back the output and the exit code. A page of your own can serve `ind
   Output therefore keeps the order in which the threads wrote it, and the launcher writes it out.
 - **The exit.** `ExitProcess` records the exit code. The launcher then writes the remaining output
   and stops every Worker. A trap in any executor gives exit code 101, after a line naming the trap.
-  `ExitThread` ends the thread calling it as its returning would, which is how a stop in a world
-  ends a thread started in the world (values-and-memory.md 1.15).
-- **What a browser has none of.** There are no files, processes or sockets, so each of those calls
-  fails as Windows reports a file that is not there. `GetEnvironmentVariableA` finds only what the
+- **Files.** The launcher may be given files the program can read: a map from each path, relative
+  and with `/` between its parts, to its bytes. `run_node.mjs --files DIR` gives every file under
+  `DIR`, and a page fetches them as one bundle (`?files=URL`, a JSON map of paths to base64, which
+  `run_browser.py --files DIR` serves). `CreateFileA` opens one for reading, and `ReadFile`,
+  `GetFileSize`, `SetFilePointerEx` and `CloseHandle` work on it. `GetFileAttributesA` reports a
+  given file, or a directory some given file lies under. `FindFirstFileA` and `FindNextFileA` list
+  a directory's entries. So `read_file`, `file_exists`, `list_dir` and includes work over the
+  files given, and the front end can run in a browser: a world can run a program's text there
+  (values-and-memory.md 1.15). Opening a file to write it fails, as Windows reports access denied.
+- **What a browser has none of.** There are no processes or sockets, and no files besides those
+  given, so each of those calls fails as Windows reports a file that is not there. `GetEnvironmentVariableA` finds only what the
   launcher is given, which by default is nothing, and the standard input is empty.

@@ -3,7 +3,7 @@
 // its own (docs/spec/ir.md, "The WASM host"). It provides the Windows calls
 // the runtime makes, over the control block the launcher shares.
 
-import { L, STD_IN, STD_OUT, STD_ERR, THREAD_H, FIBER_H, HOST_AREA, GB4 } from "./layout.mjs";
+import { L, STD_IN, STD_OUT, STD_ERR, THREAD_H, FIBER_H, FILE_H, HOST_AREA, GB4 } from "./layout.mjs";
 
 const isNode = typeof process !== "undefined" && !!(process.versions && process.versions.node);
 let post;
@@ -17,8 +17,6 @@ if (isNode) {
 }
 
 class Exit extends Error {}
-// a thread ending itself (ExitThread): a stop in a world on a thread of its own
-class ThreadExit extends Error {}
 
 function start(init) {
   const { module, memory, ctl, out, me, kind } = init;
@@ -37,6 +35,49 @@ function start(init) {
     let n = at;
     while (m[n] !== 0) n++;
     return new TextDecoder().decode(m.slice(at, n));
+  }
+
+  // The files the launcher was given, read-only: path -> bytes, each path
+  // relative, with "/" between its parts. A directory is any path some file
+  // lies under, "" being the top when there are any. Handles are this
+  // executor's own: a file is opened, read and closed by one call of the
+  // runtime's. With no files, each file call fails as it always has.
+  const files = init.files || {};
+  const dirs = new Set(Object.keys(files).length > 0 ? [""] : []);
+  for (const f of Object.keys(files)) {
+    const parts = f.split("/");
+    for (let k = 1; k < parts.length; k++) dirs.add(parts.slice(0, k).join("/"));
+  }
+  function norm(path) {
+    const out = [];
+    for (const part of path.replace(/\\/g, "/").split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") out.pop();
+      else out.push(part);
+    }
+    return out.join("/");
+  }
+  const opened = new Map();
+  let nextFile = 0;
+  function entries(dir) {
+    const names = new Set();
+    const prefix = dir === "" ? "" : dir + "/";
+    for (const f of Object.keys(files)) {
+      if (!f.startsWith(prefix)) continue;
+      const rest = f.slice(prefix.length);
+      const k = rest.indexOf("/");
+      names.add(k < 0 ? rest : rest.slice(0, k) + "/");
+    }
+    return [...names];
+  }
+  // WIN32_FIND_DATAA: the attributes at 0, the name at 44, NUL-ended
+  function findData(at, name) {
+    const m = u8();
+    const isDir = name.endsWith("/");
+    const raw = new TextEncoder().encode(isDir ? name.slice(0, -1) : name);
+    m.fill(0, at, at + 320);
+    dv().setUint32(at, isDir ? 16 : 128, true);
+    m.set(raw.slice(0, 259), at + 44);
   }
 
   // stdout: appended under a lock to the shared buffer the launcher drains,
@@ -79,7 +120,6 @@ function start(init) {
       }
       throw new Exit();
     },
-    ExitThread(code) { throw new ThreadExit(); },
     GetStdHandle(n) {
       const k = Number(BigInt.asIntN(32, n));
       return k === -10 ? STD_IN : k === -11 ? STD_OUT : k === -12 ? STD_ERR : -1;
@@ -93,7 +133,16 @@ function start(init) {
       return 1;
     },
     ReadFile(h, buf, n, read) {
-      if (num(h) !== STD_IN) { lastError = 6; return 0; }
+      const hn = num(h);
+      const f = opened.get(hn);
+      if (f) {
+        const len = Math.max(0, Math.min(num(n), f.data.length - f.pos));
+        u8().set(f.data.subarray(f.pos, f.pos + len), num(buf));
+        f.pos += len;
+        if (num(read) !== 0) dv().setUint32(num(read), len, true);
+        return 1;
+      }
+      if (hn !== STD_IN) { lastError = 6; return 0; }
       if (num(read) !== 0) dv().setUint32(num(read), 0, true);
       return 1;
     },
@@ -154,7 +203,7 @@ function start(init) {
       }
       return 0;
     },
-    CloseHandle() { return 1; },
+    CloseHandle(h) { opened.delete(num(h)); return 1; },
     Sleep(ms) { Atomics.wait(C, L.SLEEP, 0, num(ms)); return 0; },
     ConvertThreadToFiber() { return FIBER_H + me; },
     ConvertFiberToThread() { return 1; },
@@ -189,14 +238,60 @@ function start(init) {
       m[num(buf) + raw.length] = 0;
       return raw.length;
     },
-    // no files, processes or sockets in a browser: each reports failure
-    CreateFileA() { lastError = 2; return -1; },
-    GetFileAttributesA() { lastError = 2; return 0xFFFFFFFF; },
-    FindFirstFileA() { lastError = 2; return -1; },
-    FindNextFileA() { lastError = 18; return 0; },
-    FindClose() { return 1; },
-    GetFileSize() { lastError = 6; return 0xFFFFFFFF; },
-    SetFilePointerEx() { lastError = 6; return 0; },
+    // the files given are read; nothing is written, and there are no
+    // processes or sockets: each of those reports failure
+    CreateFileA(name, access) {
+      const path = norm(cstr(num(name)));
+      // GENERIC_READ alone
+      if ((num(access) & 0x40000000) !== 0) { lastError = 5; return -1; }
+      if (!(path in files)) { lastError = dirs.has(path) ? 5 : 2; return -1; }
+      const h = FILE_H + nextFile++;
+      opened.set(h, { data: files[path], pos: 0 });
+      return h;
+    },
+    GetFileAttributesA(name) {
+      const path = norm(cstr(num(name)));
+      if (path in files) return 128;
+      if (dirs.has(path)) return 16;
+      lastError = 2;
+      return 0xFFFFFFFF;
+    },
+    FindFirstFileA(pattern, data) {
+      const p = norm(cstr(num(pattern)));
+      if (!p.endsWith("*")) { lastError = 2; return -1; }
+      const dir = norm(p.slice(0, -1));
+      if (!dirs.has(dir)) { lastError = 3; return -1; }
+      const list = entries(dir);
+      if (list.length === 0) { lastError = 2; return -1; }
+      const h = FILE_H + nextFile++;
+      opened.set(h, { list, next: 1 });
+      findData(num(data), list[0]);
+      return h;
+    },
+    FindNextFileA(h, data) {
+      const f = opened.get(num(h));
+      if (!f || !f.list || f.next >= f.list.length) { lastError = 18; return 0; }
+      findData(num(data), f.list[f.next++]);
+      return 1;
+    },
+    FindClose(h) { opened.delete(num(h)); return 1; },
+    GetFileSize(h, high) {
+      const f = opened.get(num(h));
+      if (!f || !f.data) { lastError = 6; return 0xFFFFFFFF; }
+      if (num(high) !== 0) dv().setUint32(num(high), 0, true);
+      return f.data.length;
+    },
+    SetFilePointerEx(h, distance, newPos, method) {
+      const f = opened.get(num(h));
+      if (!f || !f.data) { lastError = 6; return 0; }
+      const d = Number(BigInt.asIntN(64, distance));
+      const m = num(method);
+      const at = m === 0 ? d : m === 1 ? f.pos + d : f.data.length + d;
+      if (at < 0) { lastError = 131; return 0; }
+      f.pos = at;
+      if (num(newPos) !== 0) dv().setBigInt64(num(newPos), BigInt(at), true);
+      return 1;
+    },
     DeleteFileA() { lastError = 2; return 0; },
     RemoveDirectoryA() { lastError = 2; return 0; },
     CreateDirectoryA() { lastError = 5; return 0; },
@@ -255,11 +350,7 @@ function start(init) {
       u8().set(new TextEncoder().encode(init.cmdline + "\0"), HOST_AREA);
       x.main();
     } else if (kind === "thread") {
-      try {
-        x.table.get(init.start)(init.param);
-      } catch (e) {
-        if (!(e instanceof ThreadExit)) throw e;
-      }
+      x.table.get(init.start)(init.param);
       Atomics.store(C, L.THREADS + init.thread, 1);
       Atomics.notify(C, L.THREADS + init.thread);
       post({ t: "done", e: me });

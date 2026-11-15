@@ -158,8 +158,13 @@ make a function called iv_translate takes func returns tr
     elif op == "copy" then
       let code = iv_put3(code, 1, iv_off(ins[1]), iv_slot(vars, ins[2]))
     elif op == "call" then
-      # the function itself is found at the first call; its cell keeps it
-      let code = iv_put4(code, 2, iv_off(ins[1]), iv_off(list_len(aux)), iv_off(list_len(aux) + 1))
+      # the function itself is found at the first call; its cell keeps it. 17:
+      # a call written caught(...), which keeps the unwinding mark as its value
+      let kind = 2
+      if iv_caught_next(instrs, i) then
+        let kind = 17
+      end
+      let code = iv_put4(code, kind, iv_off(ins[1]), iv_off(list_len(aux)), iv_off(list_len(aux) + 1))
       let aux = list_push(aux, iv_cell_new())
       let aux = list_push(aux, ins[2])
       let code = iv_push_slots(code, vars, ins[3])
@@ -194,13 +199,23 @@ make a function called iv_translate takes func returns tr
       let aux = list_push(aux, [ins[2], ins[5]])
       let code = iv_push_slots(code, vars, ins[3])
     elif op == "callv" then
-      # 16: closure_call_unchecked's, its arguments already fitted
+      # 16: closure_call_unchecked's, its arguments already fitted; 18 and 19
+      # the two written caught(...)
       let kind = 12
       if ir_callv_unchecked(ins) == 1 then
         let kind = 16
       end
+      if iv_caught_next(instrs, i) then
+        let kind = kind + 6
+        if kind == 22 then
+          let kind = 19
+        end
+      end
       let code = iv_put2(code, kind, iv_off(ins[1]))
       let code = iv_push_slots(code, vars, ins[2])
+    elif op == "caught" then
+      # its call, the one before, has its own kind
+      let skip = true
     else
       print("interpreter: " + op + " needs the compiler")
       let code = list_push(code, 14)
@@ -213,6 +228,15 @@ make a function called iv_translate takes func returns tr
     let i = i + 1
   end
   return [code, aux, ir_fn_nslots(func)]
+end
+
+# Whether the instruction after the one at i is caught's (lower.patlang).
+make a function called iv_caught_next takes instrs, i returns yes
+  let yes = false
+  if i + 1 < list_len(instrs) then
+    let yes = instrs[i + 1][0] == "caught"
+  end
+  return yes
 end
 
 # ---- the program ----
@@ -379,7 +403,9 @@ make a function called iv_run takes table, entry, args returns result
     mem_store_value(block, 32 + 16 * a, args[a])
     let a = a + 1
   end
-  let r = iv_loop(table, mem_load_value(t, 32), mem_load_value(t, 48), block, sk)
+  # a stop in a world gives the unwinding mark here as any other result: the
+  # frame and the stack are given back, and the caller unwinds in turn
+  let r = caught(iv_loop(table, mem_load_value(t, 32), mem_load_value(t, 48), block, sk))
   iv_pop_frame(sk, block)
   rt_free(stack)
   return r
@@ -432,6 +458,10 @@ make a function called iv_loop takes table, code, aux, block, sk returns result
     elif kind == 9 then
       mem_store_value(block, mem_load(at, 16), mem_take_value(block, mem_load(at, 32)))
       let pc = pc + 48
+    elif kind == 17 then
+      # a call written caught(...): its value is the unwinding mark too
+      mem_store_value(block, mem_load(at, 16), caught(iv_call(table, ab, at, block, sk)))
+      let pc = pc + 80 + 16 * mem_load(at, 64)
     elif kind == 15 then
       # The taken value goes straight into the call, so op_add_taken holds its only
       # reference and can append in place; a let would keep a second one.
@@ -473,6 +503,10 @@ make a function called iv_rare takes table, ab, at, block, kind, pc returns next
   elif (kind == 12) or (kind == 16) then
     let vals = iv_read_words(block, at + 48, mem_load(at, 32))
     mem_store_value(block, mem_load(at, 16), iv_call_closure(vals, kind == 16))
+    let pc = pc + 48 + 16 * mem_load(at, 32)
+  elif (kind == 18) or (kind == 19) then
+    let vals = iv_read_words(block, at + 48, mem_load(at, 32))
+    mem_store_value(block, mem_load(at, 16), caught(iv_call_closure(vals, kind == 19)))
     let pc = pc + 48 + 16 * mem_load(at, 32)
   else
     return rt_stop(80)
@@ -555,9 +589,15 @@ make a function called iv_call takes table, ab, at, block, sk returns r
       mem_store_value(nb, 32 + 16 * a, iv_read(block, mem_load(at, 80 + 16 * a)))
       let a = a + 1
     end
-    let r = iv_loop(table, mem_load_value(t, 32), mem_load_value(t, 48), nb, sk)
+    let r = caught(iv_loop(table, mem_load_value(t, 32), mem_load_value(t, 48), nb, sk))
     iv_pop_frame(sk, nb)
     return r
+  end
+  if value_class(target) == 8 then
+    # a name nothing declares: its arguments are taken, and the call stops
+    # there, as a compiled call of it does (lower.patlang, lw_undeclared_function)
+    iv_read_words(block, at + 80, n)
+    return rt_undeclared(target)
   end
   return iv_call_native(target, block, at + 80, n)
 end
@@ -582,14 +622,14 @@ make a function called iv_call_target takes table, name returns target
   return iv_code_of(entry)
 end
 
-# A runtime function's closure, from those the table kept (iv_table), or one
-# that stops the program as a compiled call of an undeclared name does.
+# A runtime function's closure, from those the table kept (iv_table), or, for a
+# name nothing declares, the name itself (iv_call).
 make a function called iv_runtime_function takes table, name returns f
   require list_len(table) == 1025
   let fns = table[1024]
   let i = rt_pairs_last_index(fns, name)
   if i < 0 then
-    return |a, b, c, d, e, g, h, j| { return rt_undeclared(name) }
+    return name
   end
   return fns[i][1]
 end

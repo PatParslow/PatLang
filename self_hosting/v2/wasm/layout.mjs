@@ -19,6 +19,7 @@ export const L = {
 export const OUT_BYTES = 1 << 20;
 export const STD_IN = 0x10, STD_OUT = 0x11, STD_ERR = 0x12;
 export const THREAD_H = 0x1000000, FIBER_H = 0x2000000;
+export const FILE_H = 0x3000000;
 export const HOST_AREA = 4096;
 export const GB4 = 4294967296;
 export const TRAP_CODE = 101;

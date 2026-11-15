@@ -31,6 +31,21 @@ Feature: worlds (spec 1.15)
     When the code takes the thread's result and prints a line of its own
     Then the call gives stopped with code 9, the world's output has both lines, and the program goes on
 
+  Scenario: a thread a stop in a world ends has finished
+    Given code in a world that starts a thread which stops by exit_with(9)
+    When the code polls the thread until it has finished, then takes its result
+    Then the call gives stopped with code 9, thread_poll said the thread had finished, and its result was unit
+
+  Scenario: a stop in a world gives back what the frames it ends held
+    Given a loop of N iterations that each call code in a new world which holds a list of 1000 ints on each of three frames and then stops, directly, inside a fiber, or on a thread the code started
+    When it runs for N and for 10N iterations
+    Then for each, the peak memory does not grow as more stops end frames
+
+  Scenario: a fiber paused in a world is unwound when the world is freed
+    Given a loop of N iterations that each call code in a new world which starts a fiber that holds a list of 1000 ints and yields, and then free the world
+    When it runs for N and for 10N iterations
+    Then the peak memory does not grow as more paused fibers are freed with their worlds
+
   Scenario: a program that asks for every runtime function by name runs the same interpreted
     Given a program that declares runtime_functions_by_name(), as one that runs source in a world through the interpreter does, and reaches a runtime function by name in the program and in a world
     When it runs on the interpreter and compiled

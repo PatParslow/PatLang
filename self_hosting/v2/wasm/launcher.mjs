@@ -2,7 +2,10 @@
 // fibre, each a Worker. The launcher itself never runs the program, so it
 // can stay on a browser's main thread, which may not block.
 //
-//   run({ bytes, args, env, newWorker, onOutput }) -> Promise<exit code>
+//   run({ bytes, args, env, files, newWorker, onOutput }) -> Promise<exit code>
+//
+// files: the files the program may read, path -> Uint8Array, each path
+// relative with "/" between its parts (docs/spec/ir.md, "The WASM host").
 //
 // newWorker() gives { post(message), onMessage(callback), terminate() }.
 
@@ -12,7 +15,7 @@ function quote(a) {
   return '"' + a.replace(/"/g, '\\"') + '"';
 }
 
-export async function run({ bytes, args = [], env = {}, newWorker, onOutput, onError = onOutput, name = "program" }) {
+export async function run({ bytes, args = [], env = {}, files = {}, newWorker, onOutput, onError = onOutput, name = "program" }) {
   const module = await WebAssembly.compile(bytes);
   // the data segment lies within the module, so this covers the constants
   const pages = Math.ceil((131072 + bytes.byteLength) / 65536);
@@ -65,7 +68,7 @@ export async function run({ bytes, args = [], env = {}, newWorker, onOutput, onE
           finish(TRAP_CODE);
         }
       });
-      w.post({ module, memory, ctl, out, me: e, env, cmdline, ...init });
+      w.post({ module, memory, ctl, out, me: e, env, files, cmdline, ...init });
     }
     spawn(0, { kind: "main" });
   });

@@ -1,12 +1,14 @@
 """Runs a v2 WASM module in headless Chrome, with the host in this folder.
 
-    py -3 self_hosting/v2/wasm/run_browser.py PROGRAM.wasm [ARGS...]
+    py -3 self_hosting/v2/wasm/run_browser.py [--files DIR]... PROGRAM.wasm [ARGS...]
 
 It serves this folder and the program from 127.0.0.1 with the headers that
 make the page cross-origin isolated (so it has SharedArrayBuffer), opens the
 page in a new headless Chrome profile, and waits for the page to post its
 result. The program's output goes to stdout and its exit code is this
-script's. CHROME names the browser when it is not in the usual place.
+script's. CHROME names the browser when it is not in the usual place. Each
+--files DIR gives the program every file under DIR to read, at its path
+relative to the current directory: the page fetches them as one bundle.
 """
 import base64
 import json
@@ -27,7 +29,21 @@ CHROMES = [
 ]
 
 
-def serve(program):
+def bundle(dirs):
+    """The files under each directory, as the page fetches them: JSON mapping
+    each path, relative to the current directory with "/" between its parts,
+    to its bytes in base64."""
+    files = {}
+    for d in dirs:
+        for root, _subdirs, names in os.walk(d):
+            for name in names:
+                full = os.path.join(root, name)
+                with open(full, "rb") as f:
+                    files[os.path.relpath(full).replace("\\", "/")] = base64.b64encode(f.read()).decode()
+    return json.dumps(files).encode()
+
+
+def serve(program, files):
     result = {}
     got = threading.Event()
 
@@ -47,6 +63,8 @@ def serve(program):
 
         def do_GET(self):
             path = self.path.split("?")[0].lstrip("/") or "index.html"
+            if path == "files.json" and files is not None:
+                return self.send(200, files, "application/json")
             if path == "program.wasm":
                 full = program
             elif "/" not in path and "\\" not in path and os.path.isfile(os.path.join(HERE, path)):
@@ -70,15 +88,21 @@ def serve(program):
 
 
 def main(argv):
+    dirs = []
+    while len(argv) > 2 and argv[1] == "--files":
+        dirs.append(argv[2])
+        argv = argv[:1] + argv[3:]
     if len(argv) < 2:
-        print("usage: run_browser.py PROGRAM.wasm [ARGS...]")
+        print("usage: run_browser.py [--files DIR]... PROGRAM.wasm [ARGS...]")
         return 2
     chrome = os.environ.get("CHROME") or next((c for c in CHROMES if os.path.isfile(c)), None)
     if not chrome:
         print("run_browser: no Chrome found; set CHROME")
         return 2
-    server, result, got = serve(os.path.abspath(argv[1]))
+    server, result, got = serve(os.path.abspath(argv[1]), bundle(dirs) if dirs else None)
     query = "report&args=" + json.dumps(argv[2:]).replace(" ", "%20")
+    if dirs:
+        query += "&files=files.json"
     url = "http://127.0.0.1:%d/index.html?%s" % (server.server_address[1], query)
     profile = tempfile.mkdtemp(prefix="patlang_chrome_")
     proc = subprocess.Popen([chrome, "--headless=new", "--no-first-run", "--no-default-browser-check",

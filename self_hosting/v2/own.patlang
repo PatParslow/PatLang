@@ -30,6 +30,15 @@
 # variables, and the temporaries a branch or a return reads or a copy writes.
 # Only those start as unit and are released at a return; a result going to any
 # other temporary goes straight there.
+#
+# Unwinding (docs/spec/values-and-memory.md 2.2): a stop in a world returns the
+# unwinding mark from the call it happens in. After each instruction that may
+# run program code (a call, callv, op, un, list or closure), once its own
+# arguments and operands are released, "unwound" tests its result: the mark
+# goes to the function's unwind tail, which releases every held slot and every
+# temporary still holding a value at some such test, and returns the mark. Those
+# temporaries start as unit too, so each slot the tail releases holds a value of
+# its own or unit. A call written caught(...) is not tested (lower.patlang).
 
 make a function called own_produces takes op returns yes
   return (op == "const") or (op == "call") or (op == "op") or (op == "un") or (op == "prim") or (op == "extern") or (op == "externf") or (op == "list") or (op == "closure") or (op == "callv")
@@ -53,11 +62,17 @@ make a function called own_function takes func returns out
     end
     let k = k + 1
   end
+  let tail = own_next_label(instrs)
+  let tested = false
   let i = 0
   while i < list_len(instrs) do
     let ins = instrs[i]
     let op = ins[0]
     if own_produces(op) then
+      let caught = false
+      if i + 1 < list_len(instrs) then
+        let caught = instrs[i + 1][0] == "caught"
+      end
       let d = ins[1]
       # the result goes straight to a temporary nothing else can be holding
       let t = d
@@ -85,6 +100,10 @@ make a function called own_function takes func returns out
       end
       if (op != "call") and (op != "callv") then
         own_release_operand_temps(res, vars, own_operands(ins), d)
+      end
+      if own_may_unwind(op) and (not caught) then
+        vec_push(res, ["unwound", d, tail])
+        let tested = true
       end
       if (not v2_contains(vars, d)) and (not vec_get(read, d)) then
         vec_push(res, ["release", d])
@@ -117,13 +136,110 @@ make a function called own_function takes func returns out
         let k = k + 1
       end
       vec_push(res, ins)
+    elif op == "caught" then
+      # its call is the one before, and was not tested
+      let skip = true
     else
       vec_push(res, ins)
     end
     let i = i + 1
   end
-  let out = ir_fn(ir_fn_name(func), nparams, vec_get(counter, 0), vec_to_list(res), vars)
+  let body = vec_to_list(res)
+  let total = vec_get(counter, 0)
+  if tested then
+    let body = own_with_tail(body, nparams, total, held, tail)
+  end
+  let out = ir_fn(ir_fn_name(func), nparams, total, body, vars)
   ensure ir_well_formed(out, true)
+  return out
+end
+
+# Whether slot k is held: the slots the stage adds are temporaries.
+make a function called own_held_at takes held, k returns yes
+  return (k < vec_len(held)) and vec_get(held, k)
+end
+
+# The instructions that may run program code, and so may give the mark.
+make a function called own_may_unwind takes op returns yes
+  return (op == "call") or (op == "callv") or (op == "op") or (op == "un") or (op == "list") or (op == "closure")
+end
+
+# A label number no instruction of the function uses.
+make a function called own_next_label takes instrs returns n
+  let n = 0
+  let i = 0
+  while i < list_len(instrs) do
+    if (instrs[i][0] == "label") and (instrs[i][1] >= n) then
+      let n = instrs[i][1] + 1
+    end
+    let i = i + 1
+  end
+  ensure n >= 0
+  return n
+end
+
+# The body with its unwind tail: the temporaries holding a value at some test
+# (besides the one tested) cleared at the start, as the held slots are; then,
+# at the end, the tail releasing all of them and returning the mark. In the
+# order the instructions are written a temporary holds a value from the
+# instruction writing it to the one clearing it or moving it out: within a
+# statement, which is where a temporary lives.
+make a function called own_with_tail takes body, nparams, nslots, held, tail returns out
+  require (nslots >= nparams) and (tail >= 0)
+  let holding = vec_new()
+  let kept = vec_new()
+  let k = 0
+  while k < nslots do
+    vec_push(holding, false)
+    vec_push(kept, false)
+    let k = k + 1
+  end
+  let i = 0
+  while i < list_len(body) do
+    let ins = body[i]
+    let op = ins[0]
+    if op == "unwound" then
+      let k = nparams
+      while k < nslots do
+        if vec_get(holding, k) and (k != ins[1]) then
+          vec_set(kept, k, true)
+        end
+        let k = k + 1
+      end
+    elif op == "clear" then
+      vec_set(holding, ins[1], false)
+    elif op == "move" then
+      vec_set(holding, ins[1], true)
+      vec_set(holding, ins[2], false)
+    elif own_produces(op) or (op == "copy") then
+      vec_set(holding, ins[1], true)
+    end
+    let i = i + 1
+  end
+  let res = vec_new()
+  let k = nparams
+  while k < nslots do
+    if vec_get(kept, k) and (not own_held_at(held, k)) then
+      vec_push(res, ["clear", k])
+    end
+    let k = k + 1
+  end
+  let i = 0
+  while i < list_len(body) do
+    vec_push(res, body[i])
+    let i = i + 1
+  end
+  vec_push(res, ["label", tail])
+  let k = nparams
+  while k < nslots do
+    if own_held_at(held, k) or vec_get(kept, k) then
+      vec_push(res, ["release", k])
+    end
+    let k = k + 1
+  end
+  vec_push(res, ["unwind"])
+  let out = vec_to_list(res)
+  ensure list_len(out) >= list_len(body) + 2
   return out
 end
 

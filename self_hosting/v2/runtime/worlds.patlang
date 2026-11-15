@@ -18,9 +18,8 @@
 #   4480 what the world printed, a string builder (unit in the program's world)
 #   4496 the steps left, -1 for no budget   4504 the budget given
 #   4512 the code the world stopped with   4520 the job of the fiber world_call
-#   runs it on, 0 when no call is running   4528 the context of the thread that
-#   call runs on   4536, 4544 the output's ticket lock   4552 1 once a stop has
-#   ended the call
+#   runs it on, 0 when no call is running   4536, 4544 the output's ticket lock
+#   4552 1 once a stop has ended the call
 #
 # What belongs to the engine and not to any world stays in runtime_state():
 # fibers' jobs (4112), the counter for renaming a rule's variables (4288),
@@ -31,7 +30,26 @@
 # A thread context holds, at 2680, the base of the world its code runs in, 0
 # for the program's own; a fiber's job holds the base of the world it was made
 # in at 264 (fibers.patlang), and fiber_resume swaps it in.
+#
+# A stop inside a world_call returns the unwinding mark, a value of type word
+# 16, which no value has (docs/spec/values-and-memory.md 2.2). Each call that
+# gets it releases what its frame holds and returns it in turn (own.patlang),
+# up to a call written caught(...): world_call's, a fiber's first function's
+# (fibers.patlang) and a thread's (threads.patlang). Making the mark is such
+# a call too.
 quiet_operators()
+
+make a function called rt_unwinding_mark returns m
+  let m = value_make(16, 0)
+  ensure value_class(m) == 16
+  return m
+end
+
+make a function called rt_is_unwinding takes v returns yes
+  let yes = value_class(v) == 16
+  ensure value_class(yes) == 1
+  return yes
+end
 
 # The program's world's slots, and the engine's, set once at start.
 make a function called rt_worlds_init returns r
@@ -42,7 +60,6 @@ make a function called rt_worlds_init returns r
   mem_store(st, 4504, 0)
   mem_store(st, 4512, 0)
   mem_store(st, 4520, 0)
-  mem_store(st, 4528, 0)
   mem_store(st, 4536, 0)
   mem_store(st, 4544, 0)
   mem_store(st, 4552, 0)
@@ -153,7 +170,6 @@ make a function called rt_world_state_init takes by_name returns r
   mem_store(b, 4504, 0)
   mem_store(b, 4512, 0)
   mem_store(b, 4520, 0)
-  mem_store(b, 4528, 0)
   mem_store(b, 4536, 0)
   mem_store(b, 4544, 0)
   mem_store(b, 4552, 0)
@@ -247,7 +263,9 @@ make a function called rt_world_check_threads takes b, id returns r
   return r
 end
 
-# The world's fibers that have not finished are given back with it.
+# The world's fibers that have not finished are given back with it: one that
+# has been resumed is paused in fiber_yield, and resumed with the unwinding
+# mark, which unwinds it and so finishes it; one never resumed has no frames.
 make a function called rt_world_end_fibers takes b returns r
   require b != 0
   rt_jobs_lock()
@@ -257,7 +275,11 @@ make a function called rt_world_end_fibers takes b returns r
   while k < list_len(jobs) do
     let job = jobs[k][1]
     if (mem_load(job, 64) == 0) and (mem_load(job, 264) == b) then
-      rt_fiber_abandon(jobs[k][0])
+      if mem_load(job, 80) != 0 then
+        caught(fiber_resume(jobs[k][0], caught(rt_unwinding_mark())))
+      else
+        rt_fiber_abandon(jobs[k][0])
+      end
     end
     let k = k + 1
   end
@@ -282,13 +304,13 @@ make a function called world_call takes id, f returns result
   let fid = rt_fiber_start(|resumed| { return f() })
   mem_store(ctx, 2680, saved)
   mem_store(b, 4520, rt_fiber_job(fid))
-  mem_store(b, 4528, ctx)
   mem_store(b, 4552, 0)
-  let value = fiber_resume(fid, value_make(0, 0))
+  # a stop unwinds the call's fiber to its start, which finishes it, and the
+  # mark comes back here; a stop on a thread the call started ends that thread
+  # alone, and the call ends when f returns
+  let value = caught(fiber_resume(fid, value_make(0, 0)))
   mem_store(b, 4520, 0)
-  mem_store(b, 4528, 0)
   if mem_load(b, 4552) == 1 then
-    rt_world_end_stopped(fid)
     let result = ["stopped", mem_load(b, 4512)]
     ensure list_len(result) == 2
     return result
@@ -298,77 +320,27 @@ make a function called world_call takes id, f returns result
   return result
 end
 
-# After a stop: the fibers the stop left part-way through, the call's own and
-# every fiber between it and the one that stopped, are never resumed again.
-make a function called rt_world_end_stopped takes fid returns r
-  require value_class(fid) == 2
-  if fiber_alive(fid) then
-    rt_fiber_abandon(fid)
-  end
-  rt_jobs_lock()
-  let jobs = rt_engine_get(4112)
-  rt_jobs_unlock()
-  let k = 0
-  while k < list_len(jobs) do
-    let job = jobs[k][1]
-    if (mem_load(job, 64) == 0) and (mem_load(job, 88) == 2) then
-      rt_fiber_abandon(jobs[k][0])
-    end
-    let k = k + 1
-  end
-  let r = 0
-  ensure r == 0
-  return r
-end
-
-# A stop: inside a world_call, it ends the call. Gives back only when the code
-# runs in no world_call, and the program then stops.
+# A stop: inside a world_call, on the call's own thread or on one it started,
+# it records the code and gives the unwinding mark, and the caller unwinds.
+# Elsewhere it gives 0, and the program then stops (core.patlang, rt_stop).
 make a function called rt_world_stop takes code returns r
   require value_class(code) == 2
   let r = 0
-  let st = runtime_state()
-  if mem_load(st, 4584) != 0 then
-    let ctx = rt_context()
-    let b = mem_load(ctx, 2680)
+  if mem_load(runtime_state(), 4584) != 0 then
+    let b = mem_load(rt_context(), 2680)
     if b != 0 then
-      let root = mem_load(b, 4520)
-      if root != 0 then
-        mem_store(b, 4512, code)
-        mem_store(b, 4552, 1)
-        if ctx != mem_load(b, 4528) then
-          # a thread started in the world: it ends here
-          extern_call("KERNEL32.DLL", "ExitThread", code)
+      if mem_load(b, 4520) != 0 then
+        # the first stop's code is the call's
+        if mem_load(b, 4552) == 0 then
+          mem_store(b, 4512, code)
+          mem_store(b, 4552, 1)
         end
-        # the fibers between this one and the call's own are left part-way
-        let job = mem_load(ctx, 2592)
-        while (job != 0) and (job != root) do
-          mem_store(job, 88, 2)
-          let job = rt_job_by_handle(mem_load(job, 80))
-        end
-        extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(root, 80))
+        let r = caught(rt_unwinding_mark())
       end
     end
   end
-  ensure r == 0
+  ensure (value_class(r) == 2) or rt_is_unwinding(r)
   return r
-end
-
-# The job of the fiber with this handle, 0 for none (a thread's own fiber).
-make a function called rt_job_by_handle takes h returns job
-  rt_jobs_lock()
-  let jobs = rt_engine_get(4112)
-  rt_jobs_unlock()
-  let job = 0
-  let k = 0
-  while k < list_len(jobs) do
-    let j = jobs[k][1]
-    if (mem_load(j, 64) == 0) and (mem_load(j, 72) == h) then
-      let job = j
-    end
-    let k = k + 1
-  end
-  ensure value_class(job) == 2
-  return job
 end
 
 # ---- what a world printed ----

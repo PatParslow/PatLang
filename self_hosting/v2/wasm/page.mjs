@@ -1,5 +1,7 @@
 // The browser page: runs ?wasm=URL (default program.wasm) with ?args=[JSON],
-// shows its output, and with ?report posts {code, out} to /result.
+// shows its output, and with ?report posts {code, out} to /result. ?files=URL
+// names a bundle of files the program may read: JSON mapping each path to its
+// bytes in base64 (run_browser.py, bundle).
 
 import { run } from "./launcher.mjs";
 
@@ -28,11 +30,22 @@ try {
   }
   const response = await fetch(q.get("wasm") || "program.wasm");
   const bytes = new Uint8Array(await response.arrayBuffer());
+  const files = {};
+  if (q.has("files")) {
+    const listed = await (await fetch(q.get("files"))).json();
+    for (const [path, b64] of Object.entries(listed)) {
+      const raw = atob(b64);
+      const data = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
+      files[path] = data;
+    }
+  }
   status.textContent = "Running…";
   const executor = new URL("./executor.mjs", import.meta.url);
   const code = await run({
     bytes,
     args: JSON.parse(q.get("args") || "[]"),
+    files,
     name: "program",
     newWorker() {
       const w = new Worker(executor, { type: "module" });

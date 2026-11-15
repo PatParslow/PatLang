@@ -711,6 +711,14 @@ class FnGen:
                 c.alu("test", RAX, RAX)
                 c.jcc(JZ, label(ins[3]))
                 c.jmp(label(ins[2]))
+            elif op == "unwound":              # the unwinding mark: type word 16
+                self.load_t(RAX, ins[1])
+                c.alu_imm("cmp", RAX, 16)
+                c.jcc(JZ, label(ins[2]))
+            elif op == "unwind":
+                c.mov_imm(RAX, 16)
+                c.mov_imm(RDX, 0)
+                c.emit(0xC9, 0xC3)            # leave; ret
             elif op == "return":
                 self.load_t(RAX, ins[1])
                 self.load_d(RDX, ins[1])

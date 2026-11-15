@@ -123,6 +123,24 @@ Made by the project owner on 2026-11-05:
      `queue_signals_vfs_selftest` 28/28 under block-model and the interpreter alike,
      `isolate_selftest` 65/65 compiled and interpreted, `interp_run_selftest` 54/54
      compiled and interpreted.
+
+     Follow-ups, 2026-11-15:
+     - A stop in a world unwinds ([#257](https://github.com/PatParslow/PatLang/issues/257)).
+       It returns a reserved mark, and each compiled frame and interpreter frame releases what
+       it holds and passes the mark up to `world_call`. Threads it ends finish, so
+       `thread_poll` gives true, and fibers left paused when a world is freed unwind too. 2000
+       stops in a world, against 200, use 5 MB compiled and 15 MB interpreted at both counts,
+       where before the change they grew from 16 MB to 119 MB. The compiler is 9.6% larger
+       (18.3 to 20.0 MB) and builds itself in the same time.
+     - The WASM host takes a read-only file bundle
+       ([#258](https://github.com/PatParslow/PatLang/issues/258)): `run_node.mjs --files DIR`,
+       the page's `?files=`, `run_browser.py --files DIR`. A program's text with an include
+       runs in a world in headless Chrome and prints what the native build prints.
+     - The full gates passed after these: fixpoint, bootstrap and WASM identical; part1 179/179
+       on both engines; engines agree 62/62; part2 119/120, the one failure a check whose
+       list of IR instruction names lacked the three new ones (fixed, and its feature re-run
+       9/9); the language suite 297/297 on both; match 26/26; block-model 210/210;
+       `interp_run_selftest` 54/54; `isolate_selftest` 65/65.
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical. Done, and

@@ -102,6 +102,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When v2 builds it natively and as a WebAssembly module
     Then both print the line and stop at the call with host fn 'no_such_fn' not found
 
+  Scenario: a program's text runs in a world in a browser, reading the files the page was given (spec 1.15, 2.6)
+    Given a program's text with an include, run in a world by interp_run's world backend, and the runtime's files and the library given to the page as its files
+    When v2 builds it natively and as a WebAssembly module, and a headless browser runs the module
+    Then the browser prints what v2's own build prints: the program's output from the world, and a stop in the second run
+
   Scenario: slots never live at the same time share a WebAssembly local (spec 2.6)
     Given two programs whose top level runs 100 and 1000 statements, each making temporaries and dropping them
     When v2 builds each as a WebAssembly module
