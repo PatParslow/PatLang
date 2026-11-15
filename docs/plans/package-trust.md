@@ -1,7 +1,10 @@
 # Package trust
 
-How a program that installs a PatLang package decides to trust it. This is a plan: nothing below
-is built beyond the content hashes in each manifest (`packages/README.md`). It applies the
+How a program that installs a PatLang package decides to trust it. T0 and T1 are built: the
+content hashes in each manifest (`packages/README.md`), and the records and every check of a
+release against its group's log, in `packages/trust/`. Phase W is built too: Ed25519 and X25519
+written in PatLang, which `self_hosting/v2/examples/trust_attacks.patlang` passes to those checks.
+T2 to T7 are still a plan ("Phases" below gives each one's state). It applies the
 ensemble design for PatLang networking (`docs/plans/ensemble-membership.md`), so packages and
 networking share one trust model, as the project owner decided on 2026-11-08. The package manager
 it belongs to is planned in `docs/plans/package-manager.md`.

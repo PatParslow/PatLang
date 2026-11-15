@@ -21,7 +21,7 @@ must not take time from it before then.
 
 ## Built so far
 
-As of 2026-11-08 (commit 683621c):
+As of 2026-11-15:
 
 - the layout: `packages/<name>/` with `manifest.pkg`, includes, `spec/` and an ignored `build/`;
 - the manifest format: `package`, `version`, `summary`, `entry`, `include`, `depends`, `file`
@@ -31,10 +31,13 @@ As of 2026-11-08 (commit 683621c):
 - `packages/tools/verify_manifest.patlang`, which checks every `file` hash (10 ok);
 - feature files may be UTF-8: `gherkin.patlang` reads them as characters (fixed 2026-11-08; all v2
   gates pass with it);
-- P1, the resolver, in `packages/resolve/` (2026-11-08, not yet committed): 35 scenarios, 127 checks
-  passing, checked against a Python oracle that resolves without logic programming. It is slow
-  until v2's logic engine is fixed ([#252](https://github.com/PatParslow/PatLang/issues/252)): a
-  200-package universe takes about 31 s.
+- P1, the resolver, in `packages/resolve/` (2026-11-08, commit b481bd3): 35 scenarios, 127 checks
+  passing, checked against a Python oracle that resolves without logic programming. A 200-package
+  universe took about 31 s before v2's logic engine was reworked
+  ([#252](https://github.com/PatParslow/PatLang/issues/252)). On 2026-11-15, `spec/bench.patlang`
+  over generated universes of 50, 100, 200 and 400 packages took 0.75, 1.7, 4.9 and 13.1 s. That
+  is still more than linear, at 2.2 to 3 times per doubling, and reading the manifests grows
+  fastest (0.24, 0.59, 1.5 and 4.5 s), so the reader is the next thing to profile.
 
 ## Resolution
 
