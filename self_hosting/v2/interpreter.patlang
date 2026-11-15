@@ -840,14 +840,126 @@ end
 # messages] when it does not compile, as the interpreter's command line
 # reports it.
 make a function called iv_compile takes rt, path, text returns result
+  return iv_compile_traced(rt, path, text, false)
+end
+
+# iv_compile, the program lowered to report each step to a trace when trace
+# is true (lower.patlang, lw_program_traced); iv_world_trace runs it.
+make a function called iv_compile_traced takes rt, path, text, trace returns result
   require (list_len(rt) == 2) and (type_of(path) == "string") and (type_of(text) == "string")
-  let lowered = v2_front_end_text(rt, path, text)
+  let lowered = v2_front_end_text_traced(rt, path, text, trace)
   if lowered[0] == "error" then
     let result = lowered
     ensure list_len(result) == 2
     return result
   end
   let result = ["ok", [lowered[1][0], lowered[1][3]]]
+  ensure list_len(result) == 2
+  return result
+end
+
+# ---- a trace of a run ----
+#
+# A program lowered with a trace calls __trace_step at each statement with a
+# line, and __trace_enter and __trace_leave around each function's body. The
+# table of a traced run gives those names closures that record into a trace:
+# [the steps, the names of the calls the code is inside, [how many of those
+# names are current, how many steps went unrecorded], the most steps kept].
+# A step is [function, line, [[name, value as text], ...], the calls]. The
+# trace is the run's, not a thread's: steps from threads the program starts
+# go into the same lists, unordered between threads.
+make a function called iv_trace_new takes cap returns trace
+  require (type_of(cap) == "int") and (cap > 0)
+  let counts = vec_new()
+  vec_push(counts, 0)
+  vec_push(counts, 0)
+  let trace = [vec_new(), vec_new(), counts, cap]
+  ensure list_len(trace) == 4
+  return trace
+end
+
+# A value as a trace shows it: a string quoted, anything else as it prints,
+# cut short past 120 characters.
+make a function called iv_trace_text takes v returns text
+  let text = ""
+  if type_of(v) == "string" then
+    let text = chr(34) + v + chr(34)
+  else
+    let text = "" + v
+  end
+  if text.length > 120 then
+    let text = substr(text, 0, 117) + "..."
+  end
+  return text
+end
+
+make a function called iv_trace_record takes trace, line, fname, names, values returns done
+  let counts = trace[2]
+  if vec_len(trace[0]) >= trace[3] then
+    vec_set(counts, 1, vec_get(counts, 1) + 1)
+    return false
+  end
+  let locals = []
+  let i = 0
+  while i < list_len(names) do
+    let locals = list_push(locals, [names[i], iv_trace_text(values[i])])
+    let i = i + 1
+  end
+  let calls = []
+  let i = 0
+  while i < vec_get(counts, 0) do
+    let calls = list_push(calls, vec_get(trace[1], i))
+    let i = i + 1
+  end
+  vec_push(trace[0], [fname, line, locals, calls])
+  return true
+end
+
+make a function called iv_trace_enter takes trace, fname returns done
+  let counts = trace[2]
+  let depth = vec_get(counts, 0)
+  if depth < vec_len(trace[1]) then
+    vec_set(trace[1], depth, fname)
+  else
+    vec_push(trace[1], fname)
+  end
+  vec_set(counts, 0, depth + 1)
+  return true
+end
+
+make a function called iv_trace_leave takes trace returns done
+  let counts = trace[2]
+  if vec_get(counts, 0) > 0 then
+    vec_set(counts, 0, vec_get(counts, 0) - 1)
+  end
+  return true
+end
+
+# The closures a traced run's calls of __trace_step, __trace_enter and
+# __trace_leave reach, as [name, closure] pairs.
+make a function called iv_trace_functions takes trace returns pairs
+  let step = |line, fname, names, values| { return iv_trace_record(trace, line, fname, names, values) }
+  let enter = |fname| { return iv_trace_enter(trace, fname) }
+  let leave = || { return iv_trace_leave(trace) }
+  return [["__trace_step", step], ["__trace_enter", enter], ["__trace_leave", leave]]
+end
+
+# The steps recorded, and whether every step was.
+make a function called iv_trace_steps takes trace returns steps
+  return vec_to_list(trace[0])
+end
+
+make a function called iv_trace_complete takes trace returns yes
+  return vec_get(trace[2], 1) == 0
+end
+
+# A program iv_compile_traced lowered with a trace, run in world w into trace:
+# what world_call gives.
+make a function called iv_world_trace takes w, program, trace returns result
+  require (type_of(w) == "int") and (list_len(program) == 2) and (list_len(trace) == 4)
+  let table = iv_table(program[0], program[1])
+  let table = list_set(table, 1024, v2_concat(table[1024], iv_trace_functions(trace)))
+  let result = world_call(w, || { return iv_run(table, iv_find(table, "__main"), []) })
   ensure list_len(result) == 2
   return result
 end

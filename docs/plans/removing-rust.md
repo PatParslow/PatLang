@@ -141,10 +141,22 @@ Made by the project owner on 2026-11-05:
        list of IR instruction names lacked the three new ones (fixed, and its feature re-run
        9/9); the language suite 297/297 on both; match 26/26; block-model 210/210;
        `interp_run_selftest` 54/54; `isolate_selftest` 65/65.
+     - The portfolio's playground, REPL, IDE and dynamic-syntax demo run on v2
+       ([#259](https://github.com/PatParslow/PatLang/issues/259)): the playground program is
+       `interp_run`'s world backend, built for the browser by v2, and the pages give it the
+       runtime's files. The IDE's debugger steps through a trace the v2 interpreter records
+       ([#260](https://github.com/PatParslow/PatLang/issues/260)): the lowering, asked to,
+       calls a trace function before each statement and on each call and return, with the
+       line, the function and its locals. The portfolio built on v2 with all 38 pages clean.
+     - The gates run what has changed, in parallel within what the machine can spare
+       ([#261](https://github.com/PatParslow/PatLang/issues/261), `docs/plans/gates.md`).
+       `gates.sh` builds the first compiler from the IR when there is none, then the gates tool,
+       and runs it. With nothing fresh, every suite passed in 2 h 36 min, against 4 h 52 min
+       one after another, with the counts above (part2 136 with this session's scenarios).
 3. **Specify the IR and write the first reader**
    ([#247](https://github.com/PatParslow/PatLang/issues/247)). The reader builds the compiler from
    the IR, that compiler builds itself, and the generations must be byte identical. Done, and
-   the issue was closed on 2026-11-14; `gates.sh` checks the chain on every run.
+   the issue was closed on 2026-11-14; the gates check the chain whenever the compiler's sources or the reader change.
 
    Progress, 2026-11-07:
    - The IR is specified in `docs/spec/ir.md`, and `compile.patlang ... --ir` writes it. The
@@ -154,7 +166,7 @@ Made by the project owner on 2026-11-05:
    - That compiler built the compiler with `--no-cache` in 6 minutes. Its build is byte identical
      to v2's own build of the compiler, and to the build it then made of itself.
    - `gates.sh` builds its first `v2.exe` this way, from `bootstrap/v2_compiler.ir`, and checks the
-     chain on every run. Since 2026-11-14 no step of any suite starts `pat`.
+     chain whenever its inputs change. Since 2026-11-14 no step of any suite starts `pat`.
    - The `compiler_structure.feature` scenario builds a program reaching every kind of
      instruction from its IR, and checks that it gives the same output as v2's own build.
 4. **Build the browser WASM backend and host**

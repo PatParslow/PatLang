@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +101,7 @@ def main(argv):
         print("run_browser: no Chrome found; set CHROME")
         return 2
     server, result, got = serve(os.path.abspath(argv[1]), bundle(dirs) if dirs else None)
-    query = "report&args=" + json.dumps(argv[2:]).replace(" ", "%20")
+    query = "report&args=" + urllib.parse.quote(json.dumps(argv[2:]))
     if dirs:
         query += "&files=files.json"
     url = "http://127.0.0.1:%d/index.html?%s" % (server.server_address[1], query)

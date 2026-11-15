@@ -6,8 +6,11 @@
 //   V2_LAUNCHER  a function giving the launcher's run(), with the layout
 //   V2_EXECUTOR_SRC  the executor's source, with the layout, as one module
 //
-// and the page's own `const WASMS = { id: base64 module, ... }`. The executor
-// starts as a Worker from a Blob, so a page needs no file beside it.
+// and the page's own `const WASMS = { id: base64 module, ... }`, and, on a
+// page whose programs read files, `const FILES = { path: base64 bytes, ... }`
+// (the playground's driver reads the runtime's declarations; docs/spec/ir.md,
+// "Files"). The executor starts as a Worker from a Blob, so a page needs no
+// file beside it.
 //
 // v2's modules share their memory between threads, which needs
 // SharedArrayBuffer, which a browser gives only to a cross-origin isolated
@@ -39,6 +42,17 @@ function b64bytes(s) {
 })();
 
 const MODCACHE = {};
+let PAGE_FILES = null;
+
+// The page's FILES as bytes, decoded once.
+function pageFiles() {
+  if (PAGE_FILES) return PAGE_FILES;
+  PAGE_FILES = {};
+  if (typeof FILES !== 'undefined') {
+    for (const path of Object.keys(FILES)) PAGE_FILES[path] = b64bytes(FILES[path]);
+  }
+  return PAGE_FILES;
+}
 const v2Run = V2_LAUNCHER();
 let V2_EXECUTOR_URL = null;
 
@@ -66,6 +80,7 @@ async function runWasmText(wasmId, args, onText) {
   const code = await v2Run({
     bytes: MODCACHE[wasmId],
     args: (args || []).map(String),
+    files: pageFiles(),
     name: wasmId,
     newWorker: v2NewWorker,
     onOutput(b) {

@@ -1,48 +1,38 @@
-# Playground driver (concatenate after lib/lexer + lib/parser + lib/lower +
-# lib/regex_dsl + lib/syntax_dsl + lib/json + lib/interp). Takes PatLang
-# source as its first argument, and an optional mode as its second ("run"
-# default, "tokens", "ast", or "debug"), so the same in-browser wasm module
-# that runs code can also show the compiler's own intermediate
-# representations - no rustc needed either way, so this works compiled to
-# WASM in the browser (the PatLang IDE page uses this for its inspector
-# tabs and its debugger).
+# The portfolio's playground driver: the playground, REPL, IDE and coverage
+# pages run it, built by v2 as WebAssembly. It takes PatLang source as its
+# first argument and a mode as its second:
 #
-# "debug" mode runs through lib/interp.patlang's dbg_trace_json instead of
-# the native run_ir host call every other mode uses -- only the
-# self-hosted meta-circular interpreter supports the fiber-based pause/
-# step machinery dbg_trace needs; run_ir just runs straight to completion
-# with no way to inspect state along the way. It returns a full captured
-# execution trace as one JSON string (see interp.patlang's dbg_trace/
-# dbg_trace_json comments for why this is a replay, not a live
-# click-driven session: this site's WASM calling convention is one-shot
-# per call, with no persistent-instance or blocking-stdin bridge to drive
-# genuine interactive stepping across separate calls).
+#   run     (the default) compiles the source with v2's front end and runs it
+#           on the v2 interpreter in a world of its own (lib/interp_run.patlang's
+#           world backend, docs/spec/values-and-memory.md 1.15), printing what
+#           the program prints. A program that does not compile, or stops,
+#           prints why, and the driver exits with 1.
+#   tokens  the lexer's tokens, one a line: kind, text, line
+#   ast     the parser's syntax tree, one top-level statement a line
+#   debug   runs the program as run does, recording a trace of it, and prints
+#           one line of JSON: {"ok": whether every step was kept (the first
+#           2000 are), "trace": [{"fname", "line", "locals": {name: value as
+#           text}, "call_stack": [the functions the step is inside]}, ...],
+#           "final_ok": whether the program compiled and ran to its end,
+#           "output": what it printed}. A step is a statement the parser
+#           gave a line: a let, an expression, a return, a contract or a
+#           field assignment. The IDE's debugger steps through it.
 #
-# Source is first passed through expand_syntax_dsls, so user-defined
-# `syntax NAME { ... }` DSL blocks (and their triggered `<keyword> { ... }`
-# usage blocks) are expanded to plain PatLang before tokenizing/parsing -
-# matching what compile_native/compile_both do for the native + wasm
-# Portfolio builds (see self_hosting/tools/build_portfolio.patlang). A
-# source with no `syntax { ... }` blocks passes through unchanged.
+# In a browser the front end reads the runtime's declarations from the files
+# the page was given (self_hosting/v2/runtime, docs/spec/ir.md, "Files").
 #
-# Error detection below renders each top-level statement with ast_to_str
-# (which has an explicit "Err(message)" case and recurses into every
-# statement/expression shape it knows) and scans for that marker, rather
-# than only checking whether the top-level statement node ITSELF is an
-# Err -- a top-level Let/If/etc whose Err is nested in its own value/
-# condition (e.g. `let z = (((`) is a real Err the parser produced, just
-# not sitting at the very top of that statement's node. Found and fixed
-# 2026-07-13 while building the live REPL (self_hosting/tools/repl.patlang,
-# build_portfolio.patlang's repl_page): a nested Err going undetected here
-# meant the REPL's browser side silently treated a broken entry as
-# successful and persisted it into its session buffer.
+# Source is first passed through expand_syntax_dsls for the tokens and ast
+# modes, so `syntax NAME { ... }` blocks show expanded, as the compiler sees
+# them; the run mode's compile expands them itself.
+include "../lib/interp_run.patlang"
+include "../lib/json.patlang"
 
+# The position of the first "Err(" in s, or -1. s is one statement's syntax
+# tree written out, so it is short.
 make a function called pg_find_err_marker takes s returns idx
-  let n = s.length
-  let needle_len = 4
   let i = 0
-  while i <= n - needle_len do
-    if substr(s, i, needle_len) == "Err(" then
+  while i <= s.length - 4 do
+    if substr(s, i, 4) == "Err(" then
       return i
     end
     let i = i + 1
@@ -50,65 +40,135 @@ make a function called pg_find_err_marker takes s returns idx
   return -1
 end
 
-let args = argv()
-let src = ""
-if args.length >= 1 then
-  let src = args[0]
-end
-let mode = "run"
-if args.length >= 2 then
-  let mode = args[1]
+# The parse errors in the program's statements, one line each, and how many.
+make a function called pg_parse_errors takes stmts returns result
+  let b = sb_new()
+  let n = 0
+  let i = 0
+  while i < list_len(stmts) do
+    let rendered = ast_to_str(stmts[i])
+    let at = pg_find_err_marker(rendered)
+    if at >= 0 then
+      sb_push(b, "parse error: " + substr(rendered, at + 4, rendered.length - at - 4) + chr(10))
+      let n = n + 1
+    end
+    let i = i + 1
+  end
+  return [sb_str(b), n]
 end
 
-if src == "" then
-  print("[playground] usage: playground <source> [run|tokens|ast]")
-else
-  let src = expand_syntax_dsls(src)
-  let toks = tokenize(src)
-  if mode == "tokens" then
-    let n = vec_len(toks)
-    let i = 0
-    while i < n do
-      let t = vec_get(toks, i)
-      print(t[0] + chr(9) + t[1] + chr(9) + "line " + t[2])
-      let i = i + 1
-    end
+# Prints text that already ends in a newline, if it is not empty.
+make a function called pg_print_text takes text returns done
+  if text.length == 0 then return true end
+  if char_code(text, text.length - 1) == 10 then
+    print(substr(text, 0, text.length - 1))
   else
-    let ast = parse_program(toks)
-    let stmts = ast[1]
-    let i = 0
-    let errs = 0
-    while i < stmts.length do
-      let s = stmts[i]
-      let rendered = ast_to_str(s)
-      let err_at = pg_find_err_marker(rendered)
-      if err_at >= 0 then
-        print("parse error: " + substr(rendered, err_at + 4, rendered.length - err_at - 4))
-        let errs = errs + 1
-      end
-      let i = i + 1
-    end
-    if mode == "ast" then
-      let i = 0
-      while i < stmts.length do
-        print(ast_to_str(stmts[i]))
-        let i = i + 1
-      end
-    else
-      if mode == "debug" then
-        if errs == 0 then
-          print(dbg_trace_json(src, 2000))
-        end
-      else
-        if errs == 0 then
-          let ir = lower_program(ast)
-          # lib/interp.patlang's interpreter runs the lowered program
-          let result = interpret_ir(ir)
-          if result[0] == "Err" then
-            print("error: " + result[1])
-          end
-        end
-      end
-    end
+    print(text)
   end
+  return true
 end
+
+make a function called pg_tokens takes src returns done
+  let toks = tokenize(expand_syntax_dsls(src))
+  let i = 0
+  while i < vec_len(toks) do
+    let t = vec_get(toks, i)
+    print(t[0] + chr(9) + t[1] + chr(9) + "line " + t[2])
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called pg_ast takes src returns done
+  let stmts = parse_program(tokenize(expand_syntax_dsls(src)))[1]
+  pg_print_text(pg_parse_errors(stmts)[0])
+  let i = 0
+  while i < list_len(stmts) do
+    print(ast_to_str(stmts[i]))
+    let i = i + 1
+  end
+  return true
+end
+
+# Runs the program; true when it compiled and ran to its end.
+make a function called pg_run takes ctx, src returns ok
+  let r = interp_run(ctx, src, [["backend", "world"], ["name", "playground"]])
+  pg_print_text(r[0])
+  return r[2]
+end
+
+# A list of strings as JSON.
+make a function called pg_json_strings takes items returns json
+  let b = sb_new()
+  sb_push(b, "[")
+  let i = 0
+  while i < list_len(items) do
+    if i > 0 then sb_push(b, ",") end
+    sb_push(b, json_quote(items[i]))
+    let i = i + 1
+  end
+  sb_push(b, "]")
+  return sb_str(b)
+end
+
+make a function called pg_json_step takes step returns json
+  let b = sb_new()
+  sb_push(b, "{" + json_quote("fname") + ":" + json_quote(step[0]) + "," + json_quote("line") + ":" + step[1] + "," + json_quote("locals") + ":{")
+  let locals = step[2]
+  let i = 0
+  while i < list_len(locals) do
+    if i > 0 then sb_push(b, ",") end
+    sb_push(b, json_quote(locals[i][0]) + ":" + json_quote(locals[i][1]))
+    let i = i + 1
+  end
+  sb_push(b, "}," + json_quote("call_stack") + ":" + pg_json_strings(step[3]) + "}")
+  return sb_str(b)
+end
+
+# Runs the program with a trace; prints the JSON the IDE's debugger reads.
+make a function called pg_debug takes ctx, src returns done
+  let r = interp_run_full(ctx, src, [["backend", "world"], ["name", "playground"], ["trace", 2000]])
+  let steps = []
+  let complete = true
+  if list_len(r[4]) == 2 then
+    let steps = r[4][0]
+    let complete = r[4][1]
+  end
+  let b = sb_new()
+  sb_push(b, "{" + json_quote("ok") + ":" + complete + "," + json_quote("trace") + ":[")
+  let i = 0
+  while i < list_len(steps) do
+    if i > 0 then sb_push(b, ",") end
+    sb_push(b, pg_json_step(steps[i]))
+    let i = i + 1
+  end
+  sb_push(b, "]," + json_quote("final_ok") + ":" + r[2] + "," + json_quote("output") + ":" + json_quote(r[0]) + "}")
+  print(sb_str(b))
+  return true
+end
+
+make a function called pg_main takes ctx, args returns code
+  if list_len(args) < 1 then
+    print("usage: playground <source> [run|tokens|ast|debug]")
+    return 2
+  end
+  let src = args[0]
+  let mode = "run"
+  if list_len(args) >= 2 then let mode = args[1] end
+  if mode == "tokens" then
+    pg_tokens(src)
+  elif mode == "ast" then
+    pg_ast(src)
+  elif mode == "run" then
+    if not pg_run(ctx, src) then return 1 end
+  elif mode == "debug" then
+    pg_debug(ctx, src)
+  else
+    print("playground: no mode " + mode + " (run, tokens, ast or debug)")
+    return 2
+  end
+  return 0
+end
+
+let code = pg_main(context_new(), argv())
+if code != 0 then exit_with(code) end

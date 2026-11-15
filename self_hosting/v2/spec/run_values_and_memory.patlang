@@ -21,12 +21,10 @@ make a function called vm_engine returns e
   return "interp"
 end
 
-# The feature files a run covers: a feature named after the engine runs alone.
+# The feature files the engine's run covers (spec_library/values_and_memory/
+# NAME.feature): engines_agree for both. A feature file's path after the
+# engine on the command line runs alone (run_suite).
 make a function called vm_features returns names
-  let a = argv()
-  if list_len(a) > 1 then
-    return [a[1]]
-  end
   if vm_engine() == "both" then
     return ["engines_agree"]
   end
@@ -43,7 +41,7 @@ end
 
 # The executable the v2 engine builds for a fixture.
 make a function called vm_exe takes name returns path
-  return "self_hosting/build/v2_spec_" + name + ".exe"
+  return spec_out() + "/v2_spec_" + name + ".exe"
 end
 
 # Output with carriage returns dropped and trailing blank lines removed.
@@ -482,8 +480,34 @@ make a function called st_pg_exec_peak takes ctx returns ok
   let b = expect(ctx, "no standard error when it exits 0", contains_text(out, "quiet"), false)
   let c = expect(ctx, "standard output when it fails", contains_text(out, "failed:to out"), true)
   let d = expect(ctx, "standard error when it fails", contains_text(out, "to err"), true)
-  let e = expect(ctx, "a peak above 0 both times", contains_text(out, "false"), false)
+  # the commands' own output has line ends in it, so lines are counted, not numbered
+  let lines = split_lines(out)
+  let trues = 0
+  let falses = 0
+  let i = 0
+  while i < list_len(lines) do
+    if lines[i] == "true" then
+      let trues = trues + 1
+    end
+    if lines[i] == "false" then
+      let falses = falses + 1
+    end
+    let i = i + 1
+  end
+  let e = expect(ctx, "a peak above 0 both times", (trues == 3) and (falses == 0), true)
+  ctx_set(ctx, "pg_exec_peak_out", out)
   return a and b and c and d and e
+end
+
+make a function called st_pg_exec_tree takes ctx returns ok
+  return expect(ctx, "the child's memory in the measured peak, not in the command's own", contains_text(ctx_get(ctx, "pg_exec_peak_out"), "tree:true|true"), true)
+end
+
+make a function called st_pg_exec_measured takes ctx returns ok
+  let out = ctx_get(ctx, "pg_exec_peak_out")
+  let a = expect(ctx, "the two outputs apart, the exit as false, a peak above 0", contains_text(out, "measured:true|true|false|true"), true)
+  let b = expect(ctx, "true for the command that succeeds", contains_text(out, "|true" + nl() + "true" + nl() + "tree:"), true)
+  return a and b
 end
 
 make a function called st_tx_sed takes ctx returns ok
@@ -498,6 +522,10 @@ make a function called st_pg_list_dir_missing takes ctx returns ok
   return vm_expect(ctx, "[], then false, then true", "vi_list_dir_missing", "[]" + nl() + "false" + nl() + "true")
 end
 
+make a function called st_pg_machine_state takes ctx returns ok
+  return vm_expect(ctx, "a processor, times that grow, memory free within the total", "vi_machine_state", "true" + nl() + "true" + nl() + "true" + nl() + "true")
+end
+
 make a function called st_pg_using_unknown_role takes ctx returns ok
   let out = vm_run(ctx, "vi_using_unknown_role")
   let a = expect(ctx, "the error names the unknown role", contains_text(out, "unknown store role 'planner'"), true)
@@ -508,6 +536,10 @@ end
 make a function called st_pg_logic_stores takes ctx returns ok
   let want = ["rule_store", "[x;y]", "[]", "[alice,york]", "[]", "[one;two]", "[two;one]", "[alice,bob;bob,carol]", "[alice,bob;bob,carol]", "[]", "[go]", "true", "[]", "true", "true", "[]"]
   return vm_expect(ctx, "each line of the stores program", "vi_logic_stores", str_join(want, nl()))
+end
+
+make a function called st_pg_plan_scale takes ctx returns ok
+  return vm_expect(ctx, "a plan for ten goals, none for an unreachable one, the cheaper route, and about cubic time", "vi_plan_scale", "true" + nl() + "true" + nl() + "true" + nl() + "true")
 end
 
 make a function called st_pg_logic_scale takes ctx returns ok
@@ -726,9 +758,41 @@ end
 
 # ---- engines_agree.feature (1.7) ----
 
-# A command run in self_hosting/build, a directory other than the repository.
+# A command run in the run's output directory (spec_out), a directory other
+# than the repository's root.
 make a function called vm_in_build_dir takes command returns out
-  return vm_clean(exec_capture("cmd", "/c", "cd /d self_hosting" + chr(92) + "build && " + command))
+  return vm_clean(exec_capture("cmd", "/c", "cd /d " + vm_backslashes(spec_out()) + " && " + command))
+end
+
+make a function called vm_backslashes takes path returns out
+  let b = sb_new()
+  let i = 0
+  while i < path.length do
+    if char_code(path, i) == 47 then
+      sb_push(b, chr(92))
+    else
+      sb_push(b, substr(path, i, 1))
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# The repository's root from the output directory: "..\" for each of its parts.
+make a function called vm_to_root returns path
+  let b = sb_new()
+  sb_push(b, "..")
+  sb_push(b, chr(92))
+  let i = 0
+  let dir = spec_out()
+  while i < dir.length do
+    if char_code(dir, i) == 47 then
+      sb_push(b, "..")
+      sb_push(b, chr(92))
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
 end
 
 make a function called st_ea_anywhere takes ctx returns ok
@@ -737,8 +801,8 @@ make a function called st_ea_anywhere takes ctx returns ok
   let z = expect(ctx, "the fixture and the interpreter build", built, "")
   let dot = "." + chr(92)
   let a = expect(ctx, "v2, started elsewhere", vm_in_build_dir(dot + "v2_spec_vi_anywhere.exe"), wanted)
-  let up = ".." + chr(92) + "v2" + chr(92) + "spec" + chr(92) + "fixtures" + chr(92) + "vi_anywhere.patlang"
-  let b = expect(ctx, "the interpreter, started elsewhere", vm_in_build_dir(dot + "v2_interp.exe " + up), wanted)
+  let up = vm_to_root() + vm_backslashes(vm_fixture("vi_anywhere"))
+  let b = expect(ctx, "the interpreter, started elsewhere", vm_in_build_dir(vm_to_root() + vm_backslashes(v2_interpreter()) + " " + up), wanted)
   return z and a and b
 end
 
@@ -991,19 +1055,25 @@ make a function called register_values_and_memory_steps takes ctx returns done
   vm_noops(ctx, ["a program that writes unit, and binds unit as a parameter and as a variable", "it runs"])
   step(ctx, "unit is the value a function with no statements gives, and a bound unit is the program's own", "st_pg_unit")
   step(ctx, "it gives both", "st_pg_exec_stderr")
-  vm_noops(ctx, ["a command that writes to both outputs, once exiting 0 and once exiting 3", "exec_peak_memory runs each"])
+  vm_noops(ctx, ["a command that writes to both outputs, once exiting 0 and once exiting 3", "exec_peak_memory runs each, and exec_measured the second, a command that succeeds, and a command whose child commits several hundred MB"])
+  step(ctx, "exec_measured gives the two outputs apart, false then true for the exits, and a peak above 0", "st_pg_exec_measured")
+  step(ctx, "exec_measured's peak counts the child's memory, where exec_peak_memory's is the command's own", "st_pg_exec_tree")
   vm_noops(ctx, ["sed commands with and without g and i, with no match, an empty pattern, no replacement, an empty replacement, flags after a slash, characters of two bytes and an int as input", "each is applied", "add, multiply and subtract of ints and of rationals, and calculate, calculate_result, get_value, process and validate of an int, a string and a list"])
   step(ctx, "each gives what spec 1.10 says", "st_tx_sed")
   vm_noops(ctx, ["a status read before any report and after two, and a one-action plan found with plan and with plan_incremental, then the actions cleared", "chr of a float"])
   step(ctx, "the status is empty, then the second report; both plans are the action, and after action_clear there is no plan", "st_pg_progress_plan")
   vm_noops(ctx, ["a path with no directory at it, and a directory with files", "list_dir reads each"])
   step(ctx, "the first gives [] and the program goes on, file_exists says the path is missing, and the second gives entries", "st_pg_list_dir_missing")
+  vm_noops(ctx, ["cpu_count, cpu_times and memory_status, cpu_times read 100 ms apart", "each is called"])
+  step(ctx, "there is at least one processor, the times grow between the readings, and the free memory is no more than the total", "st_pg_machine_state")
   vm_noops(ctx, ["a store with one fact added twice through two holders, rules declared in a named store and read with from, two stores each holding q, a store solved into twice, a plan from a store's facts, a contract checked, the default store cleared and a named store deleted"])
   step(ctx, "each prints what spec 1.13 says of stores", "st_pg_logic_stores")
   vm_noops(ctx, ["a program with `using kb as planner do ... end`", "it is compiled"])
   step(ctx, "the error names the unknown role, and nothing runs", "st_pg_using_unknown_role")
   vm_noops(ctx, ["4,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 4,000 and 8,000 solutions"])
   step(ctx, "twice the rules take no more than about three times as long, the other predicate's rules cost the goal little, and twice the solutions take no more than about three times as long", "st_pg_logic_scale")
+  vm_noops(ctx, ["a chain of two builds and 10 goals each needing the second, a goal no action reaches, two routes of different cost, and 40 then 80 goals timed", "plan is asked for each"])
+  step(ctx, "the builds come first and every goal is met, the unreachable goal gives [], the cheaper route is taken, and twice the goals take no more than about nine times as long", "st_pg_plan_scale")
   step(ctx, "it stops at chr, naming the require clause", "st_tx_chr_float")
   step(ctx, "add, multiply and subtract give the sum, product and difference, and the others give 0 or true", "st_pg_shims")
   step(ctx, "it gives standard output, standard error only from the failure, and a peak above 0", "st_pg_exec_peak")
@@ -1029,10 +1099,18 @@ let ctx = ctx_new()
 register_values_and_memory_steps(ctx)
 register_worlds_steps(ctx)
 print("engine: " + vm_engine())
-let features = vm_features()
+let names = vm_features()
+let features = []
 let i = 0
-while i < list_len(features) do
-  run_feature_file(ctx, "spec_library/values_and_memory/" + features[i] + ".feature")
+while i < list_len(names) do
+  let features = list_push(features, "spec_library/values_and_memory/" + names[i] + ".feature")
   let i = i + 1
 end
-ctx_report(ctx)
+let args = argv()
+let rest = []
+let i = 1
+while i < list_len(args) do
+  let rest = list_push(rest, args[i])
+  let i = i + 1
+end
+run_suite(ctx, features, rest)

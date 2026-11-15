@@ -26,10 +26,17 @@ Feature: what functions, commands and includes give (spec 1.13)
     When list_dir reads each
     Then the first gives [] and the program goes on, file_exists says the path is missing, and the second gives entries
 
-  Scenario: exec_peak_memory gives a command's output and its peak memory
+  Scenario: a program reads how many processors the machine has, how busy they have been, and its memory
+    Given cpu_count, cpu_times and memory_status, cpu_times read 100 ms apart
+    When each is called
+    Then there is at least one processor, the times grow between the readings, and the free memory is no more than the total
+
+  Scenario: exec_peak_memory and exec_measured give a command's output and its peak memory
     Given a command that writes to both outputs, once exiting 0 and once exiting 3
-    When exec_peak_memory runs each
+    When exec_peak_memory runs each, and exec_measured the second, a command that succeeds, and a command whose child commits several hundred MB
     Then it gives standard output, standard error only from the failure, and a peak above 0
+    And exec_measured gives the two outputs apart, false then true for the exits, and a peak above 0
+    And exec_measured's peak counts the child's memory, where exec_peak_memory's is the command's own
 
   Scenario: the runtime has the stage-0 shims
     Given add, multiply and subtract of ints and of rationals, and calculate, calculate_result, get_value, process and validate of an int, a string and a list
@@ -45,6 +52,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     Given a store with one fact added twice through two holders, rules declared in a named store and read with from, two stores each holding q, a store solved into twice, a plan from a store's facts, a contract checked, the default store cleared and a named store deleted
     When the program runs
     Then each prints what spec 1.13 says of stores
+
+  Scenario: plan finds a cheapest plan for many goals, and says there is none only when none exists
+    Given a chain of two builds and 10 goals each needing the second, a goal no action reaches, two routes of different cost, and 40 then 80 goals timed
+    When plan is asked for each
+    Then the builds come first and every goal is met, the unreachable goal gives [], the cheaper route is taken, and twice the goals take no more than about nine times as long
 
   Scenario: the logic engine's work grows with what each call needs
     Given 4,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 4,000 and 8,000 solutions

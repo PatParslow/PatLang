@@ -9,10 +9,11 @@ nothing of PatLang's builds the compiler with:
 py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe
 ```
 
-`self_hosting/v2/tools/gates.sh` does this when there is no `v2.exe`. On every
-run it also rewrites `v2_compiler.ir` with `v2.exe ... --ir`, builds a compiler
-from it with the reader, and checks that this compiler builds the compiler
-byte for byte as `v2.exe` does.
+`self_hosting/v2/tools/gates.sh` does this when there is no `v2.exe`. Whenever
+the compiler's sources or the reader change, the gates also rewrite
+`v2_compiler.ir` with `v2.exe ... --ir`, build a compiler from it with the
+reader, and check that this compiler builds the compiler byte for byte as
+`v2.exe` does.
 
 `ir_wasm.py` builds a WebAssembly module from the same IR (GitHub #248), byte
 for byte what `v2.exe SRC OUT.wasm --wasm` writes. The module runs under the

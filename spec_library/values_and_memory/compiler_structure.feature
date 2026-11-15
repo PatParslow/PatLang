@@ -76,6 +76,16 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When it is compiled
     Then the compiler prints the error, exits non-zero, and writes no executable
 
+  Scenario: a parse error inside an expression names its file and line
+    Given a program whose fourth line is print(1 +)
+    When it is compiled
+    Then the compiler names the file and line 4 in the error, and writes no executable
+
+  Scenario: a program ending in an operator is a parse error, not a compiler that never finishes
+    Given a program whose last line, line 4, is let y = 3 *
+    When it is compiled
+    Then the compiler names the file and line 4 in the error, and writes no executable
+
   Scenario: synthesized names come from their declaration
     Given two functions each containing a closure and a loop
     When they are compiled in either order
@@ -106,6 +116,12 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     Given a program's text with an include, run in a world by interp_run's world backend, and the runtime's files and the library given to the page as its files
     When v2 builds it natively and as a WebAssembly module, and a headless browser runs the module
     Then the browser prints what v2's own build prints: the program's output from the world, and a stop in the second run
+
+  Scenario: the portfolio's playground runs a program's text on v2's interpreter in a browser (spec 1.15, 2.6)
+    Given the playground's driver, which the playground, REPL, IDE and coverage pages run, and a program's text
+    When v2 builds the driver natively and as a WebAssembly module, and a headless browser runs the module given the runtime's files
+    Then the browser prints what v2's own build prints for the program run, its tokens and its syntax tree, and the driver reaches neither lib/lower.patlang's lowering nor lib/interp.patlang's interpreter
+    And its debug mode gives the run's trace, each statement's line with the function's named locals and the calls it is inside, in the browser as natively
 
   Scenario: slots never live at the same time share a WebAssembly local (spec 2.6)
     Given two programs whose top level runs 100 and 1000 statements, each making temporaries and dropping them

@@ -30,13 +30,24 @@ include "../lib/transpile_ruby.patlang"
 # Every demo is compiled by v2 (self_hosting/build/v2.exe), natively for its
 # build-machine transcript and as WebAssembly for the browser.
 #
+# A demo's source is its text, or ["file", path] for a program v2 builds from
+# its own file, so that each file it includes keeps what it declares for
+# itself (quiet_operators(), runtime_functions_by_name()).
+#
 # Build cache: a demo whose source is unchanged since the last build, built
-# by the same compiler, is not rebuilt. The key is the demo's source and v2's
-# own cache key (self_hosting/build/v2.exe.key, the hash of the sources v2
-# was built from), so a rebuilt compiler rebuilds every demo once; v2's own
-# per-function cache then makes that cheap.
+# by the same compiler, is not rebuilt. The key is the text v2 compiles, its
+# includes expanded, and v2's own cache key (self_hosting/build/v2.exe.key,
+# the hash of the sources v2 was built from), so a rebuilt compiler rebuilds
+# every demo once; v2's own per-function cache then makes that cheap.
 make a function called cache_key takes src returns key
-  return hash_string(src + read_file("self_hosting/build/v2.exe.key"))
+  return hash_string(portfolio_key_text(src) + read_file("self_hosting/build/v2.exe.key"))
+end
+
+make a function called portfolio_key_text takes src returns text
+  if type_of(src) == "list" then
+    return expand_includes_once(read_file(src[1]), path_dirname(src[1]))
+  end
+  return portfolio_source(src)
 end
 
 make a function called cache_valid takes id, src returns valid
@@ -98,7 +109,7 @@ make a function called portfolio_source takes src returns text
   return expand_includes_once(text, "self_hosting/lib")
 end
 
-# Writes the demo's source to a scratch file and builds it with v2: an
+# Builds the demo with v2, its text written to a scratch file first: an
 # executable when target is "", else a WebAssembly module. Gives "" when
 # the build succeeded, else what v2 said, with the demo named.
 make a function called portfolio_try_compile takes src, id, out_path, target returns failure
@@ -107,7 +118,11 @@ make a function called portfolio_try_compile takes src, id, out_path, target ret
   if target != "" then
     let scratch = "portfolio/build/" + id + "_wasm.patlang"
   end
-  write_file(scratch, portfolio_source(src))
+  if type_of(src) == "list" then
+    let scratch = src[1]
+  else
+    write_file(scratch, portfolio_source(src))
+  end
   if target == "" then
     let said = exec_capture("self_hosting/build/v2.exe", scratch, out_path, "--workers", "2")
   else
@@ -303,7 +318,7 @@ make a function called build_precompile_jobs returns jobs
 
   let tower_src = read_file("self_hosting/lib/math.patlang") + chr(10) + read_file("self_hosting/examples/numeric_tower_demo.patlang")
   let jobs = add_job(jobs, "towerdemo", tower_src, "")
-  let dynsyntax_src = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/regex_dsl.patlang") + read_file("self_hosting/lib/syntax_dsl.patlang") + read_file("self_hosting/lib/interp.patlang") + read_file("self_hosting/examples/dynamic_syntax_demo.patlang")
+  let dynsyntax_src = ["file", "self_hosting/examples/dynamic_syntax_demo.patlang"]
   let jobs = add_job(jobs, "dynsyntaxdemo", dynsyntax_src, "")
   let jobs = add_job(jobs, "threadingdemo", read_file("self_hosting/examples/threading_demo.patlang"), "")
   let report_lib_src = read_file("self_hosting/lib/report.patlang")
@@ -311,7 +326,7 @@ make a function called build_precompile_jobs returns jobs
   let jobs = add_job(jobs, "report", report_src, "")
   let report_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + report_lib_src + chr(10) + read_file("self_hosting/examples/report_wasm_main.patlang")
   let jobs = add_job(jobs, "report_timeline", report_wasm_src, "wasm")
-  let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/lib/json.patlang") + chr(10) + read_file("self_hosting/lib/interp.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
+  let pg_src = ["file", "self_hosting/examples/playground_main.patlang"]
   let jobs = add_job(jobs, "playground", pg_src, "")
   let jobs = add_job(jobs, "playground", pg_src, "wasm")
   let flow_full = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/tools/flowgraph_main.patlang")
@@ -385,15 +400,31 @@ end
 # its own (the same source as the native transcript's), and "Run in this
 # browser" runs that module.
 make a function called demo_page takes slug, title, blurb, src, transcript returns done
+  return demo_page_with(slug, title, blurb, src, transcript, false)
+end
+
+# demo_page for a program that reads the runtime's files (pg_files_js).
+make a function called demo_page_reading takes slug, title, blurb, src, transcript returns done
+  return demo_page_with(slug, title, blurb, src, transcript, true)
+end
+
+make a function called demo_page_with takes slug, title, blurb, src, transcript, reads returns done
   let card_b64 = compile_wasm_only(src, slug + "_card")
+  let shown = src
+  if type_of(src) == "list" then
+    let shown = read_file(src[1])
+  end
   let sections = [tpl_para(blurb)]
-  let sections = list_push(sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src' id='src-" + slug + "'>" + html_escape(src) + "</pre></details>"))
+  let sections = list_push(sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src' id='src-" + slug + "'>" + html_escape(shown) + "</pre></details>"))
   let sections = list_push(sections, tpl_raw("<p><button onclick='runCard(" + q() + slug + q() + ")'>Run in this browser</button> <span class='ms' id='ms-" + slug + "'></span></p>"))
   let sections = list_push(sections, tpl_raw("<pre class='out' id='out-" + slug + "'>(not run yet)</pre>"))
   let sections = list_push(sections, tpl_raw("<p class='label'>Native run on the build machine:</p>"))
   let sections = list_push(sections, tpl_raw("<pre class='out native'>" + html_escape(transcript) + "</pre>"))
   let js = sb_new()
   sb_push(js, "const WASMS = { " + json_quote(slug) + ": '" + card_b64 + "' };" + nl())
+  if reads then
+    pg_files_js(js)
+  end
   runwasm_core_js(js)
   sb_push(js, "function runCard(id) { return runWasm(id, id, []); }" + nl())
   let sections = list_push(sections, tpl_script(sb_str(js)))
@@ -436,6 +467,7 @@ make a function called language_flavors_page takes java_src, java_native, cpp_sr
   let sections = list_push(sections, lang_flavor_card("pythonese", "Python-ese", "No semicolons, <code>def</code> for functions, an <code>if</code>/<code>elif</code>/<code>else</code> chain (the same <code>Many</code> primitive Java-ese uses for <code>case</code> clauses, applied to a different construct), and <code>for x in range(n)</code> translated into a counting <code>while</code> loop underneath. Blocks still use <code>{ }</code> -- see the disclaimer above.", py_src, py_native))
   let js = sb_new()
   sb_push(js, "const WASMS = { playground: '" + pg_b64 + "' };" + nl())
+  pg_files_js(js)
   wasi_shim_js(js)
   sb_push(js, "function runCard(id) { return runWasm(id, 'playground', [srcText(id)]); }" + nl())
   let sections = list_push(sections, tpl_script(sb_str(js)))
@@ -445,55 +477,25 @@ make a function called language_flavors_page takes java_src, java_native, cpp_sr
   return true
 end
 
-# repl_page: a live, in-browser REPL reusing the SAME shared "playground"
-# wasm module every other demo card uses (self_hosting/examples/
-# playground_main.patlang, which already takes source text as argv()[0] and
-# already checks for parse errors before running -- exactly what a REPL
-# needs, no new wasm build required). All new code here is JS state
-# management on top of the existing wasi_shim_js runWasm/b64bytes bridge:
-# a growing declBuffer (persisted declarations only) plus a transcript,
-# mirroring self_hosting/lib/repl_core.patlang's design one-for-one --
-# declarations (let/make a function called/rule_add(/action_add(/when /
-# include /syntax ) are appended raw to declBuffer and never print
-# anything on success, so replaying the whole buffer every turn (the same
-# approach the CLI REPL uses, since there's no incremental-eval state to
-# carry between runWasm calls either) never re-echoes a past turn's
-# output; anything else is wrapped in print(...) and run transiently,
-# never persisted. See self_hosting/tools/repl.patlang's header for the
-# one shared honest limitation (a `let` with a side-effecting
-# right-hand side re-runs that side effect every subsequent turn).
-#
-# Real bug found and fixed 2026-07-13 via a genuine functional test (a
-# Node.js harness driving the actual compiled wasm module, not a mock --
-# see self_hosting/lib/repl_core.patlang's session notes): wasi_shim_js's
-# runWasm caught a fatal PatLang runtime error (no try/catch in PatLang
-# itself -- this is real, not a REPL bug) via JS try/catch, but only put
-# the error text in the DOM element, not in the RETURNED string -- so
-# `hadError` here, which only inspects the return value, never saw runtime
-# failures, only parse errors. A crashed declaration turn was silently
-# treated as successful and permanently baked into replDeclBuffer, replaying
-# (and re-failing) every subsequent turn. Fixed by making runWasm's catch
-# branch return the error-annotated string too, and widening `hadError`
-# to check for it. NOTE this is browser-only: the CLI REPL can't have this
-# failure mode at all, because a fatal error there kills the whole OS
-# process -- there's no continuation to persist a broken entry into.
-#
-# Also worth knowing, not fixed: an entry that mixes a real declaration
-# with OTHER statements on later lines (e.g. `let x = 10` then a `print(...)`
-# in the same multi-line entry) gets classified as one unit by its first
-# line and, if it runs without error, the WHOLE thing -- including the
-# print -- is appended to replDeclBuffer, so that print will re-fire every
-# future turn too. One entry should be one statement (a single multi-line
-# block like `make a function called ... end` is still fine, since that's
-# genuinely one statement) -- mixing several separate statements into one
-# entry is a real gap in what this REPL classifies correctly.
+# repl_page: a live REPL in the page, on the playground's module
+# (self_hosting/examples/playground_main.patlang). The page keeps the
+# declarations entered so far (let, make a function called, rule_add(,
+# action_add(, when, include, syntax) and runs them again before each new
+# entry, since nothing carries over between runs; any other entry is wrapped
+# in print(...) and run once, never kept. A declaration is kept only when
+# its run succeeds: the driver exits with 1 when the program does not
+# compile or stops, and runWasm adds the exit code to the output. As in
+# self_hosting/tools/repl.patlang, a `let` whose right-hand side does
+# something runs it again on every later entry, and an entry should be one
+# statement: one whose first line declares is kept whole.
 make a function called repl_page takes pg_b64 returns done
-  let sections = [tpl_para("A live PatLang session, running entirely in this tab -- no server involved. Each entry should be ONE statement -- a single line, or a single multi-line block like <code>make a function called ... end</code> -- press the Run button or Ctrl+Enter to evaluate. This reuses the exact same compiled playground module every other demo card on this site shares, and the exact same session-buffer design as the real, standalone CLI REPL (<code>self_hosting/tools/repl.patlang</code>, <code>pat --ir-run</code> it yourself) -- see the <a href='patlang-paradigms.html'>Paradigms Guide</a> for how PatLang's self-hosted compiler pipeline (tokenize/parse_program/lower_program/run_ir) makes this possible with no new Rust at all.")]
+  let sections = [tpl_para("A live PatLang session, running entirely in this tab -- no server involved. Each entry should be ONE statement -- a single line, or a single multi-line block like <code>make a function called ... end</code> -- press the Run button or Ctrl+Enter to evaluate. It runs on the playground's module: PatLang's compiler front end and interpreter, written in PatLang and built as WebAssembly. The session keeps your declarations and runs them again before each entry.")]
   let sections = list_push(sections, tpl_raw("<pre id='repl-transcript' class='out' style='min-height:12em;white-space:pre-wrap'></pre>"))
   let sections = list_push(sections, tpl_raw("<textarea id='repl-input' rows='3' style='width:100%;font-family:monospace' placeholder='let x = 10' onkeydown='replKeydown(event)'></textarea>"))
   let sections = list_push(sections, tpl_raw("<p><button onclick='replSubmit()'>Run (Ctrl+Enter)</button> <button onclick='replReset()'>Reset session</button></p>"))
   let js = sb_new()
   sb_push(js, "const WASMS = { playground: '" + pg_b64 + "' };" + nl())
+  pg_files_js(js)
   wasi_shim_js(js)
   sb_push(js, "let replDeclBuffer = '';" + nl())
   sb_push(js, "const REPL_DECL_PREFIXES = ['let ', 'make a function called', 'rule_add(', 'action_add(', 'when ', 'include ', 'syntax '];" + nl())
@@ -514,7 +516,7 @@ make a function called repl_page takes pg_b64 returns done
   sb_push(js, "  const candidate = replDeclBuffer + (isDecl ? entry + String.fromCharCode(10) : 'print(' + entry + ')' + String.fromCharCode(10));" + nl())
   sb_push(js, "  replAppend('patlang> ', entry);" + nl())
   sb_push(js, "  const output = await runWasm('repl', 'playground', [candidate]);" + nl())
-  sb_push(js, "  const hadError = output.indexOf('parse error:') >= 0 || output.indexOf('[error:') >= 0;" + nl())
+  sb_push(js, "  const hadError = output.indexOf('[exit ') >= 0 || output.indexOf('[error:') >= 0;" + nl())
   sb_push(js, "  if (isDecl && !hadError) {" + nl())
   sb_push(js, "    replDeclBuffer += entry + String.fromCharCode(10);" + nl())
   sb_push(js, "    replAppend('', output ? output : '(ok)');" + nl())
@@ -1043,6 +1045,7 @@ make a function called coverage_page takes pg_b64, coverage_b64 returns done
   let sections = list_push(sections, tpl_raw("<div id='cov-detail'></div>"))
   let js = sb_new()
   sb_push(js, "const WASMS = { playground: '" + pg_b64 + "', coverage: '" + coverage_b64 + "' };" + nl())
+  pg_files_js(js)
   runwasm_only_js(js)
   sb_push(js, "function covEsc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }" + nl())
   sb_push(js, "function covPercent(covered, total) { return total ? Math.floor(covered * 100 / total) : 100; }" + nl())
@@ -1155,6 +1158,24 @@ end
 # host (layout, launcher, and the executor as a Worker's source), then
 # self_hosting/tools/portfolio_runner.js, which defines runWasm,
 # runWasmThreaded and runWasmText over them.
+# `const FILES`, the files a page gives its programs to read (portfolio_
+# runner.js): the runtime's, whose declarations the playground's front end
+# reads, each as base64 under its path.
+make a function called pg_files_js takes b returns done
+  let dir = "self_hosting/v2/runtime"
+  let names = list_dir(dir)
+  sb_push(b, "const FILES = {" + nl())
+  let i = 0
+  while i < list_len(names) do
+    if str_ends_with(names[i], ".patlang") then
+      sb_push(b, "  " + json_quote(dir + "/" + names[i]) + ": '" + read_file_b64(dir + "/" + names[i]) + "'," + nl())
+    end
+    let i = i + 1
+  end
+  sb_push(b, "};" + nl())
+  return true
+end
+
 make a function called runwasm_core_js takes b returns done
   let layout = js_module_body(read_file("self_hosting/v2/wasm/layout.mjs"))
   let executor = layout + js_module_body(read_file("self_hosting/v2/wasm/executor.mjs"))
@@ -1349,14 +1370,8 @@ print("queue recovery demo done")
 # User-defined DSL demo: `syntax RouterDSL { ... }` + `routes { ... }` blocks
 # in self_hosting/examples/router_dsl_demo.patlang are expanded to plain
 # `register_route(...)` calls by self_hosting/lib/syntax_dsl.patlang (a
-# source-to-source preprocessing pass, using the general-purpose regex
-# engine at self_hosting/lib/regex_dsl.patlang for the per-token patterns),
-# BEFORE the result is handed to the ordinary compiler. Both of those lib
-# files use `|params| do ... end` closures, which only the self-hosted
-# lexer/parser (tokenize/parse_program, included above) understand -- not
-# the Rust CLI's own parser -- so they can't be `include`d directly into
-# this file; instead we run them as data through the same tokenize/
-# parse_program/lower_program/run_ir pipeline used for the wasm builds.
+# source-to-source pass, using lib/regex_dsl.patlang for the per-token
+# patterns) before the result is compiled.
 let router_raw = read_file("self_hosting/examples/router_dsl_demo.patlang")
 let router_src = expand_syntax_dsls(router_raw)
 write_file("portfolio/build/router_dsl_expanded.patlang", router_src)
@@ -1389,24 +1404,12 @@ compile_native(tower_src, "towerdemo")
 let tower_native = exec_capture("portfolio/build/towerdemo.exe")
 print("numeric tower demo done")
 
-# Dynamic syntax demo: unlike router_dsl_demo (a passive `syntax {...}`
-# literal that the SURROUNDING playground engine's own expand_syntax_dsls/
-# tokenize/parse_program/lower_program calls handle), this demo's own code
-# calls expand_syntax_dsls_with/tokenize/parse_program/lower_program itself
-# -- so when it's submitted as "user code" to the live playground, it needs
-# its OWN copies of those functions in scope, because run_ir's nested
-# interpreter (rust-runtime/src/ir/hosts.rs's host_run_ir) starts a fresh,
-# isolated Program containing only the functions decoded from whatever was
-# just lowered -- it does not inherit the outer compiled binary's own
-# lexer/parser/lower/regex_dsl/syntax_dsl functions. Concatenating them
-# ahead of the demo (same as the wasm build below) is what makes both the
-# native transcript AND the "Compile and run in this browser" button work.
-let dynsyntax_src1 = read_file("self_hosting/lib/lexer.patlang")
-let dynsyntax_src2 = dynsyntax_src1 + read_file("self_hosting/lib/parser.patlang")
-let dynsyntax_src3 = dynsyntax_src2 + read_file("self_hosting/lib/lower.patlang")
-let dynsyntax_src4 = dynsyntax_src3 + read_file("self_hosting/lib/regex_dsl.patlang")
-let dynsyntax_src5 = dynsyntax_src4 + read_file("self_hosting/lib/syntax_dsl.patlang") + read_file("self_hosting/lib/interp.patlang")
-let dynsyntax_src = dynsyntax_src5 + read_file("self_hosting/examples/dynamic_syntax_demo.patlang")
+# Dynamic syntax demo: its own code defines a `syntax` extension at run time,
+# builds a program's text with it and runs that with lib/interp_run.patlang's
+# world backend. It is built from its own file, so the interpreter it
+# includes keeps what it declares for itself (portfolio_try_compile), and its
+# page gives it the runtime's files to read (demo_page_reading).
+let dynsyntax_src = ["file", "self_hosting/examples/dynamic_syntax_demo.patlang"]
 compile_native(dynsyntax_src, "dynsyntaxdemo")
 let dynsyntax_native = exec_capture("portfolio/build/dynsyntaxdemo.exe")
 print("dynamic syntax demo done")
@@ -1440,14 +1443,11 @@ let report_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + re
 let report_b64 = compile_wasm_only(report_wasm_src, "report_timeline")
 print("report timeline wasm done")
 
-let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/lib/json.patlang") + chr(10) + read_file("self_hosting/lib/interp.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
+# The playground's driver runs a program's text on v2's interpreter, reading
+# the runtime's declarations from the files the page gives it (PG_FILES).
+let pg_src = ["file", "self_hosting/examples/playground_main.patlang"]
 let pg_b64 = compile_both(pg_src, "playground")
 print("playground done")
-
-# The playground module carries lib/interp.patlang, which runs programs and
-# gives the "debug" mode's trace (dbg_trace_json), and every v2 module has
-# threads, so the IDE's debugger uses the same module.
-let pg_debug_b64 = pg_b64
 
 # hexrts: a small hex-grid RTS-lite economy sim (self_hosting/lib/
 # hexrts.patlang) -- unlike the REPL/playground, this is a NORMAL compiled
@@ -1689,7 +1689,7 @@ print("wrote portfolio/demos/maze.html")
 # already handles run/tokens/ast). Reuses wasi_shim_js's runWasm/hlHtml/
 # loadExample helpers unchanged; only ide.html-specific bits are added below.
 let ide_body = sb_new()
-sb_push(ide_body, "<p>The self-hosted compiler (lexer, parser, lowerer), compiled to WebAssembly once and reused for every run in this page. <b>Run</b> executes your program; <b>Tokens</b> and <b>AST</b> show the compiler's own intermediate representations for the same source, with no rustc involved for any of the three. Ctrl+Enter runs. Your code is kept in this browser's local storage.</p>" + nl())
+sb_push(ide_body, "<p>PatLang's compiler front end and interpreter, written in PatLang and built as WebAssembly, run every program in this page. <b>Run</b> executes your program; <b>Tokens</b> and <b>AST</b> show what the lexer and parser make of it; <b>Debug</b> records the run and lets you step back and forth through it, with each step's variables and calls. Ctrl+Enter runs. Your code is kept in this browser's local storage.</p>" + nl())
 sb_push(ide_body, "<style>" + nl())
 sb_push(ide_body, ".edwrap { position: relative; height: 28rem; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 6px; overflow: hidden; }" + nl())
 sb_push(ide_body, ".edwrap pre.hl, .edwrap textarea { position: absolute; inset: 0; margin: 0; padding: 0.6rem; font: 0.9rem/1.5 monospace; white-space: pre; overflow: auto; border: 0; background: transparent; }" + nl())
@@ -1728,10 +1728,8 @@ sb_push(ide_body, "<p style='font-size:0.85em;opacity:0.8'>This captures one com
 sb_push(ide_body, "</div>" + nl())
 
 let ide_js = sb_new()
-sb_push(ide_js, "const WASMS = {" + nl())
-sb_push(ide_js, "  playground: '" + pg_b64 + "'," + nl())
-sb_push(ide_js, "  debugwasm: '" + pg_debug_b64 + "'" + nl())
-sb_push(ide_js, "};" + nl())
+sb_push(ide_js, "const WASMS = { playground: '" + pg_b64 + "' };" + nl())
+pg_files_js(ide_js)
 wasi_shim_js(ide_js)
 sb_push(ide_js, "function ideSave() { try { localStorage.setItem('patlang_ide_src', document.getElementById('ed').value); } catch (e) {} }" + nl())
 sb_push(ide_js, "function ideReset() { loadExample(); ideSave(); }" + nl())
@@ -1745,7 +1743,7 @@ sb_push(ide_js, "  const panel = document.getElementById('dbg-panel');" + nl())
 sb_push(ide_js, "  const statusEl = document.getElementById('dbg-status');" + nl())
 sb_push(ide_js, "  panel.hidden = false;" + nl())
 sb_push(ide_js, "  statusEl.textContent = 'capturing trace...';" + nl())
-sb_push(ide_js, "  await runWasmThreaded('ide-debug', 'debugwasm', [document.getElementById('ed').value, 'debug']);" + nl())
+sb_push(ide_js, "  await runWasm('ide-debug', 'playground', [document.getElementById('ed').value, 'debug']);" + nl())
 sb_push(ide_js, "  const raw = document.getElementById('out-ide-debug').textContent;" + nl())
 sb_push(ide_js, "  let parsed;" + nl())
 sb_push(ide_js, "  try { parsed = JSON.parse(raw); } catch (e) {" + nl())
@@ -1753,6 +1751,7 @@ sb_push(ide_js, "    statusEl.textContent = 'debug capture failed: ' + raw; dbgT
 sb_push(ide_js, "  }" + nl())
 sb_push(ide_js, "  dbgTrace = parsed.trace || [];" + nl())
 sb_push(ide_js, "  dbgFinal = parsed;" + nl())
+sb_push(ide_js, "  document.getElementById('out-ide').textContent = parsed.output;" + nl())
 sb_push(ide_js, "  dbgIdx = 0;" + nl())
 sb_push(ide_js, "  dbgRender();" + nl())
 sb_push(ide_js, "}" + nl())
@@ -1768,20 +1767,18 @@ sb_push(ide_js, "  ed.focus(); ed.setSelectionRange(start, end);" + nl())
 sb_push(ide_js, "  const lineHeight = 0.9 * 1.5 * 16;" + nl())
 sb_push(ide_js, "  ed.scrollTop = Math.max(0, (lineNo - 3) * lineHeight);" + nl())
 sb_push(ide_js, "}" + nl())
-sb_push(ide_js, "// dbg_trace_json's \"ok\" means the CAPTURE completed (false only if the" + nl())
-sb_push(ide_js, "// 2000-step safety cap was hit, with the real error in .error) -- it does" + nl())
-sb_push(ide_js, "// NOT mean the program itself succeeded. A program that hits a genuine" + nl())
-sb_push(ide_js, "// runtime error (e.g. a host function the self-hosted interpreter doesn't" + nl())
-sb_push(ide_js, "// support, like register_event_handler for when/emit) still gets ok:true" + nl())
-sb_push(ide_js, "// with an empty or partial trace and final_ok:false -- the real error is" + nl())
-sb_push(ide_js, "// in .final_value then, not .error." + nl())
+sb_push(ide_js, "// The playground driver's debug mode (self_hosting/examples/playground_main" + nl())
+sb_push(ide_js, "// .patlang): ok is false when the trace was cut at its first 2000 steps;" + nl())
+sb_push(ide_js, "// final_ok whether the program compiled and ran to its end, its output" + nl())
+sb_push(ide_js, "// saying why not when it did not." + nl())
 sb_push(ide_js, "function dbgSucceeded(f) { return !!(f && f.ok && f.final_ok); }" + nl())
 sb_push(ide_js, "function dbgErrorText(f) {" + nl())
 sb_push(ide_js, "  if (!f) return 'unknown error';" + nl())
-sb_push(ide_js, "  if (!f.ok) return f.error;" + nl())
-sb_push(ide_js, "  if (!f.final_ok) return f.final_value;" + nl())
+sb_push(ide_js, "  if (!f.final_ok) return f.output;" + nl())
+sb_push(ide_js, "  if (!f.ok) return 'the trace stops after its first ' + f.trace.length + ' steps';" + nl())
 sb_push(ide_js, "  return '';" + nl())
 sb_push(ide_js, "}" + nl())
+sb_push(ide_js, "function dbgWhere(ev) { return ev.fname === '__main' ? 'top level' : ev.fname + '()'; }" + nl())
 sb_push(ide_js, "function dbgRender() {" + nl())
 sb_push(ide_js, "  const statusEl = document.getElementById('dbg-status');" + nl())
 sb_push(ide_js, "  const localsEl = document.getElementById('dbg-locals');" + nl())
@@ -1794,9 +1791,9 @@ sb_push(ide_js, "  }" + nl())
 sb_push(ide_js, "  const ev = dbgTrace[dbgIdx];" + nl())
 sb_push(ide_js, "  const atEnd = dbgIdx === dbgTrace.length - 1;" + nl())
 sb_push(ide_js, "  let tail = '';" + nl())
-sb_push(ide_js, "  if (atEnd) tail = dbgSucceeded(dbgFinal) ? (' -- finished, result: ' + JSON.stringify(dbgFinal.final_value)) : (' -- error: ' + dbgErrorText(dbgFinal));" + nl())
-sb_push(ide_js, "  statusEl.textContent = 'step ' + (dbgIdx + 1) + '/' + dbgTrace.length + ': ' + ev.fname + '() line ' + ev.line + tail;" + nl())
-sb_push(ide_js, "  localsEl.textContent = Object.keys(ev.locals).length ? Object.entries(ev.locals).map(([k, v]) => k + ' = ' + JSON.stringify(v)).join(" + q() + "\\n" + q() + ") : '(none yet)';" + nl())
+sb_push(ide_js, "  if (atEnd) tail = dbgSucceeded(dbgFinal) ? ' -- finished' : (' -- error: ' + dbgErrorText(dbgFinal));" + nl())
+sb_push(ide_js, "  statusEl.textContent = 'step ' + (dbgIdx + 1) + '/' + dbgTrace.length + ': ' + dbgWhere(ev) + ' line ' + ev.line + tail;" + nl())
+sb_push(ide_js, "  localsEl.textContent = Object.keys(ev.locals).length ? Object.entries(ev.locals).map(([k, v]) => k + ' = ' + v).join(" + q() + "\\n" + q() + ") : '(none yet)';" + nl())
 sb_push(ide_js, "  csEl.textContent = ev.call_stack.length ? ev.call_stack.join(' -> ') : '(top level)';" + nl())
 sb_push(ide_js, "  dbgSelectLine(ev.line);" + nl())
 sb_push(ide_js, "}" + nl())
@@ -1966,7 +1963,7 @@ demo_page("bench", "Self-timing benchmark", "fib(27), a 2-million iteration loop
 
 # Live playground: bespoke content (an editor, not a source/transcript
 # pair), so built directly with template.patlang rather than demo_page.
-let pgnd_sections = [tpl_para("The self-hosted PatLang compiler (lexer, parser, lowerer) compiled to WebAssembly. Edit the program, press Run: your source is tokenized, parsed, and lowered by PatLang code running in this page, then executed on the runtime VM. No server, no rustc.")]
+let pgnd_sections = [tpl_para("PatLang's compiler front end and interpreter, written in PatLang and built as WebAssembly. Edit the program and press Run: this page compiles it and runs it, with no server involved.")]
 let pgnd_sections = list_push(pgnd_sections, tpl_style(".edwrap { position: relative; height: 16rem; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 6px; overflow: hidden; } .edwrap pre.hl, .edwrap textarea { position: absolute; inset: 0; margin: 0; padding: 0.6rem; font: 0.85rem/1.45 monospace; white-space: pre; overflow: auto; border: 0; background: transparent; } .edwrap textarea { color: transparent; caret-color: light-dark(black, white); resize: none; width: 100%; height: 100%; outline: none; } .hl i { font-style: normal; } .hk { color: #c678dd; font-weight: 600; } .hs { color: #98c379; } .hn { color: #d19a66; } .hc { color: #7f848e; }"))
 let pgnd_body = sb_new()
 sb_push(pgnd_body, "<pre id='src-default' hidden>" + html_escape(read_file("self_hosting/examples/playground_default.patlang")) + "</pre>" + nl())
@@ -1981,6 +1978,7 @@ sb_push(pgnd_body, "<pre class='out' id='out-playground'>(not run yet)</pre>" + 
 let pgnd_sections = list_push(pgnd_sections, tpl_raw(sb_str(pgnd_body)))
 let pgnd_js = sb_new()
 sb_push(pgnd_js, "const WASMS = { playground: '" + pg_b64 + "' };" + nl())
+pg_files_js(pgnd_js)
 wasi_shim_js(pgnd_js)
 sb_push(pgnd_js, "function runPlayground() { return runWasm('playground', 'playground', [document.getElementById('ed').value]); }" + nl())
 let pgnd_sections = list_push(pgnd_sections, tpl_script(sb_str(pgnd_js)))
@@ -2316,7 +2314,7 @@ let cga_sections = list_push(cga_sections, tpl_script(sb_str(cga_js)))
 write_file("portfolio/demos/cga.html", render_page(tpl_page("CGA Interval Classifier", "fragment", cga_sections)))
 print("wrote portfolio/demos/cga.html")
 
-demo_page("dynsyntax", "Dynamic syntax: grammar extensions as runtime data", "The DSL page above declares its <code>syntax { ... }</code> block as a literal, expanded once before the compiler ever runs &mdash; indistinguishable from a macro. This one instead computes its trigger keyword and rules from data at runtime, calls <code>expand_syntax_dsls_with(src, existing_defs)</code> itself to define the grammar extension, keeps only the returned <code>defs</code> list, then makes a SEPARATE, later call &mdash; on a string containing only the usage line, no syntax declaration anywhere in it &mdash; passing those <code>defs</code> forward. Two independent calls, composing through nothing but an ordinary list value, exactly like passing along any other piece of program state. The assembled result runs through the same <code>tokenize</code>/<code>parse_program</code>/<code>lower_program</code> chain, and <code>lib/interp.patlang</code>'s <code>interpret_ir</code>, that already power the playground (see <code>self_hosting/examples/playground_main.patlang</code>) &mdash; PatLang's compiler has always been callable from PatLang code; this demo is the first to close the loop and use that to synthesize a language construct that couldn't have existed until the program ran. It runs live in this page: the program, built by v2 as WebAssembly, carries the compiler pipeline and an interpreter, and calls the pipeline again on its own usage line; the native run below is the same program built as an executable.", dynsyntax_src, dynsyntax_native)
+demo_page_reading("dynsyntax", "Dynamic syntax: grammar extensions as runtime data", "The DSL page above declares its <code>syntax { ... }</code> block as a literal, expanded once before the compiler ever runs &mdash; indistinguishable from a macro. This one instead computes its trigger keyword and rules from data at runtime, calls <code>expand_syntax_dsls_with(src, existing_defs)</code> itself to define the grammar extension, keeps only the returned <code>defs</code> list, then makes a SEPARATE, later call &mdash; on a string containing only the usage line, no syntax declaration anywhere in it &mdash; passing those <code>defs</code> forward. Two independent calls, composing through nothing but an ordinary list value, exactly like passing along any other piece of program state. The assembled program then runs with <code>interp_run</code>: v2's front end compiles it and v2's interpreter runs it in a world of its own, as the playground runs what you type. It runs live in this page: the program, built by v2 as WebAssembly, carries the front end and the interpreter; the native run below is the same program built as an executable.", dynsyntax_src, dynsyntax_native)
 
 native_page("signalsdemo", "Runtime signals: quit and status from outside the process", "A running PatLang program can receive a named signal + optional payload from OUTSIDE itself &mdash; a second CLI invocation (<code>server.exe --quit</code> sent to an already-running server, not a new one) or a local network call &mdash; dispatched through the same <code>when &lt;name&gt; do ... end</code> / <code>emit(...)</code> mechanism every other event in PatLang already uses, not a new handler concept. <code>signal_claim(port)</code> lets a process become the &quot;primary&quot; holder of a port (a second bind to the same port simply failing IS the &quot;is a primary already running&quot; detector, for free); a process that can't claim it instead calls <code>signal_send(port, name, payload)</code> for fire-and-forget signals like <code>quit</code>, or <code>signal_query(port, name, payload)</code> for request/response signals like <code>status</code>, which waits for and returns whatever the primary's handler passed to <code>signal_reply(text)</code>. This demo's real, live state (an uptime counter and a ping tally, both genuinely tracked while the process runs) is what <code>status</code> actually reports back &mdash; not a canned string. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: this needs real TCP sockets and real separate OS processes, neither available in the WASI sandbox. The transcript below simulates the primary/secondary roles as two real OS threads within one process (build-time transcripts need to run to completion, but a real primary only exits once it receives <code>quit</code>) &mdash; the source shown is the real <code>self_hosting/lib/signals.patlang</code> library plus that thread-based driver; see <code>self_hosting/examples/signals_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself: start it once in the background, then run it again with <code>quit</code>, <code>status</code>, or <code>ping &lt;message&gt;</code> as arguments.", signals_src, signals_native)
 

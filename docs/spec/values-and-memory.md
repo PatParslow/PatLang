@@ -218,6 +218,14 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - `exec_peak_memory(program, args)` runs the program with the list of arguments and gives two
   things: what it wrote to standard output, followed by what it wrote to standard error if it
   exited non-zero, and its peak working set in bytes, or -1 where the system gives none.
+- `exec_measured(program, args)` runs the program and gives four things: what it wrote to
+  standard output, what it wrote to standard error, whether it exited 0, and its peak memory
+  in bytes (or -1): the most that it and every process it started committed between them.
+- `cpu_count()` gives the machine's logical processors, at least 1. `cpu_times()` gives
+  `[idle, busy]`, the processors' time since the machine started, summed over all of them, in
+  milliseconds; how busy the machine was between two readings is in their differences.
+  `memory_status()` gives `[total, available]`, the physical memory in bytes. Where the system
+  gives no figures, as in a browser, `cpu_times` and `memory_status` give `[-1, -1]`.
 - A file reached by several includes is included once, before the files that include it.
 - The runtime has the stage-0 shims: `add(a, b)`, `multiply(a, b)` and `subtract(a, b)` give
   `a + b`, `a * b` and `a - b`; `calculate`, `calculate_result` and `get_value` of anything give
@@ -226,6 +234,10 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   gives it, `""` before any report.
 - `action_clear()` forgets every action `action_add` added, and `plan_incremental(goals)` gives
   what `plan(goals)` gives.
+- `plan(goals)` gives a cheapest sequence of the actions' steps from the stores' ground facts to
+  a state meeting every goal, and `[]` only when no sequence reaches one: the search has no
+  limit that gives up early. For n goals that independent steps meet, it takes time growing
+  about as n cubed (40 goals in about 0.2 s, 160 in about 9 s, compiled).
 - Adding a rule takes about the same time however many rules there are. A goal's cost does not
   depend on the rules of other predicates, and finding its solutions takes time in proportion
   to their number.

@@ -780,6 +780,71 @@ make a function called lw_using_form takes role, name, n returns to
   return ""
 end
 
+# ---- tracing (lw_program_traced) ----
+
+make a function called lw_tracing takes fb returns yes
+  return (list_len(fb[7]) > 6) and fb[7][6]
+end
+
+make a function called lw_trace_call takes fb, name, args returns done
+  let d = lw_new_slot(fb)
+  lw_emit(fb, ["call", d, name, args])
+  return true
+end
+
+# A statement the parser gave a line (its last element): the step it starts.
+# The variables are those bound so far under a name of the program's own.
+make a function called lw_trace_step takes fb, st returns done
+  if not lw_tracing(fb) then return false end
+  let line = st[list_len(st) - 1]
+  if (type_of(line) != "int") or (line <= 0) then return false end
+  let names = vec_new()
+  let slots = vec_new()
+  let i = 0
+  while i < vec_len(fb[1]) do
+    let name = vec_get(fb[1], i)
+    if (name != "") and (substr(name, 0, 2) != "__") then
+      vec_push(names, lw_const(fb, "str", name))
+      vec_push(slots, vec_get(fb[2], i))
+    end
+    let i = i + 1
+  end
+  let ns = lw_new_slot(fb)
+  lw_emit(fb, ["list", ns, vec_to_list(names)])
+  let vs = lw_new_slot(fb)
+  lw_emit(fb, ["list", vs, vec_to_list(slots)])
+  return lw_trace_call(fb, "__trace_step", [lw_const(fb, "int", line.to_s), lw_const(fb, "str", lw_trace_name(fb)), ns, vs])
+end
+
+# The function's name as its source has it (lw_user_name).
+make a function called lw_trace_name takes fb returns name
+  let name = fb[5]
+  let prefix = lw_user_name("")
+  if str_starts_with(name, prefix) then
+    return substr(name, prefix.length, name.length - prefix.length)
+  end
+  return name
+end
+
+# A statement as lw_trace_step leaves it out: its line, if it has one, 0.
+make a function called lw_untraced takes st returns out
+  let last = list_len(st) - 1
+  if type_of(st[last]) == "int" then
+    return list_set(st, last, 0)
+  end
+  return st
+end
+
+make a function called lw_trace_enter takes fb returns done
+  if (not lw_tracing(fb)) or (fb[5] == "__main") then return false end
+  return lw_trace_call(fb, "__trace_enter", [lw_const(fb, "str", lw_trace_name(fb))])
+end
+
+make a function called lw_trace_leave takes fb returns done
+  if (not lw_tracing(fb)) or (fb[5] == "__main") then return false end
+  return lw_trace_call(fb, "__trace_leave", [])
+end
+
 # ---- statements ----
 
 make a function called lw_stmts takes fb, stmts returns done
@@ -816,6 +881,7 @@ make a function called lw_stmt_value takes fb, st returns slot
     return lw_var_slot(fb, st[1])
   end
   if kind == "Expr" then
+    lw_trace_step(fb, st)
     return lw_expr(fb, st[1])
   end
   if kind == "If" then
@@ -885,6 +951,7 @@ end
 
 make a function called lw_stmt takes fb, st returns done
   let kind = st[0]
+  lw_trace_step(fb, st)
   if kind == "Let" then
     if lw_gives_var(st[1], st[2]) and (lw_var_slot(fb, st[1]) >= 0) then
       return lw_let_giving(fb, st[1], st[2])
@@ -910,6 +977,7 @@ make a function called lw_stmt takes fb, st returns done
   if kind == "Return" then
     let r = lw_expr(fb, st[1])
     lw_raise_events(fb, r)
+    lw_trace_leave(fb)
     lw_emit(fb, ["return", r])
     return true
   end
@@ -1408,6 +1476,7 @@ make a function called lw_function_with takes name, params, body, captured, lift
     end
     let i = i + 1
   end
+  lw_trace_enter(fb)
   if list_len(captured) > 0 then
     # read once per capture, so a variable, under no name
     let block = lw_new_slot(fb)
@@ -1427,6 +1496,7 @@ make a function called lw_function_with takes name, params, body, captured, lift
   # falling off the end returns the body's value
   let u = lw_block_value(fb, body)
   lw_raise_events(fb, u)
+  lw_trace_leave(fb)
   lw_emit(fb, ["return", u])
   let func = ir_fn(name, list_len(pnames), vec_get(fb[3], 0), vec_to_list(fb[0]), vec_to_list(fb[2]))
   ensure ir_well_formed(func, false) and ir_temps_read_once(func)
@@ -1438,6 +1508,16 @@ end
 # [stmts, quiet]. [fns, errors, facts]: facts are the program facts code
 # generation needs, [the event names some `when` handles].
 make a function called lw_program takes files returns result
+  return lw_program_traced(files, false)
+end
+
+# lw_program, the program's own files traced when trace is true: each
+# statement with a line first calls __trace_step with that line, the
+# function's name and its named variables' names and values, and each
+# function but __main calls __trace_enter on entry and __trace_leave before
+# it returns. Nothing declares those names; only the interpreter, asked for a
+# trace, gives them (interpreter.patlang, iv_trace_new).
+make a function called lw_program_traced takes files, trace returns result
   let shadows = lw_shadowing(files)
   let files = lw_rename_shadowing(files, shadows)
   let symbols = list_push(lw_symbols(files), shadows)
@@ -1464,7 +1544,7 @@ make a function called lw_program takes files returns result
   let f = 0
   while f < list_len(files) do
     let stmts = files[f][0]
-    let ctx = [files[f][1], symbols, by_name, handled, rules, false]
+    let ctx = [files[f][1], symbols, by_name, handled, rules, false, trace and (not files[f][1])]
     let i = 0
     while i < list_len(stmts) do
       let st = stmts[i]
@@ -1486,6 +1566,9 @@ make a function called lw_program takes files returns result
         let errors = v2_concat(errors, r[1])
       elif st[0] == "ClassDecl" then
         let classes = list_push(classes, lw_class_registration(st))
+      elif trace and files[f][1] then
+        # a runtime file's statement is no step of the program's
+        let top = list_push(top, lw_untraced(st))
       else
         let top = list_push(top, st)
       end
@@ -1496,7 +1579,7 @@ make a function called lw_program takes files returns result
   # __main registers the functions reached by name first: __register is
   # lowered last, when every by_name call has been seen
   let start = ["Expr", ["Call", "__register", []], 0]
-  let r = lw_function_with("__main", [], v2_concat([start], v2_concat(classes, top)), [], lifted, false, [false, symbols, by_name, handled, rules, false], [])
+  let r = lw_function_with("__main", [], v2_concat([start], v2_concat(classes, top)), [], lifted, false, [false, symbols, by_name, handled, rules, false, trace], [])
   let fns = list_push(fns, r[0])
   let errors = v2_concat(errors, r[1])
   let registrations = lw_by_name_registrations(files, symbols, vec_to_list(by_name))

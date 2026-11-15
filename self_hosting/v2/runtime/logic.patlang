@@ -951,29 +951,193 @@ make a function called rt_state_satisfies takes state, goals returns yes
   return yes
 end
 
-# The frontier's cheapest node, the first of equals, and the frontier without
-# it: [node, rest].
-make a function called rt_frontier_pop takes frontier returns result
-  require (value_class(frontier) == 9) and (list_len(frontier) > 0)
-  let best = 0
-  let i = 1
-  while i < list_len(frontier) do
-    if frontier[i][0] < frontier[best][0] then
-      let best = i
-    end
-    let i = i + 1
-  end
-  let rest = []
+# ---- the plan search ----
+#
+# A* from the stores' ground facts (spec 1.13). A node is [f, g, seq, state,
+# path, unmet]: g the cost so far, f that plus the estimate below, seq the
+# order it was made in, unmet how many goals its state does not meet. The frontier is a binary heap in a vec, the node to expand
+# first at index 0: least f, then most g (deeper first, so a run of equally
+# good steps is followed to its end), then least seq. A state is expanded
+# once, the first time it is taken from the frontier; the search ends with
+# the first state taken that meets the goals, or with [] when the frontier
+# is empty, every reachable state having been tried. Each expansion makes a
+# child for every applicable step, each a copy of the state, so for n
+# independent goals the search takes time growing about as n cubed.
+
+# How many of the goals the state does not meet.
+make a function called rt_plan_unmet takes state, goals returns unmet
+  require (value_class(state) == 9) and (value_class(goals) == 9)
+  let unmet = 0
   let i = 0
-  while i < list_len(frontier) do
-    if i != best then
-      let rest = list_push(rest, frontier[i])
+  while i < list_len(goals) do
+    if not rt_state_contains(state, goals[i]) then
+      let unmet = unmet + 1
     end
     let i = i + 1
   end
-  let result = [frontier[best], rest]
-  ensure list_len(result[1]) == list_len(frontier) - 1
-  return result
+  ensure (unmet >= 0) and (unmet <= list_len(goals))
+  return unmet
+end
+
+# The goals a step leaves unmet, from those its state left: each goal it adds
+# that was not there is met, each goal it deletes that was there is not. A
+# step's effects are few, so this costs far less than counting again.
+make a function called rt_plan_unmet_after takes unmet, state, effects, subst, adding, goals returns out
+  require (value_class(state) == 9) and (value_class(effects) == 9) and (value_class(goals) == 9)
+  let out = unmet
+  let i = 0
+  while i < list_len(effects) do
+    let f = [effects[i][0], apply_subst(effects[i][1], subst)]
+    if rt_state_contains(goals, f) and (rt_state_contains(state, f) != adding) then
+      if adding then
+        let out = out - 1
+      else
+        let out = out + 1
+      end
+    end
+    let i = i + 1
+  end
+  ensure out >= 0
+  return out
+end
+
+# The estimate of what is left: the goals not yet met, over the most facts any
+# action adds, rounded up, times the cheapest action's cost. No action meets
+# more goals than it adds facts or costs less than the cheapest, so it never
+# overestimates, and the plan found is a cheapest one.
+make a function called rt_plan_estimate takes unmet, most_adds, cheapest returns h
+  require (unmet >= 0) and (most_adds >= 1)
+  let h = 0
+  if (unmet > 0) and (cheapest > 0) then
+    let h = word_div(unmet + most_adds - 1, most_adds) * cheapest
+  end
+  ensure h >= 0
+  return h
+end
+
+# [the most facts an action adds (at least 1), the cheapest action's cost (0
+# when some action costs nothing or there are none)].
+make a function called rt_plan_shape takes actions returns shape
+  require value_class(actions) == 9
+  let most = 1
+  let cheapest = 0
+  let i = 0
+  while i < list_len(actions) do
+    if list_len(actions[i][2]) > most then
+      let most = list_len(actions[i][2])
+    end
+    if (i == 0) or (actions[i][4] < cheapest) then
+      let cheapest = actions[i][4]
+    end
+    let i = i + 1
+  end
+  if cheapest < 0 then
+    let cheapest = 0
+  end
+  let shape = [most, cheapest]
+  ensure (list_len(shape) == 2) and (shape[0] >= 1)
+  return shape
+end
+
+# Whether node a is expanded before node b.
+make a function called rt_pq_before takes a, b returns yes
+  require (list_len(a) == 6) and (list_len(b) == 6)
+  if a[0] != b[0] then
+    let yes = a[0] < b[0]
+  elif a[1] != b[1] then
+    let yes = a[1] > b[1]
+  else
+    let yes = a[2] < b[2]
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_pq_push takes heap, node returns done
+  require (value_class(heap) == 12) and (list_len(node) == 6)
+  vec_push(heap, node)
+  let i = vec_len(heap) - 1
+  let moving = true
+  while moving and (i > 0) do
+    let up = word_div(i - 1, 2)
+    if rt_pq_before(vec_get(heap, i), vec_get(heap, up)) then
+      let x = vec_get(heap, i)
+      vec_set(heap, i, vec_get(heap, up))
+      vec_set(heap, up, x)
+      let i = up
+    else
+      let moving = false
+    end
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# The node to expand first, taken out of the heap.
+make a function called rt_pq_pop takes heap returns node
+  require (value_class(heap) == 12) and (vec_len(heap) > 0)
+  let node = vec_get(heap, 0)
+  let n = vec_len(heap) - 1
+  let last = rt_vec_pop(heap)
+  if n > 0 then
+    vec_set(heap, 0, last)
+    let i = 0
+    let moving = true
+    while moving do
+      let l = 2 * i + 1
+      let r = l + 1
+      let best = i
+      if (l < n) and rt_pq_before(vec_get(heap, l), vec_get(heap, best)) then
+        let best = l
+      end
+      if (r < n) and rt_pq_before(vec_get(heap, r), vec_get(heap, best)) then
+        let best = r
+      end
+      if best == i then
+        let moving = false
+      else
+        let x = vec_get(heap, i)
+        vec_set(heap, i, vec_get(heap, best))
+        vec_set(heap, best, x)
+        let i = best
+      end
+    end
+  end
+  ensure list_len(node) == 6
+  return node
+end
+
+# The states expanded: 1024 buckets of state keys, by the key's hash.
+make a function called rt_key_set_new returns set
+  let set = vec_new()
+  let i = 0
+  while i < 1024 do
+    vec_push(set, [])
+    let i = i + 1
+  end
+  ensure vec_len(set) == 1024
+  return set
+end
+
+# Adds key to the set: true when it was not there.
+make a function called rt_key_set_add takes set, key returns added
+  require (value_class(set) == 12) and (value_class(key) == 8)
+  let k = word_and(rt_fnv_text(rt_fnv_start(), key), 1023)
+  let bucket = vec_get(set, k)
+  let i = 0
+  while i < list_len(bucket) do
+    if bucket[i] == key then
+      let added = false
+      ensure value_class(added) == 1
+      return added
+    end
+    let i = i + 1
+  end
+  vec_set(set, k, list_push(bucket, key))
+  let added = true
+  ensure value_class(added) == 1
+  return added
 end
 
 # [path, the state it reaches], or [[], []] when no plan is found, starting
@@ -981,28 +1145,22 @@ end
 make a function called rt_plan_from takes stores, goal_facts returns result
   require (value_class(stores) == 9) and (value_class(goal_facts) == 9)
   let actions = rt_global_get(4240)
-  let frontier = [[0, rt_ground_facts(stores), []]]
-  let visited = []
-  let expansions = 0
-  while list_len(frontier) > 0 do
-    if expansions >= 5000 then
-      let result = [[], []]
+  let shape = rt_plan_shape(actions)
+  let start = rt_ground_facts(stores)
+  let heap = vec_new()
+  let unmet = rt_plan_unmet(start, goal_facts)
+  rt_pq_push(heap, [rt_plan_estimate(unmet, shape[0], shape[1]), 0, 0, start, [], unmet])
+  let seq = 1
+  let expanded = rt_key_set_new()
+  while vec_len(heap) > 0 do
+    let node = rt_pq_pop(heap)
+    let state = node[3]
+    if node[5] == 0 then
+      let result = [node[4], state]
       ensure list_len(result) == 2
       return result
     end
-    let popped = rt_frontier_pop(frontier)
-    let node = popped[0]
-    let frontier = popped[1]
-    let state = node[1]
-    let expansions = expansions + 1
-    if rt_state_satisfies(state, goal_facts) then
-      let result = [node[2], state]
-      ensure list_len(result) == 2
-      return result
-    end
-    let key = rt_state_key(state)
-    if not rt_state_contains(visited, key) then
-      let visited = list_push(visited, key)
+    if rt_key_set_add(expanded, rt_state_key(state)) then
       let a = 0
       while a < list_len(actions) do
         let action = actions[a]
@@ -1010,10 +1168,17 @@ make a function called rt_plan_from takes stores, goal_facts returns result
         let k = 0
         while k < list_len(insts) do
           let subst = insts[k]
-          let next = rt_state_effects(state, action[3], subst, false)
-          let next = rt_state_effects(next, action[2], subst, true)
-          let path = list_push(node[2], action_instance_label(action[0], action[1], subst))
-          let frontier = list_push(frontier, [node[0] + action[4], next, path])
+          let mid = rt_state_effects(state, action[3], subst, false)
+          let next = rt_state_effects(mid, action[2], subst, true)
+          # a step that changes nothing leads nowhere new
+          if next != state then
+            let left = rt_plan_unmet_after(node[5], state, action[3], subst, false, goal_facts)
+            let left = rt_plan_unmet_after(left, mid, action[2], subst, true, goal_facts)
+            let g = node[1] + action[4]
+            let path = list_push(node[4], action_instance_label(action[0], action[1], subst))
+            rt_pq_push(heap, [g + rt_plan_estimate(left, shape[0], shape[1]), g, seq, next, path, left])
+            let seq = seq + 1
+          end
           let k = k + 1
         end
         let a = a + 1

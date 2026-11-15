@@ -227,6 +227,15 @@ function start(init) {
       dv().setBigUint64(num(p), ft, true);
       return 0;
     },
+    // The processors the browser reports; it gives no processor times or
+    // memory figures, so cpu_times and memory_status give [-1, -1].
+    GetSystemInfo(p) {
+      const n = (typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 1;
+      dv().setUint32(num(p) + 32, n, true);
+      return 0;
+    },
+    GetSystemTimes() { lastError = 50; return 0; },
+    GlobalMemoryStatusEx() { lastError = 50; return 0; },
     GetCommandLineA() { return HOST_AREA; },
     GetEnvironmentVariableA(name, buf, size) {
       const v = init.env[cstr(num(name))];
@@ -305,6 +314,10 @@ function start(init) {
     TerminateProcess() { lastError = 6; return 0; },
     PeekNamedPipe() { lastError = 6; return 0; },
     K32GetProcessMemoryInfo() { lastError = 50; return 0; },
+    CreateJobObjectA() { lastError = 50; return 0; },
+    AssignProcessToJobObject() { lastError = 6; return 0; },
+    ResumeThread() { lastError = 6; return -1; },
+    QueryInformationJobObject() { lastError = 6; return 0; },
   };
   const winsock = {
     WSAStartup() { return 10091; },

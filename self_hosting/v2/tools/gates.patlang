@@ -1,0 +1,950 @@
+# v2's gates (docs/plans/gates.md): what has changed since it last passed,
+# run in parallel within what the machine can spare.
+#
+#   self_hosting/build/v2_gates_tool.exe [--all] [--plan] [--cap N] [--only PREFIX]
+#
+# --all runs every unit, fresh or not; --plan says what would run and runs
+# nothing; --cap N gives the units N cores whatever the machine is doing;
+# --only PREFIX keeps the units whose names start with PREFIX as goals (what
+# they need still runs when it must).
+#
+# A unit is one build (the compiler and its fixpoint, the bootstrap reader,
+# the WASM writers, the interpreter, a suite's executable) or one feature file
+# of one suite on one engine. Each unit has the units it needs, the files and
+# directories its result depends on, the cores it keeps busy, and a lane:
+# units in the same lane never run at once (the language suite's two engines
+# share ports, queue topics and files).
+#
+# A unit's key is the hash of its inputs and of the keys of the units it
+# needs. A unit that passed with its current key is fresh, and is not run
+# again; --all runs every unit. The stale units are the planner's goals
+# (spec 1.13, plan): its actions are the units, each needing what the units
+# it needs make, so a build no stale unit needs and whose product is there is
+# not run, and one whose product is missing is.
+#
+# Units start when what they need has passed and the machine can take them:
+# their cores within the logical cores less two, less what other programs
+# are using (measured with cpu_times before each start), and their memory
+# (the peak recorded last time, or 2 GB) within what memory_status says is
+# available, less a 4 GB reserve and the peaks of the units running. Each
+# unit writes under self_hosting/build/gates/out/UNIT (PATLANG_SPEC_OUT) and
+# its output to self_hosting/build/gates/logs/UNIT.log.
+#
+# Progress goes to self_hosting/build/gates/status as units start and
+# finish; a `status` signal on the port that file names gives the same. A
+# `quit` signal starts no more units: those running finish, and each unit's
+# result goes to the record as it finishes, so the next run starts where this
+# one stopped. A run that quit exits with 2.
+include "../../lib/includes.patlang"
+include "../../lib/signals.patlang"
+
+# ---- paths ----
+
+make a function called gt_dir returns d
+  return "self_hosting/build/gates"
+end
+
+make a function called gt_build returns d
+  return "self_hosting/build"
+end
+
+# A unit's name as a file name: its slashes as double underscores.
+make a function called gt_file_name takes name returns out
+  let b = sb_new()
+  let i = 0
+  while i < name.length do
+    let c = substr(name, i, 1)
+    if c == "/" then
+      sb_push(b, "__")
+    else
+      sb_push(b, c)
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called gt_out_dir takes name returns d
+  return gt_dir() + "/out/" + gt_file_name(name)
+end
+
+make a function called gt_log_path takes name returns p
+  return gt_dir() + "/logs/" + gt_file_name(name) + ".log"
+end
+
+make a function called gt_backslashes takes path returns out
+  let b = sb_new()
+  let i = 0
+  while i < path.length do
+    if char_code(path, i) == 47 then
+      sb_push(b, chr(92))
+    else
+      sb_push(b, substr(path, i, 1))
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# ---- hashing what a unit depends on ----
+
+# Files written by builds and runs, never sources: left out of a directory's
+# hash, so that a run writing beside its inputs does not make them change.
+make a function called gt_generated takes name returns yes
+  let ends = [".exe", ".asm", ".ledger", ".timing", ".facts", ".key", ".progress", ".log", ".wasm", ".ir", ".obj", ".bak", ".srchash", ".pyc"]
+  let i = 0
+  while i < list_len(ends) do
+    if str_ends_with(name, ends[i]) then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# Every file under a directory, its path then its text, onto b.
+make a function called gt_hash_dir takes dir, b returns done
+  return gt_hash_dir_except(dir, [], b)
+end
+
+# The same, leaving out the directory's subdirectories named in skip.
+make a function called gt_hash_dir_except takes dir, skip, b returns done
+  let names = list_dir(dir)
+  let i = 0
+  while i < list_len(names) do
+    let n = names[i]
+    if str_ends_with(n, "/") then
+      let sub = substr(n, 0, n.length - 1)
+      if (sub != "__pycache__") and (sub != "build") and (not gt_member(skip, sub)) then
+        gt_hash_dir(dir + "/" + sub, b)
+      end
+    elif not gt_generated(n) then
+      sb_push(b, dir + "/" + n + chr(0) + hash_string(read_file(dir + "/" + n)) + chr(10))
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# A program's file and every file it includes, one each.
+make a function called gt_include_closure takes path returns files
+  let seen = vec_new()
+  vec_push(seen, path_normalize(path))
+  expand_includes_once_with(read_file(path), path_dirname(path), seen)
+  return vec_to_list(seen)
+end
+
+# The hash of a unit's inputs: ["file", path], ["dir", path],
+# ["dir_except", path, subdirectories left out] or ["program", path] (the
+# file and its includes).
+# Each input's hash is worked out once a run: memo holds [kind:path, hash]
+# pairs, since many units share a directory.
+make a function called gt_inputs_hash takes inputs, memo returns h
+  let b = sb_new()
+  let i = 0
+  while i < list_len(inputs) do
+    sb_push(b, gt_input_hash(inputs[i], memo) + "|")
+    let i = i + 1
+  end
+  return hash_string(sb_str(b))
+end
+
+make a function called gt_input_hash takes input, memo returns h
+  let id = input[0] + ":" + input[1]
+  if input[0] == "dir_except" then
+    let id = id + ":" + input[2]
+  end
+  let i = 0
+  while i < vec_len(memo) do
+    if vec_get(memo, i)[0] == id then return vec_get(memo, i)[1] end
+    let i = i + 1
+  end
+  let b = sb_new()
+  let kind = input[0]
+  let path = input[1]
+  if kind == "dir" then
+    gt_hash_dir(path, b)
+  elif kind == "dir_except" then
+    gt_hash_dir_except(path, input[2], b)
+  elif kind == "program" then
+    let files = gt_include_closure(path)
+    let k = 0
+    while k < list_len(files) do
+      sb_push(b, files[k] + chr(0) + hash_string(read_file(files[k])) + chr(10))
+      let k = k + 1
+    end
+  else
+    sb_push(b, path + chr(0) + hash_string(read_file(path)) + chr(10))
+  end
+  let h = hash_string(sb_str(b))
+  vec_push(memo, [id, h])
+  return h
+end
+
+# ---- units ----
+#
+# A unit is a list:
+#   0 name   1 needs (names)   2 inputs   3 cores   4 lane ("" for none)
+#   5 what it runs: ["cmd", program, args] run with PATLANG_SPEC_OUT, or
+#     ["fixpoint"], ["bootstrap"], ["wasm"], the build checks below
+#   6 its product, a file a build leaves ("" for a suite)
+
+make a function called gt_unit takes name, needs, inputs, cores, lane, run, product returns u
+  return [name, needs, inputs, cores, lane, run, product]
+end
+
+# What the compiler is built from: the front end's files, the runtime's.
+make a function called gt_compiler_inputs returns inputs
+  return [["program", "self_hosting/v2/compile.patlang"], ["dir", "self_hosting/v2/runtime"]]
+end
+
+make a function called gt_build_units takes cores returns units
+  let b = gt_build()
+  let w = "" + cores
+  let units = []
+  let units = list_push(units, gt_unit("compiler", [], gt_compiler_inputs(), cores, "", ["fixpoint", w], b + "/v2.exe"))
+  let units = list_push(units, gt_unit("bootstrap", ["compiler"], list_push(gt_compiler_inputs(), ["file", "bootstrap/ir_reader.py"]), cores, "", ["bootstrap", w], ""))
+  let units = list_push(units, gt_unit("wasm", ["bootstrap"], list_push(gt_compiler_inputs(), ["file", "bootstrap/ir_wasm.py"]), 1, "", ["wasm"], ""))
+  let units = list_push(units, gt_unit("interpreter", ["compiler"], [["program", "self_hosting/v2/interp.patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/v2/interp.patlang", b + "/v2_interp.exe", "--workers", w]], b + "/v2_interp.exe"))
+  let units = list_push(units, gt_unit("language_suite", ["compiler"], [["program", "self_hosting/tools/run_language_spec_suite.patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/tools/run_language_spec_suite.patlang", b + "/v2_language_suite.exe", "--workers", w]], b + "/v2_language_suite.exe"))
+  let tests = ["interp_run_selftest", "isolate_selftest"]
+  let i = 0
+  while i < list_len(tests) do
+    let t = tests[i]
+    let units = list_push(units, gt_unit(t + "_build", ["compiler"], [["program", "self_hosting/" + t + ".patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/" + t + ".patlang", b + "/" + t + ".exe", "--workers", w]], b + "/" + t + ".exe"))
+    let units = list_push(units, gt_unit(t, [t + "_build", "interpreter"], [["program", "self_hosting/" + t + ".patlang"], ["dir", "self_hosting/lib"]], 1, "", ["cmd", b + "/" + t + ".exe", []], ""))
+    let i = i + 1
+  end
+  return units
+end
+
+# The suites: [name, the program running them, its arguments before the
+# feature file, the units it needs, the directories its steps read, lane].
+make a function called gt_suites returns suites
+  let b = gt_build()
+  let i = b + "/v2_interp.exe"
+  let part1 = ["dir", "self_hosting/v2/spec/fixtures"]
+  let lib = ["dir", "self_hosting/lib"]
+  let lang = [["dir", "self_hosting/tools/spec_fixtures"], lib, ["dir", "self_hosting/examples"], ["dir", "spec_library/language"]]
+  let bm = [["dir", "self_hosting/block_model"], lib, ["dir", "self_hosting/examples"], ["dir", "spec_library/block_model"]]
+  let wasm_host = ["dir", "self_hosting/v2/wasm"]
+  return [["part1_v2", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "v2"], ["interpreter", "compiler"], [part1, lib], ""],
+    ["part1_interp", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "interp"], ["interpreter", "compiler"], [part1, lib], ""],
+    ["engines_agree", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "both"], ["interpreter", "compiler"], [part1, lib], ""],
+    ["part2", i, ["self_hosting/v2/spec/run_runtime.patlang"], ["interpreter", "compiler"], [part1, lib, wasm_host, ["dir_except", "self_hosting/v2", ["tools"]], ["file", "bootstrap/ir_reader.py"], ["file", "bootstrap/ir_wasm.py"], ["dir", "self_hosting/tools"]], ""],
+    ["language_interp", i, ["self_hosting/tools/run_language_spec_suite.patlang"], ["interpreter", "compiler"], lang, "language"],
+    ["language_v2", b + "/v2_language_suite.exe", [], ["language_suite", "interpreter", "compiler"], lang, "language"],
+    ["match", i, ["self_hosting/tools/run_match_spec_suite.patlang"], ["interpreter", "compiler"], lang, "language"],
+    ["block_model", i, ["self_hosting/block_model/run_block_model_spec_suite.patlang"], ["interpreter", "compiler"], bm, ""]]
+end
+
+# The runner's source, for a suite whose program is the interpreter.
+make a function called gt_suite_runner takes suite returns path
+  if list_len(suite[2]) > 0 then return suite[2][0] end
+  return "self_hosting/tools/run_language_spec_suite.patlang"
+end
+
+# A suite's feature files, as its runner lists them (gherkin.patlang,
+# run_suite): the runner is the one place that says which a suite has. The
+# runner's source is run on the interpreter, so a built suite older than its
+# source does not answer for it.
+# The list is kept in self_hosting/build/gates/lists/SUITE under the hash of
+# the runner and its includes, and listed again when they change.
+make a function called gt_features takes suite returns paths
+  let args = [gt_suite_runner(suite)]
+  if list_len(suite[2]) > 1 then
+    let args = list_push(args, suite[2][1])
+  end
+  let key = gt_inputs_hash([["program", gt_suite_runner(suite)]], vec_new()) + " " + str_join(args, " ")
+  let kept = gt_dir() + "/lists/" + suite[0]
+  let lines = split_lines(read_file(kept))
+  if (list_len(lines) > 0) and (lines[0] == key) then
+    let paths = []
+    let i = 1
+    while i < list_len(lines) do
+      if str_ends_with(lines[i], ".feature") then
+        let paths = list_push(paths, lines[i])
+      end
+      let i = i + 1
+    end
+    return paths
+  end
+  let paths = gt_list_features(args)
+  write_file(kept, key + chr(10) + str_join(paths, chr(10)) + chr(10))
+  return paths
+end
+
+make a function called gt_list_features takes args returns paths
+  let r = exec_measured(gt_build() + "/v2_interp.exe", list_push(args, "--list"))
+  let paths = []
+  let lines = split_lines(r[0])
+  let i = 0
+  while i < list_len(lines) do
+    let l = str_trim(lines[i])
+    if str_ends_with(l, ".feature") then
+      let paths = list_push(paths, l)
+    end
+    let i = i + 1
+  end
+  return paths
+end
+
+make a function called gt_base_name takes path returns name
+  let base = path_basename(path)
+  if str_ends_with(base, ".feature") then
+    return substr(base, 0, base.length - 8)
+  end
+  return base
+end
+
+make a function called gt_suite_units takes suites returns units
+  let units = []
+  let s = 0
+  while s < list_len(suites) do
+    let suite = suites[s]
+    let features = gt_features(suite)
+    if list_len(features) == 0 then
+      print("gates: " + suite[0] + " lists no feature files")
+    end
+    let f = 0
+    while f < list_len(features) do
+      let inputs = v2_list_concat([["program", gt_suite_runner(suite)], ["file", features[f]]], suite[4])
+      let units = list_push(units, gt_unit(suite[0] + "/" + gt_base_name(features[f]), suite[3], inputs, 1, suite[5], ["cmd", suite[1], list_push(suite[2], features[f])], ""))
+      let f = f + 1
+    end
+    let s = s + 1
+  end
+  return units
+end
+
+make a function called v2_list_concat takes a, b returns out
+  let out = a
+  let i = 0
+  while i < list_len(b) do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called gt_find takes units, name returns u
+  let i = 0
+  while i < list_len(units) do
+    if units[i][0] == name then return units[i] end
+    let i = i + 1
+  end
+  return []
+end
+
+# Every unit's key: its inputs' hash with the keys of what it needs, in order,
+# as [name, key] pairs. A need comes before what needs it in the list.
+make a function called gt_keys takes units returns keys
+  let memo = vec_new()
+  let keys = []
+  let i = 0
+  while i < list_len(units) do
+    let u = units[i]
+    let b = sb_new()
+    sb_push(b, gt_inputs_hash(u[2], memo))
+    let k = 0
+    while k < list_len(u[1]) do
+      sb_push(b, "|" + gt_key_of(keys, u[1][k]))
+      let k = k + 1
+    end
+    sb_push(b, "|" + u[5])
+    let keys = list_push(keys, [u[0], hash_string(sb_str(b))])
+    let i = i + 1
+  end
+  return keys
+end
+
+make a function called gt_key_of takes keys, name returns key
+  let i = 0
+  while i < list_len(keys) do
+    if keys[i][0] == name then return keys[i][1] end
+    let i = i + 1
+  end
+  return ""
+end
+
+# ---- the record of passes ----
+#
+# self_hosting/build/gates/record: a line a unit, name, key, "pass" or
+# "fail", milliseconds and peak bytes, tab separated, the latest run's.
+
+make a function called gt_record_path returns p
+  return gt_dir() + "/record"
+end
+
+make a function called gt_record_read returns rows
+  let rows = []
+  let lines = split_lines(read_file(gt_record_path()))
+  let i = 0
+  while i < list_len(lines) do
+    let f = gt_split_tabs(lines[i])
+    if list_len(f) == 5 then
+      let rows = list_push(rows, [f[0], f[1], f[2], to_num(f[3]), to_num(f[4])])
+    end
+    let i = i + 1
+  end
+  return rows
+end
+
+make a function called gt_split_tabs takes line returns fields
+  let fields = []
+  let b = sb_new()
+  let i = 0
+  while i < line.length do
+    let c = substr(line, i, 1)
+    if c == chr(9) then
+      let fields = list_push(fields, sb_str(b))
+      let b = sb_new()
+    elif c != chr(13) then
+      sb_push(b, c)
+    end
+    let i = i + 1
+  end
+  return list_push(fields, sb_str(b))
+end
+
+make a function called gt_row_of takes rows, name returns row
+  let i = 0
+  while i < list_len(rows) do
+    if rows[i][0] == name then return rows[i] end
+    let i = i + 1
+  end
+  return []
+end
+
+# The rows with this unit's replaced by row, written out.
+make a function called gt_record_put takes rows, row returns out
+  let out = []
+  let i = 0
+  while i < list_len(rows) do
+    if rows[i][0] != row[0] then
+      let out = list_push(out, rows[i])
+    end
+    let i = i + 1
+  end
+  let out = list_push(out, row)
+  let b = sb_new()
+  let i = 0
+  while i < list_len(out) do
+    let r = out[i]
+    sb_push(b, r[0] + chr(9) + r[1] + chr(9) + r[2] + chr(9) + r[3] + chr(9) + r[4] + chr(10))
+    let i = i + 1
+  end
+  write_file(gt_record_path(), sb_str(b))
+  return out
+end
+
+make a function called gt_fresh takes rows, name, key returns yes
+  let r = gt_row_of(rows, name)
+  return (list_len(r) == 5) and (r[1] == key) and (r[2] == "pass")
+end
+
+# ---- choosing what runs: the planner ----
+
+# The units that run: the planner's steps for the stale units' verdicts, each
+# action a unit needing what its needs make. A build that passed with its key
+# and whose product is there has made it already.
+make a function called gt_plan takes units, keys, rows, all, only returns names
+  action_clear()
+  rules_clear()
+  let goals = []
+  let i = 0
+  while i < list_len(units) do
+    let u = units[i]
+    let pre = []
+    let k = 0
+    while k < list_len(u[1]) do
+      let pre = list_push(pre, ["made", [u[1][k]]])
+      let k = k + 1
+    end
+    action_add(u[0], pre, [["made", [u[0]]]], [], 1)
+    let fresh = (not all) and gt_fresh(rows, u[0], gt_key_of(keys, u[0]))
+    if fresh and ((u[6] == "") or file_exists(u[6])) then
+      rule_add("made", [u[0]], [])
+    end
+    if (not fresh) and str_starts_with(u[0], only) then
+      let goals = list_push(goals, ["made", [u[0]]])
+    end
+    let i = i + 1
+  end
+  if list_len(goals) == 0 then return [] end
+  let names = plan(goals)
+  if list_len(names) == 0 then
+    print("gates: the planner found no way to run the stale units")
+  end
+  return names
+end
+
+# ---- the machine ----
+
+# [cores the units may use now, the sample for next time]: the logical cores
+# less two, less the cores other programs kept busy since the last sample
+# (the busy time beyond what the running units' cores account for).
+make a function called gt_core_budget takes last, ours returns result
+  let cap = cpu_count() - 2
+  if cap < 1 then let cap = 1 end
+  let now = [now_ms(), cpu_times()]
+  let budget = cap
+  let dt = now[0] - last[0]
+  if (dt > 0) and (now[1][1] >= 0) and (last[1][1] >= 0) then
+    # core-milliseconds busy, less what the running units' cores could
+    # account for, as whole cores, rounded
+    let others = (now[1][1] - last[1][1]) - ours * dt
+    if others > 0 then
+      let budget = cap - word_div(others + word_div(dt, 2), dt)
+    end
+  end
+  if budget < 1 then let budget = 1 end
+  return [budget, now]
+end
+
+make a function called gt_reserve returns bytes
+  return 4 * 1073741824
+end
+
+make a function called gt_default_peak returns bytes
+  return 2 * 1073741824
+end
+
+# ---- running a unit ----
+
+# What a unit's run does, on a thread of its own: [ok, output, peak bytes].
+make a function called gt_run takes u returns result
+  let run = u[5]
+  let out = gt_out_dir(u[0])
+  exec_measured("cmd", ["/c", "mkdir " + gt_backslashes(out) + " 2>nul"])
+  if run[0] == "cmd" then
+    let args = ["/c", "set PATLANG_SPEC_OUT=" + out + "&& " + gt_backslashes(run[1])]
+    let r = exec_measured("cmd", v2_list_concat(args, run[2]))
+    return [r[2], r[0] + r[1], r[3]]
+  end
+  if run[0] == "fixpoint" then
+    return gt_fixpoint(run[1])
+  end
+  if run[0] == "bootstrap" then
+    return gt_bootstrap(run[1])
+  end
+  return gt_wasm()
+end
+
+make a function called gt_step takes log, label, r returns ok
+  sb_push(log, "== " + label + ": " + r[2] + chr(10) + r[0] + r[1])
+  return r[2]
+end
+
+# v2.exe builds a, a builds b; they must be byte identical, and b becomes
+# v2.exe, its key beside it.
+make a function called gt_fixpoint takes w returns result
+  let b = gt_build()
+  let log = sb_new()
+  let peak = 0
+  let ra = exec_measured(b + "/v2.exe", ["self_hosting/v2/compile.patlang", b + "/v2_gen_a.exe", "--no-cache", "--workers", w])
+  if not gt_step(log, "compiler a", ra) then return [false, sb_str(log), ra[3]] end
+  let rb = exec_measured(b + "/v2_gen_a.exe", ["self_hosting/v2/compile.patlang", b + "/v2_gen_b.exe", "--no-cache", "--workers", w])
+  if not gt_step(log, "compiler b", rb) then return [false, sb_str(log), rb[3]] end
+  let same = gt_same_bytes(b + "/v2_gen_a.exe", b + "/v2_gen_b.exe")
+  sb_push(log, "== fixpoint: a and b " + gt_same_text(same) + chr(10))
+  if same then
+    exec_measured("cmd", ["/c", "copy /y " + gt_backslashes(b + "/v2_gen_b.exe") + " " + gt_backslashes(b + "/v2.exe")])
+    exec_measured("cmd", ["/c", "copy /y " + gt_backslashes(b + "/v2_gen_b.exe.key") + " " + gt_backslashes(b + "/v2.exe.key")])
+  end
+  let peak = ra[3]
+  if rb[3] > peak then let peak = rb[3] end
+  return [same, sb_str(log), peak]
+end
+
+make a function called gt_same_text takes same returns t
+  if same then return "byte identical" end
+  return "differ"
+end
+
+make a function called gt_same_bytes takes a, b returns same
+  let r = exec_measured("cmd", ["/c", "fc /b " + gt_backslashes(a) + " " + gt_backslashes(b) + " >nul"])
+  return r[2] and file_exists(a) and file_exists(b)
+end
+
+# The bootstrap (spec 2.6): the compiler's IR, written again; the compiler the
+# reader builds from it; that compiler building the compiler as v2.exe does.
+make a function called gt_bootstrap takes w returns result
+  let b = gt_build()
+  let log = sb_new()
+  let r = exec_measured(b + "/v2.exe", ["self_hosting/v2/compile.patlang", "bootstrap/v2_compiler.ir", "--ir"])
+  if not gt_step(log, "compiler IR", r) then return [false, sb_str(log), r[3]] end
+  let r = exec_measured("py", ["-3", "-I", "bootstrap/ir_reader.py", "bootstrap/v2_compiler.ir", b + "/v2_read.exe"])
+  if not gt_step(log, "reader", r) then return [false, sb_str(log), r[3]] end
+  let r2 = exec_measured(b + "/v2_read.exe", ["self_hosting/v2/compile.patlang", b + "/v2_read_a.exe", "--no-cache", "--workers", w])
+  if not gt_step(log, "reader's compiler builds the compiler", r2) then return [false, sb_str(log), r2[3]] end
+  let same = gt_same_bytes(b + "/v2_read_a.exe", b + "/v2.exe")
+  sb_push(log, "== bootstrap: v2_read_a.exe and v2.exe " + gt_same_text(same) + chr(10))
+  return [same, sb_str(log), r2[3]]
+end
+
+# The WASM form (spec 2.6): v2.exe's module and ir_wasm.py's from the same IR
+# must be the same bytes.
+make a function called gt_wasm returns result
+  let b = gt_build()
+  let log = sb_new()
+  let r = exec_measured(b + "/v2.exe", ["self_hosting/v2/compile.patlang", b + "/v2_compiler.wasm", "--wasm"])
+  if not gt_step(log, "compiler as WASM", r) then return [false, sb_str(log), r[3]] end
+  let r2 = exec_measured("py", ["-3", "-I", "bootstrap/ir_wasm.py", "bootstrap/v2_compiler.ir", b + "/v2_compiler_py.wasm"])
+  if not gt_step(log, "ir_wasm.py", r2) then return [false, sb_str(log), r2[3]] end
+  let same = gt_same_bytes(b + "/v2_compiler.wasm", b + "/v2_compiler_py.wasm")
+  sb_push(log, "== wasm: the two modules " + gt_same_text(same) + chr(10))
+  return [same, sb_str(log), r[3]]
+end
+
+# The "tests: N passed, M failed" line of a suite unit's output, or "".
+make a function called gt_tests_line takes text returns line
+  let lines = split_lines(text)
+  let i = list_len(lines) - 1
+  while i >= 0 do
+    if str_starts_with(lines[i], "tests: ") then return str_trim(lines[i]) end
+    let i = i - 1
+  end
+  return ""
+end
+
+# ---- status ----
+
+make a function called gt_status_path returns p
+  return gt_dir() + "/status"
+end
+
+make a function called gt_status_text takes started, running, waiting, done, failed, skipped returns text
+  let b = sb_new()
+  sb_push(b, "running " + list_len(running) + ", waiting " + waiting + ", done " + done + ", failed " + list_len(failed) + ", fresh " + skipped + ", " + word_div(now_ms() - started, 1000) + " s" + chr(10))
+  let i = 0
+  while i < list_len(running) do
+    sb_push(b, "  running " + running[i][0][0] + " for " + word_div(now_ms() - running[i][2], 1000) + " s" + chr(10))
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(failed) do
+    sb_push(b, "  FAILED " + failed[i] + chr(10))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+when status do
+  signal_reply(vfs_read("/gates/status"))
+end
+
+# No more units start; the running ones finish and are recorded, so the next
+# run takes up what this one left.
+when quit do
+  vfs_write("/gates/quit", "1")
+  signal_reply("quitting: the running units finish, no more start")
+end
+
+make a function called gt_quitting returns yes
+  # vfs_exists gives the text "1" or "0" (runtime/vfs.patlang)
+  return vfs_exists("/gates/quit") == "1"
+end
+
+make a function called gt_publish takes port, text, events returns done
+  vfs_write("/gates/status", text)
+  write_file(gt_status_path(), "port " + port + chr(10) + text + events)
+  return true
+end
+
+# ---- the dispatcher ----
+
+make a function called gt_names_of takes units returns names
+  let names = []
+  let i = 0
+  while i < list_len(units) do
+    let names = list_push(names, units[i][0])
+    let i = i + 1
+  end
+  return names
+end
+
+make a function called gt_member takes names, x returns yes
+  let i = 0
+  while i < list_len(names) do
+    if names[i] == x then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# Runs the planned units; gives [the rows after, the names that failed].
+make a function called gt_dispatch takes units, names, keys, rows, cap_override returns result
+  let started = now_ms()
+  # the port's number is what signal_claim gives (lib/signals.patlang)
+  let port = signal_claim(0)
+  let port_no = port
+  let todo = names
+  let running = []
+  let failed = []
+  let done = []
+  let events = sb_new()
+  let sample = [now_ms(), cpu_times()]
+  let ours = 0
+  let looping = true
+  while looping do
+    # finished units
+    let still = []
+    let ours = 0
+    let i = 0
+    while i < list_len(running) do
+      let r = running[i]
+      if thread_poll(r[1]) then
+        let res = thread_result(r[1])
+        let u = r[0]
+        let ms = now_ms() - r[2]
+        write_file(gt_log_path(u[0]), res[1])
+        let verdict = "fail"
+        if res[0] then let verdict = "pass" end
+        let rows = gt_record_put(rows, [u[0], gt_key_of(keys, u[0]), verdict, ms, res[2]])
+        let done = list_push(done, u[0])
+        if not res[0] then let failed = list_push(failed, u[0]) end
+        sb_push(events, verdict + " " + u[0] + " " + word_div(ms, 1000) + " s " + gt_tests_line(res[1]) + chr(10))
+      else
+        let still = list_push(still, r)
+        let ours = ours + r[0][3]
+      end
+      let i = i + 1
+    end
+    let running = still
+    # what may start
+    let b = gt_core_budget(sample, ours)
+    let sample = b[1]
+    let budget = b[0]
+    if cap_override > 0 then let budget = cap_override end
+    let mem = memory_status()
+    let committed = 0
+    let i = 0
+    while i < list_len(running) do
+      let committed = committed + gt_peak_of(rows, running[i][0][0])
+      let i = i + 1
+    end
+    let next = []
+    if gt_quitting() and (list_len(todo) > 0) then
+      sb_push(events, "quit: " + list_len(todo) + " units not started" + chr(10))
+      let todo = []
+    end
+    let i = 0
+    while i < list_len(todo) do
+      let u = gt_find(units, todo[i])
+      let state = gt_ready(u, done, failed, running, todo)
+      if state == "skip" then
+        let failed = list_push(failed, u[0])
+        let done = list_push(done, u[0])
+        sb_push(events, "skipped " + u[0] + ": a unit it needs failed" + chr(10))
+      elif (state == "ready") and ((ours + u[3] <= budget) or (list_len(running) == 0)) and gt_memory_allows(mem, committed, gt_peak_of(rows, u[0]), list_len(running)) then
+        let t = thread_spawn(|unit| { return gt_run(unit) }, u)
+        let running = list_push(running, [u, t, now_ms()])
+        let ours = ours + u[3]
+        let committed = committed + gt_peak_of(rows, u[0])
+        sb_push(events, "start " + u[0] + chr(10))
+      else
+        let next = list_push(next, todo[i])
+      end
+      let i = i + 1
+    end
+    let todo = next
+    gt_publish(port_no, gt_status_text(started, running, list_len(todo), list_len(done), failed, 0), sb_str(events))
+    if (list_len(todo) == 0) and (list_len(running) == 0) then
+      let looping = false
+    else
+      signal_poll(port, 500)
+    end
+  end
+  return [rows, failed, sb_str(events)]
+end
+
+# The units, those that took longest last time first (an insertion sort: a
+# few hundred units at most), the rest after them in the planner's order. The
+# dispatcher starts a unit only when what it needs has passed, so the order
+# only says which of the ready units goes first.
+make a function called gt_longest_first takes names, rows returns out
+  let out = []
+  let i = 0
+  while i < list_len(names) do
+    let ms = gt_ms_of(rows, names[i])
+    let k = 0
+    while (k < list_len(out)) and (gt_ms_of(rows, out[k]) >= ms) do
+      let k = k + 1
+    end
+    let out = gt_insert_at(out, k, names[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called gt_insert_at takes items, k, x returns out
+  let out = []
+  let i = 0
+  while i < list_len(items) do
+    if i == k then let out = list_push(out, x) end
+    let out = list_push(out, items[i])
+    let i = i + 1
+  end
+  if k >= list_len(items) then let out = list_push(out, x) end
+  return out
+end
+
+make a function called gt_ms_of takes rows, name returns ms
+  let r = gt_row_of(rows, name)
+  if list_len(r) == 5 then return r[3] end
+  return 0
+end
+
+make a function called gt_peak_of takes rows, name returns bytes
+  let r = gt_row_of(rows, name)
+  if (list_len(r) == 5) and (r[4] > 0) then return r[4] end
+  return gt_default_peak()
+end
+
+# Whether memory_status's available memory covers this unit's peak with the
+# reserve kept and room for the running units' peaks. Where the system gives
+# no figures, or nothing is running, it does.
+make a function called gt_memory_allows takes mem, committed, peak, n_running returns yes
+  if (n_running == 0) or (mem[1] < 0) then return true end
+  return mem[1] - gt_reserve() - committed >= peak
+end
+
+# "ready", "wait" (a unit it needs is still to run or running), "skip" (one
+# failed), or "lane" (a unit of its lane is running).
+make a function called gt_ready takes u, done, failed, running, todo returns state
+  let i = 0
+  while i < list_len(u[1]) do
+    if gt_member(failed, u[1][i]) then return "skip" end
+    let i = i + 1
+  end
+  let busy = gt_running_names(running)
+  let i = 0
+  while i < list_len(u[1]) do
+    if gt_member(busy, u[1][i]) or gt_member(todo, u[1][i]) then return "wait" end
+    let i = i + 1
+  end
+  if u[4] != "" then
+    let i = 0
+    while i < list_len(running) do
+      if running[i][0][4] == u[4] then return "lane" end
+      let i = i + 1
+    end
+  end
+  return "ready"
+end
+
+make a function called gt_running_names takes running returns names
+  let names = []
+  let i = 0
+  while i < list_len(running) do
+    let names = list_push(names, running[i][0][0])
+    let i = i + 1
+  end
+  return names
+end
+
+# ---- main ----
+
+make a function called gt_arg takes args, name returns yes
+  return gt_member(args, name)
+end
+
+make a function called gt_arg_text takes args, name, fallback returns v
+  let i = 0
+  while i + 1 < list_len(args) do
+    if args[i] == name then return args[i + 1] end
+    let i = i + 1
+  end
+  return fallback
+end
+
+make a function called gt_arg_value takes args, name, fallback returns v
+  let i = 0
+  while i + 1 < list_len(args) do
+    if args[i] == name then return to_num(args[i + 1]) end
+    let i = i + 1
+  end
+  return fallback
+end
+
+# A line of progress, with the seconds since start, to the terminal and the
+# status file.
+make a function called gt_note takes t0, text returns done
+  let line = "gates: " + word_div(now_ms() - t0, 1000) + " s: " + text
+  print(line)
+  write_file(gt_status_path(), line + chr(10))
+  return true
+end
+
+# A stage: plan what of these units is stale, then run it. [rows, failed].
+make a function called gt_stage takes label, units, rows, all, only_plan, cap, only returns result
+  let t0 = now_ms()
+  gt_note(t0, label + ": hashing the inputs of " + list_len(units) + " units")
+  let keys = gt_keys(units)
+  gt_note(t0, label + ": planning")
+  let names = gt_plan(units, keys, rows, all, only)
+  gt_note(t0, label + ": planned")
+  print("gates: " + label + ": " + list_len(names) + " of " + list_len(units) + " units to run")
+  if only_plan then
+    let i = 0
+    while i < list_len(names) do
+      print("  " + names[i])
+      let i = i + 1
+    end
+    return [rows, []]
+  end
+  if list_len(names) == 0 then return [rows, []] end
+  let r = gt_dispatch(units, gt_longest_first(names, rows), keys, rows, cap)
+  print(r[2])
+  return [r[0], r[1]]
+end
+
+make a function called gt_main takes args returns code
+  let all = gt_arg(args, "--all")
+  let only_plan = gt_arg(args, "--plan")
+  let cap = gt_arg_value(args, "--cap", 0)
+  let cores = cpu_count() - 2
+  if cores < 1 then let cores = 1 end
+  if cores > 8 then let cores = 8 end
+  let rows = gt_record_read()
+  let t0 = now_ms()
+  # the builds first: the suites' feature files are listed by their runners,
+  # run on the interpreter built here
+  let only = gt_arg_text(args, "--only", "")
+  let build_only = only
+  if only != "" then
+    # the builds a subset needs run as the planner finds them needed
+    let build_only = chr(1)
+  end
+  let r = gt_stage("builds", gt_build_units(cores), rows, all, only_plan, cap, build_only)
+  let failed = r[1]
+  let rows = r[0]
+  if list_len(failed) > 0 then
+    print("gates: builds failed: " + failed)
+    return 1
+  end
+  if gt_quitting() then
+    print("gates: quit after the builds; the suites were not run")
+    return 2
+  end
+  let builds = gt_build_units(cores)
+  gt_note(t0, "listing the suites' feature files")
+  let units = v2_list_concat(builds, gt_suite_units(gt_suites()))
+  let r = gt_stage("suites", units, rows, all, only_plan, cap, only)
+  let failed = r[1]
+  print("gates: " + list_len(failed) + " failed, " + word_div(now_ms() - t0, 1000) + " s")
+  let i = 0
+  while i < list_len(failed) do
+    print("  FAILED " + failed[i] + " (" + gt_log_path(failed[i]) + ")")
+    let i = i + 1
+  end
+  if list_len(failed) > 0 then return 1 end
+  if gt_quitting() then
+    print("gates: quit; what did not run is still stale")
+    return 2
+  end
+  return 0
+end
+
+exec_measured("cmd", ["/c", "mkdir " + gt_backslashes(gt_dir() + "/logs") + " 2>nul"])
+let code = gt_main(argv())
+if code != 0 then exit_with(code) end

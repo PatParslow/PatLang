@@ -372,11 +372,10 @@ make a function called remove_file takes path returns result
   return result
 end
 
-# A directory's entries, sorted, a subdirectory's with a trailing "/".
-# WIN32_FIND_DATAA: attributes at 0, the file name at 44.
 # A directory's entries, sorted, each subdirectory's name ending in "/"; a
 # path with no directory to read gives [] (file_exists tells it from an empty
-# one), as read_file gives "" for a file it cannot read.
+# one), as read_file gives "" for a file it cannot read. WIN32_FIND_DATAA has
+# the attributes at 0 and the file name at 44.
 make a function called list_dir takes path returns entries
   require (value_class(path) == 8)
   let cpath = rt_cstr(path + "/*")
@@ -481,6 +480,56 @@ make a function called sleep_ms takes ms returns done
   return done
 end
 
+# The machine's logical processors (spec 1.13). SYSTEM_INFO has their number
+# as 32 bits at 32.
+make a function called cpu_count returns n
+  let buf = rt_alloc(64)
+  extern_call("KERNEL32.DLL", "GetSystemInfo", buf + 16)
+  let n = word_and(mem_load(buf, 48), 4294967295)
+  rt_free(buf)
+  if n < 1 then
+    let n = 1
+  end
+  ensure (value_class(n) == 2) and (n >= 1)
+  return n
+end
+
+# The processors' time since the machine started, summed over all of them, in
+# milliseconds: [idle, busy], or [-1, -1] where the system gives none (spec
+# 1.13). A caller tells how busy the machine was between two readings from the
+# differences. GetSystemTimes' kernel time includes the idle time.
+make a function called cpu_times returns times
+  let buf = rt_alloc(24)
+  let got = extern_call("KERNEL32.DLL", "GetSystemTimes", buf + 16, buf + 24, buf + 32)
+  if got == 0 then
+    let times = [0 - 1, 0 - 1]
+  else
+    let idle = mem_load(buf, 16)
+    let busy = mem_load(buf, 24) + mem_load(buf, 32) - idle
+    let times = [word_div(idle, 10000), word_div(busy, 10000)]
+  end
+  rt_free(buf)
+  ensure (list_len(times) == 2) and (value_class(times[0]) == 2) and (value_class(times[1]) == 2)
+  return times
+end
+
+# The machine's physical memory in bytes: [total, available now], or [-1, -1]
+# where the system gives none (spec 1.13). MEMORYSTATUSEX is 64 bytes, its
+# length in its first 32 bits, the total at 8 and what is available at 16.
+make a function called memory_status returns m
+  let buf = rt_alloc(64)
+  mem_store(buf, 16, 64)
+  let got = extern_call("KERNEL32.DLL", "GlobalMemoryStatusEx", buf + 16)
+  if got == 0 then
+    let m = [0 - 1, 0 - 1]
+  else
+    let m = [mem_load(buf, 24), mem_load(buf, 32)]
+  end
+  rt_free(buf)
+  ensure (list_len(m) == 2) and (value_class(m[0]) == 2) and (value_class(m[1]) == 2)
+  return m
+end
+
 make a function called host_caps returns caps
   let caps = ["x64", "subprocess", "tcp", "fs"]
   ensure (value_class(caps) == 9)
@@ -509,6 +558,14 @@ end
 # caller frees it), or 0 when it could not start.
 make a function called rt_start_process takes program, args, h_in, h_out, h_err returns pi
   require value_live(program) and (value_class(args) == 9)
+  let pi = rt_start_process_flags(program, args, h_in, h_out, h_err, 0)
+  ensure (value_class(pi) == 2)
+  return pi
+end
+
+# rt_start_process with CreateProcessA's creation flags (4: suspended).
+make a function called rt_start_process_flags takes program, args, h_in, h_out, h_err, flags returns pi
+  require value_live(program) and (value_class(args) == 9) and (value_class(flags) == 2)
   let cmd = rt_command_line(program, args)
   # STARTUPINFOA, 104 bytes: cb, then dwFlags = STARTF_USESTDHANDLES at 60,
   # the standard handles at 80, 88, 96
@@ -524,7 +581,7 @@ make a function called rt_start_process takes program, args, h_in, h_out, h_err 
   mem_store(si, 104, h_out)
   mem_store(si, 112, h_err)
   let pi = rt_alloc(24)
-  let ok = extern_call("KERNEL32.DLL", "CreateProcessA", 0, cmd + 16, 0, 0, 1, 0, 0, 0, si + 16, pi + 16)
+  let ok = extern_call("KERNEL32.DLL", "CreateProcessA", 0, cmd + 16, 0, 0, 1, flags, 0, 0, si + 16, pi + 16)
   rt_free(cmd)
   rt_free(si)
   if ok == 0 then
@@ -733,6 +790,19 @@ make a function called exec_peak_memory takes program, args returns result
   return result
 end
 
+# Runs a program with a list of arguments: [what it wrote to standard output,
+# what it wrote to standard error, whether it exited 0, its peak working set
+# in bytes or -1 where the system gives none] (spec 1.13). The peak is of the
+# program and every process it starts: the most memory they committed
+# between them.
+make a function called exec_measured takes program, args returns result
+  require value_live(program) and (value_class(args) == 9)
+  let run = rt_run_process_tree(program, args, "", 0, true)
+  let result = [run[0], run[1], run[2], run[3]]
+  ensure (list_len(result) == 4) and (value_class(result[2]) == 1) and (value_class(result[3]) == 2)
+  return result
+end
+
 # Whether s holds anything but spaces, tabs and line ends.
 make a function called rt_has_non_space takes s returns yes
   require value_class(s) == 8
@@ -752,10 +822,33 @@ end
 # working set in bytes or -1].
 make a function called rt_run_process takes program, args, stdin_text, timeout_ms returns result
   require value_live(program) and value_live(stdin_text) and (value_class(args) == 9)
+  let result = rt_run_process_tree(program, args, stdin_text, timeout_ms, false)
+  ensure (list_len(result) == 4) and (value_class(result[2]) == 1)
+  return result
+end
+
+# rt_run_process; with tree, the program runs in a job object of its own,
+# started suspended and resumed once in it so that every process it starts
+# is in the job too, and the peak is the job's: the most memory the processes
+# committed between them.
+make a function called rt_run_process_tree takes program, args, stdin_text, timeout_ms, tree returns result
+  require value_live(program) and value_live(stdin_text) and (value_class(args) == 9) and (value_class(tree) == 1)
   let in_pipe = rt_pipe(true)
   let out_pipe = rt_pipe(false)
   let err_pipe = rt_pipe(false)
-  let pi = rt_start_process(program, args, in_pipe[0], out_pipe[1], err_pipe[1])
+  let job = 0
+  let flags = 0
+  if tree then
+    let job = extern_call("KERNEL32.DLL", "CreateJobObjectA", 0, 0)
+    if job != 0 then
+      let flags = 4
+    end
+  end
+  let pi = rt_start_process_flags(program, args, in_pipe[0], out_pipe[1], err_pipe[1], flags)
+  if (pi != 0) and (job != 0) then
+    extern_call("KERNEL32.DLL", "AssignProcessToJobObject", job, mem_load(pi, 16))
+    extern_call("KERNEL32.DLL", "ResumeThread", mem_load(pi, 24))
+  end
   extern_call("KERNEL32.DLL", "CloseHandle", in_pipe[0])
   extern_call("KERNEL32.DLL", "CloseHandle", out_pipe[1])
   extern_call("KERNEL32.DLL", "CloseHandle", err_pipe[1])
@@ -803,6 +896,16 @@ make a function called rt_run_process takes program, args, stdin_text, timeout_m
     let peak = mem_load(counters, 24)
   end
   rt_free(counters)
+  if job != 0 then
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (class 9), 144 bytes:
+    # PeakJobMemoryUsed at 136
+    let info = rt_alloc(144)
+    if rt_i32(extern_call("KERNEL32.DLL", "QueryInformationJobObject", job, 9, info + 16, 144, 0)) != 0 then
+      let peak = mem_load(info, 152)
+    end
+    rt_free(info)
+    extern_call("KERNEL32.DLL", "CloseHandle", job)
+  end
   extern_call("KERNEL32.DLL", "CloseHandle", out_pipe[0])
   extern_call("KERNEL32.DLL", "CloseHandle", err_pipe[0])
   extern_call("KERNEL32.DLL", "CloseHandle", h)
