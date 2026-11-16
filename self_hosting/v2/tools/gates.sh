@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v2's gates (docs/plans/gates.md).
 #
-#   self_hosting/v2/tools/gates.sh [--all] [--plan] [--cap N] [--only PREFIX]
+#   self_hosting/v2/tools/gates.sh [--all] [--plan] [--cap N] [--only PREFIX] [--failed]
 #
 # This script only starts them. When there is no self_hosting/build/v2.exe,
 # the first is built from the compiler's IR, bootstrap/v2_compiler.ir, by the

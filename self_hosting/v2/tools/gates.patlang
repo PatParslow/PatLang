@@ -1,12 +1,17 @@
 # v2's gates (docs/plans/gates.md): what has changed since it last passed,
 # run in parallel within what the machine can spare.
 #
-#   self_hosting/build/v2_gates_tool.exe [--all] [--plan] [--cap N] [--only PREFIX]
+#   self_hosting/build/v2_gates_tool.exe [--all] [--plan] [--cap N] [--only PREFIX] [--failed]
 #
 # --all runs every unit, fresh or not; --plan says what would run and runs
 # nothing; --cap N gives the units N cores whatever the machine is doing;
 # --only PREFIX keeps the units whose names start with PREFIX as goals (what
-# they need still runs when it must).
+# they need still runs when it must); --failed keeps the units that failed in
+# the last run.
+#
+# A feature file whose whole run took more than ten minutes runs as one unit
+# per scenario (SUITE/NAME@N), so its scenarios share the cores and a change
+# reruns only the scenarios whose inputs it touches; once split it stays split.
 #
 # A unit is one build (the compiler and its fixpoint, the bootstrap reader,
 # the WASM writers, the interpreter, a suite's executable) or one feature file
@@ -205,6 +210,8 @@ make a function called gt_build_units takes cores returns units
   let units = list_push(units, gt_unit("wasm", ["bootstrap"], list_push(gt_compiler_inputs(), ["file", "bootstrap/ir_wasm.py"]), 1, "", ["wasm"], ""))
   let units = list_push(units, gt_unit("interpreter", ["compiler"], [["program", "self_hosting/v2/interp.patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/v2/interp.patlang", b + "/v2_interp.exe", "--workers", w]], b + "/v2_interp.exe"))
   let units = list_push(units, gt_unit("language_suite", ["compiler"], [["program", "self_hosting/tools/run_language_spec_suite.patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/tools/run_language_spec_suite.patlang", b + "/v2_language_suite.exe", "--workers", w]], b + "/v2_language_suite.exe"))
+  # the repository's own tools, tested with the Python a fresh clone needs anyway
+  let units = list_push(units, gt_unit("edit_tool", [], [["file", "tools/edit_files.py"], ["file", "tools/test_edit_files.py"]], 1, "", ["cmd", "py", ["-3", "-I", "tools/test_edit_files.py"]], ""))
   let tests = ["interp_run_selftest", "isolate_selftest"]
   let i = 0
   while i < list_len(tests) do
@@ -314,7 +321,34 @@ make a function called gt_base_name takes path returns name
   return base
 end
 
-make a function called gt_suite_units takes suites returns units
+# A feature file runs as one unit per scenario once its whole run took more
+# than ten minutes, and stays split once it has scenario rows.
+make a function called gt_split_ms returns ms
+  return 600000
+end
+
+make a function called gt_split_feature takes rows, name returns yes
+  let whole = gt_row_of(rows, name)
+  if (list_len(whole) == 5) and (whole[3] > gt_split_ms()) then return true end
+  return list_len(gt_row_of(rows, name + "@1")) == 5
+end
+
+# How many scenarios a feature file has: its lines starting "Scenario:", as the
+# Gherkin runner counts them (gherkin_scenario_count, lib/gherkin.patlang).
+make a function called gt_scenario_count takes path returns n
+  let lines = split_lines(read_file(path))
+  let n = 0
+  let i = 0
+  while i < list_len(lines) do
+    if str_starts_with(str_trim(lines[i]), "Scenario:") then
+      let n = n + 1
+    end
+    let i = i + 1
+  end
+  return n
+end
+
+make a function called gt_suite_units takes suites, rows returns units
   let units = []
   let s = 0
   while s < list_len(suites) do
@@ -331,7 +365,18 @@ make a function called gt_suite_units takes suites returns units
         let item = ["program", features[f]]
       end
       let inputs = v2_list_concat([["program", gt_suite_runner(suite)], item], suite[4])
-      let units = list_push(units, gt_unit(suite[0] + "/" + gt_base_name(features[f]), suite[3], inputs, 1, suite[5], ["cmd", suite[1], list_push(suite[2], features[f])], ""))
+      let name = suite[0] + "/" + gt_base_name(features[f])
+      if str_ends_with(features[f], ".feature") and gt_split_feature(rows, name) then
+        # sc, not s: s is the suite loop's index
+        let n = gt_scenario_count(features[f])
+        let sc = 1
+        while sc <= n do
+          let units = list_push(units, gt_unit(name + "@" + sc, suite[3], inputs, 1, suite[5], ["cmd", suite[1], list_push(suite[2], features[f] + "@" + sc)], ""))
+          let sc = sc + 1
+        end
+      else
+        let units = list_push(units, gt_unit(name, suite[3], inputs, 1, suite[5], ["cmd", suite[1], list_push(suite[2], features[f])], ""))
+      end
       let f = f + 1
     end
     let s = s + 1
@@ -449,15 +494,60 @@ make a function called gt_record_put takes rows, row returns out
     let i = i + 1
   end
   let out = list_push(out, row)
+  gt_record_write(out)
+  return out
+end
+
+make a function called gt_record_write takes rows returns done
   let b = sb_new()
   let i = 0
-  while i < list_len(out) do
-    let r = out[i]
+  while i < list_len(rows) do
+    let r = rows[i]
     sb_push(b, r[0] + chr(9) + r[1] + chr(9) + r[2] + chr(9) + r[3] + chr(9) + r[4] + chr(10))
     let i = i + 1
   end
   write_file(gt_record_path(), sb_str(b))
-  return out
+  return true
+end
+
+# The record without rows for units that no longer exist (a renamed suite, a
+# deleted feature file, a feature now split by scenario).
+make a function called gt_record_prune takes units returns dropped
+  let names = gt_names_of(units)
+  let rows = gt_record_read()
+  let kept = []
+  let dropped = 0
+  let i = 0
+  while i < list_len(rows) do
+    if gt_member(names, rows[i][0]) then
+      let kept = list_push(kept, rows[i])
+    else
+      let dropped = dropped + 1
+    end
+    let i = i + 1
+  end
+  if dropped > 0 then gt_record_write(kept) end
+  return dropped
+end
+
+# The units whose last run failed.
+make a function called gt_failed_names takes rows returns names
+  let names = []
+  let i = 0
+  while i < list_len(rows) do
+    if (list_len(rows[i]) == 5) and (rows[i][2] == "fail") then
+      let names = list_push(names, rows[i][0])
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# Whether a unit is one of the goals asked for: only is a prefix of names, or
+# a list of names (--failed).
+make a function called gt_selected takes name, only returns yes
+  if type_of(only) == "list" then return gt_member(only, name) end
+  return str_starts_with(name, only)
 end
 
 make a function called gt_fresh takes rows, name, key returns yes
@@ -488,7 +578,7 @@ make a function called gt_plan takes units, keys, rows, all, only returns names
     if fresh and ((u[6] == "") or file_exists(u[6])) then
       rule_add("made", [u[0]], [])
     end
-    if (not fresh) and str_starts_with(u[0], only) then
+    if (not fresh) and gt_selected(u[0], only) then
       let goals = list_push(goals, ["made", [u[0]]])
     end
     let i = i + 1
@@ -937,8 +1027,16 @@ make a function called gt_main takes args returns code
   # the builds first: the suites' feature files are listed by their runners,
   # run on the interpreter built here
   let only = gt_arg_text(args, "--only", "")
+  if gt_arg(args, "--failed") then
+    let only = gt_failed_names(rows)
+    if list_len(only) == 0 then
+      print("gates: nothing failed in the last run")
+      return 0
+    end
+    print("gates: rerunning what failed: " + str_join(only, ", "))
+  end
   let build_only = only
-  if only != "" then
+  if (type_of(only) == "list") or (only != "") then
     # the builds a subset needs run as the planner finds them needed
     let build_only = chr(1)
   end
@@ -955,9 +1053,13 @@ make a function called gt_main takes args returns code
   end
   let builds = gt_build_units(cores)
   gt_note(t0, "listing the suites' feature files")
-  let units = v2_list_concat(builds, gt_suite_units(gt_suites()))
+  let units = v2_list_concat(builds, gt_suite_units(gt_suites(), rows))
   let r = gt_stage("suites", units, rows, all, only_plan, cap, only)
   let failed = r[1]
+  if not only_plan then
+    let dropped = gt_record_prune(units)
+    if dropped > 0 then print("gates: " + dropped + " record rows for units that no longer exist dropped") end
+  end
   print("gates: " + list_len(failed) + " failed, " + word_div(now_ms() - t0, 1000) + " s")
   let i = 0
   while i < list_len(failed) do

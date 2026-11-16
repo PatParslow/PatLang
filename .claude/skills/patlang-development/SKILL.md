@@ -26,10 +26,8 @@ code is written.
 4. **Report**: state the command run, the output, and how it aligns with the
    spec -- not just "done."
 
-This was NOT followed consistently for this session's own exploratory work
-(e.g. Phase 9 debugging, the WASM viability check) -- ad hoc `.patlang`
-diagnostic files were written first and Gherkin formalized only after
-something worked. That's the failure mode this rule exists to close.
+The `patlang-change` skill is the checklist from scenario to commit, including
+what a new runtime function, selftest or gates suite also needs.
 
 Formal feature work lives in `spec_library/**/*.feature`, wired through
 `self_hosting/lib/gherkin.patlang`'s Gherkin runner and (for language-level
@@ -129,14 +127,15 @@ project `CLAUDE.md` §6 for the canonical statement -- summarized here):
 
 ## 5. Verified performance traps
 
-- **String indexing is O(n) per call, not O(1)**: `char_code`, `substr`,
-  and `s[i]` each re-check `s.is_ascii()` on the WHOLE string every call
-  (`rust-runtime/src/ir/hosts.rs`; found on `pat`, not yet measured on
-  v2). Any character-scanning loop over a
-  PatLang String costs O(length²) overall. Use `List<Int>` (genuinely
-  O(1)-indexed) for any parsing/scanning code that could plausibly process
-  more than a short, fixed literal. Build a String only for short, final,
-  already-bounded output via `chr(byte)` + `sb_push(...)`.
+- **Indexing a non-ASCII string walks from its start** (spec 1.10): v2
+  indexes an all-ASCII string in O(1), but one non-ASCII character anywhere
+  (an em dash in a comment is enough) makes `s[i]`, `substr` and `char_code`
+  O(i), so a character scan of the text is O(length²). Measured: the
+  repository checks took over 3 minutes searching source files with an
+  interpreted `contains_text`, and 27 s with the runtime's `str_contains`.
+  Search with `str_contains` or `sed`, scan with the string cursor
+  (`str_intern`, `sc_code`) or a `List<Int>` of bytes, and build strings with
+  `sb_push`.
 - **String concatenation in a loop is O(n²)**: PatLang strings are
   immutable, so `out = out + x` inside a loop copies the entire accumulated
   string every iteration. Always use `sb_new()`/`sb_push(b, ...)`/`sb_str(b)`
@@ -261,9 +260,9 @@ apply to v2, which has no Rust side.
 
 ## 10. Issues and the project board
 
-After `gh issue create`, always follow with `gh project item-add` to add it
-to the PatParslow/PatLang project board -- an issue that isn't on the board
-is easy to lose track of.
+After `gh issue create`, always follow with
+`gh project item-add 5 --owner PatParslow --url URL`: an issue that isn't on
+the board is easy to lose track of.
 
 ## 11. Build/test command cheat sheet
 

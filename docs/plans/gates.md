@@ -155,3 +155,13 @@ finished.
     its reason ([#266](https://github.com/PatParslow/PatLang/issues/266) for the
     unported ones);
   - no program tests a missing field with `"" + get(`.
+- **Long feature files run by scenario.** A feature file whose whole run took more
+  than ten minutes becomes one unit per scenario, `SUITE/NAME@N`, and stays split
+  once it has scenario rows. The Gherkin runner takes `FILE.feature@N` and lists
+  them with `--list-scenarios` (`self_hosting/gherkin_select_selftest.patlang`).
+  From the record of the last full run that splits twelve features into 116 units,
+  among them `block_model/library_selftest_parity` (11), `part2/compiler_structure`
+  (24) and `part1_v2/programs` (23).
+- **`--failed`** reruns only the units whose last run failed, and the record drops
+  rows for units that no longer exist at the end of each run.
+- **`tools/edit_files.py`** has its tests as the `edit_tool` unit.

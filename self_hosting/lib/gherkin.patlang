@@ -19,6 +19,8 @@
 #   8 pattern steps, [text, function name], first registered wins
 #   9 the captures of the step being run, [name, value]
 #   10 contract clauses deferred until a plan binds their variable
+#   11 the one scenario of the file to run, counted from 1 (0 for all)
+#   12 the scenarios of the file met so far
 include "context.patlang"
 include "gherkin_text.patlang"
 include "gherkin_clauses.patlang"
@@ -41,6 +43,8 @@ make a function called ctx_new returns ctx
   vec_push(ctx, [])
   vec_push(ctx, [])
   vec_push(ctx, [])
+  vec_push(ctx, 0)
+  vec_push(ctx, 0)
   return ctx
 end
 
@@ -243,7 +247,12 @@ make a function called ctx_start_scenario takes ctx, raw returns done
   let filter = vec_get(ctx, 4)
   let tags = vec_get(ctx, 5)
   vec_set(ctx, 5, "")
-  if filter == "" then
+  vec_set(ctx, 12, vec_get(ctx, 12) + 1)
+  let chosen = vec_get(ctx, 11)
+  if (chosen > 0) and (vec_get(ctx, 12) != chosen) then
+    # another scenario of the file was chosen: this one is not run or shown
+    vec_set(ctx, 6, true)
+  elif filter == "" then
     vec_set(ctx, 6, false)
     print(raw)
   elif (tags != "") and contains_text(tags, filter) then
@@ -276,11 +285,13 @@ end
 # A feature file: its text, read as characters (UTF-8), run as run_feature
 # runs a feature given as a string.
 # A suite's run, from its runner's command line (args): every feature file in
-# features, or only the ones args names, each a path ending in .feature; with
-# --list, the paths of the suite's feature files, one a line, and nothing run.
-# Reports the counts, and exits with 1 when a test failed, so a caller can
-# tell from the exit code alone (the gates run each feature file of a suite
-# as a unit of its own, docs/plans/gates.md).
+# features, or only the ones args names. A name is a path ending in .feature,
+# or FILE.feature@N for its Nth scenario alone, counted from 1. With --list,
+# the paths of the suite's feature files, one a line; with --list-scenarios,
+# FILE.feature@N for each scenario of each; neither runs anything. Reports the
+# counts, and exits with 1 when a test failed, so a caller can tell from the
+# exit code alone (the gates run each feature file, or each scenario of a long
+# one, as a unit of its own, docs/plans/gates.md).
 make a function called run_suite takes ctx, features, args returns ok
   let chosen = []
   let i = 0
@@ -294,7 +305,20 @@ make a function called run_suite takes ctx, features, args returns ok
       end
       return true
     end
-    if (a.length > 8) and (substr(a, a.length - 8, 8) == ".feature") then
+    if a == "--list-scenarios" then
+      let k = 0
+      while k < list_len(features) do
+        let n = gherkin_scenario_count(features[k])
+        let s = 1
+        while s <= n do
+          print(features[k] + "@" + s)
+          let s = s + 1
+        end
+        let k = k + 1
+      end
+      return true
+    end
+    if gherkin_named_part(a)[0] != "" then
       let chosen = list_push(chosen, a)
     end
     let i = i + 1
@@ -304,7 +328,17 @@ make a function called run_suite takes ctx, features, args returns ok
   end
   let i = 0
   while i < list_len(chosen) do
-    run_feature_file(ctx, chosen[i])
+    let part = gherkin_named_part(chosen[i])
+    if part[0] == "" then
+      let part = [chosen[i], 0]
+    end
+    vec_set(ctx, 11, part[1])
+    run_feature_file(ctx, part[0])
+    if (part[1] > 0) and (vec_get(ctx, 12) < part[1]) then
+      ctx_count_failure(ctx)
+      print("  FAIL: " + part[0] + " has no scenario " + part[1])
+    end
+    vec_set(ctx, 11, 0)
     let i = i + 1
   end
   let ok = ctx_report(ctx)
@@ -314,12 +348,56 @@ make a function called run_suite takes ctx, features, args returns ok
   return ok
 end
 
+# [the feature file, the scenario number] a command-line name stands for:
+# FILE.feature gives [FILE.feature, 0], FILE.feature@N gives [FILE.feature, N],
+# and anything else ["", 0].
+make a function called gherkin_named_part takes a returns part
+  let at = a.length - 1
+  while (at >= 0) and (a[at] != "@") do
+    let at = at - 1
+  end
+  if at > 0 then
+    let digits = substr(a, at + 1, a.length - at - 1)
+    let file = substr(a, 0, at)
+    let all_digits = digits.length > 0
+    let k = 0
+    while k < digits.length do
+      if (a[at + 1 + k] < "0") or (a[at + 1 + k] > "9") then
+        let all_digits = false
+      end
+      let k = k + 1
+    end
+    if all_digits and str_ends_with(file, ".feature") then
+      return [file, to_num(digits)]
+    end
+  end
+  if str_ends_with(a, ".feature") then
+    return [a, 0]
+  end
+  return ["", 0]
+end
+
+# How many scenarios a feature file has: its lines starting "Scenario:".
+make a function called gherkin_scenario_count takes path returns n
+  let lines = split_lines(read_file(path))
+  let n = 0
+  let i = 0
+  while i < list_len(lines) do
+    if starts_with(trim_left(lines[i]), "Scenario:") then
+      let n = n + 1
+    end
+    let i = i + 1
+  end
+  return n
+end
+
 make a function called run_feature_file takes ctx, path returns ok
   return run_feature(ctx, read_file(path))
 end
 
 # A feature's text.
 make a function called run_feature takes ctx, feature returns ok
+  vec_set(ctx, 12, 0)
   let h = str_intern(feature)
   let n = sc_len(h)
   let line = sb_new()
