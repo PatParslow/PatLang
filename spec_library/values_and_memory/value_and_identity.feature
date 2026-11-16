@@ -26,6 +26,11 @@ Feature: values and objects with identity (spec 1.5)
     When get(o, "color") is read
     Then it is "red"
 
+  Scenario: get tells a field holding false from a field that is not there
+    Given o = new("Widget", "ga1") and send(o, "set", "off", false)
+    When get(o, "off"), get(o, "missing"), get("ga1", "missing") and get(5, "missing") are read
+    Then the first is false, and the other three are unit
+
   Scenario: two objects with the same contents are not equal
     Given two objects of class Point, each with x = 1 and y = 2
     When they are compared with ==

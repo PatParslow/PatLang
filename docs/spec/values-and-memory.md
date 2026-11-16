@@ -84,6 +84,10 @@ any event is (`emit`, `when`), with nothing specific to operators.
   is seen through every holder, and `bool_array_push` keeps the same
   array when it grows. Two of them are equal only if they are the same
   object.
+- **Reading a field:** `get(v, key)` gives the field's value, or `unit` when `v`
+  has no field `key`, including when `v` is not an object. A field holding `false`
+  reads as `false`, so `get(v, key) == unit` tells a missing field from one set to
+  `false`. `unit` is false as a condition.
 
 ### 1.6 Memory
 

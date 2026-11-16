@@ -33,4 +33,4 @@ Feature: the named-object contract (GitHub issue #178)
   Scenario: object_delete drops a named object exactly as under the real engine
     Given a function that creates a named Dict, sets a key, reads it, deletes the object and reads the key again
     When it runs through bm_lower_program/bi_run
-    Then it prints 1, true and bool, as the v2 interpreter does for the identical source
+    Then it prints 1, true and unit, as the v2 interpreter does for the identical source
