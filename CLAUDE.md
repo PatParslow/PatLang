@@ -45,13 +45,36 @@ leaving two cores and 4 GB free.
 
 - Results go to `self_hosting/build/gates/record`, and logs to
   `self_hosting/build/gates/logs/UNIT.log`.
-- `status` and `quit` signals work on the port named in
-  `self_hosting/build/gates/status`.
+- `gates.sh --status` asks a running tool what it is doing; `--quit` starts no more
+  units and lets the running ones finish; `--kill` stops the tool and every unit it
+  started. Killing the shell that started the gates does not stop the tool: its
+  units go on as orphans.
 - A unit's inputs are declared in `self_hosting/v2/tools/gates.patlang`. A new
   suite, runner or fixture directory needs its unit and inputs declared there.
   See `docs/plans/gates.md`.
 
 Don't edit files a running gate reads.
+
+---
+
+## 2.5 Working habits that have each cost time more than once
+
+- **Edits:** use the Edit tool. A scripted edit (many files, or anchors with quotes
+  or backslashes) goes in a Python file written with the Write tool and run with
+  `py -3 -I FILE`, never as a Python heredoc in a shell command: shell quoting
+  mangles the anchors. The script reads with `newline=''`, keeps each file's line
+  endings, and refuses to write when an anchor is missing or appears twice.
+- **Probes:** run a program from the shell with `< /dev/null`. An interpreter left
+  with an open stdin can wait on it, and the call looks hung.
+- **Before a long gates run:** run the changed code path once by hand on a real
+  input. A runner's `--list` does not exercise its run path.
+- **Waiting on a file another run writes:** match something only the new run
+  writes. A previous run's file can already contain the text you wait for.
+- **A fix that works because "values here are always X"** is a question for the
+  owner: check whether the sentinel can also be a legitimate value, and whether the
+  language should make the distinction.
+- **Tests assert on what the program prints,** never on what an engine adds after
+  it. Run programs through `self_hosting/lib/program_run.patlang`.
 
 ---
 
@@ -73,6 +96,11 @@ Don't edit files a running gate reads.
    - `spec_library/language/`: `self_hosting/tools/run_language_spec_suite.patlang` on
      both engines, and `match_pattern` by `run_match_spec_suite.patlang`.
    - `spec_library/block_model/`.
+   - The selftests: `self_hosting/tools/run_selftests.patlang` runs every
+     `*_selftest.patlang` a gate runs, and lists the retired ones with their reasons.
+     A new selftest goes in its list, or the repository checks fail.
+   - `spec_library/repository/`: `self_hosting/tools/run_repository_checks.patlang`
+     checks the repository's own rules over every tracked file.
 
    Step registrations are in `self_hosting/lib/spec_steps_*.patlang`, on the Gherkin
    runner `self_hosting/lib/gherkin.patlang`. A runner lists its feature files with

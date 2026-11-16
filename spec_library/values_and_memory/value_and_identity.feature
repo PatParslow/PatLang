@@ -31,6 +31,11 @@ Feature: values and objects with identity (spec 1.5)
     When get(o, "off"), get(o, "missing"), get("ga1", "missing") and get(5, "missing") are read
     Then the first is false, and the other three are unit
 
+  Scenario: each lookup says the same thing when nothing is there
+    Given a list, a vec, a string, an object, an unset environment variable, a missing file, a missing virtual file and an unknown predicate
+    When each is read where nothing is
+    Then a list, a vec, a non-list or an object gives unit, a string gives "", getenv and read_file give "", file_exists gives false, vfs_exists gives "0" and query gives 0
+
   Scenario: two objects with the same contents are not equal
     Given two objects of class Point, each with x = 1 and y = 2
     When they are compared with ==

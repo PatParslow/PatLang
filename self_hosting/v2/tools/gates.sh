@@ -15,8 +15,24 @@
 # Progress goes to self_hosting/build/gates/status, each unit's output to
 # self_hosting/build/gates/logs/UNIT.log, and what passed, with its key, time
 # and peak memory, to self_hosting/build/gates/record.
+#
+# Stopping a run:
+#   gates.sh --status   asks the running tool what it is doing
+#   gates.sh --quit     starts no more units; the running ones finish and are
+#                       recorded, so the next run takes up the rest
+#   gates.sh --kill     stops the tool and every unit it started at once
+# Killing the shell that started the tool does not stop the tool: on Windows
+# its units go on as orphans. Use --quit or --kill.
 cd "$(dirname "$0")/../../.." || exit 1
 B=self_hosting/build
+case "$1" in
+  --status|--quit)
+    exec $B/v2_interp.exe self_hosting/v2/tools/gates_signal.patlang "${1#--}" < /dev/null ;;
+  --kill)
+    # /T takes the tool's whole process tree: the units and what they started
+    taskkill //IM v2_gates_tool.exe //T //F
+    exit $? ;;
+esac
 mkdir -p $B/gates
 if [ ! -f $B/v2.exe ]; then
   echo "gates: building the first compiler from bootstrap/v2_compiler.ir"

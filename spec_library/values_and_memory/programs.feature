@@ -26,6 +26,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When list_dir reads each
     Then the first gives [] and the program goes on, file_exists says the path is missing, and the second gives entries
 
+  Scenario: path_absolute gives a path in full, with / between its parts
+    Given a path relative to the current directory, the same path through .., and the full path itself
+    When path_absolute reads each
+    Then each gives the same full path, longer than the relative one, ending in it, naming a file that exists, with no backslash
+
   Scenario: a program reads how many processors the machine has, how busy they have been, and its memory
     Given cpu_count, cpu_times and memory_status, cpu_times read 100 ms apart
     When each is called

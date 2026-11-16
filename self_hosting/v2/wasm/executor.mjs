@@ -306,7 +306,16 @@ function start(init) {
     CreateDirectoryA() { lastError = 5; return 0; },
     MoveFileExA() { lastError = 2; return 0; },
     CopyFileA() { lastError = 2; return 0; },
-    GetFullPathNameA() { lastError = 2; return 0; },
+    // the files given are one tree, rooted at /: a path in full is / and the
+    // path with . and .. taken out (path_absolute, spec 1.13)
+    GetFullPathNameA(name, size, buf) {
+      const raw = new TextEncoder().encode("/" + norm(cstr(num(name))));
+      if (raw.length + 1 > num(size)) return raw.length + 1;
+      const m = u8();
+      m.set(raw, num(buf));
+      m[num(buf) + raw.length] = 0;
+      return raw.length;
+    },
     CreatePipe() { lastError = 50; return 0; },
     SetHandleInformation() { lastError = 6; return 0; },
     CreateProcessA() { lastError = 2; return 0; },

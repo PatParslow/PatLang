@@ -1,0 +1,434 @@
+# The repository's own rules, checked over every file it tracks
+# (spec_library/repository/repository.feature).
+#
+# Usage, from the repository root:
+#   self_hosting/build/v2_interp.exe self_hosting/tools/run_repository_checks.patlang [--list] [FEATURE...]
+#
+# The gates run it as the repository suite (self_hosting/v2/tools/gates.patlang).
+
+include "../lib/includes.patlang"
+include "../lib/gherkin.patlang"
+
+# ---- the files ----
+
+# text without its carriage returns (sed is compiled: no character walk)
+make a function called rc_clean takes text returns out
+  return sed("s/" + chr(13) + "//g", text)
+end
+
+# Every file git tracks, and the untracked ones under self_hosting it does not
+# ignore (new files not yet added).
+make a function called rc_tracked returns paths
+  let a = exec_measured("git", ["ls-files", "-c"])
+  let b = exec_measured("git", ["ls-files", "-o", "--exclude-standard", "--", "self_hosting"])
+  let lines = split_lines(rc_clean(a[0]) + chr(10) + rc_clean(b[0]))
+  let paths = []
+  let i = 0
+  while i < list_len(lines) do
+    if (lines[i] != "") and file_exists(lines[i]) then
+      let paths = list_push(paths, lines[i])
+    end
+    let i = i + 1
+  end
+  return paths
+end
+
+make a function called rc_patlang_files returns paths
+  let all = rc_tracked()
+  let paths = []
+  let i = 0
+  while i < list_len(all) do
+    if str_ends_with(all[i], ".patlang") then
+      let paths = list_push(paths, all[i])
+    end
+    let i = i + 1
+  end
+  return paths
+end
+
+# A file's code: its lines trimmed, without blank lines and whole-line comments.
+make a function called rc_code_lines takes path returns lines
+  let all = split_lines(rc_clean(read_file(path)))
+  let out = []
+  let i = 0
+  while i < list_len(all) do
+    let t = str_trim(all[i])
+    if (t != "") and (not str_starts_with(t, "#")) then
+      let out = list_push(out, t)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# A line with what its strings hold taken out: text a program writes for another
+# program, or looks for, is not its own code.
+make a function called rc_without_strings takes line returns code
+  let out = sb_new()
+  let in_string = false
+  let i = 0
+  while i < line.length do
+    let c = line[i]
+    if in_string then
+      if c == chr(92) then
+        let i = i + 1
+      elif c == chr(34) then
+        let in_string = false
+      end
+    elif c == chr(34) then
+      let in_string = true
+    else
+      sb_push(out, c)
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# s cut at each sep (one character): the pieces between, in order.
+make a function called rc_split takes s, sep returns parts
+  let parts = []
+  let b = sb_new()
+  let i = 0
+  while i < s.length do
+    let c = s[i]
+    if c == sep then
+      let parts = list_push(parts, sb_str(b))
+      let b = sb_new()
+    else
+      sb_push(b, c)
+    end
+    let i = i + 1
+  end
+  return list_push(parts, sb_str(b))
+end
+
+make a function called rc_member takes items, x returns yes
+  let i = 0
+  while i < list_len(items) do
+    if items[i] == x then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# Whether a file's text holds any of needles at all: a quick check before its
+# lines are looked at.
+make a function called rc_text_has_any takes path, needles returns yes
+  let text = read_file(path)
+  let n = 0
+  while n < list_len(needles) do
+    if str_contains(text, needles[n]) then return true end
+    let n = n + 1
+  end
+  return false
+end
+
+# The first of needles a file's code holds, or "".
+make a function called rc_first_needle takes path, needles returns found
+  if not rc_text_has_any(path, needles) then return "" end
+  let lines = rc_code_lines(path)
+  let i = 0
+  while i < list_len(lines) do
+    let n = 0
+    while n < list_len(needles) do
+      if str_contains(lines[i], needles[n]) then
+        return needles[n]
+      end
+      let n = n + 1
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# ---- no program keeps its state in globals ----
+
+# The old native runtime's private state, and fixtures testing set_var as a
+# language feature, go when the old compiler does (docs/plans/v2-implementation.md).
+make a function called rc_may_keep_globals takes path returns yes
+  if str_contains(path, "/spec_fixtures/") or str_starts_with(path, "self_hosting/build/") then
+    return true
+  end
+  return rc_member(["self_hosting/lib/x64_runtime.patlang", "self_hosting/lib/world_native.patlang", "self_hosting/block_model/heap.patlang", "self_hosting/tools/run_repository_checks.patlang"], path)
+end
+
+make a function called rc_keeps_globals takes path returns yes
+  let quote = chr(34)
+  let needles = ["set_global(", "get_global(", "set_var(", "get(" + quote + "__vars" + quote]
+  if not rc_text_has_any(path, needles) then return false end
+  let lines = rc_code_lines(path)
+  let i = 0
+  while i < list_len(lines) do
+    let n = 0
+    while n < list_len(needles) do
+      if str_contains(lines[i], needles[n]) then
+        # a needle holding a quote is only ever in code as itself
+        if (n == 3) or str_contains(rc_without_strings(lines[i]), needles[n]) then
+          return true
+        end
+      end
+      let n = n + 1
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called st_rc_no_globals takes ctx returns ok
+  let files = rc_patlang_files()
+  let found = []
+  let checked = 0
+  let i = 0
+  while i < list_len(files) do
+    let p = files[i]
+    if not rc_may_keep_globals(p) then
+      let checked = checked + 1
+      if rc_keeps_globals(p) then
+        let found = list_push(found, p)
+      end
+    end
+    let i = i + 1
+  end
+  let a = expect(ctx, "files were searched", checked > 500, true)
+  let b = expect(ctx, "none of them keeps global state", found, [])
+  return a and b
+end
+
+# ---- every selftest is run by a gate or retired with a reason ----
+
+make a function called rc_runner_lines takes flag returns lines
+  let r = exec_measured("self_hosting/build/v2_interp.exe", ["self_hosting/tools/run_selftests.patlang", flag])
+  let all = split_lines(rc_clean(r[0]))
+  let out = []
+  let i = 0
+  while i < list_len(all) do
+    if all[i] != "" then
+      let out = list_push(out, all[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# The selftests the block-model suite runs: "Given self_hosting/NAME.patlang" in
+# its library parity feature.
+make a function called rc_parity_selftests returns paths
+  let lines = split_lines(rc_clean(read_file("spec_library/block_model/library_selftest_parity.feature")))
+  let paths = []
+  let i = 0
+  while i < list_len(lines) do
+    let t = str_trim(lines[i])
+    if str_starts_with(t, "Given self_hosting/") then
+      let rest = substr(t, 6, t.length - 6)
+      let comma = 0
+      while (comma < rest.length) and (rest[comma] != ",") and (rest[comma] != " ") do
+        let comma = comma + 1
+      end
+      let p = substr(rest, 0, comma)
+      if str_ends_with(p, "_selftest.patlang") and (not rc_member(paths, p)) then
+        let paths = list_push(paths, p)
+      end
+    end
+    let i = i + 1
+  end
+  return paths
+end
+
+# The selftests the gates build and run as build units: the names in
+# gates.patlang's `let tests = [...]` line.
+make a function called rc_build_unit_selftests returns paths
+  let lines = split_lines(rc_clean(read_file("self_hosting/v2/tools/gates.patlang")))
+  let paths = []
+  let i = 0
+  while i < list_len(lines) do
+    let t = str_trim(lines[i])
+    if str_starts_with(t, "let tests = [") then
+      let parts = rc_split(t, chr(34))
+      let k = 1
+      while k < list_len(parts) do
+        let paths = list_push(paths, "self_hosting/" + parts[k] + ".patlang")
+        let k = k + 2
+      end
+    end
+    let i = i + 1
+  end
+  return paths
+end
+
+make a function called st_rc_selftests_covered takes ctx returns ok
+  let run = rc_runner_lines("--list")
+  let retired_rows = rc_runner_lines("--retired")
+  let retired = []
+  let no_reason = []
+  let i = 0
+  while i < list_len(retired_rows) do
+    let cols = rc_split(retired_rows[i], chr(9))
+    let retired = list_push(retired, cols[0])
+    if (list_len(cols) < 2) or (str_trim(cols[1]) == "") then
+      let no_reason = list_push(no_reason, cols[0])
+    end
+    let i = i + 1
+  end
+  let lists = [run, retired, rc_parity_selftests(), rc_build_unit_selftests()]
+  let all = rc_tracked()
+  let missing = []
+  let twice = []
+  let i = 0
+  while i < list_len(all) do
+    let p = all[i]
+    if str_ends_with(p, "_selftest.patlang") then
+      let n = 0
+      let k = 0
+      while k < list_len(lists) do
+        if rc_member(lists[k], p) then let n = n + 1 end
+        let k = k + 1
+      end
+      if n == 0 then let missing = list_push(missing, p) end
+      if n > 1 then let twice = list_push(twice, p) end
+    end
+    let i = i + 1
+  end
+  # a listed path that is not a tracked file is a stale entry
+  let stale = []
+  let k = 0
+  while k < list_len(lists) do
+    let j = 0
+    while j < list_len(lists[k]) do
+      if not rc_member(all, lists[k][j]) then let stale = list_push(stale, lists[k][j]) end
+      let j = j + 1
+    end
+    let k = k + 1
+  end
+  let a = expect(ctx, "the runner lists selftests", list_len(run) > 40, true)
+  let b = expect(ctx, "every selftest is run or retired", missing, [])
+  let c = expect(ctx, "no selftest is in two places", twice, [])
+  let d = expect(ctx, "every retired selftest says why", no_reason, [])
+  let e = expect(ctx, "every listed selftest is a tracked file", stale, [])
+  return a and b and c and d and e
+end
+
+# ---- no program starts a retired tool ----
+
+make a function called rc_retired_tool_needles returns needles
+  let q = chr(34)
+  return ["rust-runtime/target", "patc1.exe", "pat.exe" + q, q + "--ir-run" + q]
+end
+
+# Files that may name a retired tool, each with its reason: [path or directory
+# ending in /, reason]. An entry comes off when its file no longer needs it.
+make a function called rc_retired_tool_allowed returns rows
+  let old = "the old route's own: builds, drives or measures the old compiler or the Rust runtime, retired with them"
+  let unported = "not yet ported to v2 (issue #266)"
+  return [
+    ["self_hosting/build_patc1.patlang", old],
+    ["self_hosting/lib/runtime_rs.patlang", old],
+    ["self_hosting/tools/x64_build_fresh.patlang", old],
+    ["self_hosting/tools/build_all.patlang", old],
+    ["self_hosting/tools/parity_main.patlang", old],
+    ["self_hosting/run_benchmarks.patlang", old],
+    ["self_hosting/block_model/bench/", old],
+    ["self_hosting/x64_bool_array_selftest.patlang", old],
+    ["self_hosting/x64_i64_ctor_literal_range_selftest.patlang", old],
+    ["self_hosting/lib/interp_run.patlang", "runs a program on whichever interpreter it is given, v2_interp by default, and knows pat.exe's arguments"],
+    ["self_hosting/tools/run_repository_checks.patlang", "holds the names this check looks for"],
+    ["friendly_cli/", unported],
+    ["self_hosting/examples/goap_loop_rollup_demo.patlang", unported],
+    ["self_hosting/examples/goap_numeric_fluent_demo.patlang", unported],
+    ["self_hosting/examples/goap_webservice_demo.patlang", unported],
+    ["self_hosting/examples/microservices_demo.patlang", unported],
+    ["self_hosting/examples/spawn_readiness_demo.patlang", unported],
+    ["self_hosting/examples/webcrawler.patlang", unported],
+    ["self_hosting/tools/coverage_main.patlang", unported],
+    ["self_hosting/tools/agent_team.patlang", unported],
+    ["self_hosting/tools/goap_snippet_synthesis_prototype.patlang", unported]
+  ]
+end
+
+make a function called rc_allowed_row takes rows, path returns i
+  let i = 0
+  while i < list_len(rows) do
+    let a = rows[i][0]
+    if (a == path) or (str_ends_with(a, "/") and str_starts_with(path, a)) then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called st_rc_no_retired_tools takes ctx returns ok
+  let rows = rc_retired_tool_allowed()
+  let used = []
+  let k = 0
+  while k < list_len(rows) do
+    let used = list_push(used, false)
+    let k = k + 1
+  end
+  let needles = rc_retired_tool_needles()
+  let files = rc_patlang_files()
+  let found = []
+  let i = 0
+  while i < list_len(files) do
+    let p = files[i]
+    let needle = rc_first_needle(p, needles)
+    if needle != "" then
+      let row = rc_allowed_row(rows, p)
+      if row < 0 then
+        let found = list_push(found, p + " (" + needle + ")")
+      else
+        let used = list_set(used, row, true)
+      end
+    end
+    let i = i + 1
+  end
+  # an entry no file needs any more is stale: it comes off the list
+  let stale = []
+  let k = 0
+  while k < list_len(rows) do
+    if not used[k] then
+      let stale = list_push(stale, rows[k][0])
+    end
+    let k = k + 1
+  end
+  let a = expect(ctx, "no program outside the allowed ones starts a retired tool", found, [])
+  let b = expect(ctx, "every allowed file still names a retired tool", stale, [])
+  return a and b
+end
+
+# ---- no program tests a lookup's absence by turning it into text ----
+
+make a function called st_rc_no_text_absence takes ctx returns ok
+  let q = chr(34)
+  let needle = q + q + " + get("
+  let files = rc_patlang_files()
+  let found = []
+  let i = 0
+  while i < list_len(files) do
+    let p = files[i]
+    if (p != "self_hosting/tools/run_repository_checks.patlang") and (rc_first_needle(p, [needle]) != "") then
+      let found = list_push(found, p)
+    end
+    let i = i + 1
+  end
+  return expect(ctx, "no program writes \"\" + get( to test for a missing field", found, [])
+end
+
+make a function called st_rc_noop takes ctx returns ok
+  return true
+end
+
+let ctx = ctx_new()
+step(ctx, "every PatLang file but the old runtime's own and the fixtures testing set_var as a language feature", "st_rc_noop")
+step(ctx, "its code is searched for set_global, get_global, set_var and reads of __vars", "st_rc_noop")
+step(ctx, "there are none", "st_rc_no_globals")
+step(ctx, "every tracked file named *_selftest.patlang", "st_rc_noop")
+step(ctx, "each is looked for in run_selftests.patlang's lists, the block-model library parity feature and the gates' own build units", "st_rc_noop")
+step(ctx, "each is in exactly one of them, and each retired one says why", "st_rc_selftests_covered")
+step(ctx, "every tracked PatLang file but the old route's own, each allowed one with its reason", "st_rc_noop")
+step(ctx, "its code is searched for rust-runtime/target, patc1.exe, pat.exe and --ir-run", "st_rc_noop")
+step(ctx, "there are none, and every allowed file still exists and still needs its place", "st_rc_no_retired_tools")
+step(ctx, "every tracked PatLang file", "st_rc_noop")
+step(ctx, "its code is searched for \"\" + get(", "st_rc_noop")
+step(ctx, "there are none: a missing field reads as unit, so the test is == unit (spec 1.5)", "st_rc_no_text_absence")
+run_suite(ctx, ["spec_library/repository/repository.feature"], argv())

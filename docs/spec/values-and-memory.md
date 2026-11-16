@@ -88,6 +88,13 @@ any event is (`emit`, `when`), with nothing specific to operators.
   has no field `key`, including when `v` is not an object. A field holding `false`
   reads as `false`, so `get(v, key) == unit` tells a missing field from one set to
   `false`. `unit` is false as a condition.
+- **When nothing is there:** indexing a list or a vec past its ends, or indexing a
+  value that has no elements, gives `unit`, as `get` does for a missing field.
+  Indexing a string past its ends gives `""`. `getenv` gives `""` for an unset
+  variable and `read_file` gives `""` for a missing file; `file_exists` tells a
+  missing file from an empty one. `vfs_exists` gives the text `"1"` or `"0"`,
+  which the old engines' library code shares, and `vfs_read` of a missing path
+  stops the program. `query` gives the number of matches, 0 for none.
 
 ### 1.6 Memory
 
@@ -154,6 +161,9 @@ A string holds characters, whatever bytes they take. `.length`, indexes, `substr
 An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
 the cursor. `chr(n)` gives the character whose code is the int `n`; anything else stops the
 program.
+
+`str_contains(text, needle)` says whether the text holds the needle, in time that grows
+with the text's bytes whatever characters it holds. The empty needle is in every text.
 
 `sed(command, input)` takes a command `s/pattern/replacement/flags` and replaces the first
 literal match of the pattern in the input, or every match, left to right and not overlapping,

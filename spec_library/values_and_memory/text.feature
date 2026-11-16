@@ -25,3 +25,8 @@ Feature: a program sees characters, whatever bytes they take
     Given sed commands with and without g and i, with no match, an empty pattern, no replacement, an empty replacement, flags after a slash, characters of two bytes and an int as input
     When each is applied
     Then each gives what spec 1.10 says
+
+  Scenario: str_contains says whether text holds a needle
+    Given text of plain and of two- and three-byte characters, a needle at its start, middle and end, a needle it lacks, an empty needle, and a needle longer than the text
+    When str_contains looks for each
+    Then it is true where the text holds the needle, the empty needle included, and false elsewhere

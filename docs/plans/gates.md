@@ -74,15 +74,16 @@ finished.
   `self_hosting/build/gates/<unit>/`, given to the runner as `PATLANG_SPEC_OUT`.
   Runners take their scratch paths from it (the executables they build, the files
   they write), so two units never write the same file. Ports are already safe:
-  the fixtures listen on port 0. The synthesis selftests are the exception: they
-  write the programs they generate under `self_hosting/build/`, because some of
-  those programs include libraries by paths relative to it. Each selftest's files
-  have names of its own there, so no two units write the same file.
+  the fixtures listen on port 0. A program a test writes includes a library by
+  its full path (`path_absolute`, spec 1.13), so it runs from the unit's
+  directory.
 - **Status:** the dispatcher claims a signal port and answers `status` with the
   units running, waiting and done, and their times; it writes the same to
   `self_hosting/build/gates/status` as each unit finishes. `quit` starts no more
   units and lets the running ones finish; since each result is recorded as it
-  comes, the next run takes up the rest.
+  comes, the next run takes up the rest. `gates.sh --status` and `--quit` send
+  these; `--kill` stops the tool and every unit it started. A finished run's
+  status file names no port.
 
 ## Steps
 
@@ -140,8 +141,17 @@ finished.
 
 2026-11-16:
 
-- **The synthesis selftests are a suite:** `self_hosting/tools/run_synthesis_selftests.patlang`
-  lists its 29 selftests with `--list` and runs the ones it is given, so each is a
-  unit (`synthesis/NAME`), hashed with the files it includes, `self_hosting/lib` and
-  `self_hosting/composite_library`. A runner may list programs (`.patlang`) as well as
-  feature files.
+- **The selftests are a suite:** `self_hosting/tools/run_selftests.patlang` lists
+  the 50 selftests it runs with `--list`, and the 21 retired ones, each with its
+  reason, with `--retired`. Each runs as a unit (`selftests/NAME`), hashed with the
+  files it includes and the data it reads. A runner may list programs (`.patlang`)
+  as well as feature files.
+- **The repository suite** (`self_hosting/tools/run_repository_checks.patlang`,
+  `spec_library/repository/repository.feature`) checks every tracked file:
+  - no program keeps its state in globals (moved out of part2's
+    `compiler_structure`, so part2 no longer depends on `self_hosting/tools`);
+  - every selftest is run by a gate or retired with a reason;
+  - no program starts a retired tool, but for an allowlist where each entry has
+    its reason ([#266](https://github.com/PatParslow/PatLang/issues/266) for the
+    unported ones);
+  - no program tests a missing field with `"" + get(`.
