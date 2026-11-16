@@ -12,7 +12,7 @@ Feature: the repository keeps its own rules
 
   Scenario: every selftest is run by a gate or retired with a reason
     Given every tracked file named *_selftest.patlang
-    When each is looked for in run_selftests.patlang's lists, the block-model library parity feature and the gates' own build units
+    When each is looked for in run_selftests.patlang's lists and the gates' own build units
     Then each is in exactly one of them, and each retired one says why
 
   Scenario: no program starts a retired tool

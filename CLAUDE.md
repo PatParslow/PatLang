@@ -12,8 +12,9 @@ and passes every gate (checked 2026-11-15).
 `rust-runtime/` (`pat`) and the earlier compiler (`patc1.exe`,
 `self_hosting/build_patc1*.patlang`, `self_hosting/block_model/`,
 `self_hosting/lib/codegen*.patlang`, `x64_runtime.patlang`) are the old route.
-Don't develop on them or fix their failures unless asked. The block-model suite
-still tests the block-model engine, run on the v2 interpreter. Notes that were
+Don't develop on them or fix their failures unless asked. The gates no longer run
+the block-model suite (`spec_library/block_model/`, retired 2026-11-16); the
+libraries its parity feature exercised are selftests on v2. Notes that were
 only about the old route are in `docs/history/claude-md-old-route-notes.md`.
 
 Skills in `.claude/skills/` hold the step-by-step procedures:
@@ -142,7 +143,6 @@ so a runtime edit waits for a running gates run to finish.
    - `spec_library/values_and_memory/`: part 1 on both engines, and part 2 (`@runtime`).
    - `spec_library/language/`: `self_hosting/tools/run_language_spec_suite.patlang` on
      both engines, and `match_pattern` by `run_match_spec_suite.patlang`.
-   - `spec_library/block_model/`.
    - The selftests: `self_hosting/tools/run_selftests.patlang` runs every
      `*_selftest.patlang` a gate runs, and lists the retired ones with their reasons.
      A new selftest goes in its list, or the repository checks fail.

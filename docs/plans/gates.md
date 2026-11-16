@@ -165,3 +165,11 @@ finished.
 - **`--failed`** reruns only the units whose last run failed, and the record drops
   rows for units that no longer exist at the end of each run.
 - **`tools/edit_files.py`** has its tests as the `edit_tool` unit.
+- **A unit that reports a failed test fails** even when it exits 0: its last
+  `tests: N passed, M failed` line decides too. `interp_run_selftest` had passed
+  that way with two checks failing after `get` began giving `unit`.
+- **The block-model suite is retired.** It tested the old route's block-model
+  engine, and its longest scenarios (zs_refine and zs_explore re-run inside that
+  engine, 83 and 28 minutes) set the floor of a full run. The eleven library
+  selftests its parity feature ran are in `run_selftests.patlang`, on v2, where
+  they take 2 to 25 seconds each.

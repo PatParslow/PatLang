@@ -19,8 +19,9 @@ truth. This is how to use them.
   notification. Do not poll.
 - Results: `self_hosting/build/gates/record` (unit, key, pass, ms, peak bytes);
   logs: `self_hosting/build/gates/logs/UNIT.log`, with `/` in the name as `__`.
-- A unit passes when its command exits 0. A suite unit's log ends with its
-  `tests: N passed, M failed` line.
+- A unit passes when its command exits 0 and its last `tests: N passed, M failed`
+  line, if it prints one, has 0 failed: a test program that forgets its exit code
+  still fails.
 
 ## Watching and stopping
 
