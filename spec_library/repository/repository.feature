@@ -15,6 +15,16 @@ Feature: the repository keeps its own rules
     When each is looked for in run_selftests.patlang's lists and the gates' own build units
     Then each is in exactly one of them, and each retired one says why
 
+  Scenario: every demo program is run by the demos suite
+    Given every tracked PatLang file in demos/
+    When each is looked for in run_demos.patlang's list
+    Then each is listed, and each listed demo exists and has its expected output in demos/expected/
+
+  Scenario: every package's files match its manifest
+    Given every directory under packages/ that holds a manifest.pkg
+    When packages/tools/verify_manifest.patlang checks it
+    Then every file line is ok, and no PatLang file it ships is unlisted
+
   Scenario: no program starts a retired tool
     Given every tracked PatLang file but the old route's own, each allowed one with its reason
     When its code is searched for rust-runtime/target, patc1.exe, pat.exe and --ir-run

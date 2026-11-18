@@ -227,6 +227,13 @@ function start(init) {
       dv().setBigUint64(num(p), ft, true);
       return 0;
     },
+    // clock_ms: a clock that never goes back. Each worker has its own
+    // performance.now() origin, so the origin is added: every thread agrees.
+    QueryPerformanceFrequency(p) { dv().setBigUint64(num(p), 1000000n, true); return 1; },
+    QueryPerformanceCounter(p) {
+      dv().setBigUint64(num(p), BigInt(Math.floor((performance.timeOrigin + performance.now()) * 1000)), true);
+      return 1;
+    },
     // The processors the browser reports; it gives no processor times or
     // memory figures, so cpu_times and memory_status give [-1, -1].
     GetSystemInfo(p) {
@@ -318,7 +325,10 @@ function start(init) {
     },
     CreatePipe() { lastError = 50; return 0; },
     SetHandleInformation() { lastError = 6; return 0; },
-    CreateProcessA() { lastError = 2; return 0; },
+    // no handle here can be inherited: there are no processes to inherit it
+    GetHandleInformation() { lastError = 6; return 0; },
+    // the program is no file here: program_path() gives ""
+    GetModuleFileNameA() { lastError = 2; return 0; },    CreateProcessA() { lastError = 2; return 0; },
     GetExitCodeProcess() { lastError = 6; return 0; },
     TerminateProcess() { lastError = 6; return 0; },
     PeekNamedPipe() { lastError = 6; return 0; },
@@ -331,6 +341,20 @@ function start(init) {
   const winsock = {
     WSAStartup() { return 10091; },
     WSAGetLastError() { return 10050; },
+  };
+  // random_bytes: the host's cryptographic source. getRandomValues takes no
+  // view of shared memory and at most 65536 bytes a call, so it fills a buffer
+  // of its own that is then copied in.
+  const bcrypt = {
+    BCryptGenRandom(alg, buf, n, flags) {
+      const len = num(n);
+      const out = new Uint8Array(len);
+      for (let at = 0; at < len; at += 65536) {
+        globalThis.crypto.getRandomValues(out.subarray(at, Math.min(len, at + 65536)));
+      }
+      u8().set(out, num(buf));
+      return 0;
+    },
   };
   const round = (x) => {
     const r = Math.trunc(x);
@@ -352,7 +376,7 @@ function start(init) {
       imports[lib][func] = crt[func];
       continue;
     }
-    const impl = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : undefined;
+    const impl = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : lib === "BCRYPT.DLL" ? bcrypt[func] : undefined;
     imports[lib][func] = impl
       ? (...args) => { const r = impl(...args); return typeof r === "bigint" ? r : BigInt(r); }
       : () => { throw new Error(lib + "!" + func + " is not available on this host"); };

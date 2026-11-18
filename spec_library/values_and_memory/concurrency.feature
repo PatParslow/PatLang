@@ -66,3 +66,33 @@ Feature: fibers, budgeted blocks and threads (spec 1.8)
     Given 8 threads, each reading its own length of one file 400 times and printing a number of seven copies of its own digit each time
     When parallel_map runs them
     Then every read gives the length asked for, and every number is printed whole
+
+  Scenario: threads change the runtime's tables together
+    Given 4 workers, each writing 50 virtual files 100 times over, appending to a file of its own 5000 times and adding an action
+    When parallel_map runs them
+    Then every file holds its last write, every append is there, and every action can be planned
+
+  Scenario: threads waiting on one listener at once each get their answer
+    Given a listener, and 3 threads that each wait on it with tcp_accept_timeout for 20, 30 and 40 ms, 20 times over
+    When a client then connects while the program waits in tcp_accept
+    Then every timed wait gives -1, and tcp_accept gets the client and what it sent
+
+  Scenario: a fiber that is running cannot be resumed
+    Given a fiber whose function resumes the fiber it is running in
+    When it runs
+    Then the program stops at that resume, saying the fiber is already running, and nothing after it runs
+
+  Scenario: a budgeted block costs little per iteration and still yields near its deadline
+    Given 2 million cheap iterations, plain and in a budgeted block, and a block of 1 ms iterations given 50 ms
+    When each runs, the slow one continued until done
+    Then the budgeted loop takes no more than five times the plain one, the slow block first yields between 25 and 80 ms, and all its iterations run
+
+  Scenario: more threads than processors do not hold off a lock's next holder
+    Given 32000 virtual files written by 4 threads, and then by 16
+    When each group runs
+    Then the 16 take no more than about four times as long as the 4
+
+  Scenario: a vec belongs to one thread at a time
+    Given 4 threads each pushing 50000 values onto one vec
+    When their results are taken
+    Then every push is there, or the program stops saying a vec was changed by one thread while another was using it

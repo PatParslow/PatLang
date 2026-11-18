@@ -1,0 +1,238 @@
+# Demo 7: a bakery's order desk, using every paradigm in one program.
+#
+#   orders arrive over TCP            networking, threads
+#   a fibre turns lines into orders   fibres, objects
+#   rules say what can be baked       logic programming
+#   prices are worked out in parallel parallel_map, functional style
+#   a plan is found and carried out   goals and planning
+#   every change is announced         events
+#   and written down                  the virtual file system
+#   with each step checked            contracts
+#
+# Written for a file in demos/ under the repository root. Sockets need a
+# native build or the interpreter on Windows.
+
+# ---- objects: an order, which announces each change of status ----
+
+class Order {
+  field item = ""
+  field quantity = 0
+  field status = "received"
+  field price = 0
+  make a function called mark takes self, status returns r raises order_changed
+    self.status = status
+    return status
+  end
+}
+
+# ---- events: every change goes to the day's log, a virtual file ----
+
+when order_changed do
+  vfs_append("/bakery/log.txt", event_data[0].item + ": " + event_data[2] + chr(10))
+end
+
+# ---- logic: the recipes, the pantry, and what follows from them ----
+
+rule recipe(scone, flour).
+rule recipe(scone, butter).
+rule recipe(brownie, flour).
+rule recipe(brownie, cocoa).
+rule recipe(meringue, eggs).
+rule pantry(flour).
+rule pantry(butter).
+rule pantry(cocoa).
+rule missing(Item, Thing) :- recipe(Item, Thing), lacks(Thing).
+rule lacks(eggs).
+rule unit_price(scone, 3).
+rule unit_price(brownie, 4).
+rule unit_price(meringue, 5).
+
+# Whether the item has a recipe and nothing it needs is missing.
+make a function called can_bake takes item returns yes
+  let known = list_len(solve("recipe", [item, logic_var("Thing")])) > 0
+  let short = list_len(solve("missing", [item, logic_var("Thing")])) > 0
+  return known and (not short)
+end
+
+# ---- functional helpers ----
+
+make a function called map takes items, f returns out
+  let out = []
+  let i = 0
+  while i < list_len(items) do
+    let out = list_push(out, f(items[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called keep takes items, wanted returns out
+  let out = []
+  let i = 0
+  while i < list_len(items) do
+    if wanted(items[i]) then
+      let out = list_push(out, items[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called sum takes numbers returns total
+  let total = 0
+  let i = 0
+  while i < list_len(numbers) do
+    let total = total + numbers[i]
+    let i = i + 1
+  end
+  return total
+end
+
+# ---- threads: pricing is a pure function of its argument, so it can run
+# on a thread per order ----
+
+make a function called price_line takes line returns price
+  require line[1] > 0
+  let unit = to_num(solve("unit_price", [line[0], logic_var("P")])[0][1])
+  let price = unit * line[1]
+  # a dozen or more: one tenth off, kept exact as a rational
+  if line[1] >= 12 then
+    let price = price * 9 / 10
+  end
+  ensure price > 0
+  return price
+end
+
+# ---- fibres: the intake desk takes one line per resume and yields an order ----
+
+make a function called intake takes line returns never
+  let current = line
+  while true do
+    let parts = split_words(current)
+    let order = new("Order", "order-" + parts[0])
+    order.item = parts[0]
+    order.quantity = to_num(parts[1])
+    let current = fiber_yield(order)
+  end
+  return 0
+end
+
+make a function called split_words takes line returns out
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  while i < line.length do
+    if line[i] == " " then
+      let out = list_push(out, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, line[i])
+    end
+    let i = i + 1
+  end
+  return list_push(out, sb_str(cur))
+end
+
+# A text's lines, without their line ends. (split_lines is a function of
+# self_hosting/lib/includes.patlang, not of the runtime, so the demo has its
+# own.)
+make a function called text_lines takes text returns lines
+  let lines = []
+  let cur = sb_new()
+  let i = 0
+  while i < text.length do
+    let c = char_code(text, i)
+    if c == 10 then
+      let lines = list_push(lines, sb_str(cur))
+      let cur = sb_new()
+    elif c != 13 then
+      sb_push(cur, text[i])
+    end
+    let i = i + 1
+  end
+  if sb_len(cur) > 0 then
+    let lines = list_push(lines, sb_str(cur))
+  end
+  return lines
+end
+
+# ---- networking: a customer on another thread sends its orders ----
+
+make a function called customer takes port, lines returns sent
+  let i = 0
+  while i < list_len(lines) do
+    let conn = tcp_connect("127.0.0.1", port)
+    tcp_write(conn, lines[i] + chr(10))
+    tcp_read_or_empty(conn)
+    tcp_close(conn)
+    let i = i + 1
+  end
+  return i
+end
+
+make a function called receive takes port, count returns lines
+  let lines = []
+  while list_len(lines) < count do
+    let conn = tcp_accept_timeout(port, 5000)
+    require conn >= 0
+    let lines = list_push(lines, text_lines(tcp_read_or_empty(conn))[0])
+    tcp_write(conn, "received" + chr(10))
+    tcp_close(conn)
+  end
+  return lines
+end
+
+# ---- goals and planning: what it takes to have an item ready ----
+
+action_add("gather", [["wanted", [logic_var("I")]]], [["gathered", [logic_var("I")]]], [], 1)
+action_add("bake", [["gathered", [logic_var("I")]]], [["baked", [logic_var("I")]]], [["gathered", [logic_var("I")]]], 5)
+action_add("box", [["baked", [logic_var("I")]]], [["ready", [logic_var("I")]]], [], 1)
+
+action_bind("gather", |args| do
+  send("order-" + args[0], "mark", "ingredients gathered")
+  return true
+end)
+action_bind("bake", |args| do
+  send("order-" + args[0], "mark", "baked")
+  return true
+end)
+action_bind("box", |args| do
+  send("order-" + args[0], "mark", "ready")
+  return true
+end)
+
+# ---- the day ----
+
+let port = tcp_listen(0)
+let wanted = ["scone 12", "meringue 6", "brownie 2"]
+let sender = thread_spawn(|p, lines| { return customer(p, lines) }, port, wanted)
+let lines = receive(port, list_len(wanted))
+print("received over TCP: " + lines + " (" + thread_result(sender) + " sent)")
+
+let desk = fiber_new("intake")
+let orders = map(lines, |line| { return fiber_resume(desk, line) })
+print("orders: " + map(orders, |o| { return o.quantity + " x " + o.item }))
+
+let accepted = keep(orders, |o| { return can_bake(o.item) })
+let refused = keep(orders, |o| { return not can_bake(o.item) })
+map(refused, |o| { return o.mark("refused: missing " + solve("missing", [o.item, logic_var("T")])[0][1]) })
+print("accepted: " + map(accepted, |o| { return o.item }) + ", refused: " + map(refused, |o| { return o.item }))
+
+let prices = parallel_map(map(accepted, |o| { return [o.item, o.quantity] }), "price_line")
+let i = 0
+while i < list_len(accepted) do
+  let o = accepted[i]
+  o.price = prices[i]
+  rule_add("wanted", [o.item], [])
+  let i = i + 1
+end
+print("prices: " + prices + ", takings: " + sum(prices))
+
+let goals = map(accepted, |o| { return ["ready", [o.item]] })
+let steps = plan(goals)
+print("plan: " + plan_labels(steps))
+print("carried out: " + (activate steps))
+
+print("statuses: " + map(orders, |o| { return o.item + " = " + o.status }))
+print("the day's log:")
+print(vfs_read("/bakery/log.txt"))

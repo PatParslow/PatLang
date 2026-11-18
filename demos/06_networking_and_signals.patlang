@@ -1,0 +1,180 @@
+# Demo 6: TCP and signals.
+#
+# Covers: tcp_listen, tcp_accept_timeout, tcp_connect, tcp_read_or_empty,
+# tcp_write, tcp_close, a line-framed request/response protocol, a server on
+# its own thread, and the signals library: a running program that answers
+# `status` and obeys `quit` while it works.
+#
+# Written for a file in demos/ under the repository root (the include below
+# is relative to this file). Sockets need a native build or the interpreter
+# on Windows; a browser build has none.
+include "../self_hosting/lib/signals.patlang"
+
+# A text's lines, without their line ends. (split_lines is a function of
+# self_hosting/lib/includes.patlang, not of the runtime, so the demo has its
+# own.)
+make a function called text_lines takes text returns lines
+  let lines = []
+  let cur = sb_new()
+  let i = 0
+  while i < text.length do
+    let c = char_code(text, i)
+    if c == 10 then
+      let lines = list_push(lines, sb_str(cur))
+      let cur = sb_new()
+    elif c != 13 then
+      sb_push(cur, text[i])
+    end
+    let i = i + 1
+  end
+  if sb_len(cur) > 0 then
+    let lines = list_push(lines, sb_str(cur))
+  end
+  return lines
+end
+
+make a function called starts_with takes text, prefix returns yes
+  return substr(text, 0, prefix.length) == prefix
+end
+
+# ---- framing: TCP is a stream, so one read is not one message ----
+
+# Reads until a line end has arrived: the line without it, or what there is
+# when the other side closes first.
+make a function called read_line takes conn returns line
+  let b = sb_new()
+  while true do
+    let chunk = tcp_read_or_empty(conn)
+    if chunk == "" then
+      return sb_str(b)
+    end
+    sb_push(b, chunk)
+    let text = sb_str(b)
+    if str_contains(text, chr(10)) then
+      return text_lines(text)[0]
+    end
+  end
+end
+
+make a function called write_line takes conn, text returns done
+  return tcp_write(conn, text + chr(10))
+end
+
+# The words of a line, split on single spaces.
+make a function called words takes line returns out
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  while i < line.length do
+    if line[i] == " " then
+      let out = list_push(out, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, line[i])
+    end
+    let i = i + 1
+  end
+  return list_push(out, sb_str(cur))
+end
+
+# ---- the server: one request per connection, until it is told to stop ----
+
+make a function called answer takes request returns reply
+  let w = words(request)
+  match w do
+    case ["ping"] then
+      return "pong"
+    case ["add", a, b] then
+      return "" + (to_num(a) + to_num(b))
+    case ["echo", text] then
+      return text
+    case ["stop"] then
+      return "stopping"
+    case _ then
+      return "error: unknown request"
+  end
+end
+
+# Runs on its own thread. It reads only its arguments and returns a value;
+# the listener it accepts on was opened by the thread that started it.
+make a function called serve takes port returns served
+  let served = 0
+  let going = true
+  while going do
+    let conn = tcp_accept_timeout(port, 200)
+    if conn >= 0 then
+      let request = read_line(conn)
+      write_line(conn, answer(request))
+      tcp_close(conn)
+      let served = served + 1
+      if request == "stop" then
+        let going = false
+      end
+    end
+  end
+  return served
+end
+
+make a function called ask takes port, request returns reply
+  let conn = tcp_connect("127.0.0.1", port)
+  write_line(conn, request)
+  let reply = read_line(conn)
+  tcp_close(conn)
+  return reply
+end
+
+print("== request and response over TCP ==")
+let port = tcp_listen(0)
+let server = thread_spawn(|p| { return serve(p) }, port)
+print("ping  -> " + ask(port, "ping"))
+print("add   -> " + ask(port, "add 19 23"))
+print("echo  -> " + ask(port, "echo hello"))
+print("bogus -> " + ask(port, "launch missiles"))
+print("stop  -> " + ask(port, "stop"))
+print("the server handled " + thread_result(server) + " requests")
+
+# ---- signals: a working program that answers while it works ----
+
+# The work is a loop that polls its signal port as it goes. The state the
+# handlers read and write is in a vec: [units done, still running].
+print("== signals ==")
+let state = vec_new()
+vec_push(state, 0)
+vec_push(state, true)
+
+when status do
+  signal_reply("done " + vec_get(state, 0) + " units")
+end
+
+when quit do
+  vec_set(state, 1, false)
+  signal_reply("stopping after " + vec_get(state, 0) + " units")
+end
+
+let signal_port = signal_claim(0)
+signal_allow(["status", "quit"])
+
+# Another program would do this part, given the port. Here a thread stands in
+# for it: it asks for the status twice, then tells the program to stop.
+let controller = thread_spawn(|p| do
+  sleep_ms(150)
+  let first = signal_query(p, "status", "")
+  sleep_ms(150)
+  let second = signal_query(p, "status", "")
+  let last = signal_query(p, "quit", "")
+  return [first, second, last]
+end, signal_port)
+
+while vec_get(state, 1) do
+  # one unit of work
+  sleep_ms(10)
+  vec_set(state, 0, vec_get(state, 0) + 1)
+  # then anything that has come in
+  signal_poll(signal_port, 5)
+end
+
+let heard = thread_result(controller)
+print("first status had the form 'done N units': " + starts_with(heard[0], "done "))
+print("progress between the two: " + (heard[0] != heard[1]))
+print("quit was answered: " + starts_with(heard[2], "stopping after "))
+print("the loop ended with work done: " + (vec_get(state, 0) > 0))

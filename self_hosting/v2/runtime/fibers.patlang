@@ -3,19 +3,22 @@
 # A fiber is a Windows fiber: its own stack, on whichever thread resumes it,
 # using that thread's memory context. A program holds an id, an int; the list
 # at runtime_state() + 4112 pairs each unfinished one with its job, under the
-# ticket lock at 4416 and 4424, 4432 being the last id given. A fiber's entry
+# lock at 4416 (rt_lock_take; 4424 unused), 4432 being the last id given. A fiber's entry
 # stays until it finishes and a thread's until thread_result takes its result,
 # so an id is live as long as the program can still use it.
 #
 # A job (threads.patlang) is an uncounted block: 16 the function, 32 the value
 # handed across a switch (a thread's arguments), 48 a thread's result, 64 a
 # thread's context, 0 for a fiber, 72 its handle, 80 the fiber that resumed it,
-# 88 1 once it has finished; for a fiber, 96 its deadline in ms or -1, 104 the
-# last budget check or -1, 112 how many durations are held, 120 up to 16 of them,
+# 88 1 once it has finished; for a fiber, 96 its deadline in microseconds
+# (rt_clock_us) or -1, 104 the last look at the clock or -1, 112 how many
+# durations are held, 120 up to 16 of them (each an iteration's, in
+# nanoseconds), 280 the back-edges left before the next look and 288 how many
+# the batch since the last look holds,
 # 248 the events whose handlers are running on it while another runs (the
 # running one's are in the thread context at 2576), 264 the base of the world
-# it was made in, 0 for the program's (worlds.patlang). 80 is 0 until the fiber
-# is first resumed.
+# it was made in, 0 for the program's (worlds.patlang), and 272 1 while the
+# fiber runs (fiber_resume). 80 is 0 until the fiber is first resumed.
 #
 # A stop in a world unwinds a fiber to rt_fiber_run, which keeps the unwinding
 # mark as what the fiber returned, and fiber_resume gives it to the resumer,
@@ -41,10 +44,7 @@ end
 
 make a function called rt_jobs_lock returns r
   let st = runtime_state()
-  let mine = atomic_add(st + 4416, 1)
-  while mem_load(st, 4424) != mine do
-    let spin = 0
-  end
+  rt_lock_take(st + 4416)
   let r = 0
   ensure r == 0
   return r
@@ -52,7 +52,7 @@ end
 
 make a function called rt_jobs_unlock returns r
   let st = runtime_state()
-  mem_store(st, 4424, mem_load(st, 4424) + 1)
+  rt_lock_give(st + 4416)
   let r = 0
   ensure r == 0
   return r
@@ -65,7 +65,7 @@ make a function called rt_job_add takes job returns id
   let st = runtime_state()
   let id = mem_load(st, 4432) + 1
   mem_store(st, 4432, id)
-  rt_engine_set(4112, list_push(rt_engine_get(4112), [id, job]))
+  rt_engine_push(4112, [id, job])
   rt_jobs_unlock()
   ensure id > 0
   return id
@@ -96,18 +96,7 @@ end
 make a function called rt_job_remove takes id returns r
   require value_class(id) == 2
   rt_jobs_lock()
-  let jobs = rt_engine_get(4112)
-  let kept = []
-  let n = list_len(jobs)
-  let k = 0
-  while k < n do
-    let row = jobs[k]
-    if row[0] != id then
-      let kept = list_push(kept, row)
-    end
-    let k = k + 1
-  end
-  rt_engine_set(4112, kept)
+  rt_engine_drop(4112, id)
   rt_jobs_unlock()
   let r = 0
   ensure r == 0
@@ -129,7 +118,7 @@ end
 
 make a function called rt_fiber_start takes f returns id
   require value_class(f) == 10
-  let job = rt_job_new(256)
+  let job = rt_job_new(280)
   mem_init_value(job, 16, f)
   # a fiber runs in the world it was made in
   mem_store(job, 264, mem_load(rt_context(), 2680))
@@ -157,6 +146,15 @@ end
 make a function called fiber_resume takes id, arg returns value
   require rt_fiber_job(id) != 0
   let job = rt_fiber_job(id)
+  # a fiber runs on one thread at a time: taken here, given back below when
+  # it yields or ends, so the fiber itself, or a second thread, finds it taken
+  if atomic_add(job + 272, 1) != 0 then
+    atomic_add(job + 272, 0 - 1)
+    print("fiber_resume: fiber " + id + " is already running: a fiber runs on one thread at a time, and cannot resume itself")
+    let value = rt_stop(90)
+    ensure value_live(value) or rt_is_unwinding(value)
+    return value
+  end
   let ctx = rt_context()
   if mem_load(ctx, 2600) == 0 then
     mem_store(ctx, 2600, extern_call("KERNEL32.DLL", "ConvertThreadToFiber", 0))
@@ -175,6 +173,8 @@ make a function called fiber_resume takes id, arg returns value
   let my_world = mem_load(ctx, 2680)
   mem_store(ctx, 2680, mem_load(job, 264))
   extern_call("KERNEL32.DLL", "SwitchToFiber", mem_load(job, 72))
+  # it has yielded or ended: another resume may take it
+  atomic_add(job + 272, 0 - 1)
   # this fiber may have been resumed on another thread since
   let back = rt_context()
   mem_store(back, 2680, my_world)
@@ -268,9 +268,11 @@ make a function called rt_budgeted takes ms, f, existing returns out
     print("budgeted: fiber " + id + " has already finished")
     exit_with(94)
   end
-  mem_store(job, 96, now_ms() + ms)
+  mem_store(job, 96, rt_clock_us() + 1000 * ms)
   mem_store(job, 104, 0 - 1)
   mem_store(job, 112, 0)
+  mem_store(job, 280, 0)
+  mem_store(job, 288, 1)
   let value = fiber_resume(id, value_make(0, 0))
   if fiber_alive(id) then
     let out = ["paused", id]
@@ -314,14 +316,29 @@ make a function called rt_budget_predict takes job returns ms
   return ms
 end
 
-# At every loop's back-edge inside a budgeted block: yields once the next
-# iteration, judged by the recent ones, would pass the deadline.
+# At every loop's back-edge inside a budgeted block. The clock is read once
+# per batch of back-edges: a batch is as many iterations as take about a
+# millisecond, or half the time left, at the rate the recent ones predict
+# (rt_budget_predict, never below the slowest of them), and at least one.
+# At each look, the block yields once the next iteration would pass the
+# deadline. Reading the clock and predicting at every back-edge made a loop
+# of cheap iterations about a hundred times slower budgeted than plain
+# (review finding O12). An iteration of a millisecond or more is a batch of
+# its own, as every iteration was; a batch of faster ones can pass the
+# deadline by what the rate it was judged at underestimated.
 make a function called budget_check returns r
   let r = 0
   let job = mem_load(rt_context(), 2592)
   if job != 0 then
-    let now = now_ms()
+    let left = mem_load(job, 280) - 1
+    if left > 0 then
+      mem_store(job, 280, left)
+      ensure r == 0
+      return r
+    end
+    let now = rt_clock_us()
     let last = mem_load(job, 104)
+    let batch = mem_load(job, 288)
     if last >= 0 then
       let n = mem_load(job, 112)
       if n == 16 then
@@ -336,16 +353,39 @@ make a function called budget_check returns r
       if took < 0 then
         let took = 0
       end
-      mem_store(job, 120 + 8 * n, took)
+      mem_store(job, 120 + 8 * n, word_div(1000 * took, batch))
       mem_store(job, 112, n + 1)
     end
     mem_store(job, 104, now)
+    # nanoseconds an iteration is judged to take, at least one
+    let per = rt_budget_predict(job)
+    if per < 1 then
+      let per = 1
+    end
+    let next = word_div(1000000, per)
+    # with no iteration measured yet, the next batch is one, to measure it
+    if mem_load(job, 112) == 0 then
+      let next = 1
+    end
     let deadline = mem_load(job, 96)
     if deadline >= 0 then
-      if now + rt_budget_predict(job) >= deadline then
+      if 1000 * now + per >= 1000 * deadline then
         fiber_yield(value_make(0, 0))
+        # time paused is no iteration's: the next look starts afresh
+        let now = rt_clock_us()
+        mem_store(job, 104, now)
+        let deadline = mem_load(job, 96)
+      end
+      let half = word_div(500 * (deadline - now), per)
+      if half < next then
+        let next = half
       end
     end
+    if next < 1 then
+      let next = 1
+    end
+    mem_store(job, 288, next)
+    mem_store(job, 280, next)
   end
   ensure r == 0
   return r

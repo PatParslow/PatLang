@@ -173,3 +173,8 @@ finished.
   engine, 83 and 28 minutes) set the floor of a full run. The eleven library
   selftests its parity feature ran are in `run_selftests.patlang`, on v2, where
   they take 2 to 25 seconds each.
+- **The demos are a suite:** `self_hosting/tools/run_demos.patlang` lists the
+  programs in `demos/` with `--list`. Each runs as a unit (`demos/NAME`),
+  interpreted and compiled, and both outputs are compared with
+  `demos/expected/NAME.txt`. The repository suite checks that every program in
+  `demos/` is listed and has its expected output.

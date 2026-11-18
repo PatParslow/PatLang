@@ -7,8 +7,9 @@ include "x64_asm.patlang"
 # x64_assemble_chunk, plus a fixed list of DLL imports, merged into a
 # single working PE32+ .exe. Not a general linker -- no arbitrary object
 # file formats, no static libraries, no ordinal imports, always
-# import-by-name, no base relocation table (ASLR off, fixed ImageBase),
-# matching what the design plan scoped for Phase 1.
+# import-by-name. Every absolute address it writes (a data section's
+# `dq label`) is listed in a base relocation table, and the image asks for a
+# random base (ASLR: DYNAMIC_BASE and HIGH_ENTROPY_VA; review finding S14).
 #
 # Entry point is set directly to the "main" symbol (the program is
 # CRT-less and calls ExitProcess itself -- confirmed safe by inspecting
@@ -635,6 +636,9 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
   # header for the measured cost of not doing this).
   let unused_pidx = x64_build_progress(ctx, "link-index-symbols", 0, to_num(list_len(symtab_names)))
   let symtab_index = xpl_build_index(symtab_names, symtab_values)
+  # every absolute address written, by its RVA: the base relocation table
+  # lists them, so the loader can move the image (ASLR)
+  let abs_rvas = vec_new()
   let ri = 0
   let rn = vec_len(all_relocs)
   # Reported every 500 relocations rather than every one: enough
@@ -699,6 +703,7 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     # benefits without needing to change anything here.
     if kind == "ABS64" then
       xpl_put_le(merged_data, offset, image_base + target_rva + addend, 8)
+      vec_push(abs_rvas, data_rva + offset)
     else
       let reloc_rva = text_rva + thunk_area_size + offset
       xpl_put_le(merged_text, offset, (target_rva + addend) - (reloc_rva + 4), 4)
@@ -712,11 +717,16 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
 
   # ---- Assemble final image ----
   let idata_datadir_size = descriptors_size
-  let sizeof_image = xpl_round_up(idata_rva + idata_size_raw, section_align)
+  let reloc_rva = idata_rva + xpl_section_span(idata_size_raw, section_align)
+  let relocs = xpl_base_relocs(vec_to_list(abs_rvas), data_rva)
+  let reloc_size_raw = list_len(relocs)
+  let reloc_size = xpl_round_up(reloc_size_raw, file_align)
+  let sizeof_image = xpl_round_up(reloc_rva + reloc_size_raw, section_align)
 
   let text_file_offset = headers_size
   let data_file_offset = headers_size + text_size
   let idata_file_offset = headers_size + text_size + data_size
+  let reloc_file_offset = idata_file_offset + idata_size
 
   let hdr = xpl_build_headers(headers_size, image_base, section_align, file_align,
     entry_rva, sizeof_image,
@@ -724,7 +734,8 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     data_rva, data_size, data_size_raw, data_file_offset,
     bss_rva, xpl_round_up(bss_size_raw, section_align),
     idata_rva, idata_size, idata_size_raw, idata_datadir_size, idata_file_offset,
-    iat_region_start, iat_region_size)
+    iat_region_start, iat_region_size,
+    [reloc_rva, reloc_size, reloc_size_raw, reloc_file_offset])
 
   # One conversion back to a plain List each, here at the very end where
   # xa_emit_bytes needs List indexing -- a single O(n) copy, not one per
@@ -739,6 +750,8 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
   let out = xpl_pad_to(out, headers_size + text_size + data_size)
   let out = xa_emit_bytes(out, idata)
   let out = xpl_pad_to(out, headers_size + text_size + data_size + idata_size)
+  let out = xa_emit_bytes(out, relocs)
+  let out = xpl_pad_to(out, reloc_file_offset + reloc_size)
 
   let ok = write_file_bytes(out_path, out)
   if not ok then
@@ -779,7 +792,9 @@ end
 # text_raw/data_raw/idata_raw are the ACTUAL content sizes (before
 # file-alignment padding) -- PE's SizeOfRawData per section is the
 # padded size, but VirtualSize is the real, unpadded size.
-make a function called xpl_build_headers takes headers_size, image_base, section_align, file_align, entry_rva, sizeof_image, text_rva, text_size, text_raw, text_file_offset, data_rva, data_size, data_raw, data_file_offset, bss_rva, bss_virtual_size, idata_rva, idata_size, idata_raw, idata_datadir_size, idata_file_offset, iat_region_start, iat_region_size returns bytes
+# reloc is [rva, size in the file, size of the table, file offset] of the
+# .reloc section (xpl_base_relocs).
+make a function called xpl_build_headers takes headers_size, image_base, section_align, file_align, entry_rva, sizeof_image, text_rva, text_size, text_raw, text_file_offset, data_rva, data_size, data_raw, data_file_offset, bss_rva, bss_virtual_size, idata_rva, idata_size, idata_raw, idata_datadir_size, idata_file_offset, iat_region_start, iat_region_size, reloc returns bytes
   let b = []
   # DOS header: MZ + e_lfanew at offset 0x3C pointing past a 64-byte stub.
   let b = xa_emit_bytes(b, [77, 90])
@@ -789,9 +804,9 @@ make a function called xpl_build_headers takes headers_size, image_base, section
   # PE signature
   let b = xa_emit_bytes(b, [80, 69, 0, 0])
 
-  # COFF File Header
+  # COFF File Header: five sections (.text, .data, .bss, .idata, .reloc)
   let b = xpl_emit_u16(b, 34404)
-  let b = xpl_emit_u16(b, 4)
+  let b = xpl_emit_u16(b, 5)
   let b = xpl_emit_u32(b, 0)
   let b = xpl_emit_u32(b, 0)
   let b = xpl_emit_u32(b, 0)
@@ -802,7 +817,7 @@ make a function called xpl_build_headers takes headers_size, image_base, section
   let b = xpl_emit_u16(b, 523)
   let b = xa_emit_bytes(b, [0, 0])
   let b = xpl_emit_u32(b, text_size)
-  let b = xpl_emit_u32(b, data_size + idata_size)
+  let b = xpl_emit_u32(b, data_size + idata_size + reloc[1])
   let b = xpl_emit_u32(b, bss_virtual_size)
   let b = xpl_emit_u32(b, entry_rva)
   let b = xpl_emit_u32(b, text_rva)
@@ -820,7 +835,10 @@ make a function called xpl_build_headers takes headers_size, image_base, section
   let b = xpl_emit_u32(b, headers_size)
   let b = xpl_emit_u32(b, 0)
   let b = xpl_emit_u16(b, 3)
-  let b = xpl_emit_u16(b, 256)
+  # DllCharacteristics: HIGH_ENTROPY_VA (0x20), DYNAMIC_BASE (0x40) and
+  # NX_COMPAT (0x100): the loader puts the image at a random base, which the
+  # .reloc section's table lets it do
+  let b = xpl_emit_u16(b, 352)
   # Stack reserve: 256 MB, the stack the interpreter and the Rust-built
   # compiler run on, so a program recurses as deep natively as it does
   # there. It was 1 MB, and the native compiler overflowed lowering one
@@ -843,6 +861,10 @@ make a function called xpl_build_headers takes headers_size, image_base, section
       if dd == 12 then
         let b = xpl_emit_u32(b, idata_rva + iat_region_start)
         let b = xpl_emit_u32(b, iat_region_size)
+      elif dd == 5 then
+        # the base relocation table
+        let b = xpl_emit_u32(b, reloc[0])
+        let b = xpl_emit_u32(b, reloc[2])
       else
         let b = xpl_emit_u32(b, 0)
         let b = xpl_emit_u32(b, 0)
@@ -862,7 +884,7 @@ make a function called xpl_build_headers takes headers_size, image_base, section
   # content (e.g. a pure-arithmetic test with no globals) produced a
   # file objdump parsed fine but Windows refused to run ("Exec format
   # error"). Every section this linker ever declares is unconditional
-  # (always exactly 4), so floor VirtualSize at one page whenever the
+  # (always the same five), so floor VirtualSize at one page whenever the
   # real content is smaller than that, rather than only emitting a
   # section header when there's real content -- simpler than making
   # NumberOfSections and the RVA layout conditional.
@@ -881,8 +903,93 @@ make a function called xpl_build_headers takes headers_size, image_base, section
     let idata_virtual_size = section_align
   end
   let b = xpl_emit_section_header(b, ".idata", idata_virtual_size, idata_rva, idata_size, idata_file_offset, 3221225536)
+  # .reloc: initialized data, discardable, read (0x42000040); never empty
+  # (xpl_base_relocs), so its VirtualSize is its table's size
+  let b = xpl_emit_section_header(b, ".reloc", reloc[2], reloc[0], reloc[1], reloc[3], 1107296320)
 
   return b
+end
+
+# The base relocation table for the absolute addresses at these RVAs: a block
+# per 4 KB page holding any, each [page RVA u32][block size u32] then an entry
+# u16 per address, its type DIR64 (10) in the top four bits and its offset in
+# the page below, padded with an ABSOLUTE (0) entry to a 4-byte size. With no
+# address at all, one block of padding for the page at empty_page: a table
+# that is there, so the image can still be moved.
+make a function called xpl_base_relocs takes rvas, empty_page returns bytes
+  let sorted = xpl_sort_ints(rvas)
+  let b = []
+  if list_len(sorted) == 0 then
+    let b = xpl_emit_u32(b, empty_page - (empty_page % 4096))
+    let b = xpl_emit_u32(b, 12)
+    let b = xpl_emit_u16(b, 0)
+    let b = xpl_emit_u16(b, 0)
+    return b
+  end
+  let i = 0
+  let n = list_len(sorted)
+  while i < n do
+    let page = sorted[i] - (sorted[i] % 4096)
+    let j = i
+    while (j < n) and (sorted[j] - (sorted[j] % 4096) == page) do
+      let j = j + 1
+    end
+    let count = j - i
+    let padded = count + (count % 2)
+    let b = xpl_emit_u32(b, page)
+    let b = xpl_emit_u32(b, 8 + 2 * padded)
+    let k = i
+    while k < j do
+      let b = xpl_emit_u16(b, 40960 + (sorted[k] - page))
+      let k = k + 1
+    end
+    if padded > count then
+      let b = xpl_emit_u16(b, 0)
+    end
+    let i = j
+  end
+  return b
+end
+
+# Ints in ascending order: a merge sort.
+make a function called xpl_sort_ints takes items returns sorted
+  let n = list_len(items)
+  if n < 2 then
+    return items
+  end
+  let mid = floor(n / 2)
+  let left = []
+  let right = []
+  let i = 0
+  while i < n do
+    if i < mid then
+      let left = list_push(left, items[i])
+    else
+      let right = list_push(right, items[i])
+    end
+    let i = i + 1
+  end
+  let left = xpl_sort_ints(left)
+  let right = xpl_sort_ints(right)
+  let out = []
+  let a = 0
+  let c = 0
+  while (a < list_len(left)) or (c < list_len(right)) do
+    if c >= list_len(right) then
+      let out = list_push(out, left[a])
+      let a = a + 1
+    elif a >= list_len(left) then
+      let out = list_push(out, right[c])
+      let c = c + 1
+    elif right[c] < left[a] then
+      let out = list_push(out, right[c])
+      let c = c + 1
+    else
+      let out = list_push(out, left[a])
+      let a = a + 1
+    end
+  end
+  return out
 end
 
 # One 40-byte IMAGE_SECTION_HEADER: an 8-byte name (NUL-padded, not

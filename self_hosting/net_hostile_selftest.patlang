@@ -1,0 +1,182 @@
+# Misbehaving peers against signal_poll and a plain accept loop
+# (self_hosting/lib/signals.patlang, self_hosting/v2/runtime/net.patlang).
+#
+# Given a program that polls a signal port, allows the signal "status" alone,
+# and also has an internal event handler (grant_admin) it never meant to expose
+# When peers send an event name that is not allowed, a message without the
+#   run's token, nothing at all, half a message, 100 KB, or close before the
+#   reply is written
+# Then no handler runs for any of them, signal_poll returns within its bounds,
+#   the program goes on, and a well-behaved client is answered afterwards.
+#
+# Each peer is a thread of this program, on a real loopback socket.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/signals.patlang"
+
+when status do
+  vfs_write("/hostile/status_calls", "" + (to_num(vfs_read("/hostile/status_calls")) + 1))
+  signal_reply("fine " + event_data)
+end
+
+when grant_admin do
+  vfs_write("/hostile/admin", "" + event_data)
+end
+
+# Polls until the peer's thread has finished, at most rounds times: the
+# thread's result, or "still running".
+make a function called nh_serve takes port, peer, rounds returns result
+  let k = 0
+  while k < rounds do
+    signal_poll(port, 50)
+    if thread_poll(peer) then
+      return thread_result(peer)
+    end
+    let k = k + 1
+  end
+  return "still running"
+end
+
+# A peer that writes text as it is and gives what comes back before the
+# connection closes, waiting at most two seconds for it.
+make a function called nh_raw_peer takes port, text returns id
+  return thread_spawn(|p, t| do
+    let c = tcp_connect("127.0.0.1", p)
+    if t != "" then
+      tcp_try_write(c, t)
+    end
+    let back = tcp_read_timeout(c, 2000)
+    tcp_close(c)
+    return back
+  end, port, text)
+end
+
+let ctx = ctx_new()
+vfs_write("/hostile/status_calls", "0")
+let port = signal_claim(0)
+expect(ctx, "the port is claimed", port > 0, true)
+signal_allow(["status"])
+let token = read_file(signal_token_path(port))
+expect(ctx, "the run's token is in its file", token.length >= 32, true)
+
+# ---- a well-behaved client ----
+let good = thread_spawn(|p| do
+  return signal_query(p, "status", "one")
+end, port)
+expect(ctx, "an allowed signal is answered", nh_serve(port, good, 100), "fine one")
+expect(ctx, "its handler ran once", vfs_read("/hostile/status_calls"), "1")
+
+# ---- S2: an event name that is not an allowed signal ----
+let mallory = thread_spawn(|p| do
+  return signal_query(p, "grant_admin", "mallory")
+end, port)
+expect(ctx, "an event that is not an allowed signal gets no reply", nh_serve(port, mallory, 100), "")
+expect(ctx, "and its handler does not run", vfs_exists("/hostile/admin"), false)
+
+# ---- S2: a message without the run's token ----
+let forged = nh_raw_peer(port, "not-the-token" + chr(10) + "status" + chr(10) + "0" + chr(10))
+expect(ctx, "a message without the token gets no reply", nh_serve(port, forged, 100), "")
+let old_format = nh_raw_peer(port, "status" + chr(10) + "payload")
+expect(ctx, "a message in the old format gets no reply", nh_serve(port, old_format, 100), "")
+expect(ctx, "neither ran the handler", vfs_read("/hostile/status_calls"), "1")
+
+# ---- S3: a peer that connects and sends nothing ----
+let silent = thread_spawn(|p| do
+  let c = tcp_connect("127.0.0.1", p)
+  sleep_ms(3000)
+  tcp_close(c)
+  return "held"
+end, port)
+sleep_ms(300)
+let t0 = now_ms()
+let got = signal_poll(port, 50)
+let took = now_ms() - t0
+expect(ctx, "a silent peer gives no signal", got, "")
+expect(ctx, "signal_poll returns while the silent peer still holds its connection", took < 1500, true)
+
+# the program still answers while the silent peer is connected
+let during = thread_spawn(|p| do
+  return signal_query(p, "status", "two")
+end, port)
+expect(ctx, "a client is answered while the silent peer holds on", nh_serve(port, during, 100), "fine two")
+expect(ctx, "the silent peer finishes", nh_serve(port, silent, 200), "held")
+
+# ---- S3: half a message ----
+let half = nh_raw_peer(port, token + chr(10) + "sta")
+expect(ctx, "half a message gets no reply", nh_serve(port, half, 100), "")
+expect(ctx, "and runs no handler", vfs_read("/hostile/status_calls"), "2")
+
+# ---- S3: 100 KB ----
+let big = thread_spawn(|p| do
+  let b = sb_new()
+  let i = 0
+  while i < 10000 do
+    sb_push(b, "0123456789")
+    let i = i + 1
+  end
+  return signal_query(p, "status", sb_str(b)).length
+end, port)
+expect(ctx, "a 100 KB payload arrives whole", nh_serve(port, big, 200), 100005)
+
+# ---- S3: a peer that closes before the reply is written ----
+let rude = thread_spawn(|p, tok| do
+  let c = tcp_connect("127.0.0.1", p)
+  tcp_try_write(c, tok + chr(10) + "status" + chr(10) + "4" + chr(10) + "rude")
+  tcp_close(c)
+  return "gone"
+end, port, token)
+expect(ctx, "a peer that leaves before the reply does not stop the program", nh_serve(port, rude, 100), "gone")
+let k = 0
+while k < 5 do
+  signal_poll(port, 50)
+  let k = k + 1
+end
+
+# ---- after all of them ----
+let last = thread_spawn(|p| do
+  return signal_query(p, "status", "last")
+end, port)
+expect(ctx, "a well-behaved client is answered afterwards", nh_serve(port, last, 100), "fine last")
+expect(ctx, "the internal event never ran", vfs_exists("/hostile/admin"), false)
+
+# ---- S3: a listener keeps blocking after a timed accept ----
+let plain = tcp_listen(0)
+expect(ctx, "a timed accept with no client gives -1", tcp_accept_timeout(plain, 50), 0 - 1)
+let late = thread_spawn(|p| do
+  sleep_ms(400)
+  let c = tcp_connect("127.0.0.1", p)
+  tcp_write(c, "hello")
+  tcp_close(c)
+  return "sent"
+end, plain)
+let t1 = now_ms()
+let conn = tcp_accept(plain)
+expect(ctx, "tcp_accept after a timed accept waits for the client", now_ms() - t1 >= 300, true)
+expect(ctx, "and gives its connection", tcp_read(conn), "hello")
+tcp_close(conn)
+expect(ctx, "the late client finished", thread_result(late), "sent")
+
+# ---- S3: a write to a peer that has gone gives false ----
+let gone_port = tcp_listen(0)
+let leaver = thread_spawn(|p| do
+  let c = tcp_connect("127.0.0.1", p)
+  tcp_close(c)
+  return "left"
+end, gone_port)
+let gc = tcp_accept(gone_port)
+thread_result(leaver)
+sleep_ms(100)
+let wrote = true
+let w = 0
+while w < 50 do
+  if not tcp_try_write(gc, "into the void") then
+    let wrote = false
+  end
+  let w = w + 1
+end
+expect(ctx, "tcp_try_write to a closed peer gives false, and the program goes on", wrote, false)
+expect(ctx, "tcp_read_timeout of a closed peer gives nothing", tcp_read_timeout(gc, 100), "")
+tcp_close(gc)
+
+ctx_report(ctx)

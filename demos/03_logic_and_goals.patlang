@@ -1,0 +1,149 @@
+# Demo 3: logic programming and goal-oriented planning.
+#
+# Covers: facts and rules (declarations and rule_add), recursive rules, neq,
+# queries with variables, stores (new, named, `in`, `from`, using ... as
+# logic), solve_into, contracts as facts, actions with costs, plan, goals,
+# pursue, action_bind and activate.
+#
+# A term that starts with a capital letter is a logic variable, so every
+# constant here is lower case.
+
+# Solutions as text: each solution's terms joined by a space.
+make a function called show takes sols returns text
+  let parts = []
+  let i = 0
+  while i < list_len(sols) do
+    let parts = list_push(parts, str_join(sols[i], " "))
+    let i = i + 1
+  end
+  return str_join(parts, "; ")
+end
+
+# ---- facts and rules, in the default store ----
+
+rule parent(george, elizabeth).
+rule parent(elizabeth, charles).
+rule parent(elizabeth, anne).
+rule parent(charles, william).
+rule parent(charles, harry).
+
+rule grandparent(X, Z) :- parent(X, Y), parent(Y, Z).
+rule ancestor(X, Y) :- parent(X, Y).
+rule ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
+rule sibling(X, Y) :- parent(P, X), parent(P, Y), neq(X, Y).
+
+print("== family ==")
+print("grandchildren of elizabeth: " + show(solve("grandparent", ["elizabeth", logic_var("Who")])))
+print("ancestors of william: " + show(solve("ancestor", [logic_var("Who"), "william"])))
+print("siblings: " + show(solve("sibling", [logic_var("A"), logic_var("B")])))
+print("is george an ancestor of harry? " + (list_len(solve("ancestor", ["george", "harry"])) > 0))
+print("children of elizabeth, counted: " + query("parent", "elizabeth", 0))
+
+# ---- rules added at run time: a dependency graph ----
+
+make a function called depends takes a, b returns done
+  return rule_add("dep", [a, b], [])
+end
+
+depends("app", "ui")
+depends("app", "core")
+depends("ui", "core")
+depends("core", "util")
+rule_add("needs", [logic_var("X"), logic_var("Y")], [["dep", [logic_var("X"), logic_var("Y")]]])
+rule_add("needs", [logic_var("X"), logic_var("Y")], [["dep", [logic_var("X"), logic_var("Z")]], ["needs", [logic_var("Z"), logic_var("Y")]]])
+
+print("== dependencies ==")
+print("app needs: " + show(solve("needs", ["app", logic_var("What")])))
+
+# ---- stores: rules kept apart, and combined when asked ----
+
+print("== stores ==")
+let warehouse = logic_store_new()
+rule_add_to(warehouse, "stock", ["flour", "cupboard"], [])
+rule_add_to(warehouse, "stock", ["eggs", "fridge"], [])
+print("in the warehouse store: " + show(solve_in(warehouse, "stock", [logic_var("Item"), logic_var("Place")])))
+print("the default store sees none of it: " + list_len(solve("stock", [logic_var("Item"), logic_var("Place")])))
+
+rule supplier(flour, mill) in suppliers.
+rule supplier(eggs, farm) in suppliers.
+rule source(Item, Place, From) :- stock(Item, Place), supplier(Item, From) from suppliers.
+print("across stores: " + show(solve_in([logic_store_named("default"), warehouse], "source", [logic_var("Item"), logic_var("Place"), logic_var("From")])))
+
+# Inside a using block the plain forms use the block's store.
+let scratch = logic_store_new()
+using scratch as logic do
+  rule likes(cat, fish).
+  rule likes(dog, bones).
+  print("in the block: " + show(solve("likes", [logic_var("Who"), logic_var("What")])))
+end
+print("after the block, in the default store: " + list_len(solve("likes", [logic_var("Who"), logic_var("What")])))
+
+# solve_into keeps each answer as a fact of another store.
+let answers = logic_store_new()
+solve_into(answers, logic_store_named("default"), "grandparent", [logic_var("A"), logic_var("B")])
+print("grandparent facts kept: " + list_len(solve_in(answers, "grandparent", [logic_var("A"), logic_var("B")])))
+
+# ---- contracts leave facts behind ----
+
+make a function called half takes n returns h
+  require n % 2 == 0
+  let h = n / 2
+  ensure h * 2 == n
+  return h
+end
+
+half(10)
+print("== contracts as facts ==")
+print(show(solve("contract_holds", ["half", logic_var("Clause")])))
+
+# ---- planning: actions with preconditions, effects and costs ----
+
+print("== planning ==")
+rule_add("have", ["flour"], [])
+rule_add("have", ["eggs"], [])
+rule_add("have", ["milk"], [])
+
+action_add("mix_batter", [["have", ["flour"]], ["have", ["eggs"]], ["have", ["milk"]]], [["made", ["batter"]]], [], 2)
+action_add("heat_pan", [], [["hot", ["pan"]]], [], 1)
+action_add("fry", [["made", ["batter"]], ["hot", ["pan"]]], [["made", ["pancakes"]]], [["made", ["batter"]]], 3)
+action_add("buy_pancakes", [], [["made", ["pancakes"]]], [], 20)
+action_add("serve", [["made", ["pancakes"]]], [["served", ["breakfast"]]], [], 1)
+
+print("cheapest plan: " + plan_labels(plan([["served", ["breakfast"]]])))
+
+# An action with a variable is one step for each way the facts fill it in.
+rule_add("guest", ["ada"], [])
+rule_add("guest", ["grace"], [])
+action_add("lay_place", [["guest", [logic_var("G")]]], [["place_laid", [logic_var("G")]]], [], 1)
+print("places: " + plan_labels(plan([["place_laid", ["ada"]], ["place_laid", ["grace"]]])))
+
+# ---- goals: a named state, a plan for it, and the plan carried out ----
+
+let done = vec_new()
+action_bind("mix_batter", |args| do
+  vec_push(done, "mixed")
+  return true
+end)
+action_bind("heat_pan", |args| do
+  vec_push(done, "pan hot")
+  return true
+end)
+action_bind("fry", |args| do
+  vec_push(done, "fried")
+  return true
+end)
+action_bind("serve", |args| do
+  vec_push(done, "served")
+  return true
+end)
+action_bind("lay_place", |args| do
+  vec_push(done, "place for " + args[0])
+  return true
+end)
+
+goal breakfast { served(breakfast), place_laid(ada) }
+let steps = pursue breakfast
+print("== goals ==")
+print("steps: " + plan_labels(steps))
+print("all ran: " + (activate steps))
+print("what happened: " + vec_to_list(done))

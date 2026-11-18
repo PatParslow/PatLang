@@ -6,6 +6,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When it is compiled
     Then it goes through the same stages as a user program, with no runtime-only branch in any stage
 
+  Scenario: an executable v2 writes can be loaded anywhere (spec 2.5)
+    Given a program that reads where its own code is
+    When v2 builds it and it runs
+    Then its code lies outside the 256 MB above the preferred base, so Windows moved it, and it still runs
+
   Scenario: a built-in class's method is declared in PatLang (spec 1.2)
     Given the runtime's source
     When the declaration of int's to_s is looked for
@@ -42,9 +47,9 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     Then the chunk and assembly read back are the ones stored
 
   Scenario: a job's key tells values apart by their structure
-    Given lists, strings of one- to four-byte characters, integers of every sign and size, booleans, a float and a file
-    When jobs.patlang hashes each, and each value built a second time
-    Then values that differ hash differently, a value built twice hashes the same, and a file hashes as its length then its bytes
+    Given lists, strings of one- to four-byte characters, integers of every sign and size, booleans, a float, its text, and lists whose strings join to the same text
+    When jobs.patlang keys each, and each value built a second time
+    Then values that differ key differently, a value built twice keys the same, and a key is the SHA-256 of the value's encoding
 
   Scenario: a compiler's cache key is the one recorded when it was built
     Given a program that declares jb_compiler_key, an ordinary program, and a copy of v2.exe with no key beside it

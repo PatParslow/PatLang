@@ -21,6 +21,16 @@ Feature: a program sees characters, whatever bytes they take
     When the program runs
     Then it stops at chr, naming the require clause
 
+  Scenario: bytes that are not well-formed UTF-8 are each a character U+FFFD, and nothing reads past the end
+    Given text read from files holding a lead byte at the end, a three-byte character cut short, an overlong slash, a stray continuation byte, an encoded surrogate, a code past U+10FFFF, and well-formed two- and four-byte characters
+    When a program measures each, reads every character's code, cuts past the end, and reads it through the cursor
+    Then each byte that starts no well-formed sequence is one character with code 65533, the well-formed ones decode as ever, and the bytes are kept
+
+  Scenario: chr of a surrogate code stops the program
+    Given chr of 55295 and then of 55296
+    When the program runs
+    Then the first is one character, and it stops at the second, naming the require clause
+
   Scenario: sed replaces literal matches of its pattern
     Given sed commands with and without g and i, with no match, an empty pattern, no replacement, an empty replacement, flags after a slash, characters of two bytes and an int as input
     When each is applied

@@ -1,11 +1,15 @@
 # v2 runtime: logic programming and GOAP planning.
 #
 # A rule is [predicate, head tokens, body goals], a goal being [predicate,
-# tokens], or [predicate, tokens, store name] for one written with `from`, and
-# a capitalised token a logic variable; a ground fact is a rule with an empty
-# body and no variables. Solving is depth-first with backtracking, depth 200;
-# planning is uniform-cost search over states, sets of ground facts, up to 5000
-# expansions, an action being [name, preconditions, adds, deletes, cost].
+# tokens], or [predicate, tokens, store name] for one written with `from`. A
+# token is a constant, or a logic variable, a value of its own class made by
+# logic_var(name); a ground fact is a rule with an empty body and no variables.
+# Solving is depth-first with backtracking, at most 2000 rules deep: deeper
+# stops the program, saying so, rather than giving an answer cut short.
+# Planning is uniform-cost search over states, sets of ground facts, with no
+# limit: it says there is no plan only when none exists, so a goal that cannot
+# be reached over a very large state space searches until it has seen them
+# all. An action is [name, preconditions, adds, deletes, cost].
 #
 # Rules live in stores (spec 1.13). A store is a cell (class 14, cells.patlang)
 # whose block holds:
@@ -15,6 +19,8 @@
 #   48 its ground facts, for holding each once: a vec of buckets, each a list
 #      of facts [predicate, tokens], the count of buckets a power of two
 #   64 a word: how many facts the buckets hold
+#   80 a word: its users, as a cell's (cells.patlang): a store belongs to one
+#      thread at a time, though several may read it together
 #
 # State, the world's (worlds.patlang; rt_global_get/set):
 #   4464 the named stores: a list of [name, store]. The program's rules are in
@@ -104,9 +110,13 @@ make a function called rt_store_reset takes block, fresh returns r
 end
 
 make a function called logic_store_new returns store
-  let block = rt_alloc(64)
+  let block = rt_alloc(80)
   rt_store_reset(block, true)
+  mem_store(block, 80, 0)
+  mem_store(block, 88, 0)
   let store = value_make(4294967310, block)
+  # 88: its place in the registry of blocks that can close a cycle
+  rt_cycle_register(4294967310, block)
   ensure value_class(store) == 14
   return store
 end
@@ -119,19 +129,38 @@ make a function called rt_store_name_index takes name returns i
   return i
 end
 
-# The store with that name, made the first time the name is used. The list of
-# names is taken out while it grows, so the push does not copy it.
+# The store with that name, made the first time the name is used: looked for
+# and added under the state lock (objects.patlang), so two threads asking for a
+# new name get one store, and a name already there costs only the look-up. The
+# list of names is taken out while it grows, so the push does not copy it.
 make a function called logic_store_named takes name returns store
   require value_class(name) == 8
-  let i = rt_store_name_index(name)
+  let held = rt_state_lock()
+  let named = rt_global_take(4464)
+  let i = rt_pairs_index(named, name)
   if i >= 0 then
-    let store = rt_global_get(4464)[i][1]
+    let store = named[i][1]
+    rt_global_put(4464, named)
+    rt_state_unlock(held)
     ensure value_class(store) == 14
     return store
   end
-  let store = logic_store_new()
-  let st = rt_world_base()
-  mem_init_value(st, 4464, list_push(mem_take_value(st, 4464), [name, store]))
+  rt_global_put(4464, named)
+  rt_state_unlock(held)
+  # a new name: the store is made outside the lock (making it can run the
+  # cycle collector), then added unless another thread added one meanwhile
+  let fresh = logic_store_new()
+  let held = rt_state_lock()
+  let named = rt_global_take(4464)
+  let i = rt_pairs_index(named, name)
+  let store = fresh
+  if i >= 0 then
+    let store = named[i][1]
+  else
+    let named = list_push(named, [name, fresh])
+  end
+  rt_global_put(4464, named)
+  rt_state_unlock(held)
   ensure value_class(store) == 14
   return store
 end
@@ -146,16 +175,7 @@ make a function called store_delete takes name returns done
     ensure value_class(done) == 1
     return done
   end
-  let named = rt_global_get(4464)
-  let out = []
-  let k = 0
-  while k < list_len(named) do
-    if k != i then
-      let out = list_push(out, named[k])
-    end
-    let k = k + 1
-  end
-  rt_global_set(4464, out)
+  rt_global_drop(4464, name)
   let done = true
   ensure value_class(done) == 1
   return done
@@ -290,9 +310,28 @@ make a function called rt_store_pred_rules takes block, pred returns v
     return v
   end
   let v = vec_new()
-  mem_init_value(block, 32, list_push(mem_take_value(block, 32), [pred, v]))
+  mem_init_value(block, 32, list_push(mem_take_value(block, 32), [pred, v, rt_index_new(8)]))
   ensure value_class(v) == 12
   return v
+end
+
+# The rule at this place of pred's rules entered in pred's first-argument
+# index (a rule of no arguments needs none: every goal looks at them all).
+make a function called rt_store_index_rule takes block, pred, head_args, place returns done
+  require (block != 0) and value_live(pred) and (value_class(head_args) == 9) and (place >= 0)
+  if list_len(head_args) > 0 then
+    let i = rt_store_pred_index(block, pred)
+    let preds = mem_load_value(block, 32)
+    let entry = preds[i]
+    let idx = rt_index_add(entry[2], rt_first_key(head_args[0]), place)
+    if idx != entry[2] then
+      # grown into a new table
+      mem_store_value(block, 32, list_set(preds, i, [entry[0], entry[1], idx]))
+    end
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
 end
 
 # pred's rules in a store as a list, in the order they were added; [] when it
@@ -300,13 +339,170 @@ end
 make a function called rt_store_rules_of takes store, pred returns rules
   require (value_class(store) == 14) and value_live(pred)
   let block = value_data(store)
+  let e = rt_cell_read(block + 80)
   let i = rt_store_pred_index(block, pred)
-  if i < 0 then
-    let rules = []
-    ensure value_class(rules) == 9
-    return rules
+  let rules = []
+  if i >= 0 then
+    let rules = vec_to_list(mem_load_value(block, 32)[i][1])
   end
-  let rules = vec_to_list(mem_load_value(block, 32)[i][1])
+  rt_cell_read_end(block + 80, e)
+  ensure value_class(rules) == 9
+  return rules
+end
+
+# ---- the first-argument index (review finding O13) ----
+#
+# Beside each predicate's rules a store keeps an index from a rule head's first
+# argument to the rules' places: a hashed table, a vec of [count, bucket 1, ...,
+# bucket B], each bucket a list of [key, places], the places ascending. A
+# head whose first argument is a variable is under the key "*". A goal whose
+# first argument is bound looks only at the rules under its key and under
+# "*", in the order they were added, so a chain of n facts is followed in
+# time growing as n, where every goal once went through all of them.
+
+# A first argument's key: its class and its text, so "1" and 1 differ; "*"
+# for a variable.
+make a function called rt_first_key takes term returns key
+  require value_live(term)
+  if is_logic_var(term) then
+    let key = "*"
+    ensure value_class(key) == 8
+    return key
+  end
+  let key = "" + value_class(term) + ":" + to_s(term)
+  ensure value_class(key) == 8
+  return key
+end
+
+make a function called rt_index_new takes buckets returns idx
+  require (buckets > 0) and (word_and(buckets, buckets - 1) == 0)
+  let idx = vec_new()
+  vec_push(idx, 0)
+  let i = 0
+  while i < buckets do
+    vec_push(idx, [])
+    let i = i + 1
+  end
+  ensure vec_len(idx) == buckets + 1
+  return idx
+end
+
+make a function called rt_index_bucket takes idx, key returns at
+  require (value_class(idx) == 12) and (value_class(key) == 8)
+  let at = 1 + word_and(rt_fnv_text(rt_fnv_start(), key), vec_len(idx) - 2)
+  ensure (at >= 1) and (at < vec_len(idx))
+  return at
+end
+
+# The places under a key, ascending; [] for none.
+make a function called rt_index_get takes idx, key returns places
+  require (value_class(idx) == 12) and (value_class(key) == 8)
+  let bucket = vec_get(idx, rt_index_bucket(idx, key))
+  let k = 0
+  while k < list_len(bucket) do
+    if str_eq(bucket[k][0], key) then
+      let places = bucket[k][1]
+      ensure value_class(places) == 9
+      return places
+    end
+    let k = k + 1
+  end
+  let places = []
+  ensure value_class(places) == 9
+  return places
+end
+
+# A place added under a key: the index, twice the buckets when its keys
+# outnumber them twice over.
+make a function called rt_index_add takes idx, key, place returns out
+  require (value_class(idx) == 12) and (value_class(key) == 8) and (place >= 0)
+  let at = rt_index_bucket(idx, key)
+  let bucket = vec_get(idx, at)
+  let k = 0
+  let found = false
+  while (k < list_len(bucket)) and (not found) do
+    if str_eq(bucket[k][0], key) then
+      vec_set(idx, at, list_set(bucket, k, [key, list_push(bucket[k][1], place)]))
+      let found = true
+    end
+    let k = k + 1
+  end
+  let out = idx
+  if not found then
+    vec_set(idx, at, list_push(bucket, [key, [place]]))
+    vec_set(idx, 0, vec_get(idx, 0) + 1)
+    if vec_get(idx, 0) > 2 * (vec_len(idx) - 1) then
+      let out = rt_index_new(2 * (vec_len(idx) - 1))
+      let b = 1
+      while b < vec_len(idx) do
+        let old = vec_get(idx, b)
+        let j = 0
+        while j < list_len(old) do
+          let to = rt_index_bucket(out, old[j][0])
+          vec_set(out, to, list_push(vec_get(out, to), old[j]))
+          let j = j + 1
+        end
+        let b = b + 1
+      end
+      vec_set(out, 0, vec_get(idx, 0))
+    end
+  end
+  ensure value_class(out) == 12
+  return out
+end
+
+# Two ascending lists of places as one, ascending.
+make a function called rt_places_merge takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let out = []
+  let i = 0
+  let j = 0
+  while (i < list_len(a)) or (j < list_len(b)) do
+    if j >= list_len(b) then
+      let out = list_push(out, a[i])
+      let i = i + 1
+    elif i >= list_len(a) then
+      let out = list_push(out, b[j])
+      let j = j + 1
+    elif a[i] < b[j] then
+      let out = list_push(out, a[i])
+      let i = i + 1
+    else
+      let out = list_push(out, b[j])
+      let j = j + 1
+    end
+  end
+  ensure list_len(out) == list_len(a) + list_len(b)
+  return out
+end
+
+# The rules of pred in a store that a goal with these arguments can match, in
+# the order they were added: by the index when its first argument is bound,
+# all of them when it is not.
+make a function called rt_store_candidates takes store, pred, args, subst returns rules
+  require (value_class(store) == 14) and value_live(pred) and (value_class(args) == 9) and (value_class(subst) == 9)
+  let block = value_data(store)
+  let e = rt_cell_read(block + 80)
+  let i = rt_store_pred_index(block, pred)
+  let rules = []
+  if i >= 0 then
+    let entry = mem_load_value(block, 32)[i]
+    let first = unit
+    if list_len(args) > 0 then
+      let first = logic_walk(args[0], subst)
+    end
+    if (list_len(args) == 0) or is_logic_var(first) then
+      let rules = vec_to_list(entry[1])
+    else
+      let places = rt_places_merge(rt_index_get(entry[2], rt_first_key(first)), rt_index_get(entry[2], "*"))
+      let k = 0
+      while k < list_len(places) do
+        let rules = list_push(rules, vec_get(entry[1], places[k]))
+        let k = k + 1
+      end
+    end
+  end
+  rt_cell_read_end(block + 80, e)
   ensure value_class(rules) == 9
   return rules
 end
@@ -316,8 +512,10 @@ end
 make a function called rule_add_to takes store, head_pred, head_args, body returns added
   require (value_class(store) == 14) and (value_class(head_pred) == 8) and (value_class(head_args) == 9) and (value_class(body) == 9)
   let block = value_data(store)
+  let e = rt_cell_write(block + 80)
   if (list_len(body) == 0) and rt_is_ground(head_args) then
     if not rt_store_note_fact(block, [head_pred, head_args]) then
+      rt_cell_write_end(block + 80, e)
       let added = false
       ensure value_class(added) == 1
       return added
@@ -325,7 +523,10 @@ make a function called rule_add_to takes store, head_pred, head_args, body retur
   end
   let rule = [head_pred, head_args, body]
   vec_push(mem_load_value(block, 16), rule)
-  vec_push(rt_store_pred_rules(block, head_pred), rule)
+  let rules = rt_store_pred_rules(block, head_pred)
+  vec_push(rules, rule)
+  rt_store_index_rule(block, head_pred, head_args, vec_len(rules) - 1)
+  rt_cell_write_end(block + 80, e)
   let added = true
   ensure value_class(added) == 1
   return added
@@ -349,7 +550,10 @@ end
 # Empties a store.
 make a function called rules_clear_in takes store returns done
   require value_class(store) == 14
-  rt_store_reset(value_data(store), false)
+  let block = value_data(store)
+  let e = rt_cell_write(block + 80)
+  rt_store_reset(block, false)
+  rt_cell_write_end(block + 80, e)
   let done = true
   ensure value_class(done) == 1
   return done
@@ -433,47 +637,147 @@ end
 
 # ---- terms and substitutions ----
 
+# A logic variable is a value of a class of its own (17; 16 is the unwinding mark's, worlds.patlang), holding its name, a
+# string, at 16 in its block. Two with the same name are equal (op_eq), and one
+# is never equal to a string: a string is a constant whatever its first letter,
+# so data read at run time cannot become a variable (spec 1.13). A capitalised
+# name in a rule declaration is lowered to logic_var of that name.
+make a function called rt_logic_var_heap_type returns t
+  let t = 4294967313
+  ensure (word_and(t, 4294967295) == 17) and (word_and(t, 4294967296) != 0)
+  return t
+end
+
+make a function called logic_var takes name returns v
+  require (value_class(name) == 8) and (str_len(name) > 0)
+  let v = rt_logic_var_made(name)
+  ensure value_class(v) == 17
+  return v
+end
+
+# A logic variable: its name at 16, and at 32 its key, 56 bits of the name's
+# FNV-1a hash, which places it in a substitution (rt_subst_bind). Variables
+# with the same name are the same variable, and have the same key.
+make a function called rt_logic_var_made takes name returns v
+  require (value_class(name) == 8) and (str_len(name) > 0)
+  let block = rt_alloc(24)
+  mem_store(block, 16, 0)
+  mem_store(block, 24, 0)
+  mem_init_value(block, 16, name)
+  mem_store(block, 32, word_and(rt_fnv_text(rt_fnv_start(), name), 72057594037927935))
+  let v = value_make(rt_logic_var_heap_type(), block)
+  ensure value_class(v) == 17
+  return v
+end
+
+make a function called rt_logic_var_key takes v returns key
+  require value_class(v) == 17
+  let key = mem_load(value_data(v), 32)
+  ensure (key >= 0) and (key <= 72057594037927935)
+  return key
+end
+
+make a function called logic_var_name takes v returns name
+  require value_class(v) == 17
+  let name = mem_load_value(value_data(v), 16)
+  ensure (value_class(name) == 8) and (str_len(name) > 0)
+  return name
+end
+
 make a function called is_logic_var takes term returns yes
   require value_live(term)
-  if value_class(term) != 8 then
-    let yes = false
-    ensure value_class(yes) == 1
-    return yes
-  end
-  if str_len(term) == 0 then
-    let yes = false
-    ensure value_class(yes) == 1
-    return yes
-  end
-  let c = rt_byte_at(term, 0)
-  let yes = (c >= 65) and (c <= 90)
+  let yes = value_class(term) == 17
   ensure value_class(yes) == 1
   return yes
 end
 
-# A substitution's entry for a variable: its value, or the variable itself.
+# A substitution: what each bound variable is bound to. It is a trie on the
+# variables' keys (rt_logic_var_key), read from the lowest bit up: [] binds
+# nothing; a leaf [key, pairs] binds each [var, value] of pairs, every var
+# having that key; a branch [child0, child1, 0] holds below child0 the
+# variables whose key has 0 at this level's bit, and the rest below child1.
+# Binding copies the path to one leaf, and the substitution it was made from
+# is unchanged, so each branch of a search keeps its own. A look-up follows
+# the same path, so it costs the same however many variables are bound: a
+# chain of bindings was searched from the newest for a variable not yet bound,
+# and a rule body of n goals binding n variables took time growing as n
+# squared (review finding O13). A variable is bound at most once: unify binds
+# only one still unbound.
+make a function called rt_subst_bind takes subst, var, value returns out
+  require (value_class(subst) == 9) and is_logic_var(var) and value_live(value)
+  let out = rt_subst_put(subst, rt_logic_var_key(var), var, value, 0)
+  ensure (value_class(out) == 9) and (list_len(out) > 0)
+  return out
+end
+
+# node with var bound to value, node being the trie below shift bits of key.
+make a function called rt_subst_put takes node, key, var, value, shift returns out
+  require (value_class(node) == 9) and (shift >= 0) and (shift <= 56)
+  let n = list_len(node)
+  if n == 0 then
+    let out = [key, [[var, value]]]
+    ensure list_len(out) == 2
+    return out
+  end
+  if n == 2 then
+    if node[0] == key then
+      let out = [key, list_push(node[1], [var, value])]
+      ensure list_len(out) == 2
+      return out
+    end
+    # two keys meet here: a branch takes this leaf below its bit, and the
+    # new one goes in from the branch
+    let branch = [[], [], 0]
+    let branch = list_set(branch, word_and(word_shr(node[0], shift), 1), node)
+    let out = rt_subst_put(branch, key, var, value, shift)
+    ensure list_len(out) == 3
+    return out
+  end
+  let side = word_and(word_shr(key, shift), 1)
+  let out = list_set(node, side, rt_subst_put(node[side], key, var, value, shift + 1))
+  ensure list_len(out) == 3
+  return out
+end
+
+# A variable's binding, or the variable when it has none; a term that is not
+# a variable is itself.
 make a function called rt_subst_get takes subst, var returns v
   require (value_class(subst) == 9) and value_live(var)
-  let i = 0
-  while i < list_len(subst) do
-    if subst[i][0] == var then
-      let v = subst[i][1]
-      ensure value_live(v)
-      return v
+  if value_class(var) != 17 then
+    let v = var
+    ensure value_live(v)
+    return v
+  end
+  let key = rt_logic_var_key(var)
+  let node = subst
+  let shift = 0
+  while list_len(node) == 3 do
+    let node = node[word_and(word_shr(key, shift), 1)]
+    let shift = shift + 1
+  end
+  if (list_len(node) == 2) and (node[0] == key) then
+    let pairs = node[1]
+    let i = 0
+    while i < list_len(pairs) do
+      if pairs[i][0] == var then
+        let v = pairs[i][1]
+        ensure value_live(v)
+        return v
+      end
+      let i = i + 1
     end
-    let i = i + 1
   end
   let v = var
   ensure value_live(v)
   return v
 end
 
-# A term followed through the substitution, at most 1000 steps.
+# A term followed through the substitution to its end. Unification never
+# binds a variable to itself or to one bound back to it, so every chain ends.
 make a function called logic_walk takes term, subst returns out
   require value_live(term) and (value_class(subst) == 9)
   let cur = term
-  let hops = 0
-  while is_logic_var(cur) and (hops < 1000) do
+  while is_logic_var(cur) do
     let next = rt_subst_get(subst, cur)
     if next == cur then
       let out = cur
@@ -481,7 +785,6 @@ make a function called logic_walk takes term, subst returns out
       return out
     end
     let cur = next
-    let hops = hops + 1
   end
   let out = cur
   ensure value_live(out)
@@ -503,9 +806,9 @@ make a function called unify_args takes query_args, target_args, subst returns r
     let tw = logic_walk(target_args[i], s)
     if qw != tw then
       if is_logic_var(qw) then
-        let s = list_push(s, [qw, tw])
+        let s = rt_subst_bind(s, qw, tw)
       elif is_logic_var(tw) then
-        let s = list_push(s, [tw, qw])
+        let s = rt_subst_bind(s, tw, qw)
       else
         let result = ["Err", ""]
         ensure list_len(result) == 2
@@ -541,7 +844,7 @@ make a function called rt_rename_args takes args, suffix returns out
   let i = 0
   while i < list_len(args) do
     if is_logic_var(args[i]) then
-      let out = list_push(out, args[i] + suffix)
+      let out = list_push(out, rt_logic_var_made(logic_var_name(args[i]) + suffix))
     else
       let out = list_push(out, args[i])
     end
@@ -553,7 +856,8 @@ end
 
 make a function called logic_fresh_rename takes rule returns renamed
   require (value_class(rule) == 9) and (list_len(rule) == 3)
-  let suffix = "__" + atomic_add(runtime_state() + 4288, 1)
+  let n = atomic_add(runtime_state() + 4288, 1) + 1
+  let suffix = "__" + n
   let body = []
   let i = 0
   while i < list_len(rule[2]) do
@@ -595,22 +899,87 @@ make a function called rt_may_unify takes args, head, subst returns yes
   return yes
 end
 
-# Each of pred's rules in the stores, store by store, whose head could match is
-# renamed, unless it is a ground fact, which has no variables to keep apart,
-# then unified.
-make a function called solve_goal takes stores, pred, args, subst, depth returns results
-  require (value_class(stores) == 9) and value_live(pred) and (value_class(args) == 9) and (value_class(subst) == 9) and (value_class(depth) == 2)
-  if depth > 200 then
-    let results = []
-    ensure (value_class(results) == 9)
-    return results
+# ---- the resolver ----
+#
+# A proof goes depth first, as Prolog's does. What is left to prove is a
+# chain of frames, [stores, body, at, depth, parent]: the goals of body from
+# at on, solved against stores, depth rules down, then what is left of the
+# parent frame (0 at the end). Each substitution under which nothing is left
+# is a solution, pushed onto out in the order found, and the search stops once
+# out holds limit of them (-1: every one). A frame names a goal by its place
+# in the body, so moving on to the next goal copies nothing: copying the rest
+# of the body at each goal made a body of n goals cost n squared, and solving
+# every goal in full before the next stopped no search early (review finding
+# O13).
+
+make a function called rt_frame takes stores, body, at, depth, parent returns frame
+  require (value_class(stores) == 9) and (value_class(body) == 9) and (value_class(at) == 2) and (value_class(depth) == 2)
+  let frame = [stores, body, at, depth, parent]
+  ensure value_class(frame) == 9
+  return frame
+end
+
+make a function called rt_resolve_full takes out, limit returns full
+  require (value_class(out) == 12) and (value_class(limit) == 2)
+  let full = (limit >= 0) and (vec_len(out) >= limit)
+  ensure value_class(full) == 1
+  return full
+end
+
+make a function called rt_prove takes frame, subst, out, limit returns done
+  require (value_class(subst) == 9) and (value_class(out) == 12) and (value_class(limit) == 2)
+  if rt_resolve_full(out, limit) then
+    let done = true
+    ensure value_class(done) == 1
+    return done
   end
-  let out = vec_new()
+  # the next goal: the first frame, from this one up, with goals left
+  let f = frame
+  let looking = value_class(f) == 9
+  while looking do
+    if f[2] < list_len(f[1]) then
+      let looking = false
+    else
+      let f = f[4]
+      let looking = value_class(f) == 9
+    end
+  end
+  if value_class(f) != 9 then
+    vec_push(out, subst)
+    let done = true
+    ensure value_class(done) == 1
+    return done
+  end
+  let stores = f[0]
+  let goal = f[1][f[2]]
+  let depth = f[3]
+  let next = rt_frame(stores, f[1], f[2] + 1, depth, f[4])
+  if goal[0] == "neq" then
+    if logic_walk(goal[1][0], subst) != logic_walk(goal[1][1], subst) then
+      rt_prove(next, subst, out, limit)
+    end
+    let done = true
+    ensure value_class(done) == 1
+    return done
+  end
+  let goal_stores = stores
+  if list_len(goal) > 2 then
+    let goal_stores = [logic_store_named(goal[2])]
+  end
+  # 2000 deep is as far as every target's stack goes (a browser's ran out
+  # between 2000 and 10000, measured 2026-11-17); an answer cut short would
+  # read as "no", so the search stops the program instead
+  if depth > 2000 then
+    print("solve: the search for " + goal[0] + " went deeper than 2000 rules: a rule that leads back to itself, or a chain longer than solve follows (spec 1.13)")
+    rt_stop(89)
+  end
+  let pred = goal[0]
+  let args = apply_subst(goal[1], subst)
   let s = 0
-  while s < list_len(stores) do
-    let rules = rt_store_rules_of(stores[s], pred)
+  while (s < list_len(goal_stores)) and (not rt_resolve_full(out, limit)) do
+    let rules = rt_store_candidates(goal_stores[s], pred, args, subst)
     let i = 0
-    while i < list_len(rules) do
+    while (i < list_len(rules)) and (not rt_resolve_full(out, limit)) do
       let rule = rules[i]
       if rt_may_unify(args, rule[1], subst) then
         if (list_len(rule[2]) > 0) or (not rt_is_ground(rule[1])) then
@@ -618,73 +987,57 @@ make a function called solve_goal takes stores, pred, args, subst, depth returns
         end
         let u = unify_args(args, rule[1], subst)
         if u[0] == "Ok" then
-          vec_extend(out, resolve_conjuncts(stores, rule[2], u[1], depth + 1))
+          rt_prove(rt_frame(goal_stores, rule[2], 0, depth + 1, next), u[1], out, limit)
         end
       end
       let i = i + 1
     end
     let s = s + 1
   end
-  let results = vec_to_list(out)
-  ensure (value_class(results) == 9)
-  return results
+  let done = true
+  ensure value_class(done) == 1
+  return done
 end
 
-# A body's goals in order, each against the stores, or the store its `from`
-# names; neq(A, B) is a filter on the terms as bound so far.
-make a function called resolve_conjuncts takes stores, body, subst, depth returns results
-  require (value_class(stores) == 9) and (value_class(body) == 9) and (value_class(subst) == 9) and (value_class(depth) == 2)
-  if list_len(body) == 0 then
-    let results = [subst]
-    ensure (value_class(results) == 9)
-    return results
-  end
-  let first = body[0]
-  let rest = []
-  let i = 1
-  while i < list_len(body) do
-    let rest = list_push(rest, body[i])
-    let i = i + 1
-  end
-  if first[0] == "neq" then
-    if logic_walk(first[1][0], subst) != logic_walk(first[1][1], subst) then
-      let results = resolve_conjuncts(stores, rest, subst, depth)
-      ensure (value_class(results) == 9)
-      return results
-    end
-    let results = []
-    ensure (value_class(results) == 9)
-    return results
-  end
-  let goal_stores = stores
-  if list_len(first) > 2 then
-    let goal_stores = [logic_store_named(first[2])]
-  end
-  let found = solve_goal(goal_stores, first[0], apply_subst(first[1], subst), subst, depth)
+# The query's arguments under each of the first limit ways (-1: every way)
+# of proving it from a list of stores, in the order the search finds them.
+make a function called rt_solve_limited takes stores, pred, query_args, limit returns solutions
+  require (value_class(stores) == 9) and value_live(pred) and (value_class(query_args) == 9) and (value_class(limit) == 2)
   let out = vec_new()
+  rt_prove(rt_frame(stores, [[pred, query_args]], 0, 0, 0), [], out, limit)
+  let found = vec_to_list(out)
+  let solutions = []
   let i = 0
   while i < list_len(found) do
-    vec_extend(out, resolve_conjuncts(stores, rest, found[i], depth))
+    let solutions = list_push(solutions, apply_subst(query_args, found[i]))
     let i = i + 1
   end
-  let results = vec_to_list(out)
-  ensure (value_class(results) == 9)
-  return results
+  ensure (value_class(solutions) == 9) and ((limit < 0) or (list_len(solutions) <= limit))
+  return solutions
 end
 
 # The query's arguments under each way of proving it from a store, or a list
 # of stores.
 make a function called solve_in takes stores, pred, query_args returns solutions
   require rt_is_stores(stores) and value_live(pred) and (value_class(query_args) == 9)
-  let results = solve_goal(rt_store_list(stores), pred, query_args, [], 0)
-  let out = []
-  let i = 0
-  while i < list_len(results) do
-    let out = list_push(out, apply_subst(query_args, results[i]))
-    let i = i + 1
-  end
-  let solutions = out
-  ensure (value_class(solutions) == 9) and (list_len(solutions) == list_len(results))
+  let solutions = rt_solve_limited(rt_store_list(stores), pred, query_args, 0 - 1)
+  ensure value_class(solutions) == 9
+  return solutions
+end
+
+# The first n of the solutions solve_in gives, in its order: the search stops
+# once it has them, so asking whether there is one costs one proof.
+make a function called solve_up_to_in takes stores, pred, query_args, n returns solutions
+  require rt_is_stores(stores) and value_live(pred) and (value_class(query_args) == 9) and (value_class(n) == 2) and (n >= 0)
+  let solutions = rt_solve_limited(rt_store_list(stores), pred, query_args, n)
+  ensure (value_class(solutions) == 9) and (list_len(solutions) <= n)
+  return solutions
+end
+
+make a function called solve_up_to takes pred, query_args, n returns solutions
+  require value_live(pred) and (value_class(query_args) == 9) and (value_class(n) == 2) and (n >= 0)
+  let solutions = solve_up_to_in(rt_default_stores(), pred, query_args, n)
+  ensure (value_class(solutions) == 9) and (list_len(solutions) <= n)
   return solutions
 end
 
@@ -726,14 +1079,14 @@ end
 
 make a function called query_in takes stores, pred, a, ignored returns count
   require rt_is_stores(stores) and value_live(pred) and value_live(a)
-  let count = list_len(solve_in(stores, pred, [a, "Q"]))
+  let count = list_len(solve_in(stores, pred, [a, logic_var("Q")]))
   ensure count >= 0
   return count
 end
 
 make a function called query takes pred, a, ignored returns count
   require value_live(pred) and value_live(a)
-  let count = list_len(solve(pred, [a, "Q"]))
+  let count = list_len(solve(pred, [a, logic_var("Q")]))
   ensure count >= 0
   return count
 end
@@ -742,7 +1095,7 @@ end
 
 make a function called action_add takes name, preconds, add_effects, del_effects, cost returns done
   require value_live(name) and value_live(cost) and (value_class(preconds) == 9) and (value_class(add_effects) == 9) and (value_class(del_effects) == 9)
-  rt_global_set(4240, list_push(rt_global_get(4240), [name, preconds, add_effects, del_effects, cost]))
+  rt_global_push(4240, [name, preconds, add_effects, del_effects, cost])
   let done = true
   ensure value_class(done) == 1
   return done
@@ -771,7 +1124,10 @@ make a function called rt_ground_facts takes stores returns state
   let out = []
   let s = 0
   while s < list_len(stores) do
-    let rules = vec_to_list(mem_load_value(value_data(stores[s]), 16))
+    let sblock = value_data(stores[s])
+    let se = rt_cell_read(sblock + 80)
+    let rules = vec_to_list(mem_load_value(sblock, 16))
+    rt_cell_read_end(sblock + 80, se)
     let i = 0
     while i < list_len(rules) do
       if (list_len(rules[i][2]) == 0) and rt_is_ground(rules[i][1]) then
@@ -829,9 +1185,13 @@ make a function called rt_instances takes preconds, k, state, subst, out returns
   return all
 end
 
-# A plan step's label: the action's name, with its preconditions' variables as
-# bound ("build(X=house,Y=2)") when it has any.
-make a function called action_instance_label takes name, preconds, subst returns label
+# A plan step (review finding B6): [the action's name, its preconditions'
+# variables' values as bound, those variables' names], in the order the
+# preconditions first name them. The values keep their types (2 stays an int,
+# a text holding a comma stays one value); the names are there so that
+# step_label can still write the step as it always was written,
+# "build(X=house,Y=2)".
+make a function called action_instance_step takes name, preconds, subst returns step
   require (value_class(name) == 8) and (value_class(preconds) == 9) and (value_class(subst) == 9)
   let seen = []
   let i = 0
@@ -846,28 +1206,74 @@ make a function called action_instance_label takes name, preconds, subst returns
     end
     let i = i + 1
   end
-  if list_len(seen) == 0 then
-    let label = name
+  let values = []
+  let names = []
+  let j = 0
+  while j < list_len(seen) do
+    let values = list_push(values, logic_walk(seen[j], subst))
+    let names = list_push(names, logic_var_name(seen[j]))
+    let j = j + 1
+  end
+  let step = [name, values, names]
+  ensure (list_len(step) == 3) and (list_len(step[1]) == list_len(step[2]))
+  return step
+end
+
+# A plan step as text: its action's name, with its variables as bound
+# ("build(X=house,Y=2)") when it has any.
+make a function called step_label takes step returns label
+  require (value_class(step) == 9) and (list_len(step) == 3)
+  if list_len(step[1]) == 0 then
+    let label = step[0]
     ensure value_class(label) == 8
     return label
   end
   let b = sb_new()
-  sb_push(b, name)
+  sb_push(b, step[0])
   sb_push(b, "(")
   let j = 0
-  while j < list_len(seen) do
+  while j < list_len(step[1]) do
     if j > 0 then
       sb_push(b, ",")
     end
-    sb_push(b, seen[j])
+    sb_push(b, step[2][j])
     sb_push(b, "=")
-    sb_push(b, logic_walk(seen[j], subst))
+    sb_push(b, to_s(step[1][j]))
     let j = j + 1
   end
   sb_push(b, ")")
   let label = sb_str(b)
   ensure value_class(label) == 8
   return label
+end
+
+# A plan's steps as text, each as step_label writes it.
+make a function called plan_labels takes steps returns labels
+  require value_class(steps) == 9
+  let labels = []
+  let i = 0
+  while i < list_len(steps) do
+    let labels = list_push(labels, step_label(steps[i]))
+    let i = i + 1
+  end
+  ensure list_len(labels) == list_len(steps)
+  return labels
+end
+
+# A plan step's action name.
+make a function called step_name takes step returns name
+  require (value_class(step) == 9) and (list_len(step) == 3)
+  let name = step[0]
+  ensure value_class(name) == 8
+  return name
+end
+
+# A plan step's bound values, in order, as they were bound.
+make a function called step_values takes step returns values
+  require (value_class(step) == 9) and (list_len(step) == 3)
+  let values = step[1]
+  ensure value_class(values) == 9
+  return values
 end
 
 make a function called rt_fact_text takes f returns s
@@ -1175,7 +1581,7 @@ make a function called rt_plan_from takes stores, goal_facts returns result
             let left = rt_plan_unmet_after(node[5], state, action[3], subst, false, goal_facts)
             let left = rt_plan_unmet_after(left, mid, action[2], subst, true, goal_facts)
             let g = node[1] + action[4]
-            let path = list_push(node[4], action_instance_label(action[0], action[1], subst))
+            let path = list_push(node[4], action_instance_step(action[0], action[1], subst))
             rt_pq_push(heap, [g + rt_plan_estimate(left, shape[0], shape[1]), g, seq, next, path, left])
             let seq = seq + 1
           end
@@ -1243,13 +1649,7 @@ end
 
 make a function called goal_def takes name, deps returns done
   require value_live(name) and (value_class(deps) == 9)
-  let goals = rt_global_get(4272)
-  let i = rt_pairs_index(goals, name)
-  if i >= 0 then
-    rt_global_set(4272, list_set(goals, i, [name, deps]))
-  else
-    rt_global_set(4272, list_push(goals, [name, deps]))
-  end
+  rt_global_pair_set(4272, name, deps)
   let done = true
   ensure value_class(done) == 1
   return done
@@ -1272,13 +1672,7 @@ end
 
 make a function called action_bind takes name, closure returns done
   require value_live(name) and value_live(closure)
-  let bodies = rt_global_get(4256)
-  let i = rt_pairs_index(bodies, name)
-  if i >= 0 then
-    rt_global_set(4256, list_set(bodies, i, [name, closure]))
-  else
-    rt_global_set(4256, list_push(bodies, [name, closure]))
-  end
+  rt_global_pair_set(4256, name, closure)
   let done = true
   ensure value_class(done) == 1
   return done
@@ -1365,8 +1759,8 @@ make a function called activate takes steps returns ok
   let ok = true
   let i = 0
   while ok and (i < list_len(steps)) do
-    let f = action_lookup(action_base_name(steps[i]))
-    let r = f(action_label_args(steps[i]))
+    let f = action_lookup(step_name(steps[i]))
+    let r = f(step_values(steps[i]))
     if r == false then
       let ok = false
     end

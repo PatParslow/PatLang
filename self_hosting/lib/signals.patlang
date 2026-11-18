@@ -37,14 +37,22 @@
 #     print(reply)
 #   end
 #
-# Deliberately minimal wire format (one line: "name\npayload", a single
-# write + a single read, no length-prefix framing) -- matches this
-# codebase's existing pragmatic style for small local control messages
-# (see event_loop_server.patlang's own plain HTTP-ish read/write), not
-# meant for large payloads. Localhost-only by construction (see above), so
-# no separate auth story yet -- a real network-facing signal listener would
-# need one before ever binding beyond 127.0.0.1; out of scope here, same as
-# this feature's own backlog note said from the start.
+# What a peer can do. Loopback is reachable by every process and every user
+# on the machine, and the event namespace is the program's whole: so a
+# signal reaches a handler only when both of these hold.
+#   - The program allowed its name: signal_allow(["status", "quit"]) after
+#     signal_claim. A name not allowed is ignored, whatever `when` handlers
+#     the program has for its own events.
+#   - The message carries the run's token: signal_claim makes one from the
+#     system's random source and writes it to signal_token_path(port), a
+#     file under the user's own profile, which signal_send and signal_query
+#     read. A process that cannot read that file cannot send a signal.
+# A peer that connects and sends nothing, or half a message, costs one
+# signal_poll at most signal_read_ms() beyond its timeout, and one that
+# leaves before the reply is written costs nothing.
+#
+# Wire format: "token\nname\nN\n" then N bytes of payload. The reply is
+# everything the primary writes before it closes the connection.
 
 include "mailbox.patlang"
 
@@ -60,7 +68,127 @@ include "mailbox.patlang"
 # plain tcp_listen would.
 make a function called signal_claim takes port returns port_id
   if signal_driver() == "vfs" then return sigv_claim(port) end
-  return tcp_try_listen(port)
+  let port_id = tcp_try_listen(port)
+  if port_id >= 0 then
+    let token = signal_new_token()
+    vfs_write(signal_token_key(port_id), token)
+    write_file(signal_token_path(port_id), token)
+  end
+  return port_id
+end
+
+# signal_allow(names): the signals a peer may send this program. Each is the
+# name of a `when` handler the program means to be reached from outside.
+make a function called signal_allow takes names returns done
+  let i = 0
+  while i < list_len(names) do
+    vfs_write("/signal_state/allowed/" + names[i], "1")
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called signal_allowed takes name returns yes
+  return vfs_exists("/signal_state/allowed/" + name)
+end
+
+# Where the token of the run holding a port is kept for senders: a file under
+# the user's own profile, which other users cannot read.
+make a function called signal_token_path takes port returns path
+  let base = "" + getenv("LOCALAPPDATA")
+  if base == "" then
+    let base = "" + getenv("TEMP")
+  end
+  return base + "/PatLang/signals/" + port + ".token"
+end
+
+make a function called signal_token_key takes port_id returns key
+  return "/signal_state/token/" + port_id
+end
+
+# 32 hex digits from the system's random source.
+make a function called signal_new_token returns token
+  let digits = "0123456789abcdef"
+  let bytes = random_bytes(16)
+  let b = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    sb_push(b, substr(digits, word_shr(bytes[i], 4), 1))
+    sb_push(b, substr(digits, word_and(bytes[i], 15), 1))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# How long signal_poll waits for a connected peer's message, in ms.
+make a function called signal_read_ms returns ms
+  return 250
+end
+
+# A message's header, read from the first bytes of text: [token, name, the
+# payload's length in bytes, where the payload starts], or [] when text does
+# not yet hold three lines, or the third is not a count.
+make a function called signal_header takes text returns header
+  let fields = []
+  let start = 0
+  let i = 0
+  let n = text.length
+  if n > 400 then
+    let n = 400
+  end
+  while (i < n) and (list_len(fields) < 3) do
+    if char_code(text, i) == 10 then
+      let fields = list_push(fields, substr(text, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if list_len(fields) < 3 then
+    return []
+  end
+  let digits = fields[2]
+  if digits.length == 0 then
+    return []
+  end
+  let k = 0
+  while k < digits.length do
+    let c = char_code(digits, k)
+    if (c < 48) or (c > 57) then
+      return []
+    end
+    let k = k + 1
+  end
+  return [fields[0], fields[1], to_num(digits), start]
+end
+
+# The message a connected peer sends, within signal_read_ms(): [token, name,
+# payload], or [] when it did not send a whole one in that time.
+make a function called signal_read_message takes conn returns msg
+  let deadline = clock_ms() + signal_read_ms()
+  let b = sb_new()
+  let header = []
+  while true do
+    let left = deadline - clock_ms()
+    if left <= 0 then
+      return []
+    end
+    let chunk = tcp_read_timeout(conn, left)
+    if chunk == "" then
+      return []
+    end
+    sb_push(b, chunk)
+    if list_len(header) == 0 then
+      let header = signal_header(sb_str(b))
+    end
+    if (list_len(header) > 0) and (sb_len(b) >= header[3] + header[2]) then
+      let text = sb_str(b)
+      return [header[0], header[1], substr(text, header[3], text.length - header[3])]
+    end
+    if (list_len(header) == 0) and (sb_len(b) > 400) then
+      return []
+    end
+  end
+  return []
 end
 
 # signal_poll(port_id, timeout_ms) -> the signal name received this call,
@@ -84,32 +212,26 @@ make a function called signal_poll takes port_id, timeout_ms returns name
   if conn < 0 then
     return ""
   end
-  # tcp_read_or_empty, not tcp_read: a sender's connection can drop
-  # (reset/forcibly closed) between accept and read for entirely normal
-  # reasons (the querying script erroring out, a race on its own exit,
-  # etc.) -- plain tcp_read's fatal-on-any-I/O-error behavior meant a
-  # single flaky signal-sender could crash this PRIMARY process outright
-  # (confirmed: a status query crashed a real ~20-minute fantpop-patlang
-  # simulation one tick before completion). An empty read here is
-  # treated exactly like "no message" -- a dropped connection just means
-  # this poll cycle sees nothing, not a program-ending error.
-  let msg = tcp_read_or_empty(conn)
-  if msg == "" then
+  # Nothing a peer does here stops the program. A peer that sends nothing, or
+  # part of a message, is dropped after signal_read_ms(); one without the
+  # run's token, or naming a signal the program did not allow, is dropped
+  # unanswered; and the reply is written with tcp_try_write, since the peer
+  # may have gone (a status query once ended a 20-minute simulation one tick
+  # before it finished, when its sender dropped the connection).
+  let msg = signal_read_message(conn)
+  if list_len(msg) == 0 then
     tcp_close(conn)
     return ""
   end
-  let nl = find_substr_signals(msg, chr(10))
-  let sig_name = msg
-  let payload = ""
-  if nl >= 0 then
-    let sig_name = substr(msg, 0, nl)
-    let payload = substr(msg, nl + 1, msg.length - nl - 1)
+  if (msg[0] != vfs_read(signal_token_key(port_id))) or (not signal_allowed(msg[1])) then
+    tcp_close(conn)
+    return ""
   end
   signal_reply("")
-  emit(sig_name, payload)
-  tcp_write(conn, vfs_read(signal_reply_key()))
+  emit(msg[1], msg[2])
+  tcp_try_write(conn, vfs_read(signal_reply_key()))
   tcp_close(conn)
-  return sig_name
+  return msg[1]
 end
 
 # signal_reply(text) -- call from inside a `when <name> do ... end` handler
@@ -161,11 +283,21 @@ end
 # try/catch to catch tcp_connect's error gracefully).
 make a function called signal_query takes port, name, payload returns reply
   if signal_driver() == "vfs" then return sigv_query(port, name, payload) end
+  let text = "" + payload
   let conn = tcp_connect("127.0.0.1", port)
-  tcp_write(conn, name + chr(10) + payload)
-  let reply = tcp_read(conn)
+  tcp_write(conn, read_file(signal_token_path(port)) + chr(10) + name + chr(10) + str_len(text) + chr(10) + text)
+  # the reply is everything written before the primary closes
+  let b = sb_new()
+  while true do
+    let chunk = tcp_read_or_empty(conn)
+    if chunk == "" then
+      tcp_close(conn)
+      return sb_str(b)
+    end
+    sb_push(b, chunk)
+  end
   tcp_close(conn)
-  return reply
+  return sb_str(b)
 end
 
 # ---- vfs driver -----------------------------------------------------------
@@ -182,7 +314,7 @@ end
 # registered in the same world.
 
 make a function called signal_driver returns name
-  if vfs_exists(signal_driver_key()) == "1" then return vfs_read(signal_driver_key()) end
+  if vfs_exists(signal_driver_key()) then return vfs_read(signal_driver_key()) end
   let caps = host_caps()
   let i = 0
   while i < list_len(caps) do
@@ -203,7 +335,7 @@ end
 
 make a function called sigv_claim takes port returns port_id
   let key = "/sig/" + port + "/claim"
-  if vfs_exists(key) == "1" then
+  if vfs_exists(key) then
     return -1
   end
   vfs_write(key, "1")
@@ -230,6 +362,10 @@ make a function called sigv_poll takes port returns name
     let sig_name = substr(msg, 0, nl)
     let payload = substr(msg, nl + 1, msg.length - nl - 1)
   end
+  # a signal the program did not allow is taken from the box and ignored
+  if not signal_allowed(sig_name) then
+    return ""
+  end
   signal_reply("")
   emit(sig_name, payload)
   vfs_write("/sig/" + port + "/reply/" + m[0], vfs_read(signal_reply_key()))
@@ -240,7 +376,7 @@ make a function called sigv_query takes port, name, payload returns reply
   let id = sigv_send(port, name, payload)
   sigv_poll(port)
   let key = "/sig/" + port + "/reply/" + id
-  if vfs_exists(key) != "1" then
+  if (not vfs_exists(key)) then
     return ""
   end
   let reply = vfs_read(key)

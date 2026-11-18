@@ -21,6 +21,11 @@ Feature: the interpreter and native code are one language (spec 1.7)
     When that program is given
     Then both engines report that the include cannot be read, and nothing of the program runs
 
+  Scenario: a program reaches nothing of the engine running it
+    Given a program calling tokenize, the compiler's lexer, and one applying iv_bucket, the interpreter's own function, by a computed name
+    When each runs
+    Then both engines stop at the call, saying no such function is found, and print the same
+
   Scenario: the logic state holds nothing of the engine running the program
     Given a program with one contract, one rule and one action
     When it reads its state and the contract facts

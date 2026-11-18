@@ -226,7 +226,7 @@ class Code:
         self.op_rr((0x0F, 0x7E), x, r, prefix=(0x66,))
 
 
-JL, JGE, JE, JNE, JLE, JG, JO, JZ = 0xC, 0xD, 0x4, 0x5, 0xE, 0xF, 0x0, 0x4
+JL, JGE, JE, JNE, JLE, JG, JO, JZ, JP = 0xC, 0xD, 0x4, 0x5, 0xE, 0xF, 0x0, 0x4, 0xA
 CMP_JUMP = {"<": JL, ">": JG, "<=": JLE, ">=": JGE, "==": JE, "!=": JNE}
 OP_FN = {"+": "op_add", "q+": "op_add_quiet", "a+": "op_add_taken", "-": "op_sub", "*": "op_mul",
          "/": "op_div", "%": "op_mod", "<": "op_lt", ">": "op_gt", "<=": "op_le", ">=": "op_ge",
@@ -413,7 +413,7 @@ class FnGen:
             c.jcc(JNE, bad)
             c.mov_imm(RCX, 0xFFFFFFFF)
             c.alu("and", RCX, RAX)
-            c.alu_imm("cmp", RCX, 15)
+            c.alu_imm("cmp", RCX, 17)
             c.jcc(JLE, known)
             c.alu_imm("cmp", RCX, 63)
             c.jcc(JL, bad)
@@ -524,6 +524,7 @@ class FnGen:
                 c.op_rr((0x0F, 0x2E), 0, 1, w=False, prefix=(0x66,))   # ucomisd xmm0, xmm1
                 c.mov_imm(RAX, 0)
                 c.jcc(JNE, skip)
+                c.jcc(JP, skip)                                         # unordered: a NaN
                 c.mov_imm(RAX, 1)
                 c.place(skip)
                 return self.store_int(d)

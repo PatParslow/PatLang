@@ -239,7 +239,8 @@ make a function called gt_suites returns suites
     ["language_interp", i, ["self_hosting/tools/run_language_spec_suite.patlang"], ["interpreter", "compiler"], lang, "language"],
     ["language_v2", b + "/v2_language_suite.exe", [], ["language_suite", "interpreter", "compiler"], lang, "language"],
     ["match", i, ["self_hosting/tools/run_match_spec_suite.patlang"], ["interpreter", "compiler"], lang, "language"],
-    ["selftests", i, ["self_hosting/tools/run_selftests.patlang"], ["interpreter", "compiler"], [lib, ["dir", "self_hosting/composite_library"], ["dir", "self_hosting/depgraph_selftest_fixture"], ["dir", "self_hosting/examples/zs"], ["dir", "docs/grammar"]], ""],
+    ["selftests", i, ["self_hosting/tools/run_selftests.patlang"], ["interpreter", "compiler"], [lib, ["dir", "self_hosting/composite_library"], ["dir", "self_hosting/depgraph_selftest_fixture"], ["dir", "self_hosting/examples/zs"], ["dir", "docs/grammar"], ["program", "packages/tools/verify_manifest.patlang"]], ""],
+    ["demos", i, ["self_hosting/tools/run_demos.patlang"], ["interpreter", "compiler"], [["dir", "demos"], lib], ""],
     ["repository", i, ["self_hosting/tools/run_repository_checks.patlang"], ["interpreter", "compiler"], gt_repository_inputs(), ""]]
 end
 
@@ -247,7 +248,7 @@ end
 # feature files that say which selftests run, and .gitignore. Generated files
 # under self_hosting/build are left out.
 make a function called gt_repository_inputs returns inputs
-  return [["dir_except", "self_hosting", ["build"]], ["dir", "friendly_cli"], ["dir", "spec_library"], ["file", ".gitignore"]]
+  return [["dir_except", "self_hosting", ["build"]], ["dir", "friendly_cli"], ["dir", "spec_library"], ["dir", "demos"], ["dir", "packages"], ["file", ".gitignore"]]
 end
 
 # The runner's source, for a suite whose program is the interpreter.
@@ -582,7 +583,7 @@ make a function called gt_plan takes units, keys, rows, all, only returns names
     let i = i + 1
   end
   if list_len(goals) == 0 then return [] end
-  let names = plan(goals)
+  let names = plan_labels(plan(goals))
   if list_len(names) == 0 then
     print("gates: the planner found no way to run the stale units")
   end
@@ -648,7 +649,10 @@ make a function called gt_step takes log, label, r returns ok
 end
 
 # v2.exe builds a, a builds b; they must be byte identical, and b becomes
-# v2.exe, its key beside it.
+# v2.exe, its key beside it. When the sources change the code the compiler
+# generates, v2.exe (built from the old sources) generates a differently from
+# b, though a already generates code as the new sources do: then b builds c,
+# and b and c must be byte identical.
 make a function called gt_fixpoint takes w returns result
   let b = gt_build()
   let log = sb_new()
@@ -657,14 +661,22 @@ make a function called gt_fixpoint takes w returns result
   if not gt_step(log, "compiler a", ra) then return [false, sb_str(log), ra[3]] end
   let rb = exec_measured(b + "/v2_gen_a.exe", ["self_hosting/v2/compile.patlang", b + "/v2_gen_b.exe", "--no-cache", "--workers", w])
   if not gt_step(log, "compiler b", rb) then return [false, sb_str(log), rb[3]] end
+  let peak = ra[3]
+  if rb[3] > peak then let peak = rb[3] end
   let same = gt_same_bytes(b + "/v2_gen_a.exe", b + "/v2_gen_b.exe")
   sb_push(log, "== fixpoint: a and b " + gt_same_text(same) + chr(10))
+  if not same then
+    sb_push(log, "== the generated code changed: b builds c" + chr(10))
+    let rc = exec_measured(b + "/v2_gen_b.exe", ["self_hosting/v2/compile.patlang", b + "/v2_gen_c.exe", "--no-cache", "--workers", w])
+    if not gt_step(log, "compiler c", rc) then return [false, sb_str(log), peak] end
+    if rc[3] > peak then let peak = rc[3] end
+    let same = gt_same_bytes(b + "/v2_gen_b.exe", b + "/v2_gen_c.exe")
+    sb_push(log, "== fixpoint: b and c " + gt_same_text(same) + chr(10))
+  end
   if same then
     exec_measured("cmd", ["/c", "copy /y " + gt_backslashes(b + "/v2_gen_b.exe") + " " + gt_backslashes(b + "/v2.exe")])
     exec_measured("cmd", ["/c", "copy /y " + gt_backslashes(b + "/v2_gen_b.exe.key") + " " + gt_backslashes(b + "/v2.exe.key")])
   end
-  let peak = ra[3]
-  if rb[3] > peak then let peak = rb[3] end
   return [same, sb_str(log), peak]
 end
 
@@ -764,7 +776,7 @@ end
 
 make a function called gt_quitting returns yes
   # vfs_exists gives the text "1" or "0" (runtime/vfs.patlang)
-  return vfs_exists("/gates/quit") == "1"
+  return vfs_exists("/gates/quit")
 end
 
 make a function called gt_publish takes port, text, events returns done
@@ -799,6 +811,7 @@ make a function called gt_dispatch takes units, names, keys, rows, cap_override 
   let started = now_ms()
   # the port's number is what signal_claim gives (lib/signals.patlang)
   let port = signal_claim(0)
+  signal_allow(["status", "quit"])
   let port_no = port
   let todo = names
   let running = []

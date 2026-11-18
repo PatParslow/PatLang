@@ -7,12 +7,16 @@
 # ctx, raises]: vecs, so the helpers below can add to them. counters holds
 # [next slot, next label, next closure]; decl is the declaration's name,
 # from which every name synthesized here is made; lifted collects the
-# functions lifted out of it (closures); ctx is [quiet, symbols]: whether
-# its file declared quiet_operators(), and the symbol index (lw_symbols);
+# functions lifted out of it (closures); ctx is [quiet, symbols, ...]:
+# whether its file declared quiet_operators(), and the symbol index
+# (lw_symbols), then the flags lw_program_traced sets out (lw_ctx_flag);
 # raises lists the events the function raises when it returns.
 
 make a function called lw_new_builder takes decl, lifted, ctx, raises returns fb
+  # slots, labels, lifted closures, and the line of the statement being
+  # lowered (0 until one says), which an error names
   let counters = vec_new()
+  vec_push(counters, 0)
   vec_push(counters, 0)
   vec_push(counters, 0)
   vec_push(counters, 0)
@@ -173,8 +177,30 @@ make a function called lw_emit takes fb, ins returns done
   return true
 end
 
+# The line an error names: the statement's being lowered, or 0 for one that
+# carries none, never an earlier statement's. Every statement passes here,
+# whether it is lowered for its effect (lw_stmt) or for its block's value
+# (lw_block_value).
+make a function called lw_note_line takes fb, st returns done
+  if st[0] == "QuietStmt" then
+    return false
+  end
+  let at = st[list_len(st) - 1]
+  if (type_of(at) == "int") and (at > 0) then
+    vec_set(fb[3], 3, at)
+  else
+    vec_set(fb[3], 3, 0)
+  end
+  return true
+end
+
 make a function called lw_error takes fb, text returns done
-  vec_push(fb[4], text)
+  let line = vec_get(fb[3], 3)
+  if line > 0 then
+    vec_push(fb[4], "line " + line + ": " + text)
+  else
+    vec_push(fb[4], text)
+  end
   return true
 end
 
@@ -329,7 +355,8 @@ make a function called lw_expr takes fb, e returns s
     return d
   end
   if kind == "Call" then
-    return lw_call(fb, e[1], e[2])
+    # a fourth item "runtime" marks a call the lowering made (lw_call_as)
+    return lw_call_as(fb, e[1], e[2], (list_len(e) < 4) or (e[3] != "runtime"))
   end
   # A function reached by its name: its wrapper hands its parameters straight
   # on, exactly as given (own.patlang)
@@ -347,7 +374,11 @@ make a function called lw_expr takes fb, e returns s
   # v.name: the runtime's dot_name(v), until classes give every value its
   # methods (docs/plans/v2-implementation.md, milestone 5)
   if kind == "Member" then
-    return lw_call(fb, "rt_member", [e[1], ["Str", e[2]]])
+    return lw_call_as(fb, "rt_member", [e[1], ["Str", e[2]]], false)
+  end
+  if kind == "CallExpr" then
+    # an expression's value called: a closure, as a variable holding one is
+    return lw_callv(fb, lw_expr(fb, e[1]), e[2], 0)
   end
   if kind == "MethodCall" then
     # AST.Name(args): the node ["Name", args...] (spec 1.9), unless a variable has the name
@@ -411,13 +442,43 @@ make a function called lw_logic takes fb, op, ea, eb returns d
   return d
 end
 
+# Whether a name a program writes is the runtime's alone (review finding S8):
+# a primitive that reads or writes memory, makes a value from a word, or
+# reaches the system or the runtime's state, or a function named rt_ that the
+# runtime declares and the program does not. Only a file declaring
+# quiet_operators() calls one; the word and float arithmetic, value_class,
+# value_live and the constant-time marks are open to every program, since none
+# reaches anything the program does not already hold.
+make a function called lw_runtime_only takes fb, name returns yes
+  let held = ["mem_load", "mem_load_byte", "mem_load_value", "mem_take_value", "mem_store", "mem_store_byte", "mem_store_value", "mem_init_value", "value_make", "value_data", "value_type_word", "atomic_add", "runtime_state", "thread_entry_address", "extern_call", "extern_call_float", "closure_call_unchecked", "runtime_functions_by_name"]
+  if v2_contains(held, name) then
+    return true
+  end
+  if not str_starts_with(name, "rt_") then
+    return false
+  end
+  let symbols = fb[7][1]
+  return (list_len(symbols) > 4) and v2_contains(symbols[4], name) and (not v2_contains(symbols[2], name))
+end
+
 make a function called lw_call takes fb, name, args returns d
+  return lw_call_as(fb, name, args, true)
+end
+
+# A call; `written` is false for one the lowering itself makes (a member's
+# rt_member, a field's rt_field_set, the registrations), which may name the
+# runtime's own functions whatever file it is in.
+make a function called lw_call_as takes fb, name, args, written returns d
   let fslot = lw_var_slot(fb, name)
   if fslot >= 0 then
     return lw_callv(fb, fslot, args, 0)
   end
   if name == "caught" then
     return lw_caught(fb, args)
+  end
+  if written and (not fb[7][0]) and lw_runtime_only(fb, name) then
+    lw_error(fb, name + " is for the runtime: only a file declaring quiet_operators() uses it")
+    return lw_const(fb, "unit", "")
   end
   if name == "closure_call_unchecked" then
     # a closure's call with arguments already fitted to it (rt_apply_unchecked)
@@ -535,6 +596,9 @@ make a function called lw_fit_args takes fb, name, args returns fitted
   while (k < n) and (k < list_len(args)) do
     if params[k] == "by_name" then
       if args[k][0] == "Str" then
+        if (not fb[7][0]) and lw_runtime_only(fb, args[k][1]) then
+          lw_error(fb, args[k][1] + " is for the runtime: only a file declaring quiet_operators() uses it")
+        end
         vec_push(fb[7][2], args[k][1])
       else
         vec_push(fb[7][2], "*")
@@ -786,6 +850,16 @@ make a function called lw_tracing takes fb returns yes
   return (list_len(fb[7]) > 6) and fb[7][6]
 end
 
+# A flag of the builder's ctx past its first seven, false when it has none:
+# 7 whether the file is one of the runtime's own, 8 whether the build asked
+# for the runtime's ensures (contracts.patlang).
+make a function called lw_ctx_flag takes fb, at returns yes
+  if list_len(fb[7]) <= at then
+    return false
+  end
+  return fb[7][at]
+end
+
 make a function called lw_trace_call takes fb, name, args returns done
   let d = lw_new_slot(fb)
   lw_emit(fb, ["call", d, name, args])
@@ -876,6 +950,7 @@ end
 # none ran); unit for any other.
 make a function called lw_stmt_value takes fb, st returns slot
   let kind = st[0]
+  lw_note_line(fb, st)
   if kind == "Let" then
     lw_stmt(fb, st)
     return lw_var_slot(fb, st[1])
@@ -951,9 +1026,15 @@ end
 
 make a function called lw_stmt takes fb, st returns done
   let kind = st[0]
+  lw_note_line(fb, st)
+  if kind == "QuietStmt" then
+    # a top-level statement of a quiet file, lowered in __main as its file
+    # is: quiet (lw_program_traced)
+    return lw_stmt(list_set(fb, 7, list_set(fb[7], 0, true)), st[1])
+  end
   lw_trace_step(fb, st)
   if kind == "Let" then
-    if lw_gives_var(st[1], st[2]) and (lw_var_slot(fb, st[1]) >= 0) then
+    if lw_gives_var(fb, st[1], st[2]) and (lw_var_slot(fb, st[1]) >= 0) then
       return lw_let_giving(fb, st[1], st[2])
     end
     if lw_adds_to_var(fb, st[1], st[2]) then
@@ -1022,7 +1103,7 @@ make a function called lw_stmt takes fb, st returns done
     return true
   end
   if kind == "MemberAssign" then
-    lw_expr(fb, ["Call", "rt_field_set", [st[1], ["Str", st[2]], st[3]]])
+    lw_expr(fb, ["Call", "rt_field_set", [st[1], ["Str", st[2]], st[3]], "runtime"])
     return true
   end
   if kind == "If" then
@@ -1160,7 +1241,7 @@ end
 # the kind of clause, the function and the condition. Each is checked where
 # it is written, as the interpreter checks it.
 make a function called lw_contract takes fb, which, cond, line returns done
-  if not v2_contracts_checked() then
+  if not v2_contracts_checked(which, lw_ctx_flag(fb, 7), lw_ctx_flag(fb, 8)) then
     return true
   end
   let c = lw_expr(fb, cond)
@@ -1218,9 +1299,13 @@ make a function called lw_text takes e returns text
   if kind == "Member" then
     return lw_text(e[1]) + "." + e[2]
   end
-  if kind == "Call" then
+  if (kind == "Call") or (kind == "CallExpr") then
     let b = sb_new()
-    sb_push(b, e[1] + "(")
+    if kind == "Call" then
+      sb_push(b, e[1] + "(")
+    else
+      sb_push(b, lw_text(e[1]) + "(")
+    end
     let i = 0
     while i < list_len(e[2]) do
       if i > 0 then
@@ -1242,12 +1327,18 @@ end
 # its new one: rhs is a call with name as exactly one whole argument. Other
 # arguments may read name too: an argument cannot assign the caller's
 # variables, so the value is given only once every argument has been
-# evaluated, and nothing reads it after that.
-make a function called lw_gives_var takes name, rhs returns yes
+# evaluated, and nothing reads it after that. The call must be one of a named
+# function: a closure held in a variable, and the names lw_call lowers in a way
+# of their own, go through lw_call like any other call.
+make a function called lw_gives_var takes fb, name, rhs returns yes
   if rhs[0] != "Call" then
     return false
   end
-  if ir_is_prim(rhs[1]) or (rhs[1] == "extern_call") then
+  let callee = rhs[1]
+  if lw_var_slot(fb, callee) >= 0 then
+    return false
+  end
+  if ir_is_prim(callee) or (callee == "extern_call") or (callee == "extern_call_float") or (callee == "caught") or (callee == "closure_call_unchecked") or (callee == "quiet_operators") or (callee == "runtime_functions_by_name") then
     return false
   end
   let args = rhs[2]
@@ -1312,9 +1403,35 @@ make a function called lw_mentions takes e, name returns yes
   return false
 end
 
+# The call is resolved as lw_call resolves one: the program's function before
+# the runtime's of the same name, and the arguments fitted to the declared
+# parameters, so the wrong number is refused and rest takes the further ones.
+# When fitting puts the variable inside rest's list it is no longer a whole
+# argument, and the call is made without giving it.
 make a function called lw_let_giving takes fb, name, rhs returns done
   let s = lw_var_slot(fb, name)
-  let args = rhs[2]
+  let target = lw_call_target(fb, rhs[1])
+  let args = lw_fit_args(fb, target, rhs[2])
+  let whole = 0
+  let w = 0
+  while w < list_len(args) do
+    if (args[w][0] == "Var") and (args[w][1] == name) then
+      let whole = whole + 1
+    end
+    let w = w + 1
+  end
+  if whole != 1 then
+    let plain = []
+    let p = 0
+    while p < list_len(args) do
+      let plain = list_push(plain, lw_expr(fb, args[p]))
+      let p = p + 1
+    end
+    let pd = lw_new_slot(fb)
+    lw_emit(fb, ["call", pd, target, plain])
+    lw_emit(fb, ["copy", s, pd])
+    return true
+  end
   let slots = []
   let t = -1
   let i = 0
@@ -1330,7 +1447,7 @@ make a function called lw_let_giving takes fb, name, rhs returns done
   end
   lw_emit(fb, ["take", t, s])
   let d = lw_new_slot(fb)
-  lw_emit(fb, ["call", d, rhs[1], slots])
+  lw_emit(fb, ["call", d, target, slots])
   lw_emit(fb, ["copy", s, d])
   return true
 end
@@ -1493,8 +1610,15 @@ make a function called lw_function_with takes name, params, body, captured, lift
       let k = k + 1
     end
   end
-  # falling off the end returns the body's value
-  let u = lw_block_value(fb, body)
+  # falling off the end returns the body's value; the program's own (__main)
+  # is taken by nothing, so its last statement is one like any other, and a
+  # bare value there prints as anywhere else (lw_only_a_value)
+  if name == "__main" then
+    lw_stmts(fb, body)
+    let u = lw_const(fb, "unit", "")
+  else
+    let u = lw_block_value(fb, body)
+  end
   lw_raise_events(fb, u)
   lw_trace_leave(fb)
   lw_emit(fb, ["return", u])
@@ -1505,7 +1629,11 @@ end
 
 # A program's declarations as IR: every function, and __main for the
 # top-level statements, its classes registered first. files is a list of
-# [stmts, quiet]. [fns, errors, facts]: facts are the program facts code
+# [stmts, quiet, all_by_name, in_runtime, runtime_ensures]: in_runtime
+# whether it is one of the runtime's own files, runtime_ensures whether the
+# build asked for their ensures (contracts.patlang); an entry without the
+# last two is a program's file. [fns, errors, facts]: facts are the program
+# facts code
 # generation needs, [the event names some `when` handles].
 make a function called lw_program takes files returns result
   return lw_program_traced(files, false)
@@ -1532,6 +1660,24 @@ make a function called lw_program_traced takes files, trace returns result
     let f = f + 1
   end
   let symbols = list_push(symbols, engine)
+  # the names the runtime (its quiet files) declares: an rt_ one is for the
+  # runtime alone (lw_runtime_only)
+  let declared = []
+  let f = 0
+  while f < list_len(files) do
+    if files[f][1] then
+      let stmts = files[f][0]
+      let k = 0
+      while k < list_len(stmts) do
+        if stmts[k][0] == "Func" then
+          let declared = list_push(declared, stmts[k][1])
+        end
+        let k = k + 1
+      end
+    end
+    let f = f + 1
+  end
+  let symbols = list_push(symbols, declared)
   let by_name = vec_new()
   let handled = vec_new()
   let rules = vec_new()
@@ -1544,7 +1690,13 @@ make a function called lw_program_traced takes files, trace returns result
   let f = 0
   while f < list_len(files) do
     let stmts = files[f][0]
-    let ctx = [files[f][1], symbols, by_name, handled, rules, false, trace and (not files[f][1])]
+    let in_runtime = false
+    let runtime_ensures = false
+    if list_len(files[f]) > 4 then
+      let in_runtime = files[f][3]
+      let runtime_ensures = files[f][4]
+    end
+    let ctx = [files[f][1], symbols, by_name, handled, rules, false, trace and (not files[f][1]), in_runtime, runtime_ensures]
     let i = 0
     while i < list_len(stmts) do
       let st = stmts[i]
@@ -1566,9 +1718,20 @@ make a function called lw_program_traced takes files, trace returns result
         let errors = v2_concat(errors, r[1])
       elif st[0] == "ClassDecl" then
         let classes = list_push(classes, lw_class_registration(st))
+        # objects compare by identity (spec 1.5): == and != are never sent to
+        # a class, so a method by either name could never be called
+        let m = 0
+        while m < list_len(st[4]) do
+          if (st[4][m][0] == "==") or (st[4][m][0] == "!=") then
+            let errors = list_push(errors, "class " + st[1] + ": a method named " + st[4][m][0] + " is never called: objects compare by identity (spec 1.5)")
+          end
+          let m = m + 1
+        end
       elif trace and files[f][1] then
         # a runtime file's statement is no step of the program's
-        let top = list_push(top, lw_untraced(st))
+        let top = list_push(top, ["QuietStmt", lw_untraced(st)])
+      elif files[f][1] then
+        let top = list_push(top, ["QuietStmt", st])
       else
         let top = list_push(top, st)
       end
@@ -1598,21 +1761,42 @@ end
 # fn 'no_such_host' not found"). It takes no parameters: a call of it passes
 # none (compile.patlang's v2_without_undeclared_args).
 make a function called lw_undeclared_function takes name returns func
-  let body = [["Return", ["Call", "rt_undeclared", [["Str", name]]]]]
+  let body = [["Return", ["Call", "rt_undeclared", [["Str", name]], "runtime"]]]
   let r = lw_function_with(name, [], body, [], vec_new(), false, [true, [], vec_new(), vec_new(), vec_new(), false], [])
   return r[0]
 end
 
 # A goal's arguments as the logic engine takes them (runtime/logic.patlang):
-# each its token's text, a capitalised one a logic variable.
+# each its token's text, a constant, but for a bare capitalised name, which is
+# the logic variable of that name (logic_var).
 make a function called lw_rule_tokens takes args returns node
   let tokens = []
   let i = 0
   while i < list_len(args) do
-    let tokens = list_push(tokens, ["Str", args[i][1]])
+    if lw_names_logic_var(args[i]) then
+      let tokens = list_push(tokens, ["Call", "logic_var", [["Str", args[i][1]]]])
+    else
+      let tokens = list_push(tokens, ["Str", args[i][1]])
+    end
     let i = i + 1
   end
   return ["List", tokens]
+end
+
+# Whether a rule's term is a logic variable: a bare name that starts with a
+# capital letter. A quoted string is a constant whatever it starts with.
+make a function called lw_names_logic_var takes term returns yes
+  if (term[0] != "Var") or (list_len(term) != 2) then
+    return false
+  end
+  if type_of(term[1]) != "string" then
+    return false
+  end
+  if term[1].length == 0 then
+    return false
+  end
+  let c = char_code(term[1], 0)
+  return (c >= 65) and (c <= 90)
 end
 
 # A list of goals, [pred, args] each, or [pred, args, store name] for a goal
@@ -1730,7 +1914,7 @@ make a function called lw_by_name_registrations takes files, symbols, names retu
     end
     if params != false then
       let wrapper = ["Closure", params, [["Return", ["CallThrough", target, params], 0]]]
-      let out = list_push(out, ["Expr", ["Call", "rt_register_function", [["Str", key], wrapper]], 0])
+      let out = list_push(out, ["Expr", ["Call", "rt_register_function", [["Str", key], wrapper], "runtime"], 0])
     end
     let i = i + 1
   end

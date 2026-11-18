@@ -182,8 +182,9 @@ make a function called v2_declares takes stmts, name returns yes
 end
 
 # ["ok", lw_program's result], or ["error", messages]. The runtime's files are
-# found under runtime_root, "" being the current directory.
-make a function called v2_front_end takes src_path, runtime_root returns result
+# found under runtime_root, "" being the current directory; runtime_ensures:
+# whether their ensures are checked (--check-runtime, contracts.patlang).
+make a function called v2_front_end takes src_path, runtime_root, runtime_ensures returns result
   let collected = vec_new()
   let seen = vec_new()
   let unread = vec_new()
@@ -205,7 +206,7 @@ make a function called v2_front_end takes src_path, runtime_root returns result
   let i = 0
   while i < list_len(files) do
     let parsed = v2_parse_file(files[i][0], files[i][1])
-    let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0])])
+    let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0]), i < runtime_count, runtime_ensures])
     let errors = v2_concat(errors, parsed[1])
     let i = i + 1
   end
@@ -225,10 +226,7 @@ end
 
 # The path of the executable running.
 make a function called v2_own_path returns path
-  let buf = rt_alloc(1024)
-  let n = extern_call("KERNEL32.DLL", "GetModuleFileNameA", 0, buf + 16, 1024)
-  let path = rt_str_from_bytes(buf + 16, n)
-  rt_free(buf)
+  let path = program_path()
   ensure (type_of(path) == "string") and (path.length > 0)
   return path
 end
@@ -237,7 +235,39 @@ end
 # files' functions with their declarations alone, since the interpreter calls
 # the runtime's own compiled functions and lowering reads only what a
 # function takes. [the paths collected, the parsed files].
+#
+# Parsing the runtime's 20 files took most of an interpreter's start (2.4 s of
+# a one-line program, review finding O10), so the declarations are cached in
+# self_hosting/build/v2_runtime_declarations.txt, keyed by each runtime
+# file's size and time of writing: a start whose key matches reads them from
+# there, and any other parses and writes the cache again.
 make a function called v2_runtime_declarations takes runtime_root returns rt
+  let key = v2_runtime_key(runtime_root)
+  let cache = runtime_root + "self_hosting/build/v2_runtime_declarations.txt"
+  if file_exists(cache) then
+    let cached = v2_read_declarations(read_file(cache), key)
+    if list_len(cached) == 2 then
+      return cached
+    end
+  end
+  let rt = v2_parse_runtime_declarations(runtime_root)
+  v2_write_declarations(cache, key, rt)
+  return rt
+end
+
+# The runtime files' names, sizes and times of writing, as one line.
+make a function called v2_runtime_key takes runtime_root returns key
+  let rows = dir_files(runtime_root + "self_hosting/v2/runtime")
+  let b = sb_new()
+  let i = 0
+  while i < list_len(rows) do
+    sb_push(b, rows[i][0] + ":" + rows[i][1] + ":" + rows[i][2] + " ")
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called v2_parse_runtime_declarations takes runtime_root returns rt
   let collected = vec_new()
   let seen = vec_new()
   let unread = vec_new()
@@ -261,14 +291,159 @@ make a function called v2_runtime_declarations takes runtime_root returns rt
         if list_len(st) > 4 then
           let st = list_set(st, 4, "")
         end
+        let stmts = list_push(stmts, st)
       end
-      let stmts = list_push(stmts, st)
       let k = k + 1
     end
-    let parsed_files = list_push(parsed_files, [stmts, v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0])])
+    let parsed_files = list_push(parsed_files, [stmts, v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0]), true, false])
     let i = i + 1
   end
   return [vec_to_list(seen), parsed_files]
+end
+
+# The cache's text: the key; a line per path collected; for each file a line,
+# then a line per function: its node's length, name, parameters and the
+# events it raises; and last the count of functions, so a file cut short is
+# never taken for whole.
+make a function called v2_write_declarations takes cache, key, rt returns done
+  let tab = chr(9)
+  let nl = chr(10)
+  let b = sb_new()
+  sb_push(b, "key" + tab + key + nl)
+  let i = 0
+  while i < list_len(rt[0]) do
+    sb_push(b, "path" + tab + rt[0][i] + nl)
+    let i = i + 1
+  end
+  let count = 0
+  let f = 0
+  while f < list_len(rt[1]) do
+    let file = rt[1][f]
+    sb_push(b, "file" + tab + file[1] + tab + file[2] + nl)
+    let k = 0
+    while k < list_len(file[0]) do
+      let st = file[0][k]
+      let raises = []
+      if list_len(st) > 5 then
+        let raises = st[5]
+      end
+      sb_push(b, "func" + tab + list_len(st) + tab + st[1] + tab + str_join(st[2], ",") + tab + str_join(raises, ",") + nl)
+      let count = count + 1
+      let k = k + 1
+    end
+    let f = f + 1
+  end
+  sb_push(b, "end" + tab + count + nl)
+  # written whole under a name of its own, then moved over the cache, so a
+  # start reading it at the same moment sees the old file or the new one
+  # A cache is only a saving: a write or a move the system refuses (no files in
+  # a browser; the cache open in another start) leaves it as it was, and the
+  # start goes on
+  let temp = cache + "." + v2_hex(random_bytes(8)) + ".tmp"
+  if write_file(temp, sb_str(b)) then
+    if not try_rename_file(temp, cache) then
+      remove_file(temp)
+    end
+  end
+  return true
+end
+
+# The declarations in a cache's text, or [] when its key is not this one or
+# it is not whole.
+make a function called v2_read_declarations takes text, key returns rt
+  let lines = split_lines(text)
+  let tab = chr(9)
+  if (list_len(lines) < 2) or (lines[0] != "key" + tab + key) then
+    return []
+  end
+  let paths = []
+  let files = []
+  let stmts = []
+  let flags = []
+  let count = 0
+  let i = 1
+  while i < list_len(lines) do
+    let parts = v2_split_tabs(lines[i])
+    if parts[0] == "path" then
+      let paths = list_push(paths, parts[1])
+    elif parts[0] == "file" then
+      if list_len(flags) > 0 then
+        let files = list_push(files, [stmts, flags[0], flags[1]])
+      end
+      let stmts = []
+      let flags = [parts[1] == "true", parts[2] == "true"]
+    elif parts[0] == "func" then
+      let st = ["Func", parts[2], v2_split_commas(parts[3]), []]
+      let len = to_num(parts[1])
+      if len > 4 then
+        let st = list_push(st, "")
+      end
+      if len > 5 then
+        let st = list_push(st, v2_split_commas(parts[4]))
+      end
+      let stmts = list_push(stmts, st)
+      let count = count + 1
+    elif parts[0] == "end" then
+      if list_len(flags) > 0 then
+        let files = list_push(files, [stmts, flags[0], flags[1]])
+      end
+      if to_num(parts[1]) != count then
+        return []
+      end
+      return [paths, files]
+    end
+    let i = i + 1
+  end
+  # no end line: cut short
+  return []
+end
+
+make a function called v2_split_tabs takes line returns parts
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i < line.length do
+    if char_code(line, i) == 9 then
+      let parts = list_push(parts, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, line[i])
+    end
+    let i = i + 1
+  end
+  return list_push(parts, sb_str(cur))
+end
+
+make a function called v2_split_commas takes text returns parts
+  if text == "" then
+    return []
+  end
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i < text.length do
+    if char_code(text, i) == 44 then
+      let parts = list_push(parts, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, text[i])
+    end
+    let i = i + 1
+  end
+  return list_push(parts, sb_str(cur))
+end
+
+# Bytes as lowercase hex, two digits each.
+make a function called v2_hex takes bytes returns text
+  let digits = "0123456789abcdef"
+  let b = sb_new()
+  let i = 0
+  while i < list_len(bytes) do
+    sb_push(b, substr(digits, word_shr(bytes[i], 4), 1))
+    sb_push(b, substr(digits, word_and(bytes[i], 15), 1))
+    let i = i + 1
+  end
+  return sb_str(b)
 end
 
 # v2_front_end for a program the interpreter runs, given its path and its text,

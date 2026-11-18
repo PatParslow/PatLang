@@ -32,12 +32,15 @@ Run from the repository root: `v2.exe` reads the runtime from
 * First compiler, when there is none:
   `py -3 bootstrap/ir_reader.py bootstrap/v2_compiler.ir self_hosting/build/v2.exe`
 * Compile: `self_hosting/build/v2.exe SRC.patlang OUT.exe [--workers N]`; also
-  `OUT.ir --ir`, `OUT.wasm --wasm`, and `SRC --constant-time`.
+  `OUT.ir --ir`, `OUT.wasm --wasm`, and `SRC --constant-time`. `--check-runtime` also checks
+  the runtime's `ensure` clauses, which a build leaves out by default (spec 2.4).
 * Interpret: `self_hosting/build/v2_interp.exe SRC.patlang [args...]`
 * Rebuild the interpreter after a runtime or interpreter change:
   `self_hosting/build/v2.exe self_hosting/v2/interp.patlang self_hosting/build/v2_interp.exe --workers 4`
 * Rebuild the compiler from its sources: let the gates do it. The `compiler` unit
   builds two generations, checks they are byte identical, and installs the second.
+  When a change alters the code the compiler generates, the first two differ, so it
+  builds a third and checks that the second and third are identical.
 * WASM: `node self_hosting/v2/wasm/run_node.mjs [--files DIR] PROGRAM.wasm [ARGS...]`,
   or `self_hosting/v2/wasm/run_browser.py` for headless Chrome.
 * Scripted edits: `py -3 -I tools/edit_files.py SPEC [--check]` (§2.5).
@@ -228,7 +231,9 @@ called` is not a value you can pass by its bare name from another function.
 A program that runs for more than a few seconds, or as a daemon, is built with
 monitoring and resumability from the start.
 
-- **`status` and `quit` handlers** at the top level, at minimum.
+- **`status` and `quit` handlers** at the top level, at minimum, and
+  `signal_allow(["status", "quit"])` after `signal_claim`: a peer reaches only the
+  handlers the program allows, and only with the run's token (`lib/signals.patlang`).
 - **The handler answers while the work runs**: the main loop is in
   `budgeted(ms) { ... }` or yields as often. Verify it on a realistic workload with a
   real `signal_query(port, "status", "")` while it is busy.

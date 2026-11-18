@@ -2,8 +2,8 @@
 # docs/plans/v2-implementation.md, milestone 8).
 #
 # After the lowering, each function is one job: the ownership stage, code
-# generation and assembly, giving the function's chunk. A job's key is a
-# hash of everything its output depends on:
+# generation and assembly, giving the function's chunk. A job's key is the
+# SHA-256 of everything its output depends on (see "keys" below):
 #   - the function's IR;
 #   - what code generation reads of the program facts (B2:
 #     xv_facts_used);
@@ -17,22 +17,15 @@
 # in the order given; the chunks are linked in declaration order whatever
 # order the jobs ran in, so any worker count gives the same executable.
 
-# ---- hashing: two 32-bit FNV-1a lanes ----
-#
-# A hash is [a, b]. jb_mix mixes one code into it; the functions below
-# keep the two lanes in locals while they mix a whole string or integer,
-# so each costs one list, not one per character. An integer is mixed as
-# its eight bytes, low first (its two's complement, so every fixnum has its
-# own bytes), never through its decimal text.
+include "../../packages/sha256/sha256.patlang"
 
-make a function called jb_mix takes h, c returns out
-  require list_len(h) == 2
-  let a = ((h[0] bxor c) * 16777619) % 4294967296
-  let b = ((h[1] bxor ((c + 101) % 256)) * 16777619) % 4294967296
-  let out = [a, b]
-  ensure list_len(out) == 2
-  return out
-end
+# ---- bucket indexes: two 32-bit FNV-1a lanes ----
+#
+# A hash is [a, b], for a table's bucket index only: a collision there costs
+# a comparison, never a wrong answer. The functions below keep the two lanes
+# in locals while they mix a whole string or integer, so each costs one list,
+# not one per character. An integer is mixed as its eight bytes, low first
+# (its two's complement, so every fixnum has its own bytes).
 
 make a function called jb_hash_new returns h
   let h = [2166136261, 84696351]
@@ -89,90 +82,50 @@ make a function called jb_mix_text takes h, s returns out
   return out
 end
 
-# A length or count.
-make a function called jb_mix_int takes h, n returns out
-  require list_len(h) == 2
-  let out = jb_lanes_int(h[0], h[1], 73, n)
-  ensure list_len(out) == 2
-  return out
+# ---- keys: SHA-256 of an encoding ----
+#
+# A key names an artefact the build reuses unseen, so two inputs must never
+# share one: the FNV lanes above are for bucket indexes only, where a
+# collision costs a comparison (review finding S13: 64 bits of FNV-1a can be
+# made to collide). A key is the SHA-256 of an encoding of its inputs in
+# which each item says what it is and how long, so no two inputs encode
+# alike: a string is s, its length, :, its text; an int i, its digits, ;; a
+# list l, its length, :, then its items; anything else o, its type, :, then
+# its printed form as a string.
+
+make a function called jb_enc_text takes b, s returns b2
+  sb_push(b, "s" + s.length + ":")
+  sb_push(b, s)
+  return b
 end
 
-make a function called jb_mix_text_plain takes h, s returns out
-  require list_len(h) == 2
-  let out = jb_lanes(h[0], h[1], -1, s)
-  ensure list_len(out) == 2
-  return out
-end
-
-# A value's structure: a list's length then each element; a string's
-# length then its characters; a fixnum its bytes; anything else its type
-# and printed form, tagged.
-make a function called jb_mix_value takes h, v returns out
-  require list_len(h) == 2
+make a function called jb_enc_value takes b, v returns b2
   let c = value_class(v)
   if c == 9 then
-    let h = jb_lanes_int(h[0], h[1], 76, list_len(v))
+    sb_push(b, "l" + list_len(v) + ":")
     let i = 0
     while i < list_len(v) do
-      let h = jb_mix_value(h, v[i])
+      jb_enc_value(b, v[i])
       let i = i + 1
     end
-    return h
+    return b
   end
   if c == 8 then
-    return jb_mix_text(h, v)
+    return jb_enc_text(b, v)
   end
   if c == 2 then
-    return jb_lanes_int(h[0], h[1], 105, v)
+    sb_push(b, "i" + v + ";")
+    return b
   end
-  let out = jb_lanes(h[0], h[1], 79, type_of(v) + ":" + v)
-  ensure list_len(out) == 2
-  return out
+  sb_push(b, "o" + type_of(v) + ":")
+  return jb_enc_text(b, "" + v)
 end
 
-# A file's bytes as a list (O(n) to walk, where indexing a large string is
-# not): read_file_bytes(path, offset, length) in 1 MB windows until one
-# comes back short.
-make a function called jb_read_bytes takes path returns bytes
-  let window = 1048576
-  let bytes = []
-  let offset = 0
-  let more = true
-  while more do
-    let part = read_file_bytes(path, offset, window)
-    let k = 0
-    while k < list_len(part) do
-      let bytes = list_push(bytes, part[k])
-      let k = k + 1
-    end
-    let offset = offset + list_len(part)
-    let more = list_len(part) == window
-  end
-  return bytes
-end
-
-make a function called jb_mix_file takes h, path returns out
-  require list_len(h) == 2
-  let bytes = jb_read_bytes(path)
-  let n = list_len(bytes)
-  let h = jb_mix_int(h, n)
-  let a = h[0]
-  let b = h[1]
-  let i = 0
-  while i < n do
-    let c = bytes[i]
-    let a = ((a bxor c) * 16777619) % 4294967296
-    let b = ((b bxor ((c + 101) % 256)) * 16777619) % 4294967296
-    let i = i + 1
-  end
-  let out = [a, b]
-  ensure list_len(out) == 2
-  return out
-end
-
-# A hash as text: its two lanes in decimal.
-make a function called jb_key_text takes h returns s
-  return "" + h[0] + "_" + h[1]
+# An encoding's key: its SHA-256, in hex (a file name's safe characters).
+make a function called jb_digest takes b returns key
+  let key = sha256_string_hex(sb_str(b))
+  ensure key.length == 64
+  return key
 end
 
 # ---- ownership summaries ----
@@ -248,13 +201,13 @@ end
 # A program's key: its files' texts, in the order they were collected.
 make a function called jb_sources_key takes files returns key
   require value_class(files) == 9
-  let h = jb_hash_new()
+  let b = sb_new()
   let i = 0
   while i < list_len(files) do
-    let h = jb_mix_text(h, files[i][1])
+    jb_enc_text(b, files[i][1])
     let i = i + 1
   end
-  let key = jb_key_text(h)
+  let key = jb_digest(b)
   ensure key.length > 0
   return key
 end
@@ -270,16 +223,27 @@ make a function called jb_compiler_key returns key
   return key
 end
 
+# A job's key: the compiler's key (base), then what the job's output depends on.
 make a function called jb_fn_key takes base, func, facts, table returns key
-  let h = jb_mix_value(base, xv_facts_used(facts))
-  let h = jb_mix_value(h, func)
+  let b = sb_new()
+  jb_enc_text(b, base)
+  jb_enc_value(b, xv_facts_used(facts))
+  jb_enc_value(b, func)
   let callees = jb_callees(func)
   let i = 0
   while i < list_len(callees) do
-    let h = jb_mix_value(h, jb_summary_of(table, callees[i]))
+    jb_enc_value(b, jb_summary_of(table, callees[i]))
     let i = i + 1
   end
-  return jb_key_text(h)
+  return jb_digest(b)
+end
+
+# The entry code's key: the compiler's key, then the entry's text.
+make a function called jb_entry_key takes base, entry returns key
+  let b = sb_new()
+  jb_enc_text(b, base)
+  jb_enc_text(b, entry)
+  return jb_digest(b)
 end
 
 # ---- chunk artefacts: the text and data sections' bytes as they are
@@ -462,49 +426,6 @@ end
 
 # ---- eviction ----
 
-# A line's words, split on spaces.
-make a function called jb_words takes line returns words
-  let words = []
-  let cur = sb_new()
-  let any = false
-  let i = 0
-  let n = line.length
-  while i < n do
-    let c = char_code(line, i)
-    if c == 32 then
-      if any then
-        let words = list_push(words, sb_str(cur))
-        let cur = sb_new()
-        let any = false
-      end
-    else
-      sb_push(cur, chr(c))
-      let any = true
-    end
-    let i = i + 1
-  end
-  if any then
-    let words = list_push(words, sb_str(cur))
-  end
-  return words
-end
-
-make a function called jb_all_digits takes s returns yes
-  let n = s.length
-  if n == 0 then
-    return false
-  end
-  let i = 0
-  while i < n do
-    let c = char_code(s, i)
-    if (c < 48) or (c > 57) then
-      return false
-    end
-    let i = i + 1
-  end
-  return true
-end
-
 # Where the name's extension starts, or -1.
 make a function called jb_last_dot takes name returns at
   let i = name.length - 1
@@ -528,33 +449,62 @@ make a function called jb_stem_bucket takes stem returns b
   return h
 end
 
-# The store's files, least recently written first: a list of [name, bytes]. Each
-# line of `dir` that names a file ends in its size and its name.
+# The store's files, least recently written first, those written at the same
+# time by name: a list of [name, bytes]. Read with dir_files, never through a
+# shell: a directory's name is not a command.
 make a function called jb_store_files takes dir returns files
-  let win = sb_new()
-  let i = 0
-  while i < dir.length do
-    if char_code(dir, i) == 47 then
-      sb_push(win, chr(92))
-    else
-      sb_push(win, chr(char_code(dir, i)))
-    end
-    let i = i + 1
-  end
-  let lines = split_lines(exec_capture("cmd", "/c", "dir /a-d /o:d /t:w /-c " + sb_str(win)))
+  let rows = jb_sort_written(dir_files(dir))
   let files = []
   let k = 0
-  while k < list_len(lines) do
-    let words = jb_words(lines[k])
-    let n = list_len(words)
-    if n >= 4 then
-      if jb_all_digits(words[n - 2]) and (jb_last_dot(words[n - 1]) > 0) then
-        let files = list_push(files, [words[n - 1], to_num(words[n - 2])])
-      end
+  while k < list_len(rows) do
+    if jb_last_dot(rows[k][0]) > 0 then
+      let files = list_push(files, [rows[k][0], rows[k][1]])
     end
     let k = k + 1
   end
   return files
+end
+
+# dir_files' rows, sorted by when each was written (stable: rows written at
+# the same time keep their order, which is by name): a merge sort.
+make a function called jb_sort_written takes rows returns sorted
+  let n = list_len(rows)
+  if n < 2 then
+    return rows
+  end
+  let mid = floor(n / 2)
+  let left = []
+  let right = []
+  let i = 0
+  while i < n do
+    if i < mid then
+      let left = list_push(left, rows[i])
+    else
+      let right = list_push(right, rows[i])
+    end
+    let i = i + 1
+  end
+  let left = jb_sort_written(left)
+  let right = jb_sort_written(right)
+  let out = []
+  let a = 0
+  let b = 0
+  while (a < list_len(left)) or (b < list_len(right)) do
+    if b >= list_len(right) then
+      let out = list_push(out, left[a])
+      let a = a + 1
+    elif a >= list_len(left) then
+      let out = list_push(out, right[b])
+      let b = b + 1
+    elif right[b][2] < left[a][2] then
+      let out = list_push(out, right[b])
+      let b = b + 1
+    else
+      let out = list_push(out, left[a])
+      let a = a + 1
+    end
+  end
+  return out
 end
 
 # Removes whole jobs, least recently used first, until the store is no more than

@@ -49,10 +49,12 @@ make a function called rt_str_chars takes s returns n
     let n = 0
     let i = 0
     while i < len do
-      if word_and(mem_load_byte(at, i), 192) != 128 then
-        let n = n + 1
+      if mem_load_byte(at, i) < 128 then
+        let i = i + 1
+      else
+        let i = i + rt_utf8_step(at, i, len)
       end
-      let i = i + 1
+      let n = n + 1
     end
     mem_store(block, 24, n)
   end
@@ -74,46 +76,100 @@ make a function called rt_char_offset takes s, i returns at
   let at = 0
   let k = 0
   while (k < i) and (at < len) do
-    let at = at + rt_utf8_width(mem_load_byte(bytes, at))
+    let at = at + rt_utf8_step(bytes, at, len)
     let k = k + 1
   end
-  ensure at >= 0
+  ensure (at >= 0) and (at <= len)
   return at
 end
 
-# A character's length in bytes, from its first byte.
-make a function called rt_utf8_width takes lead returns w
-  require value_class(lead) == 2
+# The characters of a string's bytes (spec 1.10). At byte `at` of `len` there
+# is either a well-formed UTF-8 sequence, wholly within the bytes (Unicode's
+# table 3-7: no overlong form, no surrogate, nothing past U+10FFFF), or a byte
+# that starts none, which is a character of its own, U+FFFD. Counting,
+# stepping and decoding all go by this, and none reads past `len`.
+
+# Whether byte k of the sequence at `at` lies in [lo, hi] and within len.
+make a function called rt_utf8_cont takes bytes, at, k, len, lo, hi returns yes
+  require (at >= 0) and (k >= 1)
+  if at + k >= len then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let b = mem_load_byte(bytes, at + k)
+  let yes = (b >= lo) and (b <= hi)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The length of the well-formed sequence at `at`, or 0 when there is none.
+make a function called rt_utf8_seq takes bytes, at, len returns w
+  require (at >= 0) and (at < len)
+  let lead = mem_load_byte(bytes, at)
+  let w = 0
   if lead < 128 then
     let w = 1
-  elif lead < 224 then
-    let w = 2
-  elif lead < 240 then
-    let w = 3
-  else
-    let w = 4
+  elif (lead >= 194) and (lead <= 223) then
+    if rt_utf8_cont(bytes, at, 1, len, 128, 191) then
+      let w = 2
+    end
+  elif (lead >= 224) and (lead <= 239) then
+    let lo = 128
+    let hi = 191
+    if lead == 224 then
+      let lo = 160
+    elif lead == 237 then
+      let hi = 159
+    end
+    if rt_utf8_cont(bytes, at, 1, len, lo, hi) and rt_utf8_cont(bytes, at, 2, len, 128, 191) then
+      let w = 3
+    end
+  elif (lead >= 240) and (lead <= 244) then
+    let lo = 128
+    let hi = 191
+    if lead == 240 then
+      let lo = 144
+    elif lead == 244 then
+      let hi = 143
+    end
+    if rt_utf8_cont(bytes, at, 1, len, lo, hi) and rt_utf8_cont(bytes, at, 2, len, 128, 191) and rt_utf8_cont(bytes, at, 3, len, 128, 191) then
+      let w = 4
+    end
   end
-  ensure (w >= 1) and (w <= 4)
+  ensure (w >= 0) and (w <= 4) and (at + w <= len)
   return w
 end
 
-# The character starting at a byte address.
-make a function called rt_utf8_decode takes at returns code
-  require at != 0
-  let lead = mem_load_byte(at, 0)
-  let w = rt_utf8_width(lead)
-  if w == 1 then
+# How many bytes the character at `at` takes: its sequence, or the one byte.
+make a function called rt_utf8_step takes bytes, at, len returns w
+  require (at >= 0) and (at < len)
+  let w = rt_utf8_seq(bytes, at, len)
+  if w == 0 then
+    let w = 1
+  end
+  ensure (w >= 1) and (at + w <= len)
+  return w
+end
+
+# The code of the character at `at`.
+make a function called rt_utf8_code takes bytes, at, len returns code
+  require (at >= 0) and (at < len)
+  let w = rt_utf8_seq(bytes, at, len)
+  let lead = mem_load_byte(bytes, at)
+  if w == 0 then
+    let code = 65533
+  elif w == 1 then
     let code = lead
-    ensure code >= 0
-    return code
+  else
+    let code = word_and(lead, word_shr(127, w))
+    let k = 1
+    while k < w do
+      let code = word_or(word_shl(code, 6), word_and(mem_load_byte(bytes, at + k), 63))
+      let k = k + 1
+    end
   end
-  let code = word_and(lead, word_shr(127, w))
-  let k = 1
-  while k < w do
-    let code = word_or(word_shl(code, 6), word_and(mem_load_byte(at, k), 63))
-    let k = k + 1
-  end
-  ensure code >= 0
+  ensure (code >= 0) and (code < 1114112)
   return code
 end
 
@@ -262,6 +318,56 @@ make a function called str_contains takes hay, needle returns yes
   return yes
 end
 
+# Whether the whole of text matches a glob pattern (a match case's glob, spec
+# 1.13): * matches any run of characters, none included, ? any one character,
+# and every other character itself. Text that is not a string matches nothing.
+# A * that fails to cover enough is retried one character longer, so the work
+# is at most the text's length times the pattern's.
+make a function called glob_match takes text, pattern returns yes
+  require value_live(text) and (value_class(pattern) == 8)
+  if value_class(text) != 8 then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let t = str_intern(text)
+  let p = str_intern(pattern)
+  let tn = sc_len(t)
+  let pn = sc_len(p)
+  let ti = 0
+  let pi = 0
+  let star = 0 - 1
+  let mark = 0
+  while ti < tn do
+    let pc = 0 - 1
+    if pi < pn then
+      let pc = sc_code(p, pi)
+    end
+    if (pc == 63) or ((pc >= 0) and (pc != 42) and (pc == sc_code(t, ti))) then
+      let ti = ti + 1
+      let pi = pi + 1
+    elif pc == 42 then
+      let star = pi
+      let mark = ti
+      let pi = pi + 1
+    elif star >= 0 then
+      let mark = mark + 1
+      let ti = mark
+      let pi = star + 1
+    else
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+  end
+  while (pi < pn) and (sc_code(p, pi) == 42) do
+    let pi = pi + 1
+  end
+  let yes = pi == pn
+  ensure value_class(yes) == 1
+  return yes
+end
+
 # The decimal text of a 64-bit int.
 make a function called rt_int_to_s takes n returns s
   require (value_class(n) == 2)
@@ -363,6 +469,11 @@ make a function called to_s takes v returns s
   end
   if c == 15 then
     let s = rt_modint_to_s(v)
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 17 then
+    let s = logic_var_name(v)
     ensure value_class(s) == 8
     return s
   end
@@ -473,6 +584,11 @@ make a function called type_of takes v returns name
   end
   if c == 13 then
     let name = "bool_array"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 17 then
+    let name = "logic_var"
     ensure (value_class(name) == 8) and (str_len(name) > 0)
     return name
   end

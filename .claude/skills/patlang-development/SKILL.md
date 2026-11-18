@@ -101,7 +101,9 @@ this built in from the start, not bolted on after a hang is discovered (see
 project `CLAUDE.md` §6 for the canonical statement -- summarized here):
 
 - Declare `status` and `quit` signal handlers at the top level, at minimum
-  (`signal_claim`/`signal_poll`/`signal_query`/`signal_reply`).
+  (`signal_claim`/`signal_poll`/`signal_query`/`signal_reply`), and name them in
+  `signal_allow([...])` after `signal_claim`: a signal whose name is not allowed
+  is ignored, so an internal `when` event cannot be raised from outside.
 - **A `status` handler that can't respond promptly while real work is
   running does not count as done.** Wrap the actual work loop in
   `budgeted(ms) { ... }` (or an equivalent yield schedule) so the

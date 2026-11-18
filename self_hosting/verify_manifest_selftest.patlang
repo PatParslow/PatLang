@@ -1,0 +1,59 @@
+# Selftest for packages/tools/verify_manifest.patlang (review finding S16).
+#
+# Given a package whose manifest lists its one shipped file with the right
+# hash, when it is verified, then it passes.
+# Given a package that ships a file its manifest does not list, when it is
+# verified, then that file is reported UNLISTED and it fails; a file under
+# spec/ or build/ is not shipped and needs no line.
+# Given a manifest whose file line names ../ or an absolute path, when it is
+# verified, then the line is reported OUTSIDE, nothing outside the package is
+# read, and it fails.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/v2_engines.patlang"
+include "../packages/sha256/sha256.patlang"
+
+let ctx = ctx_new()
+let root = spec_out() + "/verify_manifest_selftest"
+
+# A package directory holding `files` ([path, text] pairs) and a manifest of
+# `lines`; its path.
+make a function called vmt_package takes root, name, files, lines returns dir
+  let dir = root + "/" + name
+  let i = 0
+  while i < list_len(files) do
+    write_file(dir + "/" + files[i][0], files[i][1])
+    let i = i + 1
+  end
+  write_file(dir + "/manifest.pkg", str_join(lines, chr(10)) + chr(10))
+  return dir
+end
+
+make a function called vmt_verify takes dir returns r
+  let r = exec_measured("self_hosting/build/v2_interp.exe", ["packages/tools/verify_manifest.patlang", dir])
+  return [r[2], r[0]]
+end
+
+write_file(root + "/secret.txt", "outside the package")
+let good_hash = sha256_string_hex("lib text" + chr(10))
+
+let good = vmt_package(root, "good", [["lib.patlang", "lib text" + chr(10)], ["spec/run.patlang", "a spec"], ["build/out.txt", "built"]], ["package good", "file lib.patlang sha256 " + good_hash])
+let r = vmt_verify(good)
+expect(ctx, "a package listing its shipped file passes", r[0], true)
+expect(ctx, "and says ok for it", contains_text(r[1], "ok lib.patlang"), true)
+
+let extra = vmt_package(root, "extra", [["lib.patlang", "lib text" + chr(10)], ["more.patlang", "unlisted"]], ["package extra", "file lib.patlang sha256 " + good_hash])
+let r = vmt_verify(extra)
+expect(ctx, "a shipped file with no line is reported", contains_text(r[1], "UNLISTED more.patlang"), true)
+expect(ctx, "and the package fails", r[0], false)
+
+let secret_hash = sha256_string_hex("outside the package")
+let out = vmt_package(root, "out", [["lib.patlang", "lib text" + chr(10)]], ["package out", "file lib.patlang sha256 " + good_hash, "file ../secret.txt sha256 " + secret_hash, "file " + path_absolute(root + "/secret.txt") + " sha256 " + secret_hash])
+let r = vmt_verify(out)
+expect(ctx, "a ../ path is reported outside", contains_text(r[1], "OUTSIDE ../secret.txt"), true)
+expect(ctx, "an absolute path is reported outside", contains_text(r[1], "OUTSIDE " + path_absolute(root + "/secret.txt")), true)
+expect(ctx, "neither is read as ok", contains_text(r[1], "ok ../secret.txt") or contains_text(r[1], "ok " + path_absolute(root + "/secret.txt")), false)
+expect(ctx, "and the package fails", r[0], false)
+
+ctx_report(ctx)

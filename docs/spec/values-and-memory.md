@@ -17,7 +17,7 @@ memory use.
 Every value is an object of a class, and carries that class with it.
 `type_of(v)` names the class: `int`, `bigint`, `float`, `rational`,
 `complex`, `interval`, `bool`, `unit`, `string`, `list`, `closure`,
-`string_builder`, `vec`, `bool_array`, `rule_store`, `modint`, or the class a `class` declaration
+`string_builder`, `vec`, `bool_array`, `rule_store`, `modint`, `logic_var`, or the class a `class` declaration
 or `new` gave it. No value is ever classless, and no operation changes a
 value's class without producing a new value.
 
@@ -25,7 +25,12 @@ value's class without producing a new value.
 changes today's behaviour: `new` returns the object's name, the string
 `"w1"`, and `get`, `send` and `object_delete` look the object up by that
 name. The name stays a way to find a named object (1.6): `s.field` and
-`s.field = x`, where `s` is a string holding the name, reach the object's field.
+`s.field = x`, where `s` is a string holding the name, reach the object's field,
+and `get`, `send` and `object_delete` given the name reach the object. A program
+can declare otherwise: once it calls `object_names_explicit()`, a string is only a
+string in its world (text from a file or a socket that equals a name reaches
+nothing), and `object_named(name)` gives the object with that name, or `unit`
+when none has it. `object_named` works whichever a program declares.
 `new` takes a class and a name and nothing more: further arguments stop the program,
 since inheritance and traits belong to a `class` declaration.
 
@@ -48,7 +53,13 @@ two integers that divides evenly is an `int`; otherwise it is a
 ### 1.4 Operators are methods, and raise ordinary events
 
 An operator is a method of its left operand's class: `3 + 5` sends `+` to
-3 with argument 5. A method's declaration may name events it raises. They
+3 with argument 5. Each of `<`, `>`, `<=` and `>=` is sent as itself: an
+object's class defines the ones it uses, and one it does not define stops the
+program naming the operator and the class. `==` and `!=` are never sent to a
+class, since objects compare by identity (1.5), and a class declaring a method
+by either name is refused before anything runs. A float NaN is ordered against
+nothing, itself included: every comparison with one is false, but `!=`, which
+is true. A method's declaration may name events it raises. They
 are ordinary PatLang events: named where declared, raised and handled as
 any event is (`emit`, `when`), with nothing specific to operators.
 
@@ -92,9 +103,9 @@ any event is (`emit`, `when`), with nothing specific to operators.
   value that has no elements, gives `unit`, as `get` does for a missing field.
   Indexing a string past its ends gives `""`. `getenv` gives `""` for an unset
   variable and `read_file` gives `""` for a missing file; `file_exists` tells a
-  missing file from an empty one. `vfs_exists` gives the text `"1"` or `"0"`,
-  which the old engines' library code shares, and `vfs_read` of a missing path
-  stops the program. `query` gives the number of matches, 0 for none.
+  missing file from an empty one. `vfs_exists` gives `true` or `false`, and
+  `vfs_read` of a missing path stops the program. (`vfs_exists` gave the text `"1"` or
+  `"0"`, both true as a condition, so `if vfs_exists(p)` always took its first branch.) `query` gives the number of matches, 0 for none.
 
 ### 1.6 Memory
 
@@ -103,6 +114,13 @@ any event is (`emit`, `when`), with nothing specific to operators.
   is bounded runs in bounded memory however long it runs: a loop that
   replaces a value each iteration does not grow memory with the number of
   iterations.
+- Freeing a value takes no more stack however deeply it is nested: a list nested a
+  million deep is dropped like any other.
+- Values that hold each other (two objects each in a field of the other, a vec
+  that holds itself, a closure in the vec it captured) are freed too, once
+  nothing else holds any of them, though not at once: the runtime looks for
+  them each time the number of objects, vecs and rule stores has doubled, and
+  only while no thread but the first is running.
 - **Named objects** (`new` with a name) are the one exception: they live
   until `object_delete`, which frees them and releases what they hold. Finding
   one by its name takes about the same time however many there are. A repeated
@@ -125,12 +143,20 @@ running it.
   runs it until it yields or returns, handing it `v`, and gives what it yielded
   or returned. `fiber_yield(v)` goes back to whoever resumed it, and gives what
   the next resume hands it. `fiber_alive(id)` is true until it has returned.
-  Resuming a finished fiber, and yielding on no fiber, stop the program.
+  Resuming a finished fiber, and yielding on no fiber, stop the program. A fiber
+  runs on one thread at a time: resuming one that is running (from inside
+  itself, or from a second thread while the first runs it) stops the program,
+  saying it is already running.
 - `budgeted(ms, handle) { body }` runs the body on a fiber until `ms` have passed,
-  checking at each back-edge of a loop lexically in the body, and yielding early
+  checking at the back-edges of the loops lexically in the body, and yielding early
   if the next iteration, judged by the recent ones, would pass the deadline. It
   gives `["done", value]` or `["paused", handle]`; passing the handle back continues
   the body. The body captures what it reads as a closure does.
+- The clock is read once per batch of back-edges: as many iterations as take about a
+  millisecond, or half the time left, at the rate the recent ones predict, and at least one.
+  An iteration of a millisecond or more is a batch of its own. 2 million cheap iterations take
+  46 ms budgeted and 9 ms plain (reading the clock at each back-edge took 950 ms). A batch of
+  fast iterations can pass the deadline by what the rate it was judged at underestimated.
 - `thread_spawn(closure, args...)` calls the closure with the arguments that follow it, none or
   more, on a thread of its own; their number is checked as any closure call's is (1.13).
   `thread_poll(id)` says, without waiting, whether it has finished. `thread_result(id)`
@@ -138,6 +164,34 @@ running it.
   thread held, and a further call stops the program.
 - Any number of threads may run the same function at once, including the first time
   it is called: each gives what one thread alone would.
+- What threads share. The runtime's own tables may be changed from any thread, each change
+  one step: the virtual files (`vfs_write`, `vfs_append`, `vfs_delete`), handlers, classes,
+  named objects, named rule stores, actions and goals, connections and processes. Four
+  workers writing virtual files together leave every write there.
+- A vec, a string builder, a bool array, an object's fields and a rule store each belong to
+  one thread at a time. Threads may read one together, and one thread may hand it to
+  another. When a thread changes one while another thread is reading or changing it, the
+  program stops (98) saying so; it is never left with corrupted memory. Whether two threads
+  meet depends on timing, so a program that shares one without taking turns may run or may
+  stop: give each worker its own and merge afterwards. The language has no lock.
+- TCP is on this machine only. A listener binds 127.0.0.1 itself, not every address, and while
+  it holds the port Windows refuses another socket binding 127.0.0.1 on it, from this process
+  or another, even one that sets `SO_REUSEADDR` (checked 2026-11-17). `tcp_connect` takes
+  `localhost` or a `127.x.x.x` address; another address stops the program saying it is not this
+  machine, and text that is not four numbers of 0 to 255 stops it saying it is not an address.
+- The runtime's locks go to whichever waiting thread is running when the lock comes free, not
+  to the waiters in turn, and a waiting thread spins briefly, then gives up the rest of its
+  time slice each turn. So more threads than processors, or a machine busy with other work,
+  do not hold a lock back for one waiter to be run: 16 threads take about as long as 4 for the
+  same work, idle or loaded, where they once took up to 165 times as long.
+- `tcp_accept_timeout(port, ms)` gives a connection made within `ms`, else -1, and leaves the
+  listener waiting as before: a later `tcp_accept` waits for its client. Threads may wait on
+  one listener at once, with either call: each connection goes to one of them, and each timed
+  wait still gives -1 when its time is up.
+  `tcp_read_timeout(conn, ms)` gives what arrives within `ms`, and `""` when nothing does,
+  when the peer has closed, or when the read fails. `tcp_try_write(conn, data)` gives `false`
+  when the peer has gone, where `tcp_write` stops the program. `random_bytes(n)` gives `n`
+  bytes, each 0 to 255, from the system's random source, fit for a secret.
 - A fiber's and a thread's memory is given back when it has ended and, for a thread,
   its result has been taken. A fiber that never finishes keeps its stack and what its
   frames hold, since its id can still resume it.
@@ -159,8 +213,15 @@ A string holds characters, whatever bytes they take. `.length`, indexes, `substr
 `char_code`, `chr` and the string cursor (`str_intern`, `sc_len`, `sc_code`, `sc_char`,
 `sc_substr`) all count characters; `byte_length` and `hash_string` see the UTF-8 bytes.
 An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
-the cursor. `chr(n)` gives the character whose code is the int `n`; anything else stops the
-program.
+the cursor. `chr(n)` gives the character whose code is the int `n`; anything else, a
+surrogate code (U+D800 to U+DFFF) included, stops the program.
+
+Text from outside (`read_file`, `tcp_read`, a child's output) holds whatever bytes arrived,
+and keeps them. Its characters are its well-formed UTF-8 sequences (Unicode's table 3-7: no
+overlong form, no surrogate, nothing past U+10FFFF, each wholly within the string), and each
+byte that starts none is a character of its own whose code is 65533 (U+FFFD). Counting,
+indexing, `substr`, `char_code` and the cursor all read characters this way, and none reads
+past the string's last byte.
 
 `str_contains(text, needle)` says whether the text holds the needle, in time that grows
 with the text's bytes whatever characters it holds. The empty needle is in every text.
@@ -222,16 +283,103 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   it prints. (`pat` printed the value of a program's last top-level expression; v2 does not.)
 - The name `unit` in a program is that value, unless the program binds `unit` itself, as a
   parameter or with `let`.
+- The primitives that read or write memory (`mem_load`, `mem_store` and the rest), make or take
+  apart a value's words (`value_make`, `value_data`, `value_type_word`), or reach the system or
+  the runtime's state (`extern_call`, `extern_call_float`, `atomic_add`, `runtime_state`,
+  `thread_entry_address`, `closure_call_unchecked`, `runtime_functions_by_name`), and every
+  function named `rt_` that the runtime declares and the program does not, belong to the
+  runtime: only a file declaring `quiet_operators()` calls one, or names one as a by-name
+  argument. Anywhere else the build is refused, naming each, before anything runs; the
+  interpreter refuses the same. A name made at run time reaches no runtime `rt_` function on
+  either engine. Word and float arithmetic, `value_class`, `value_live` and the constant-time
+  marks are open to every program.
+- `now_ms()` gives the wall clock, in milliseconds since 1970: for a time of day, which the
+  system may set back or forward. `clock_ms()` gives milliseconds from an unspecified start that
+  never go back: for intervals and deadlines. The runtime's own deadlines (`budgeted`,
+  `tcp_accept_timeout`, `tcp_read_timeout`, a process's timeout) use `clock_ms`, so changing
+  the wall clock moves none of them.
+- A `match` case may be a glob (`case *.txt then`, `case img* then`): the case is taken when
+  `glob_match(subject, pattern)` holds, in any program. `glob_match` is whether the whole text
+  matches: `*` matches any run of characters, none included, `?` any one character, and every
+  other character itself. A subject that is not a string matches no glob.
+- `host_caps()` says what the host running the program can do: `["x64", "subprocess", "tcp",
+  "fs"]` in a native build, and `["wasm"]` in a browser, which has none of those.
+- A statement that is only a value (a literal, a variable, operators on them, a list of them)
+  prints that value, wherever it is, the program's last statement included: nothing takes its
+  value. A call whose value nothing uses prints nothing, and a function's or closure's last
+  statement is the value it returns, not printed.
+- `not` binds more loosely than a comparison and more tightly than `and` and `or`: `not a == b`
+  is `not (a == b)`, and `not a == b and c` is `(not (a == b)) and c`.
+- Any expression followed by `(` on its line is called, as a closure held in a variable is:
+  `make_adder(3)(7)`, `fs[0](x)`, `(|x| { return x })(1)`. A bare name followed by `(` calls
+  the function or variable of that name, as before.
+- An error found while building names the line of the statement it is in (`line 6: undefined
+  variable nope`), and the lexer's own errors the line they start on: a string never closed is
+  refused at the line where it opens. A string may run over several lines, and the lines after
+  it keep their numbers. A number may have an exponent, and is then exact as any number written
+  without one is: `1e3` is 1000, `2.5e-2` is 1/40, `4E+1` is 40.
+- A stop says what went wrong in the program's terms: an exact number divided by an exact zero
+  is `division by zero` (exit 74); an operation given a type it does not take names it (`this
+  operation does not take a modint`, exit 70); running out of memory says so (exit 71); a value
+  freed twice, a defect in the runtime, says so with an exit code of its own (69), apart from a
+  call of a name nothing declares (72).
+- The interpreter takes the runtime's declarations (each function's name and parameters; it
+  runs the runtime's compiled functions themselves) from `self_hosting/build/
+  v2_runtime_declarations.txt` when that file's key, each runtime file's name, size and time
+  of writing, is the runtime's now, and otherwise parses the runtime and writes the file again
+  (under a name of its own, then moved over the old). A start then takes about 0.3 s, where
+  parsing the runtime took about 2.4 s.
+- `program_path()` gives the path of the executable running the program, in full: the program
+  itself when it is compiled, the interpreter when it is interpreted; `""` in a browser.
 - A call to a name nothing declares compiles, and stops the program when it is reached, with
   `host fn 'NAME' not found`, the lines before it having run. This holds in every build,
-  WebAssembly's included, whatever arguments the call passes.
+  WebAssembly's included, whatever arguments the call passes. The compiler names each such
+  name as it builds (`v2 warning: NAME is called, and nothing declares it`), so a typo is seen
+  before the call is reached; the build still succeeds.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
+- A child process inherits its own standard handles and nothing else this process holds: not
+  the pipes another thread made for its own child, and not a socket. A program that spawns a
+  long-running child and ends is seen to end at once by whoever captured its output, and its
+  listening ports are free once it has ended.
+- A program named with no directory (`"cmd"`, `"git"`) is looked for in the directories in
+  `PATH` alone, `.exe` added when the name has no extension: never first in the current
+  directory or the running program's own, where Windows would look. A name that no directory
+  in `PATH` holds does not start. A name with a directory in it is that file.
 - `list_dir(path)` gives a directory's entries, sorted, a subdirectory's name ending in `/`. A
   path with no directory to read gives `[]`, as `read_file` gives `""` for a file it cannot
   read, and the program goes on; `file_exists` tells a missing path from an empty directory.
+- `read_file` reads every byte of a file, whatever its size, and gives `""` for one it cannot
+  open or read; a file cut short while it is read gives the bytes there were. `write_file` and
+  `write_file_bytes` give `true` only when every byte was written and the file closed.
+- A thread that the system cannot start stops the program, saying so, rather than giving
+  `unit` as its result. A pipe that cannot be made is a program that cannot start:
+  `exec_capture` gives `""`, as for any program that cannot start, and `exec_capture_io`
+  stops the program.
+- A path, command line or environment name given to the system that holds the character with
+  code 0 stops the program before the system sees it: the system would read only the part
+  before it, so `write_file("safe.txt" + chr(0) + ".tmp", ...)` would write `safe.txt`.
+- `path_absolute(path)` gives the path in full, with `/` between its parts, or stops the program
+  saying the system could not make it absolute; it never gives a wrong path. (Windows' ANSI
+  calls, which the runtime uses, take no path longer than 260 characters.)
+- `vfs_flush_to_disk(prefix, dir)` writes each virtual file under `prefix` to `dir` followed by
+  its path, read with `/` and `\` as separators, `.` dropped and each `..` taking off the part
+  before it. A path that would leave `dir`, or that names a drive or a stream (a `:` in a
+  part), stops the program naming it, before any file is written.
+- `try_rename_file(from, to)` moves a file over another, replacing it, and gives whether it
+  moved; the system may refuse (the file it replaces is open elsewhere, or, in a browser, there
+  are no files) and the program goes on. `rename_file` is the same, but a refusal stops the
+  program.
+- `dir_files(path)` gives a directory's files, each `[name, bytes, written]`, sorted by name:
+  `written` is when the file was last written, in 100-nanosecond steps since 1601 (Windows'
+  FILETIME), so the larger is the later. Subdirectories are left out, and a path with no
+  directory to read gives `[]`, as for `list_dir`.
 - `exec_peak_memory(program, args)` runs the program with the list of arguments and gives two
   things: what it wrote to standard output, followed by what it wrote to standard error if it
   exited non-zero, and its peak working set in bytes, or -1 where the system gives none.
+- `exec_capture_io(program, args, input, timeout_ms)` gives the child its input a part at a time
+  while it reads the child's output, so a child that writes more than a pipe holds before it
+  reads its input does not wait on the program, nor the program on it. A timeout counts from the
+  start, whatever the child is doing.
 - `exec_measured(program, args)` runs the program and gives four things: what it wrote to
   standard output, what it wrote to standard error, whether it exited 0, and its peak memory
   in bytes (or -1): the most that it and every process it started committed between them.
@@ -252,6 +400,22 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   a state meeting every goal, and `[]` only when no sequence reaches one: the search has no
   limit that gives up early. For n goals that independent steps meet, it takes time growing
   about as n cubed (40 goals in about 0.2 s, 160 in about 9 s, compiled).
+- A plan's step is `[name, values, names]`: the action's name, its preconditions' variables'
+  values as bound, in the order the preconditions first name them, and those variables'
+  names. A value keeps its type: an int stays an int, a text holding a comma stays one value.
+  `step_name(step)` and `step_values(step)` give the first two; `step_label(step)` writes the
+  step as text, `build(X=house,Y=2)` (the name alone for an action with no variables), and
+  `plan_labels(steps)` writes each. `plan`, `plan_in`, `plan_incremental`, `pursue` and
+  `plan_with_state` give steps; `activate(steps)` calls each step's bound closure with its
+  values as one list. (Steps were their labels, and `activate` split a label at its commas and
+  equals signs, so a value holding either was cut apart and every value arrived as text.)
+  `action_base_name(label)` and `action_label_args(label)` still read a label a program holds.
+- A virtual file is found by a hashed look-up: writing, reading or checking one takes about the
+  same time however many files there are, and appending to one copies nothing it already holds,
+  so n appends take time in proportion to n.
+- A goal whose first argument is bound looks only at the rules whose head's first argument is
+  that value or a variable, in the order they were added; following a chain of n facts takes
+  time growing as n (1900 in about 0.4 s, compiled, where it took about 100 s).
 - Adding a rule takes about the same time however many rules there are. A goal's cost does not
   depend on the rules of other predicates, and finding its solutions takes time in proportion
   to their number.
@@ -263,6 +427,14 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   declaration add to the default store; `rule_add_to(store, pred, args, body)` adds to the
   store given, and `rule head(args) in NAME :- ...` to the store named NAME.
   `rules_clear()` empties the default store.
+- A logic variable is a value of its own, of type `logic_var`: `logic_var(name)` makes one, and
+  a bare name that starts with a capital letter in a `rule` or `goal` declaration is the
+  variable of that name. Two variables with the same name are equal, `to_s` of one is its name,
+  and `is_logic_var(v)` tells one from any other value. Every string is a constant, whatever
+  its first letter, in a declaration (`rule likes("Dave", X)`) and in every call
+  (`rule_add`, `fact`, `solve`, `query`, `action_add`, `plan`): a name, a path or a code read
+  as data matches only itself. (Before, a string starting with a capital was a variable, so a
+  fact about `"Bob"` matched every query.)
 - A store holds each ground fact (a rule with no body and no variables) once: adding a fact
   the store holds changes nothing.
 - `solve_in(stores, pred, args)` solves against a store or a list of stores: a goal sees the
@@ -270,6 +442,20 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   order they were added. A rule's body goals are solved against the same stores, except a goal
   written `pred(args) from NAME`, which is solved against the store named NAME alone.
   `solve(pred, args)` and `query` solve against the default store and the contracts store.
+- A search follows rules up to 2000 deep, as far as every target's stack goes (a browser's runs
+  out between 2000 and 10000). A search that would go deeper, through a rule that leads back to
+  itself or a longer chain, stops the program naming the goal, since an answer cut short would
+  read as "no". (It stopped at 200 and gave the answers found so far, silently.) Planning has no
+  limit: `plan` says there is no plan only when none exists.
+- `solve_up_to(pred, args, n)` and `solve_up_to_in(stores, pred, args, n)` give the first `n`
+  of the solutions `solve` and `solve_in` give, in the same order, and stop searching once they
+  have them: asking whether a goal has a solution is `solve_up_to(pred, args, 1)`, one proof,
+  where `solve` finds every one first. A search is depth first, each goal's rules tried in
+  order and each proof carried through the rest of the body before the next is tried.
+- Binding variables costs the same however many a search has bound: a rule body of 1600 goals,
+  each binding a variable, is proved in 71 ms, and one of 800 in 33 ms. (A substitution was a
+  chain searched from its newest binding for a variable not yet bound, so the same took 1.9 s
+  and 0.5 s.)
 - `solve_into(target, stores, pred, args)` gives what `solve_in(stores, pred, args)` gives, and
   adds each solution to the store `target` as a fact of `pred`.
 - `plan_in(stores, goals)` plans from the ground facts of the stores listed; `plan`, `pursue`
@@ -328,7 +514,9 @@ A world is where a program's state lives: its named objects, its classes, the ha
 registered for events, the functions reached by name, its logic stores, actions and goals, the
 contract facts recorded, and its virtual files. A program starts in a world of its own. A
 program can make more, and run code in one, which then sees that world's state and none of
-the caller's.
+the caller's. A world isolates state, not authority: code in it can do whatever the program
+running it can (files, processes, sockets, time), and a step budget bounds only interpreted
+loops and calls.
 
 - `world_new()` gives a new world, an `int`. It holds what a program that has just started
   holds: the built-in classes and nothing else, apart from the functions reached by name of the
@@ -460,11 +648,17 @@ call that may give the mark has no unwind code.
   representation invariants (2.1).
 - A broken contract stops the program at the call that broke it, naming
   the contract.
-- Contract checks run in every build.
-- That policy is one setting, read in one place, the code that decides
-  whether a `require` or `ensure` is checked. No contract and no other
-  part of the compiler or runtime depends on it. Turning checks off for
-  some builds later is a change to that setting alone.
+- A program's own clauses, and the runtime's `require` and `assert` clauses, are checked in
+  every build. The runtime's `ensure` clauses, which restate what its own code has just done,
+  are checked when the build asks for them: `v2.exe SRC OUT --check-runtime` (with `--ir` or
+  `--wasm` too). A file that declares `quiet_operators()` but is not one of the runtime's
+  files is a program's file, and its ensures are checked. Checking every runtime clause made
+  them over half of a build's time: 1.2 billion clause runs in a front-end build of the
+  interpreter, most in the smallest, most called functions (`list_get`, `op_eq`, `list_len`);
+  leaving out the runtime's ensures took that build from 36 s to 25 s.
+- That policy is one setting, `v2_contracts_checked` in `contracts.patlang`, read in one place,
+  the lowering of a clause. No contract and no other part of the compiler or runtime depends on
+  it.
 
 ### 2.5 Compiler structure
 
@@ -482,9 +676,15 @@ call that may give the mark has no unwind code.
   against its callee's summary, never its body.
 - An artefact is used only when it is complete. One cut short, by an interrupted
   build or by another build writing it at the same moment, is built again.
+- An artefact is stored under its job's key: the SHA-256 of an encoding of everything
+  the job's output depends on, in which each item says what it is and how long, so two
+  different inputs never share a key and no input can be made to reuse another's
+  artefact.
 - A build leaves artefacts in place, and marks those it reuses as just used.
   `compile.patlang --evict KEEP_MB` removes whole jobs, least recently used first,
-  until the store is no larger than that. An evicted job is built again when next needed.
+  until the store is no larger than that, reading the store with `dir_files` (no shell,
+  so a directory's name is never a command). An evicted job is built again when next
+  needed.
 - Registrations (`when` handlers, rules, functions reached only by name)
   are recorded in the program facts, never rediscovered by scanning.
 - Synthesized names are the declaration's identity plus a counter local

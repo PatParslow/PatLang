@@ -30,7 +30,9 @@
 # emit; fibers.patlang swaps it); 2592 and 2600 its fibers (fibers.patlang);
 # 2608 the word a system call writes a count into (rt_out_word); 2616 a
 # 64-byte buffer for formatting a number (rt_scratch); 2680 the base of the
-# world the thread's code runs in, 0 for the program's (worlds.patlang).
+# world the thread's code runs in, 0 for the program's (worlds.patlang);
+# 2688 the blocks waiting to be finalized (rt_finalize), 2696 1 while the
+# thread is finalizing.
 quiet_operators()
 
 make a function called rt_reserve_bytes returns n
@@ -52,8 +54,8 @@ make a function called rt_commit_step returns n
 end
 
 make a function called rt_context_bytes returns n
-  let n = 2688
-  ensure n == 2616 + 64 + 8
+  let n = 2704
+  ensure n == 2616 + 64 + 8 + 16
   return n
 end
 
@@ -138,32 +140,82 @@ make a function called rt_scratch returns addr
   return addr
 end
 
+# A lock any waiter may take: its word is 0 when free. A waiter reads it until
+# it is 0, then claims it with atomic_add, which gives the word as it was: 0,
+# and the lock is the waiter's; more, and another got there first, and the
+# claim is given back. A ticket lock gave the lock to the waiters in turn, so
+# with every processor busy each hand-over waited for one waiter to be run:
+# under load, 16 threads writing files took 47 s where 4 took 10 (review
+# finding O6). Waiting spins, then yields (rt_spin_wait).
+make a function called rt_lock_take takes addr returns r
+  require addr != 0
+  let spin = 0
+  let got = false
+  while not got do
+    if mem_load(addr, 0) == 0 then
+      if atomic_add(addr, 1) == 0 then
+        let got = true
+      else
+        atomic_add(addr, 0 - 1)
+      end
+    end
+    if not got then
+      let spin = rt_spin_wait(spin)
+    end
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_lock_give takes addr returns r
+  require addr != 0
+  atomic_add(addr, 0 - 1)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# One more turn of a lock's wait, n turns having gone: a short spin,
+# then each turn gives up the rest of its time slice (Sleep(0)), so the
+# thread whose ticket is next runs, on whichever processor. Spinning alone,
+# more waiters than processors held it off: 16 threads writing files together
+# took 36 s and 32 took 287 s, where 4 took 0.2 s; now 0.6 s and 1.5 s.
+# (SwitchToThread, which yields only to threads waiting on this processor,
+# left 16 at 28 s.) Review finding O6. It allocates nothing: the allocator's
+# lock waits here too.
+make a function called rt_spin_wait takes n returns next
+  require n >= 0
+  if n >= 64 then
+    extern_call("KERNEL32.DLL", "Sleep", 0)
+  end
+  let next = n + 1
+  ensure next > n
+  return next
+end
+
 make a function called rt_fail_memory returns r
-  rt_write_byte(77)
-  rt_write_byte(10)
+  rt_write_text("out of memory: the program needs more than the system will give it")
   let r = extern_call("KERNEL32.DLL", "ExitProcess", 71)
   ensure false
   return r
 end
 
-# ---- the pool's lock: a ticket lock on atomic_add ----
+# ---- the pool's lock (rt_lock_take, 216 unused) ----
 
 make a function called rt_pool_lock returns r
   let st = runtime_state()
-  let mine = atomic_add(st + 208, 1)
-  while mem_load(st, 216) != mine do
-    let spin = 0
-  end
+  rt_lock_take(st + 208)
   mem_store(st, 240, mem_load(st, 240) + 1)
   let r = 0
-  ensure (r == 0) and (mem_load(runtime_state(), 208) > mem_load(runtime_state(), 216))
+  ensure (r == 0) and (mem_load(runtime_state(), 208) >= 1)
   return r
 end
 
 make a function called rt_pool_unlock returns r
-  atomic_add(runtime_state() + 216, 1)
+  rt_lock_give(runtime_state() + 208)
   let r = 0
-  ensure (r == 0) and (mem_load(runtime_state(), 216) <= mem_load(runtime_state(), 208))
+  ensure r == 0
   return r
 end
 
@@ -421,6 +473,10 @@ make a function called rt_context_retire takes ctx returns r
   rt_release_value_at(ctx, 2576)
   mem_store(ctx, 2576, 0)
   mem_store(ctx, 2584, 0)
+  if mem_load(ctx, 2688) != 0 then
+    rt_free(mem_load(ctx, 2688))
+    mem_store(ctx, 2688, 0)
+  end
   rt_retire_chunk(ctx)
   rt_pool_lock()
   let idx = 0
@@ -475,16 +531,81 @@ make a function called rt_release_last takes type_word, block, before returns r
 end
 
 make a function called rt_fail_released_twice returns r
-  rt_write_byte(82)
-  rt_write_byte(10)
-  let r = extern_call("KERNEL32.DLL", "ExitProcess", 72)
+  # its own code: 72 is a name nothing declares (rt_undeclared)
+  rt_write_text("a value was freed twice: a defect in the runtime, not the program")
+  let r = extern_call("KERNEL32.DLL", "ExitProcess", 69)
   ensure false
   return r
 end
 
 # The last reference to a block is gone: release what it holds, then free it.
+# Releasing what it holds can finalize those blocks in turn, and a value
+# nested a million deep would take a million nested calls: so on each thread
+# only the first finalize runs blocks, one at a time, and a finalize it causes
+# puts its block on the thread's list of waiting blocks (context 2688) for
+# that first one to take. A block leaves the cycle registry at once, so the
+# collector never sees one that is waiting.
 make a function called rt_finalize takes cls, block returns r
   require (cls >= 0) and (mem_load(block, 0) == 0)
+  if (cls == 12) or (cls == 14) or (cls >= 63) then
+    rt_cycle_unregister(cls, block)
+  end
+  let ctx = rt_context()
+  if mem_load(ctx, 2696) != 0 then
+    rt_waiting_push(ctx, cls, block)
+    let r = 0
+    ensure r == 0
+    return r
+  end
+  mem_store(ctx, 2696, 1)
+  rt_finalize_one(cls, block)
+  let w = mem_load(ctx, 2688)
+  while (w != 0) and (mem_load(w, 16) > 0) do
+    let n = mem_load(w, 16) - 1
+    mem_store(w, 16, n)
+    rt_finalize_one(mem_load(w, 32 + 16 * n), mem_load(w, 40 + 16 * n))
+    # finalizing may have grown the list into a new block
+    let w = mem_load(ctx, 2688)
+  end
+  mem_store(ctx, 2696, 0)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# Puts a block on the thread's list of waiting blocks: an uncounted block,
+# its length at 16, its room at 24, then [class, block] pairs from 32, made
+# when first needed and twice as large when full.
+make a function called rt_waiting_push takes ctx, cls, block returns r
+  require (ctx != 0) and (cls >= 0) and (block != 0)
+  let w = mem_load(ctx, 2688)
+  if w == 0 then
+    let w = rt_alloc(16 + 16 * 64)
+    mem_store(w, 16, 0)
+    mem_store(w, 24, 64)
+    mem_store(ctx, 2688, w)
+  end
+  let n = mem_load(w, 16)
+  if n == mem_load(w, 24) then
+    let bigger = rt_alloc(16 + 32 * n)
+    rt_copy_bytes(bigger + 32, w + 32, 16 * n)
+    mem_store(bigger, 16, n)
+    mem_store(bigger, 24, 2 * n)
+    rt_free(w)
+    let w = bigger
+    mem_store(ctx, 2688, w)
+  end
+  mem_store(w, 32 + 16 * n, cls)
+  mem_store(w, 40 + 16 * n, block)
+  mem_store(w, 16, n + 1)
+  let r = 0
+  ensure (r == 0) and (mem_load(mem_load(ctx, 2688), 16) == n + 1)
+  return r
+end
+
+# What a block holds is released, and the block freed (rt_finalize).
+make a function called rt_finalize_one takes cls, block returns r
+  require (cls >= 0) and (block != 0)
   if cls == 9 then
     rt_list_release_elements(block)
   elif cls == 4 then
@@ -500,8 +621,9 @@ make a function called rt_finalize takes cls, block returns r
   elif (cls == 5) or (cls == 6) or (cls == 7) then
     rt_release_value_at(block, 16)
     rt_release_value_at(block, 32)
-  elif cls == 15 then
-    # a modint: its modulus; the rest is raw words (runtime/numbers.patlang)
+  elif (cls == 15) or (cls == 17) then
+    # a modint: its modulus; the rest is raw words (runtime/numbers.patlang).
+    # A logic variable: its name (runtime/logic.patlang)
     rt_release_value_at(block, 16)
   end
   let r = rt_free(block)
@@ -519,4 +641,455 @@ make a function called rt_release_value_at takes block, off returns r
   let r = 0
   ensure r == 0
   return r
+end
+
+# ---- freeing cycles (docs/spec/values-and-memory.md 1.6, 2.3) ----
+#
+# Counting frees a block when its last holder goes, and blocks that hold each
+# other never get there. Only a block that can be changed after it is made can
+# close a cycle: an object (its fields), a vec, a rule store. Those are kept in
+# a registry, and when their number has doubled since the last look, the cycles
+# among them are found by trial deletion and freed:
+#
+#   1. every block reachable from a registered one through lists, closures,
+#      vecs, stores and objects is a node, and each reference found from one
+#      node to another is counted against the node referred to;
+#   2. a node whose count is more than the references found to it has a holder
+#      outside the nodes (a variable, a table, a thread's job), so it is live,
+#      and so is all it reaches;
+#   3. every other node is held only by nodes like itself: garbage. What each
+#      holds outside the garbage is released, and the garbage is freed.
+#
+# Nothing is freed that anything outside the garbage can reach, since every
+# holder has a count: a reference in a variable or a raw block is a count no
+# node accounts for.
+#
+# The look happens only while no thread but the first is alive (4680 counts
+# them), so no count changes under it. Its own tables are raw blocks, so it
+# makes no value while it runs.
+#
+# runtime_state(): 4632 the registry, a raw block of [type word, block] pairs
+# from 16; 4640 how many it holds; 4648 its capacity; 4656 the number at which
+# to look next; 4664 its lock (rt_lock_take; 4672 unused); 4680 threads alive besides the
+# first; 4688 1 while a look is running. A registered block keeps its place
+# in the registry in a word of its own (rt_cycle_index_off).
+
+make a function called rt_cycles_init returns r
+  let st = runtime_state()
+  let reg = rt_alloc(16 * 1024)
+  mem_store(st, 4632, reg)
+  mem_store(st, 4640, 0)
+  mem_store(st, 4648, 1024)
+  mem_store(st, 4656, 4096)
+  mem_store(st, 4664, 0)
+  mem_store(st, 4672, 0)
+  mem_store(st, 4680, 0)
+  mem_store(st, 4688, 0)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# Where a registered block of this class keeps its place in the registry.
+make a function called rt_cycle_index_off takes cls returns off
+  require (cls == 12) or (cls == 14) or (cls >= 63)
+  let off = 64
+  if cls == 12 then
+    let off = 40
+  elif cls == 14 then
+    let off = 88
+  end
+  ensure off >= 40
+  return off
+end
+
+make a function called rt_cycle_lock returns held
+  let st = runtime_state()
+  if mem_load(st, 4608) == 0 then
+    let held = false
+    ensure value_class(held) == 1
+    return held
+  end
+  rt_lock_take(st + 4664)
+  let held = true
+  ensure value_class(held) == 1
+  return held
+end
+
+make a function called rt_cycle_unlock takes held returns r
+  require value_class(held) == 1
+  if held then
+    rt_lock_give(runtime_state() + 4664)
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# A thread besides the first has started, or has been waited for.
+make a function called rt_cycle_threads takes by returns r
+  require (by == 1) or (by == 0 - 1)
+  atomic_add(runtime_state() + 4680, by)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# Registers a new object, vec or rule store, and looks for cycles when their
+# number has reached the mark.
+make a function called rt_cycle_register takes type_word, block returns r
+  require (word_and(type_word, 4294967296) != 0) and (block != 0)
+  let st = runtime_state()
+  let held = rt_cycle_lock()
+  let n = mem_load(st, 4640)
+  let cap = mem_load(st, 4648)
+  let reg = mem_load(st, 4632)
+  if n == cap then
+    let bigger = rt_alloc(32 * cap)
+    rt_copy_bytes(bigger + 16, reg + 16, 16 * n)
+    rt_free(reg)
+    let reg = bigger
+    mem_store(st, 4632, reg)
+    mem_store(st, 4648, 2 * cap)
+  end
+  mem_store(reg, 16 + 16 * n, type_word)
+  mem_store(reg, 24 + 16 * n, block)
+  mem_store(block, rt_cycle_index_off(word_and(type_word, 4294967295)), n)
+  mem_store(st, 4640, n + 1)
+  rt_cycle_unlock(held)
+  if (n + 1 >= mem_load(st, 4656)) and (mem_load(st, 4680) == 0) and (mem_load(st, 4688) == 0) then
+    rt_cycle_collect()
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# Takes a block that is being freed out of the registry: the last entry moves
+# into its place.
+make a function called rt_cycle_unregister takes cls, block returns r
+  require ((cls == 12) or (cls == 14) or (cls >= 63)) and (block != 0)
+  let st = runtime_state()
+  let held = rt_cycle_lock()
+  let reg = mem_load(st, 4632)
+  let i = mem_load(block, rt_cycle_index_off(cls))
+  let last = mem_load(st, 4640) - 1
+  if i != last then
+    let tw = mem_load(reg, 16 + 16 * last)
+    let moved = mem_load(reg, 24 + 16 * last)
+    mem_store(reg, 16 + 16 * i, tw)
+    mem_store(reg, 24 + 16 * i, moved)
+    mem_store(moved, rt_cycle_index_off(word_and(tw, 4294967295)), i)
+  end
+  mem_store(st, 4640, last)
+  rt_cycle_unlock(held)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- what a block holds ----
+
+# Whether a class's blocks hold other values a cycle could pass through.
+make a function called rt_cycle_holds takes cls returns yes
+  require (value_class(cls) == 2) and (cls >= 0)
+  let yes = (cls == 9) or (cls == 10) or (cls == 12) or (cls == 14) or (cls >= 63)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# How many values a block of this class holds.
+make a function called rt_cycle_children takes cls, block returns n
+  require rt_cycle_holds(cls) and (block != 0)
+  let n = 2
+  if cls == 9 then
+    let n = mem_load(block, 16)
+  elif cls == 10 then
+    let n = mem_load(block, 24)
+  elif cls == 12 then
+    let n = 1
+  elif cls == 14 then
+    let n = 3
+  end
+  ensure n >= 0
+  return n
+end
+
+# Where in the block its k-th value is: an object's name and its fields, a
+# store's rules, index and facts, a vec's list, a closure's captured values, a
+# list's elements (memory.patlang's rt_finalize releases the same).
+make a function called rt_cycle_child_off takes cls, k returns off
+  require rt_cycle_holds(cls) and (k >= 0)
+  let off = 24 + 16 * k
+  if cls == 9 then
+    let off = 32 + 16 * k
+  elif cls == 10 then
+    let off = 48 + 16 * k
+  elif (cls == 12) or (cls == 14) then
+    let off = 16 + 16 * k
+  end
+  ensure off >= 16
+  return off
+end
+
+# Whether the value whose words are tw and addr is a node: a counted block of
+# a class that holds values. A constant's count is 0, and it is never freed.
+make a function called rt_cycle_is_node takes tw, addr returns yes
+  require (value_class(tw) == 2) and (value_class(addr) == 2)
+  let yes = false
+  if word_and(tw, 4294967296) != 0 then
+    if rt_cycle_holds(word_and(tw, 4294967295)) then
+      let yes = mem_load(addr, 0) >= 1
+    end
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# ---- the nodes: a raw table keyed by address ----
+#
+# t is a raw block: 16 its capacity (a power of two), 24 how many it holds,
+# and from 32 an entry of 32 bytes for each slot: the block's address (0 when
+# empty), its type word, the references found to it, and 1 once it is live.
+
+make a function called rt_nodes_new takes cap returns t
+  require (cap >= 16) and (word_and(cap, cap - 1) == 0)
+  let t = rt_alloc(16 + 32 * cap)
+  mem_store(t, 16, cap)
+  mem_store(t, 24, 0)
+  let i = 0
+  while i < cap do
+    mem_store(t, 32 + 32 * i, 0)
+    let i = i + 1
+  end
+  ensure t != 0
+  return t
+end
+
+# The offset in t of addr's entry, or of the empty one where it would go.
+make a function called rt_nodes_slot takes t, addr returns off
+  require (t != 0) and (addr != 0)
+  let mask = mem_load(t, 16) - 1
+  let h = word_shr(addr, 4)
+  let at = word_and(word_xor(h, word_shr(h, 13)), mask)
+  let off = 32 + 32 * at
+  while (mem_load(t, off) != 0) and (mem_load(t, off) != addr) do
+    let at = word_and(at + 1, mask)
+    let off = 32 + 32 * at
+  end
+  ensure off >= 32
+  return off
+end
+
+# t with room for one more: itself, or a table of twice the capacity holding
+# the same entries, the old one freed.
+make a function called rt_nodes_room takes t returns out
+  require t != 0
+  let cap = mem_load(t, 16)
+  if 2 * (mem_load(t, 24) + 1) <= cap then
+    let out = t
+    ensure out != 0
+    return out
+  end
+  let out = rt_nodes_new(2 * cap)
+  let i = 0
+  while i < cap do
+    let src_off = 32 + 32 * i
+    let addr = mem_load(t, src_off)
+    if addr != 0 then
+      let dst_off = rt_nodes_slot(out, addr)
+      mem_store(out, dst_off, addr)
+      mem_store(out, dst_off + 8, mem_load(t, src_off + 8))
+      mem_store(out, dst_off + 16, mem_load(t, src_off + 16))
+      mem_store(out, dst_off + 24, mem_load(t, src_off + 24))
+    end
+    let i = i + 1
+  end
+  mem_store(out, 24, mem_load(t, 24))
+  rt_free(t)
+  ensure out != 0
+  return out
+end
+
+# ---- a stack of [type word, address] pairs, a raw block: 16 its capacity,
+# 24 how many it holds, pairs from 32 ----
+
+make a function called rt_pairs_stack_new returns s
+  let s = rt_alloc(16 + 16 * 1024)
+  mem_store(s, 16, 1024)
+  mem_store(s, 24, 0)
+  ensure s != 0
+  return s
+end
+
+make a function called rt_pairs_stack_push takes s, tw, addr returns out
+  require s != 0
+  let out = s
+  let n = mem_load(s, 24)
+  let cap = mem_load(s, 16)
+  if n == cap then
+    let out = rt_alloc(16 + 32 * cap)
+    mem_store(out, 16, 2 * cap)
+    rt_copy_bytes(out + 32, s + 32, 16 * n)
+    rt_free(s)
+  end
+  mem_store(out, 32 + 16 * n, tw)
+  mem_store(out, 40 + 16 * n, addr)
+  mem_store(out, 24, n + 1)
+  ensure out != 0
+  return out
+end
+
+# ---- the look ----
+
+# Finds the garbage among the registered blocks and all they reach, and frees
+# it: how many blocks were freed.
+make a function called rt_cycle_collect returns freed
+  let st = runtime_state()
+  mem_store(st, 4688, 1)
+  let reg = mem_load(st, 4632)
+  let count = mem_load(st, 4640)
+  let t = rt_nodes_new(1024)
+  let stack = rt_pairs_stack_new()
+  # 1. the nodes, and the references among them
+  let i = 0
+  while i < count do
+    let tw = mem_load(reg, 16 + 16 * i)
+    let addr = mem_load(reg, 24 + 16 * i)
+    let t = rt_nodes_room(t)
+    let off = rt_nodes_slot(t, addr)
+    if mem_load(t, off) == 0 then
+      mem_store(t, off, addr)
+      mem_store(t, off + 8, tw)
+      mem_store(t, off + 16, 0)
+      mem_store(t, off + 24, 0)
+      mem_store(t, 24, mem_load(t, 24) + 1)
+      let stack = rt_pairs_stack_push(stack, tw, addr)
+    end
+    let i = i + 1
+  end
+  while mem_load(stack, 24) > 0 do
+    let top = mem_load(stack, 24) - 1
+    let ptw = mem_load(stack, 32 + 16 * top)
+    let paddr = mem_load(stack, 40 + 16 * top)
+    mem_store(stack, 24, top)
+    let pcls = word_and(ptw, 4294967295)
+    let nc = rt_cycle_children(pcls, paddr)
+    let c = 0
+    while c < nc do
+      let coff = rt_cycle_child_off(pcls, c)
+      let ctw = mem_load(paddr, coff)
+      let caddr = mem_load(paddr, coff + 8)
+      if rt_cycle_is_node(ctw, caddr) then
+        let t = rt_nodes_room(t)
+        let slot = rt_nodes_slot(t, caddr)
+        if mem_load(t, slot) == 0 then
+          mem_store(t, slot, caddr)
+          mem_store(t, slot + 8, ctw)
+          mem_store(t, slot + 16, 0)
+          mem_store(t, slot + 24, 0)
+          mem_store(t, 24, mem_load(t, 24) + 1)
+          let stack = rt_pairs_stack_push(stack, ctw, caddr)
+        end
+        mem_store(t, slot + 16, mem_load(t, slot + 16) + 1)
+      end
+      let c = c + 1
+    end
+  end
+  # 2. what has a holder outside the nodes is live, and so is all it reaches
+  let cap = mem_load(t, 16)
+  let live = 0
+  let j = 0
+  while j < cap do
+    let e = 32 + 32 * j
+    let eaddr = mem_load(t, e)
+    if eaddr != 0 then
+      if (mem_load(t, e + 24) == 0) and (mem_load(eaddr, 0) > mem_load(t, e + 16)) then
+        mem_store(t, e + 24, 1)
+        let live = live + 1
+        let stack = rt_pairs_stack_push(stack, mem_load(t, e + 8), eaddr)
+        while mem_load(stack, 24) > 0 do
+          let ltop = mem_load(stack, 24) - 1
+          let ltw = mem_load(stack, 32 + 16 * ltop)
+          let laddr = mem_load(stack, 40 + 16 * ltop)
+          mem_store(stack, 24, ltop)
+          let lcls = word_and(ltw, 4294967295)
+          let lnc = rt_cycle_children(lcls, laddr)
+          let lc = 0
+          while lc < lnc do
+            let loff = rt_cycle_child_off(lcls, lc)
+            let lctw = mem_load(laddr, loff)
+            let lcaddr = mem_load(laddr, loff + 8)
+            if rt_cycle_is_node(lctw, lcaddr) then
+              let lslot = rt_nodes_slot(t, lcaddr)
+              if (mem_load(t, lslot) != 0) and (mem_load(t, lslot + 24) == 0) then
+                mem_store(t, lslot + 24, 1)
+                let live = live + 1
+                let stack = rt_pairs_stack_push(stack, lctw, lcaddr)
+              end
+            end
+            let lc = lc + 1
+          end
+        end
+      end
+    end
+    let j = j + 1
+  end
+  # 3. the rest is garbage: what it holds outside itself is released, then
+  # every block of it is freed. No block is freed before every block has been
+  # read, since freeing one writes over what it held.
+  let freed = mem_load(t, 24) - live
+  if freed > 0 then
+    let g = 0
+    while g < cap do
+      let ge = 32 + 32 * g
+      let gaddr = mem_load(t, ge)
+      if (gaddr != 0) and (mem_load(t, ge + 24) == 0) then
+        let gcls = word_and(mem_load(t, ge + 8), 4294967295)
+        let gnc = rt_cycle_children(gcls, gaddr)
+        let gc = 0
+        while gc < gnc do
+          let goff = rt_cycle_child_off(gcls, gc)
+          let gctw = mem_load(gaddr, goff)
+          let gcaddr = mem_load(gaddr, goff + 8)
+          if word_and(gctw, 4294967296) != 0 then
+            let inside = false
+            if rt_cycle_is_node(gctw, gcaddr) then
+              let gslot = rt_nodes_slot(t, gcaddr)
+              let inside = (mem_load(t, gslot) != 0) and (mem_load(t, gslot + 24) == 0)
+            end
+            if not inside then
+              rt_release(gctw, gcaddr)
+            end
+          end
+          let gc = gc + 1
+        end
+      end
+      let g = g + 1
+    end
+    let f = 0
+    while f < cap do
+      let fe = 32 + 32 * f
+      let faddr = mem_load(t, fe)
+      if (faddr != 0) and (mem_load(t, fe + 24) == 0) then
+        let fcls = word_and(mem_load(t, fe + 8), 4294967295)
+        if (fcls == 12) or (fcls == 14) or (fcls >= 63) then
+          rt_cycle_unregister(fcls, faddr)
+        end
+        mem_store(faddr, 0, 0)
+        rt_free(faddr)
+      end
+      let f = f + 1
+    end
+  end
+  rt_free(stack)
+  rt_free(t)
+  let mark = 2 * mem_load(st, 4640)
+  if mark < 4096 then
+    let mark = 4096
+  end
+  mem_store(st, 4656, mark)
+  mem_store(st, 4688, 0)
+  ensure freed >= 0
+  return freed
 end

@@ -29,6 +29,16 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
     When each runs for N and for 10N iterations
     Then no loop's peak memory grows
 
+  Scenario: values that hold each other are freed when nothing else holds them
+    Given loops of N iterations that each make and drop two objects holding each other, a vec holding itself, an object holding a list of objects that hold it, and a closure in the vec it captured
+    When each runs for N and for 10N iterations, and a pair of objects holding each other is kept throughout
+    Then no loop's peak memory grows, and the pair kept is still whole
+
+  Scenario: releasing a deeply nested value takes no more stack
+    Given a list nested a million deep, each level a list holding the one below
+    When it is built, dropped and built again
+    Then the program ends normally, having printed the outer list's length and done
+
   Scenario: a named object lives until object_delete
     Given a loop that makes new("Widget", "w" + i) and calls object_delete on it each iteration
     When it runs for N and for 10N iterations

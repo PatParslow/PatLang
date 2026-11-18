@@ -11,6 +11,7 @@
 #   4128 which classes' methods raise which events   4144 the classes
 #   4160 the named objects' table   4176 the next class id
 #   4192, 4200 the named table's lock   4208 the functions reached by name
+#   4224 the classes by id (objects.patlang)
 #   4240 actions   4256 what each action runs   4272 named goals
 #   4368 the virtual files   4384 to 4400 the clauses that have held
 #   4464 the named rule stores
@@ -18,14 +19,15 @@
 #   4480 what the world printed, a string builder (unit in the program's world)
 #   4496 the steps left, -1 for no budget   4504 the budget given
 #   4512 the code the world stopped with   4520 the job of the fiber world_call
-#   runs it on, 0 when no call is running   4536, 4544 the output's ticket lock
+#   runs it on, 0 when no call is running   4536 the output's lock (4544 unused)
+#   4528 1 once the program declared object_names_explicit() (objects.patlang)
 #   4552 1 once a stop has ended the call
 #
 # What belongs to the engine and not to any world stays in runtime_state():
 # fibers' jobs (4112), the counter for renaming a rule's variables (4288),
 # processes, sockets, the progress status, and here:
 #   4560 the worlds: a list of [id, base]   4576 the last id given
-#   4584 1 once a world has been made   4592, 4600 the list's ticket lock
+#   4584 1 once a world has been made   4592 the list's lock (4600 unused)
 #
 # A thread context holds, at 2680, the base of the world its code runs in, 0
 # for the program's own; a fiber's job holds the base of the world it was made
@@ -98,24 +100,65 @@ end
 
 make a function called rt_engine_get takes off returns v
   require ((off == 4112) or (off == 4304) or (off == 4320) or (off == 4336) or (off == 4448) or (off == 4560))
+  let held = rt_state_lock()
   let v = mem_load_value(runtime_state(), off)
+  rt_state_unlock(held)
   ensure value_live(v)
   return v
 end
 
+# Under the state lock, as rt_global_set is (objects.patlang).
 make a function called rt_engine_set takes off, v returns r
   require ((off == 4112) or (off == 4304) or (off == 4320) or (off == 4336) or (off == 4448) or (off == 4560)) and value_live(v)
-  let r = mem_store_value(runtime_state(), off, v)
+  let st = runtime_state()
+  let held = rt_state_lock()
+  let old = mem_take_value(st, off)
+  mem_init_value(st, off, v)
+  rt_state_unlock(held)
+  let r = unit
   ensure value_class(r) == 0
   return r
 end
 
+# x pushed onto the list in one of the engine's slots, as one step.
+make a function called rt_engine_push takes off, x returns r
+  require ((off == 4112) or (off == 4304) or (off == 4320) or (off == 4336) or (off == 4560)) and value_live(x)
+  let st = runtime_state()
+  let held = rt_state_lock()
+  let l = mem_take_value(st, off)
+  let l = list_push(l, x)
+  mem_init_value(st, off, l)
+  rt_state_unlock(held)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The list in one of the engine's slots without the pairs whose first element
+# is key, as one step: how many were dropped.
+make a function called rt_engine_drop takes off, key returns dropped
+  require ((off == 4112) or (off == 4304) or (off == 4320) or (off == 4336) or (off == 4560)) and value_live(key)
+  let st = runtime_state()
+  let held = rt_state_lock()
+  let l = mem_take_value(st, off)
+  let kept = []
+  let k = 0
+  while k < list_len(l) do
+    if l[k][0] != key then
+      let kept = list_push(kept, l[k])
+    end
+    let k = k + 1
+  end
+  let dropped = list_len(l) - list_len(kept)
+  mem_init_value(st, off, kept)
+  rt_state_unlock(held)
+  ensure dropped >= 0
+  return dropped
+end
+
 make a function called rt_ticket_lock takes addr returns r
   require addr != 0
-  let mine = atomic_add(addr, 1)
-  while mem_load(addr, 8) != mine do
-    let spin = 0
-  end
+  rt_lock_take(addr)
   let r = 0
   ensure r == 0
   return r
@@ -123,7 +166,7 @@ end
 
 make a function called rt_ticket_unlock takes addr returns r
   require addr != 0
-  atomic_add(addr + 8, 1)
+  rt_lock_give(addr)
   let r = 0
   ensure r == 0
   return r
@@ -151,7 +194,7 @@ make a function called world_new returns id
   rt_ticket_lock(st + 4592)
   let id = mem_load(st, 4576) + 1
   mem_store(st, 4576, id)
-  rt_engine_set(4560, list_push(rt_engine_get(4560), [id, b]))
+  rt_engine_push(4560, [id, b])
   rt_ticket_unlock(st + 4592)
   ensure id > 0
   return id
@@ -208,18 +251,9 @@ make a function called world_free takes id returns done
   rt_world_end_fibers(b)
   let st = runtime_state()
   rt_ticket_lock(st + 4592)
-  let worlds = rt_engine_get(4560)
-  let kept = []
-  let k = 0
-  while k < list_len(worlds) do
-    if worlds[k][0] != id then
-      let kept = list_push(kept, worlds[k])
-    end
-    let k = k + 1
-  end
-  rt_engine_set(4560, kept)
+  rt_engine_drop(4560, id)
   rt_ticket_unlock(st + 4592)
-  let offs = [4096, 4128, 4144, 4176, 4208, 4240, 4256, 4272, 4368, 4464, 4480]
+  let offs = [4096, 4128, 4144, 4176, 4208, 4224, 4240, 4256, 4272, 4368, 4464, 4480]
   let k = 0
   while k < list_len(offs) do
     rt_release_value_at(b, offs[k])

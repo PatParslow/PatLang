@@ -1,26 +1,141 @@
-# v2 runtime: the in-memory file layer, a list of [path, contents] at 4368 in
-# the world's state (worlds.patlang), written to disk only by vfs_flush_to_disk.
+# v2 runtime: the in-memory file layer, at 4368 in the world's state
+# (worlds.patlang), written to disk only by vfs_flush_to_disk. Each change is
+# one step under the state lock (objects.patlang), so threads writing files
+# together lose nothing.
+#
+# The files are a hashed table, a vec: item 0 the number of files, items 1 to
+# B (B a power of two) buckets, each a list of entries [path, value, builder].
+# A file's value is what vfs_write gave it; once appended to, its text is in
+# the builder (a string builder, unit until then), so an append copies
+# nothing of what the file already holds (review finding O3). The buckets
+# double when the files outnumber them twice over, so a look-up stays short
+# however many files there are.
 quiet_operators()
+
+make a function called rt_vfs_table_new takes buckets returns t
+  require (buckets > 0) and (word_and(buckets, buckets - 1) == 0)
+  let t = vec_new()
+  vec_push(t, 0)
+  let i = 0
+  while i < buckets do
+    vec_push(t, [])
+    let i = i + 1
+  end
+  ensure vec_len(t) == buckets + 1
+  return t
+end
 
 make a function called rt_vfs_init returns r
   let st = rt_world_base()
   mem_store(st, 4368, 0)
   mem_store(st, 4376, 0)
-  mem_init_value(st, 4368, [])
+  mem_init_value(st, 4368, rt_vfs_table_new(64))
   let r = 0
   ensure r == 0
   return r
 end
 
+# The bucket a path is in, of the table's B.
+make a function called rt_vfs_bucket takes t, path returns at
+  require (value_class(t) == 12) and (value_class(path) == 8)
+  let at = 1 + word_and(rt_fnv_text(rt_fnv_start(), path), vec_len(t) - 2)
+  ensure (at >= 1) and (at < vec_len(t))
+  return at
+end
+
+# Where a path's entry is in its bucket's list, or -1.
+make a function called rt_vfs_where takes bucket, path returns i
+  require (value_class(bucket) == 9) and (value_class(path) == 8)
+  let i = 0
+  while i < list_len(bucket) do
+    if str_eq(bucket[i][0], path) then
+      ensure i >= 0
+      return i
+    end
+    let i = i + 1
+  end
+  let i = 0 - 1
+  ensure i == 0 - 1
+  return i
+end
+
+# An entry's contents as a program reads them.
+make a function called rt_vfs_contents takes entry returns contents
+  require (value_class(entry) == 9) and (list_len(entry) == 3)
+  if value_class(entry[2]) == 11 then
+    let contents = sb_str(entry[2])
+    ensure value_live(contents)
+    return contents
+  end
+  let contents = entry[1]
+  ensure value_live(contents)
+  return contents
+end
+
+# Twice the buckets, each entry rehashed: under the state lock.
+make a function called rt_vfs_grow takes t returns bigger
+  require value_class(t) == 12
+  let bigger = rt_vfs_table_new(2 * (vec_len(t) - 1))
+  let b = 1
+  while b < vec_len(t) do
+    let bucket = vec_get(t, b)
+    let k = 0
+    while k < list_len(bucket) do
+      let at = rt_vfs_bucket(bigger, bucket[k][0])
+      vec_set(bigger, at, list_push(vec_get(bigger, at), bucket[k]))
+      let k = k + 1
+    end
+    let b = b + 1
+  end
+  vec_set(bigger, 0, vec_get(t, 0))
+  ensure vec_len(bigger) == 2 * vec_len(t) - 1
+  return bigger
+end
+
+# A path's entry set to [path, value, builder], or added: under the lock.
+make a function called rt_vfs_put_entry takes entry returns done
+  require (value_class(entry) == 9) and (list_len(entry) == 3)
+  let t = rt_global_take(4368)
+  let at = rt_vfs_bucket(t, entry[0])
+  let bucket = vec_get(t, at)
+  let i = rt_vfs_where(bucket, entry[0])
+  if i >= 0 then
+    vec_set(t, at, list_set(bucket, i, entry))
+  else
+    vec_set(t, at, list_push(bucket, entry))
+    vec_set(t, 0, vec_get(t, 0) + 1)
+    if vec_get(t, 0) > 2 * (vec_len(t) - 1) then
+      let t = rt_vfs_grow(t)
+    end
+  end
+  rt_global_put(4368, t)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# A path's entry, or [] when there is none: under the lock.
+make a function called rt_vfs_entry takes path returns entry
+  require value_class(path) == 8
+  let t = rt_global_take(4368)
+  let bucket = vec_get(t, rt_vfs_bucket(t, path))
+  let i = rt_vfs_where(bucket, path)
+  rt_global_put(4368, t)
+  if i < 0 then
+    let entry = []
+    ensure value_class(entry) == 9
+    return entry
+  end
+  let entry = bucket[i]
+  ensure value_class(entry) == 9
+  return entry
+end
+
 make a function called rt_vfs_set takes path, contents returns done
   require (value_class(path) == 8) and value_live(contents)
-  let entries = rt_global_get(4368)
-  let i = rt_pairs_index(entries, path)
-  if i >= 0 then
-    rt_global_set(4368, list_set(entries, i, [path, contents]))
-  else
-    rt_global_set(4368, list_push(entries, [path, contents]))
-  end
+  let held = rt_state_lock()
+  rt_vfs_put_entry([path, contents, unit])
+  rt_state_unlock(held)
   let done = true
   ensure value_class(done) == 1
   return done
@@ -28,15 +143,20 @@ end
 
 make a function called vfs_read takes path returns contents
   require (value_class(path) == 8)
-  let entries = rt_global_get(4368)
-  let i = rt_pairs_index(entries, path)
-  if i < 0 then
+  let held = rt_state_lock()
+  let entry = rt_vfs_entry(path)
+  let found = list_len(entry) > 0
+  let contents = unit
+  if found then
+    let contents = rt_vfs_contents(entry)
+  end
+  rt_state_unlock(held)
+  if not found then
     print("vfs_read: not found: " + path)
     let contents = rt_stop(95)
     ensure value_live(contents)
     return contents
   end
-  let contents = entries[i][1]
   ensure value_live(contents)
   return contents
 end
@@ -48,47 +168,58 @@ make a function called vfs_write takes path, contents returns result
   return result
 end
 
+# The text joins the file's, which a builder holds from its first append on.
 make a function called vfs_append takes path, text returns result
   require (value_class(path) == 8) and (value_class(text) == 8)
-  let entries = rt_global_get(4368)
-  let i = rt_pairs_index(entries, path)
-  if i < 0 then
-    let result = rt_vfs_set(path, text)
-    ensure value_class(result) == 1
-    return result
+  let held = rt_state_lock()
+  let entry = rt_vfs_entry(path)
+  if list_len(entry) == 0 then
+    rt_vfs_put_entry([path, text, unit])
+  elif value_class(entry[2]) == 11 then
+    sb_push(entry[2], text)
+  else
+    let b = sb_new()
+    sb_push(b, to_s(entry[1]))
+    sb_push(b, text)
+    rt_vfs_put_entry([path, unit, b])
   end
-  let result = rt_vfs_set(path, str_concat(entries[i][1], text))
+  rt_state_unlock(held)
+  let result = true
   ensure value_class(result) == 1
   return result
 end
 
 make a function called vfs_exists takes path returns result
   require (value_class(path) == 8)
-  if rt_pairs_index(rt_global_get(4368), path) >= 0 then
-    let result = "1"
-    ensure value_class(result) == 8
-    return result
-  end
-  let result = "0"
-  ensure value_class(result) == 8
+  let held = rt_state_lock()
+  let result = list_len(rt_vfs_entry(path)) > 0
+  rt_state_unlock(held)
+  ensure value_class(result) == 1
   return result
 end
 
 make a function called vfs_delete takes path returns existed
   require (value_class(path) == 8)
-  let entries = rt_global_get(4368)
-  let out = []
-  let existed = false
-  let i = 0
-  while i < list_len(entries) do
-    if entries[i][0] == path then
-      let existed = true
-    else
-      let out = list_push(out, entries[i])
+  let held = rt_state_lock()
+  let t = rt_global_take(4368)
+  let at = rt_vfs_bucket(t, path)
+  let bucket = vec_get(t, at)
+  let i = rt_vfs_where(bucket, path)
+  let existed = i >= 0
+  if existed then
+    let kept = []
+    let k = 0
+    while k < list_len(bucket) do
+      if k != i then
+        let kept = list_push(kept, bucket[k])
+      end
+      let k = k + 1
     end
-    let i = i + 1
+    vec_set(t, at, kept)
+    vec_set(t, 0, vec_get(t, 0) - 1)
   end
-  rt_global_set(4368, out)
+  rt_global_put(4368, t)
+  rt_state_unlock(held)
   ensure value_class(existed) == 1
   return existed
 end
@@ -96,27 +227,106 @@ end
 # The paths under a prefix, sorted.
 make a function called vfs_list takes prefix returns result
   require (value_class(prefix) == 8)
-  let entries = rt_global_get(4368)
   let n = str_len(prefix)
   let matches = []
-  let i = 0
-  while i < list_len(entries) do
-    if rt_byte_substr(entries[i][0], 0, n) == prefix then
-      let matches = list_push(matches, entries[i][0])
+  let held = rt_state_lock()
+  let t = rt_global_take(4368)
+  let b = 1
+  while b < vec_len(t) do
+    let bucket = vec_get(t, b)
+    let k = 0
+    while k < list_len(bucket) do
+      if rt_byte_substr(bucket[k][0], 0, n) == prefix then
+        let matches = list_push(matches, bucket[k][0])
+      end
+      let k = k + 1
     end
-    let i = i + 1
+    let b = b + 1
   end
+  rt_global_put(4368, t)
+  rt_state_unlock(held)
   let result = rt_sort_strings(matches)
   ensure (value_class(result) == 9)
   return result
 end
 
+# A virtual path as a path under a directory: its segments split at / and \,
+# with . and empty segments dropped and each .. taking off the one before.
+# "" when it would leave the directory (a .. with nothing before it) or names
+# a drive or a stream (a : in a segment).
+make a function called rt_vfs_disk_path takes path returns rel
+  require (value_class(path) == 8)
+  # parts[0 .. depth) are the segments kept so far
+  let parts = []
+  let depth = 0
+  let start = 0
+  let i = 0
+  let n = str_len(path)
+  let bytes = rt_str_bytes(path)
+  while i <= n do
+    let c = 47
+    if i < n then
+      let c = mem_load_byte(bytes, i)
+    end
+    if (c == 47) or (c == 92) then
+      let s = rt_byte_substr(path, start, i - start)
+      let start = i + 1
+      if s == ".." then
+        if depth == 0 then
+          let rel = ""
+          ensure value_class(rel) == 8
+          return rel
+        end
+        let depth = depth - 1
+      elif str_contains(s, ":") then
+        let rel = ""
+        ensure value_class(rel) == 8
+        return rel
+      elif (s != "") and (s != ".") then
+        if depth < list_len(parts) then
+          let parts = list_set(parts, depth, s)
+        else
+          let parts = list_push(parts, s)
+        end
+        let depth = depth + 1
+      end
+    end
+    let i = i + 1
+  end
+  let b = sb_new()
+  let j = 0
+  while j < depth do
+    if j > 0 then
+      sb_push(b, "/")
+    end
+    sb_push(b, parts[j])
+    let j = j + 1
+  end
+  let rel = sb_str(b)
+  ensure value_class(rel) == 8
+  return rel
+end
+
 make a function called vfs_flush_to_disk takes prefix, real_dir returns count
   require (value_class(prefix) == 8) and (value_class(real_dir) == 8)
   let paths = vfs_list(prefix)
+  # every path is checked before any file is written
+  let rels = []
   let i = 0
   while i < list_len(paths) do
-    write_file(real_dir + "/" + paths[i], vfs_read(paths[i]))
+    let rel = rt_vfs_disk_path(paths[i])
+    if rel == "" then
+      print("vfs_flush_to_disk: the virtual file " + paths[i] + " would be written outside " + real_dir)
+      let count = rt_stop(92)
+      ensure count >= 0
+      return count
+    end
+    let rels = list_push(rels, rel)
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(paths) do
+    write_file(real_dir + "/" + rels[i], vfs_read(paths[i]))
     let i = i + 1
   end
   let count = list_len(paths)

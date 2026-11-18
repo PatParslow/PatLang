@@ -95,8 +95,12 @@ checks them:
 ./packages/tools/build/verify_manifest.exe packages/deflate packages/zip packages/sha256
 ```
 
-It prints `ok`, `MISMATCH`, `MISSING` or `MALFORMED` for each `file` line and
-exits non-zero on any failure. The files are committed with LF line ends
+It prints `ok`, `MISMATCH`, `MISSING` or `MALFORMED` for each `file` line,
+`OUTSIDE` for a `file` line whose path leaves the package (a `..` part, a
+leading `/` or `\`, or a `:`), which it never reads, and `UNLISTED` for each
+PatLang file the package ships (any outside `spec/` and `build/`) that no
+`file` line names. It exits non-zero on any of these, and the repository
+checks run it over every package. The files are committed with LF line ends
 whatever the platform (`.gitattributes`: `packages/** text eol=lf`), so a
 checkout's bytes are the ones hashed.
 

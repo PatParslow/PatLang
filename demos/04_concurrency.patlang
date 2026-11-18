@@ -1,0 +1,162 @@
+# Demo 4: threads, fibres, budgeted blocks and worlds.
+#
+# Covers: parallel_map, thread_spawn with arguments, thread_poll,
+# thread_result, the share-nothing pattern for workers, fibres as generators
+# and coroutines, budgeted blocks that pause and continue, and worlds that
+# keep a piece of code's state, output and failures to themselves.
+#
+# The rule that keeps threads safe in PatLang: a worker reads what it was
+# given and returns a value. Nothing a worker can reach is written while the
+# workers run (PatLang has no mutex), and the results are merged afterwards.
+
+# ---- parallel_map: one function over a list, a thread per item ----
+
+make a function called count_primes takes range returns n
+  let n = 0
+  let k = range[0]
+  while k < range[1] do
+    let is_prime = k > 1
+    let d = 2
+    while is_prime and (d * d <= k) do
+      if k % d == 0 then
+        let is_prime = false
+      end
+      let d = d + 1
+    end
+    if is_prime then
+      let n = n + 1
+    end
+    let k = k + 1
+  end
+  return n
+end
+
+print("== parallel_map ==")
+let ranges = [[0, 5000], [5000, 10000], [10000, 15000], [15000, 20000]]
+let counts = parallel_map(ranges, "count_primes")
+let total = 0
+let i = 0
+while i < list_len(counts) do
+  let total = total + counts[i]
+  let i = i + 1
+end
+print("primes per range: " + counts + ", below 20000: " + total)
+
+# ---- thread_spawn: a closure on its own thread, with arguments ----
+
+make a function called word_lengths takes words returns lengths
+  let lengths = []
+  let w = 0
+  while w < list_len(words) do
+    let lengths = list_push(lengths, words[w].length)
+    let w = w + 1
+  end
+  return lengths
+end
+
+print("== thread_spawn ==")
+let greeting = "computed on a thread"
+let t1 = thread_spawn(|| { return greeting + "!" })
+let t2 = thread_spawn(|a, b| { return a * b }, 6, 7)
+let t3 = thread_spawn(|words| { return word_lengths(words) }, ["fibre", "thread", "world"])
+while not thread_poll(t2) do
+  sleep_ms(1)
+end
+print(thread_result(t1))
+print("6 * 7 = " + thread_result(t2))
+print("lengths: " + thread_result(t3))
+
+# ---- fibres: a function that pauses, and carries on when resumed ----
+
+# A generator: each resume yields the next Fibonacci number.
+make a function called fibonacci takes first returns last
+  let a = 0
+  let b = 1
+  while true do
+    fiber_yield(a)
+    let next = a + b
+    let a = b
+    let b = next
+  end
+  return a
+end
+
+# A coroutine: what resume hands in is what fiber_yield gives back.
+make a function called running_average takes first returns r
+  let sum = first
+  let n = 1
+  while true do
+    let x = fiber_yield(sum / n)
+    let sum = sum + x
+    let n = n + 1
+  end
+  return 0
+end
+
+print("== fibres ==")
+let gen = fiber_new("fibonacci")
+let fibs = []
+let k = 0
+while k < 12 do
+  let fibs = list_push(fibs, fiber_resume(gen, 0))
+  let k = k + 1
+end
+print("fibonacci: " + fibs)
+print("generator still alive: " + fiber_alive(gen))
+
+let avg = fiber_new("running_average")
+print("averages: " + fiber_resume(avg, 10) + ", " + fiber_resume(avg, 20) + ", " + fiber_resume(avg, 60))
+
+# ---- budgeted: run for so many milliseconds, then pause with a handle ----
+
+make a function called slow_sum takes n returns out
+  let handle = false
+  let slices = 0
+  while true do
+    let out = budgeted(2, handle) {
+      let acc = 0
+      let j = 0
+      while j < n do
+        let acc = acc + j
+        let j = j + 1
+      end
+      acc
+    }
+    let slices = slices + 1
+    if out[0] == "done" then
+      return [out[1], slices > 1]
+    end
+    # paused: other work would go here, then the same block continues
+    let handle = out[1]
+  end
+end
+
+print("== budgeted ==")
+let r = slow_sum(300000)
+print("sum = " + r[0] + ", needed more than one 2 ms slice: " + r[1])
+
+# ---- worlds: state, output and stops kept apart from the program's ----
+
+print("== worlds ==")
+vfs_write("/note", "the program's note")
+let w = world_new()
+let first = world_call(w, || do
+  print("printed inside the world")
+  vfs_write("/note", "the world's note")
+  rule_add("seen", ["inside"], [])
+  return vfs_read("/note")
+end)
+print("world_call gave " + first)
+print("the program's note is still: " + vfs_read("/note"))
+print("the program's rules see: " + list_len(solve("seen", ["X"])) + " facts")
+print("the world printed: " + world_output(w))
+
+# A failure inside a world ends the call, not the program.
+let second = world_call(w, || do
+  let xs = [1, 2, 3]
+  assert list_len(xs) == 4
+  return "not reached"
+end)
+print("a failed assert gave " + second)
+world_free(w)
+print("the program carried on")

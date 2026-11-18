@@ -259,7 +259,7 @@ make a function called st_vi_get_absent takes ctx returns ok
 end
 
 make a function called st_vi_nothing_there takes ctx returns ok
-  return vm_expect(ctx, "each lookup's answer where nothing is", "vi_nothing_there", "unit" + nl() + "unit" + nl() + "unit" + nl() + "unit" + nl() + "[]" + nl() + "unit" + nl() + "[]" + nl() + "[]" + nl() + "false" + nl() + "0" + nl() + "0")
+  return vm_expect(ctx, "each lookup's answer where nothing is", "vi_nothing_there", "unit" + nl() + "unit" + nl() + "unit" + nl() + "unit" + nl() + "[]" + nl() + "unit" + nl() + "[]" + nl() + "[]" + nl() + "false" + nl() + "false" + nl() + "0")
 end
 
 make a function called st_tx_str_contains takes ctx returns ok
@@ -320,6 +320,23 @@ make a function called st_bm_loops takes ctx returns ok
     let i = i + 1
   end
   return all
+end
+
+make a function called st_bm_cycles takes ctx returns ok
+  let kinds = ["two_objects", "vec_in_itself", "object_list_object", "closure_in_vec"]
+  let all = true
+  let i = 0
+  while i < list_len(kinds) do
+    if not vm_not_growing(ctx, kinds[i], "bm_cycles", kinds[i], 20000) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_bm_deep_release takes ctx returns ok
+  return expect(ctx, "a million deep, released and built again", vm_run_on(ctx, vm_engine(), "bm_deep_release", ["1000000"]), "1" + nl() + "done")
 end
 
 make a function called st_bm_named_delete takes ctx returns ok
@@ -392,6 +409,254 @@ make a function called st_cc_threads_io takes ctx returns ok
 end
 
 # A fixture that stops: its output names the clause, and what follows did not run.
+# rt_paths_safe with a case: [what it printed, whether a file is where it must not be].
+make a function called st_paths_case takes ctx, kind, stray returns r
+  if file_exists(stray) then
+    remove_file(stray)
+  end
+  let out = vm_run_on(ctx, vm_engine(), "rt_paths_safe", [kind])
+  return [out, file_exists(stray)]
+end
+
+make a function called st_pg_path_nul takes ctx returns ok
+  let r = st_paths_case(ctx, "nul", "self_hosting/build/v2_rt_paths_nul.txt")
+  let a = expect(ctx, "the stop names code 0", contains_text(r[0], "holds the character with code 0"), true)
+  let b = expect(ctx, "nothing after it runs", contains_text(r[0], "not reached"), false)
+  let c = expect(ctx, "no file is made", r[1], false)
+  return a and b and c
+end
+
+make a function called st_pg_vfs_flush_inside takes ctx returns ok
+  let r = st_paths_case(ctx, "escape", "self_hosting/build/v2_rt_paths/v2_rt_paths_escaped.txt")
+  let a = expect(ctx, "the stop names the file", contains_text(r[0], "the virtual file pkg/../../v2_rt_paths_escaped.txt would be written outside"), true)
+  let b = expect(ctx, "nothing after it runs", contains_text(r[0], "not reached"), false)
+  let c = expect(ctx, "nothing is written outside", r[1], false)
+  let d = st_paths_case(ctx, "inside", "self_hosting/build/v2_rt_paths/b/pkg/sub")
+  let e = expect(ctx, "the file inside is written where it points", d[0], "1" + nl() + "inside")
+  let f = expect(ctx, "no pkg/sub is made", d[1], false)
+  return a and b and c and e and f
+end
+
+make a function called st_pg_path_absolute_long takes ctx returns ok
+  let out = vm_run_on(ctx, vm_engine(), "rt_paths_safe", ["long"])
+  let whole = out == "true"
+  let stopped = contains_text(out, "path_absolute: the system could not make abc/")
+  return expect(ctx, "the whole path, or the stop (got " + substr(out, 0, min(out.length, 120)) + ")", whole or stopped, true)
+end
+
+make a function called st_pg_tcp_hosts takes ctx returns ok
+  let a = expect(ctx, "127.0.0.1 and localhost connect", vm_run_on(ctx, vm_engine(), "rt_tcp_hosts", ["near"]), "one two")
+  let far = vm_run_on(ctx, vm_engine(), "rt_tcp_hosts", ["far"])
+  let b = expect(ctx, "10.0.0.1 is not this machine (got " + far + ")", contains_text(far, "tcp_connect: 10.0.0.1 is not this machine") and (not contains_text(far, "not reached")), true)
+  let bad = vm_run_on(ctx, vm_engine(), "rt_tcp_hosts", ["bad"])
+  let c = expect(ctx, "1.2.3 is not an address (got " + bad + ")", contains_text(bad, "tcp_connect: 1.2.3 is not an address") and (not contains_text(bad, "not reached")), true)
+  let big = vm_run_on(ctx, vm_engine(), "rt_tcp_hosts", ["big"])
+  let d = expect(ctx, "127.0.0.300 is not an address (got " + big + ")", contains_text(big, "tcp_connect: 127.0.0.300 is not an address") and (not contains_text(big, "not reached")), true)
+  return a and b and c and d
+end
+
+make a function called st_pg_spawn_handles takes ctx returns ok
+  let out = split_lines(vm_run_on(ctx, vm_engine(), "rt_spawn_handles", []))
+  let port = to_num(out[0])
+  let pid = out[1]
+  # the child pings for about thirty seconds: had the capture waited for it,
+  # it would no longer be running now (a fact about the processes, not a time)
+  let running = contains_text(exec_capture("tasklist", "/FI", "PID eq " + pid, "/NH"), " " + pid + " ")
+  let a = expect(ctx, "the capture ended while the child still runs", running, true)
+  let b = expect(ctx, "the port can be listened on again", tcp_try_listen(port), port)
+  exec_capture("taskkill", "/PID", pid, "/T", "/F")
+  return a and b
+end
+
+make a function called st_pg_exec_search takes ctx returns ok
+  let dir = vm_cmd_path(path_absolute(spec_out() + "/v2_exec_search"))
+  let err = vm_v2_build(ctx, "rt_exec_planted")
+  if err != "" then
+    return expect(ctx, "the planted program builds", err, "")
+  end
+  write_file_bytes(spec_out() + "/v2_exec_search/cmd.exe", read_file_bytes(vm_exe("rt_exec_planted"), 0, 100000000))
+  if vm_engine() == "v2" then
+    let err = vm_v2_build(ctx, "rt_exec_search")
+    if err != "" then
+      return expect(ctx, "the fixture builds", err, "")
+    end
+    write_file_bytes(spec_out() + "/v2_exec_search/rt_exec_search.exe", read_file_bytes(vm_exe("rt_exec_search"), 0, 100000000))
+    # .\ itself: cmd here need not look in the current directory
+    # (NoDefaultCurrentDirectoryInExePath)
+    let run = ".\\rt_exec_search.exe"
+  else
+    let run = vm_cmd_path(path_absolute(vm_interp_exe())) + " " + vm_cmd_path(path_absolute(vm_fixture("rt_exec_search")))
+  end
+  let out = vm_clean(exec_capture("cmd", "/c", "cd /d " + dir + " && " + run))
+  let a = expect(ctx, "the system's cmd runs (got " + out + ")", contains_text(out, "from the system"), true)
+  let b = expect(ctx, "the planted cmd.exe does not", contains_text(out, "planted"), false)
+  return a and b
+end
+
+# A path for a cmd command line: backslashes, unquoted. An argument is passed
+# with the C runtime's quoting, which cmd does not read (a \" stays), so a
+# path that would need quotes, one with a space, stops the step saying so.
+make a function called vm_cmd_path takes p returns q
+  require not contains_text(p, " ")
+  let b = sb_new()
+  let i = 0
+  while i < p.length do
+    if p[i] == "/" then
+      sb_push(b, "\\")
+    else
+      sb_push(b, p[i])
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called st_pg_dir_files takes ctx returns ok
+  return vm_expect(ctx, "the files by name, sizes, order of writing, and [] for no directory", "vi_dir_files", "2" + nl() + "a_newer.txt 7" + nl() + "b_older.txt 4" + nl() + "true" + nl() + "[]")
+end
+
+make a function called st_pg_runtime_only takes ctx returns ok
+  let out = vm_run(ctx, "rt_runtime_only")
+  let a = expect(ctx, "runtime_state is refused", contains_text(out, "runtime_state is for the runtime: only a file declaring quiet_operators() uses it"), true)
+  let b = expect(ctx, "mem_load is refused", contains_text(out, "mem_load is for the runtime"), true)
+  let c = expect(ctx, "rt_alloc is refused", contains_text(out, "rt_alloc is for the runtime"), true)
+  let d = expect(ctx, "nothing runs", contains_text(out, "not reached"), false)
+  let by_name = vm_run(ctx, "rt_runtime_by_name")
+  let e = expect(ctx, "a by-name rt_ function is refused", contains_text(by_name, "rt_str_alloc is for the runtime"), true)
+  let f = expect(ctx, "and nothing runs", contains_text(by_name, "not reached"), false)
+  return a and b and c and d and e and f
+end
+
+make a function called st_pg_runtime_by_name_made takes ctx returns ok
+  let out = vm_run(ctx, "vi_runtime_by_name_made")
+  let a = expect(ctx, "the line before runs, then the stop (got " + out + ")", out, "before" + nl() + "function 'rt_str_alloc' not found")
+  let b = expect(ctx, "the interpreter and v2 print the same", vm_run_on(ctx, "interp", "vi_runtime_by_name_made", []) == vm_run_on(ctx, "v2", "vi_runtime_by_name_made", []), true)
+  return a and b
+end
+
+make a function called st_pg_nan_order takes ctx returns ok
+  return vm_expect(ctx, "NaN unordered, the rest as before", "vi_nan_order", "[false, true, false, false]" + nl() + "[false, false, false, false, false, false, false]" + nl() + "[true, true, true, true, true, true, false]")
+end
+
+make a function called st_pg_operator_dispatch takes ctx returns ok
+  let a = vm_expect(ctx, "<= sent as itself, > to the left operand", "vi_operator_dispatch", "[true, false]" + nl() + "left's >" + nl() + "right's >")
+  let b = vm_stops(ctx, "> with only < defined", "rt_operator_missing", "no method > for P")
+  return a and b
+end
+
+make a function called st_pg_eq_method takes ctx returns ok
+  return vm_stops(ctx, "a method named ==", "rt_eq_method", "class Money: a method named == is never called: objects compare by identity (spec 1.5)")
+end
+
+make a function called st_pg_clock_ms takes ctx returns ok
+  return vm_expect(ctx, "forward across a sleep, never back, and the wall clock", "vi_clock_ms", "true" + nl() + "true" + nl() + "true")
+end
+
+make a function called st_pg_glob_match takes ctx returns ok
+  return vm_expect(ctx, "each name its case, ? one character", "vi_glob_match", "[text, image, fred, text, text, other, other]" + nl() + "[true, true, false, true, false, true]" + nl() + "[true, false, true, true, false]")
+end
+
+make a function called st_cc_fiber_self_resume takes ctx returns ok
+  return vm_stops(ctx, "a fiber resuming itself", "rt_fiber_self_resume", "fiber_resume: fiber 1 is already running")
+end
+
+make a function called st_pg_host_caps takes ctx returns ok
+  return vm_expect(ctx, "the host's own capabilities", "vi_host_caps", "true" + nl() + "true")
+end
+
+make a function called st_pg_solve_depth takes ctx returns ok
+  let out = vm_run(ctx, "rt_solve_depth")
+  let a = expect(ctx, "both reaches answer (got " + out + ")", str_starts_with(out, "1" + nl() + "1" + nl()), true)
+  let b = vm_stops(ctx, "a rule that leads back to itself", "rt_solve_depth", "solve: the search for forever went deeper than 2000 rules")
+  return a and b
+end
+
+make a function called st_pg_io_both takes ctx returns ok
+  return vm_expect(ctx, "both outputs, no wait on a full pipe", "vi_io_both", "true" + nl() + "true" + nl() + "true")
+end
+
+make a function called st_pg_not_precedence takes ctx returns ok
+  return vm_expect(ctx, "not over the comparison", "vi_not_precedence", "true" + nl() + "false" + nl() + "false" + nl() + "true" + nl() + "true" + nl() + "true")
+end
+
+make a function called st_pg_call_any takes ctx returns ok
+  return vm_expect(ctx, "each expression called", "vi_call_any", "10" + nl() + "15" + nl() + "9" + nl() + "6")
+end
+
+make a function called st_pg_error_terms takes ctx returns ok
+  let a = vm_stops(ctx, "an undefined variable", "rt_error_line", "line 6: undefined variable nope")
+  let out = vm_run(ctx, "rt_div_zero")
+  let b = expect(ctx, "7 / 0 stops with division by zero (got " + out + ")", out, "true" + nl() + "division by zero")
+  return a and b
+end
+
+make a function called st_pg_lexer takes ctx returns ok
+  let a = vm_stops(ctx, "a string never closed", "rt_lex_unclosed", "line 4: this string is never closed")
+  let b = vm_stops(ctx, "a stray ) after a string of three lines", "rt_lex_later_line", "line 8:")
+  let c = vm_expect(ctx, "exponents, and a string over two lines", "vi_lex_numbers_lines", "1000" + nl() + "0.025" + nl() + "40" + nl() + "7" + nl() + "3")
+  return a and b and c
+end
+
+make a function called st_pg_undeclared_warning takes ctx returns ok
+  let r = v2_compile([vm_fixture("rt_engine_function"), spec_out() + "/v2_warn_check.exe"])
+  let a = expect(ctx, "the build succeeds", contains_text(r[0], "v2: " + spec_out() + "/v2_warn_check.exe"), true)
+  let b = expect(ctx, "and names tokenize", contains_text(r[0], "v2 warning: tokenize is called, and nothing declares it"), true)
+  return a and b
+end
+
+make a function called st_pg_object_names takes ctx returns ok
+  let a = expect(ctx, "names implicit", vm_run_on(ctx, vm_engine(), "vi_object_names", ["implicit"]), "true" + nl() + "red" + nl() + "red" + nl() + "true" + nl() + "true" + nl() + "true")
+  let b = expect(ctx, "names explicit", vm_run_on(ctx, vm_engine(), "vi_object_names", ["explicit"]), "true" + nl() + "red" + nl() + "2" + nl() + "false" + nl() + "true" + nl() + "true")
+  return a and b
+end
+
+make a function called st_pg_plan_steps takes ctx returns ok
+  return vm_expect(ctx, "values kept as bound", "vi_plan_steps", "1" + nl() + "ship" + nl() + "[a,b, 2]" + nl() + "int" + nl() + "[ship(P=a,b,N=2)]" + nl() + "shipping a,b x2 (2 values, int)" + nl() + "true")
+end
+
+make a function called st_pg_vfs_scale takes ctx returns ok
+  return vm_expect(ctx, "writes, reads and appends in about linear time", "vi_vfs_scale", "true" + nl() + "true" + nl() + "true")
+end
+
+make a function called st_pg_runtime_cache takes ctx returns ok
+  vm_run_on(ctx, "interp", "vi_unit", [])
+  let path = "self_hosting/build/v2_runtime_declarations.txt"
+  let lines = split_lines(read_file(path))
+  let a = expect(ctx, "the cache is there", file_exists(path), true)
+  let b = expect(ctx, "its key names the runtime's files", (list_len(lines) > 2) and str_starts_with(lines[0], "key" + chr(9)) and contains_text(lines[0], "vfs.patlang:") and contains_text(lines[0], "core.patlang:"), true)
+  let funcs = 0
+  let last = ""
+  let i = 0
+  while i < list_len(lines) do
+    if str_starts_with(lines[i], "func" + chr(9)) then
+      let funcs = funcs + 1
+    end
+    if lines[i] != "" then
+      let last = lines[i]
+    end
+    let i = i + 1
+  end
+  let c = expect(ctx, "it ends with its count of functions", last, "end" + chr(9) + funcs)
+  return a and b and c
+end
+
+make a function called st_pg_solve_up_to takes ctx returns ok
+  return vm_expect_file(ctx, "the first n of solve's solutions, in time linear in a body's goals", "vi_solve_up_to")
+end
+
+make a function called st_pg_solve_chain_scale takes ctx returns ok
+  return vm_expect(ctx, "a chain in about linear time", "vi_solve_chain_scale", "true")
+end
+
+make a function called st_cc_budget_overhead takes ctx returns ok
+  return vm_expect(ctx, "a budgeted loop near a plain one's time, yielding near its deadline", "cc_budget_overhead", "true" + nl() + "true" + nl() + "200")
+end
+
+make a function called st_cc_lock_contention takes ctx returns ok
+  let out = split_lines(vm_run(ctx, "cc_lock_contention"))
+  return expect(ctx, "16 threads take about as long as 4 for the same work (" + out[0] + ")", list_len(out) > 1 and (out[1] == "true"), true)
+end
+
 make a function called vm_stops takes ctx, label, name, wanted returns ok
   let out = vm_run(ctx, name)
   let a = expect(ctx, label + ": " + wanted, contains_text(out, wanted), true)
@@ -410,6 +675,21 @@ end
 
 make a function called st_max_min takes ctx returns ok
   return vm_expect(ctx, "the larger and the smaller", "vi_max_min", "2" + nl() + "2.5" + nl() + "1" + nl() + "2.5" + nl() + "1/2" + nl() + "1/3" + nl() + "-4" + nl() + "9223372036854775808")
+end
+
+make a function called vm_stops_alike takes ctx, name, wanted returns ok
+  let a = vm_run_on(ctx, "interp", name, [])
+  let b = vm_run_on(ctx, "v2", name, [])
+  let x = expect(ctx, name + ": the interpreter stops with " + wanted, contains_text(a, wanted), true)
+  let y = expect(ctx, name + ": nothing after the call runs", contains_text(a, "not reached"), false)
+  let z = expect(ctx, name + ": v2 prints the same", b, a)
+  return x and y and z
+end
+
+make a function called st_ea_engine_functions takes ctx returns ok
+  let a = vm_stops_alike(ctx, "rt_engine_function", "host fn 'tokenize' not found")
+  let b = vm_stops_alike(ctx, "rt_engine_function_by_name", "function 'iv_bucket' not found")
+  return a and b
 end
 
 make a function called st_ea_logic_state takes ctx returns ok
@@ -460,7 +740,7 @@ make a function called st_bnot_ints takes ctx returns ok
 end
 
 make a function called st_bnot_float takes ctx returns ok
-  return vm_stops(ctx, "bnot of a float", "rt_bnot_float", "!3")
+  return vm_stops(ctx, "bnot of a float", "rt_bnot_float", "this operation does not take a float")
 end
 
 make a function called st_pg_unit takes ctx returns ok
@@ -558,12 +838,33 @@ make a function called st_pg_progress_plan takes ctx returns ok
   return vm_expect(ctx, "the status, then the second report, the plans and no plan", "vi_progress_plan", "true" + nl() + "second" + nl() + "[go]" + nl() + "true" + nl() + "0")
 end
 
+make a function called st_tx_utf8_malformed takes ctx returns ok
+  let b = sb_new()
+  sb_push(b, "cut short at the end: 2 [97, 65533] -1 2" + nl())
+  sb_push(b, "three-byte cut short: 2 [65533, 65533] -1 2" + nl())
+  sb_push(b, "overlong slash: 2 [65533, 65533] -1 2" + nl())
+  sb_push(b, "stray continuation: 3 [97, 65533, 98] -1 3" + nl())
+  sb_push(b, "surrogate: 3 [65533, 65533, 65533] -1 3" + nl())
+  sb_push(b, "past U+10FFFF: 4 [65533, 65533, 65533, 65533] -1 4" + nl())
+  sb_push(b, "well formed: 2 [233, 128512] -1 6" + nl())
+  sb_push(b, "substr past the end: 1 65533" + nl())
+  sb_push(b, "cursor: 97 65533 98" + nl())
+  sb_push(b, "bytes kept: true")
+  return vm_expect(ctx, "each malformed byte is U+FFFD", "vi_utf8_malformed", sb_str(b))
+end
+
+make a function called st_tx_chr_surrogate takes ctx returns ok
+  let a = vm_stops(ctx, "chr of a surrogate", "rt_chr_surrogate", "contract violation: precondition failed in chr()")
+  let b = expect(ctx, "chr(55295) is one character", starts_with(vm_run(ctx, "rt_chr_surrogate"), "1"), true)
+  return a and b
+end
+
 make a function called st_tx_chr_float takes ctx returns ok
   return vm_stops(ctx, "chr of a float", "rt_chr_float", "contract violation: precondition failed in chr()")
 end
 
 make a function called st_pg_program_value takes ctx returns ok
-  return vm_expect(ctx, "only what it printed", "vi_program_value", "start")
+  return vm_expect(ctx, "each bare value, the last ones included, and no call's", "vi_program_value", "start" + nl() + "3" + nl() + "5" + nl() + "text" + nl() + "42")
 end
 
 make a function called st_pg_arity_named takes ctx returns ok
@@ -575,6 +876,57 @@ make a function called st_pg_arity_named takes ctx returns ok
   let e = expect(ctx, "nothing runs", contains_text(out, "not reached"), false)
   let f = expect(ctx, "a closure takes at most 8", contains_text(out, "a closure is called with at most 8 arguments, given 9"), true)
   return a and b and c and d and e and f
+end
+
+make a function called st_cc_shared_tables takes ctx returns ok
+  return vm_expect(ctx, "every write is there", "cc_shared_tables", "[5000, 5000, 5000, 5000]" + nl() + "200" + nl() + "x4999" + nl() + "5000" + nl() + "204" + nl() + "[act4]")
+end
+
+make a function called st_cc_shared_listener takes ctx returns ok
+  return vm_expect(ctx, "every timed wait gives -1, and the client is accepted", "cc_shared_listener", "true" + nl() + "hello" + nl() + "true")
+end
+
+# Whether the threads meet depends on timing: either outcome is the defined
+# one, and anything else (a contract failure, a block released twice) is not.
+make a function called st_cc_shared_cell takes ctx returns ok
+  let out = vm_run(ctx, "cc_shared_cell")
+  let whole = out == "200000" + nl() + "200000"
+  let stopped = contains_text(out, "was changed by one thread while another was using it") and (not contains_text(out, "contract violation"))
+  return expect(ctx, "every push, or the stop that names the rule (got " + out + ")", whole or stopped, true)
+end
+
+make a function called st_pg_argv_round_trip takes ctx returns ok
+  let bs = chr(92)
+  let q = chr(34)
+  let args = ["plain", "two words", "C:" + bs + "Program Files" + bs + "dir" + bs, "next", "say " + bs + q + "hi", "", "a" + bs + bs + q + "b", "tail" + bs + bs]
+  let b = sb_new()
+  sb_push(b, "8")
+  let i = 0
+  while i < list_len(args) do
+    sb_push(b, nl() + "<" + args[i] + ">")
+    let i = i + 1
+  end
+  return expect(ctx, "each argument arrives unchanged", vm_run_on(ctx, vm_engine(), "vi_argv_echo", args), sb_str(b))
+end
+
+make a function called st_pg_vfs_exists takes ctx returns ok
+  return vm_expect(ctx, "the branch it says, and a bool", "vi_vfs_exists", "a missing file is not there" + nl() + "a written file is there" + nl() + "false" + nl() + "true" + nl() + "bool" + nl() + "false")
+end
+
+make a function called st_pg_logic_constants takes ctx returns ok
+  let wanted = "[]" + nl() + "[[Bob, user]]" + nl() + "[[Bob, user]]" + nl() + "[[alice, admin], [Bob, user]]" + nl() + "[]" + nl() + "[[Dave, Carol]]" + nl() + "[]" + nl() + "logic_var" + nl() + "X" + nl() + "true" + nl() + "false" + nl() + "false" + nl() + "true" + nl() + "false" + nl() + "1" + nl() + "0" + nl() + "[bake(T=Flour)]" + nl() + "[]"
+  return vm_expect(ctx, "constants match themselves alone", "vi_logic_constants", wanted)
+end
+
+make a function called st_pg_let_giving_calls takes ctx returns ok
+  return vm_expect(ctx, "each as through a new name", "vi_let_giving_calls", "12" + nl() + "1000" + nl() + "1000" + nl() + "6" + nl() + "6")
+end
+
+make a function called st_pg_let_giving_arity takes ctx returns ok
+  let out = vm_run(ctx, "rt_let_giving_arity")
+  let a = expect(ctx, "too many for double", contains_text(out, "double takes 1 argument, given 3"), true)
+  let b = expect(ctx, "nothing runs", contains_text(out, "not reached"), false)
+  return a and b
 end
 
 make a function called st_pg_closure_rest takes ctx returns ok
@@ -621,7 +973,7 @@ make a function called st_iv_backwards takes ctx returns ok
 end
 
 make a function called st_iv_div takes ctx returns ok
-  return vm_stops(ctx, "dividing an interval", "rt_interval_div", "!7")
+  return vm_stops(ctx, "dividing an interval", "rt_interval_div", "this operation does not take an interval")
 end
 
 make a function called st_mi_agrees takes ctx returns ok
@@ -641,26 +993,26 @@ make a function called st_mi_small takes ctx returns ok
 end
 
 make a function called st_mi_moduli takes ctx returns ok
-  return vm_stops(ctx, "moduli 7 and 11", "rt_modint_moduli", "!15")
+  return vm_stops(ctx, "moduli 7 and 11", "rt_modint_moduli", "this operation does not take a modint")
 end
 
 make a function called st_mi_float takes ctx returns ok
-  return vm_stops(ctx, "a modint and a float", "rt_modint_float", "!15")
+  return vm_stops(ctx, "a modint and a float", "rt_modint_float", "this operation does not take a modint")
 end
 
 make a function called st_mi_order takes ctx returns ok
-  let a = vm_stops(ctx, "a modint compared with <", "rt_modint_lt", "!15")
-  let b = vm_stops(ctx, "a modint's remainder", "rt_modint_mod", "!15")
+  let a = vm_stops(ctx, "a modint compared with <", "rt_modint_lt", "this operation does not take a modint")
+  let b = vm_stops(ctx, "a modint's remainder", "rt_modint_mod", "this operation does not take a modint")
   return a and b
 end
 
 make a function called st_mi_no_inverse takes ctx returns ok
-  return vm_stops(ctx, "dividing by 2 modulo 8", "rt_modint_no_inverse", "!15")
+  return vm_stops(ctx, "dividing by 2 modulo 8", "rt_modint_no_inverse", "this operation does not take a modint")
 end
 
 make a function called st_mi_bits takes ctx returns ok
-  let a = vm_stops(ctx, "band modulo 7", "rt_modint_bits", "!15")
-  let b = vm_stops(ctx, "shl 9 of an 8-bit word", "rt_modint_shift", "!15")
+  let a = vm_stops(ctx, "band modulo 7", "rt_modint_bits", "this operation does not take a modint")
+  let b = vm_stops(ctx, "shl 9 of an 8-bit word", "rt_modint_shift", "this operation does not take a modint")
   return a and b
 end
 
@@ -833,7 +1185,7 @@ make a function called st_ea_no_include takes ctx returns ok
 end
 
 make a function called st_engines_agree takes ctx returns ok
-  let names = ["vi_unit", "vi_max_min", "vi_ast", "vi_append_values", "rt_new_extra", "vi_shadow", "bm_named_many", "vo_member_by_name", "vi_bnot", "rt_bnot_float", "vi_no_return", "vi_exec_stderr", "rt_include", "vo_type_of", "vo_new_object", "vo_keeps_class", "vo_methods", "int_extremes", "int_mid", "int_leave_return", "int_below", "int_division", "int_mul_overflow", "ev_operator_method", "ev_raises", "ev_int_order", "ev_no_change", "ev_no_reentry", "ev_ordinary", "ev_no_handler", "ev_raises_result", "vi_list_set", "vi_list_push", "vi_list_eq", "vi_object_shared", "vi_get_absent", "vi_nothing_there", "vi_path_absolute", "vi_str_contains", "vi_object_eq", "vi_sb", "vi_vec", "vi_bool_array", "vi_closure_captures", "vi_fibers", "vi_threads", "vi_syntax", "vi_syntax_included", "rt_fiber_finished", "rt_fiber_no_fiber", "rt_thread_taken", "bm_named_kept", "vi_interval", "rt_interval_backwards", "rt_interval_div"]
+  let names = ["vi_unit", "vi_max_min", "vi_ast", "vi_append_values", "rt_new_extra", "vi_shadow", "bm_named_many", "vo_member_by_name", "vi_bnot", "rt_bnot_float", "vi_no_return", "vi_exec_stderr", "rt_include", "vo_type_of", "vo_new_object", "vo_keeps_class", "vo_methods", "int_extremes", "int_mid", "int_leave_return", "int_below", "int_division", "int_mul_overflow", "ev_operator_method", "ev_raises", "ev_int_order", "ev_no_change", "ev_no_reentry", "ev_ordinary", "ev_no_handler", "ev_raises_result", "vi_list_set", "vi_list_push", "vi_list_eq", "vi_object_shared", "vi_get_absent", "vi_nothing_there", "vi_path_absolute", "vi_str_contains", "vi_object_eq", "vi_sb", "vi_vec", "vi_bool_array", "vi_closure_captures", "vi_fibers", "vi_threads", "vi_syntax", "vi_syntax_included", "rt_fiber_finished", "rt_fiber_no_fiber", "rt_thread_taken", "bm_named_kept", "vi_interval", "rt_interval_backwards", "rt_interval_div", "vi_let_giving_calls", "vi_logic_constants", "vi_vfs_exists", "vi_utf8_malformed", "vi_dir_files", "vi_nan_order", "vi_operator_dispatch", "vi_clock_ms", "vi_glob_match", "vi_host_caps", "vi_not_precedence", "vi_call_any", "vi_plan_steps", "vi_solve_up_to"]
   let all = true
   let i = 0
   while i < list_len(names) do
@@ -850,7 +1202,7 @@ end
 # ---- worlds.feature (1.15) ----
 
 make a function called st_wd_isolation takes ctx returns ok
-  let wanted = "the program's function" + nl() + "[done, [0, , , 0]]" + nl() + "[0, , , 0]" + nl() + "[the program's handler]" + nl() + "[done, [1, Widget, 2, the world's file]]" + nl() + "the program's function" + nl() + "the world's handler"
+  let wanted = "the program's function" + nl() + "[done, [0, , , false]]" + nl() + "[0, , , false]" + nl() + "[the program's handler]" + nl() + "[done, [1, Widget, 2, the world's file]]" + nl() + "the program's function" + nl() + "the world's handler"
   return vm_expect(ctx, "each world sees its own state alone", "wd_isolation", wanted)
 end
 
@@ -969,7 +1321,7 @@ make a function called register_values_and_memory_steps takes ctx returns done
   vm_noops(ctx, ["o = new(\"Widget\", \"ga1\") and send(o, \"set\", \"off\", false)", "get(o, \"off\"), get(o, \"missing\"), get(\"ga1\", \"missing\") and get(5, \"missing\") are read"])
   step(ctx, "the first is false, and the other three are unit", "st_vi_get_absent")
   vm_noops(ctx, ["a list, a vec, a string, an object, an unset environment variable, a missing file, a missing virtual file and an unknown predicate", "each is read where nothing is"])
-  step(ctx, "a list, a vec, a non-list or an object gives unit, a string gives \"\", getenv and read_file give \"\", file_exists gives false, vfs_exists gives \"0\" and query gives 0", "st_vi_nothing_there")
+  step(ctx, "a list, a vec, a non-list or an object gives unit, a string gives \"\", getenv and read_file give \"\", file_exists gives false, vfs_exists gives false and query gives 0", "st_vi_nothing_there")
   step(ctx, "the result is false, and an object compared with itself is true", "st_vi_object_eq")
   step(ctx, "it is \"hi\"", "st_vi_sb")
   step(ctx, "it is 1", "st_vi_vec")
@@ -979,6 +1331,10 @@ make a function called register_values_and_memory_steps takes ctx returns done
 
   vm_noops(ctx, ["loops of N iterations that each replace a local every iteration with one of these producers:", "each runs for N and for 10N iterations", "a loop that makes new(\"Widget\", \"w\" + i) and calls object_delete on it each iteration", "it runs for N and for 10N iterations", "a loop that makes new(\"Widget\", \"w\" + i) without object_delete, then reads get of the first", "it runs"])
   step(ctx, "no loop's peak memory grows", "st_bm_loops")
+  vm_noops(ctx, ["loops of N iterations that each make and drop two objects holding each other, a vec holding itself, an object holding a list of objects that hold it, and a closure in the vec it captured", "each runs for N and for 10N iterations, and a pair of objects holding each other is kept throughout"])
+  step(ctx, "no loop's peak memory grows, and the pair kept is still whole", "st_bm_cycles")
+  vm_noops(ctx, ["a list nested a million deep, each level a list holding the one below", "it is built, dropped and built again"])
+  step(ctx, "the program ends normally, having printed the outer list's length and done", "st_bm_deep_release")
   step(ctx, "the peak memory does not grow", "st_bm_named_delete")
   step(ctx, "the first object's fields are still readable after the loop", "st_bm_named_kept")
 
@@ -991,6 +1347,17 @@ make a function called register_values_and_memory_steps takes ctx returns done
   step(ctx, "each thread gives what one thread alone would give", "st_cc_first_call")
   vm_noops(ctx, ["8 threads, each reading its own length of one file 400 times and printing a number of seven copies of its own digit each time", "parallel_map runs them"])
   step(ctx, "every read gives the length asked for, and every number is printed whole", "st_cc_threads_io")
+  vm_noops(ctx, ["4 workers, each writing 50 virtual files 100 times over, appending to a file of its own 5000 times and adding an action", "4 threads each pushing 50000 values onto one vec", "their results are taken"])
+  step(ctx, "every file holds its last write, every append is there, and every action can be planned", "st_cc_shared_tables")
+  vm_noops(ctx, ["a listener, and 3 threads that each wait on it with tcp_accept_timeout for 20, 30 and 40 ms, 20 times over", "a client then connects while the program waits in tcp_accept"])
+  step(ctx, "every timed wait gives -1, and tcp_accept gets the client and what it sent", "st_cc_shared_listener")
+  vm_noops(ctx, ["a fiber whose function resumes the fiber it is running in"])
+  step(ctx, "the program stops at that resume, saying the fiber is already running, and nothing after it runs", "st_cc_fiber_self_resume")
+  vm_noops(ctx, ["2 million cheap iterations, plain and in a budgeted block, and a block of 1 ms iterations given 50 ms", "each runs, the slow one continued until done"])
+  step(ctx, "the budgeted loop takes no more than five times the plain one, the slow block first yields between 25 and 80 ms, and all its iterations run", "st_cc_budget_overhead")
+  vm_noops(ctx, ["32000 virtual files written by 4 threads, and then by 16", "each group runs"])
+  step(ctx, "the 16 take no more than about four times as long as the 4", "st_cc_lock_contention")
+  step(ctx, "every push is there, or the program stops saying a vec was changed by one thread while another was using it", "st_cc_shared_cell")
   step(ctx, "the handler ran for the fiber, for the program while the fiber waited, and for the program after", "st_cc_fiber_events")
   step(ctx, "the program stops at that call, naming the require clause", "st_cc_fiber_finished")
   step(ctx, "the program stops at that call, naming the require clause, and fiber_yield's function", "st_cc_fiber_no_fiber")
@@ -1049,6 +1416,8 @@ make a function called register_values_and_memory_steps takes ctx returns done
   vm_noops(ctx, ["ints, floats, rationals and a bigint", "a program applies max and min", "a program with one contract, one rule and one action", "it reads its state and the contract facts"])
   step(ctx, "each gives the larger or the smaller, keeping its kind", "st_max_min")
   step(ctx, "both engines give the program's own facts alone", "st_ea_logic_state")
+  vm_noops(ctx, ["a program calling tokenize, the compiler's lexer, and one applying iv_bucket, the interpreter's own function, by a computed name", "each runs"])
+  step(ctx, "both engines stop at the call, saying no such function is found, and print the same", "st_ea_engine_functions")
   vm_noops(ctx, ["rules and ordinary code using AST.Name(args), nested, in a closure, and with a variable named AST"])
   step(ctx, "each gives a list of the name and its arguments, a function can take it, and the variable keeps its meaning", "st_ast_nodes")
   vm_noops(ctx, ["strings also held by another variable, a list, a closure and a caller", "a program appends to them with let s = s + x", "a loop of let s = s + x, at 100,000 and at 200,000 appends"])
@@ -1071,6 +1440,9 @@ make a function called register_values_and_memory_steps takes ctx returns done
   step(ctx, "exec_measured gives the two outputs apart, false then true for the exits, and a peak above 0", "st_pg_exec_measured")
   step(ctx, "exec_measured's peak counts the child's memory, where exec_peak_memory's is the command's own", "st_pg_exec_tree")
   vm_noops(ctx, ["sed commands with and without g and i, with no match, an empty pattern, no replacement, an empty replacement, flags after a slash, characters of two bytes and an int as input", "each is applied", "add, multiply and subtract of ints and of rationals, and calculate, calculate_result, get_value, process and validate of an int, a string and a list"])
+  vm_noops(ctx, ["text read from files holding a lead byte at the end, a three-byte character cut short, an overlong slash, a stray continuation byte, an encoded surrogate, a code past U+10FFFF, and well-formed two- and four-byte characters", "a program measures each, reads every character's code, cuts past the end, and reads it through the cursor", "chr of 55295 and then of 55296"])
+  step(ctx, "each byte that starts no well-formed sequence is one character with code 65533, the well-formed ones decode as ever, and the bytes are kept", "st_tx_utf8_malformed")
+  step(ctx, "the first is one character, and it stops at the second, naming the require clause", "st_tx_chr_surrogate")
   step(ctx, "each gives what spec 1.10 says", "st_tx_sed")
   vm_noops(ctx, ["text of plain and of two- and three-byte characters, a needle at its start, middle and end, a needle it lacks, an empty needle, and a needle longer than the text", "str_contains looks for each"])
   step(ctx, "it is true where the text holds the needle, the empty needle included, and false elsewhere", "st_tx_str_contains")
@@ -1080,6 +1452,62 @@ make a function called register_values_and_memory_steps takes ctx returns done
   step(ctx, "the first gives [] and the program goes on, file_exists says the path is missing, and the second gives entries", "st_pg_list_dir_missing")
   vm_noops(ctx, ["a path relative to the current directory, the same path through .., and the full path itself", "path_absolute reads each"])
   step(ctx, "each gives the same full path, longer than the relative one, ending in it, naming a file that exists, with no backslash", "st_pg_path_absolute")
+  vm_noops(ctx, ["write_file of a path whose name is followed by code 0 and .tmp", "it runs"])
+  step(ctx, "the program stops saying the path holds code 0, and no file named by the part before it is made", "st_pg_path_nul")
+  vm_noops(ctx, ["a virtual file pkg/../../v2_rt_paths_escaped.txt, and another pkg/sub/../ok.txt", "each is flushed to a directory of its own"])
+  step(ctx, "the first stops the program naming the file, with nothing written, and the second is written as pkg/ok.txt with no pkg/sub made", "st_pg_vfs_flush_inside")
+  vm_noops(ctx, ["a relative path of about 6000 characters", "path_absolute reads it"])
+  step(ctx, "it gives the current directory followed by the path, or stops saying the system could not make it absolute", "st_pg_path_absolute_long")
+  vm_noops(ctx, ["a listener, and tcp_connect to 127.0.0.1, to localhost, to 10.0.0.1, to 1.2.3 and to 127.0.0.300", "each is tried"])
+  step(ctx, "the first two connect and carry what is written, 10.0.0.1 stops the program saying it is not this machine, and the others stop it saying they are not addresses", "st_pg_tcp_hosts")
+  vm_noops(ctx, ["a program that listens on a port, spawns a child that runs on for about six seconds, prints the port and ends", "another program captures its output"])
+  step(ctx, "the capture ends in well under the child's six seconds, and the port can be listened on again while the child still runs", "st_pg_spawn_handles")
+  vm_noops(ctx, ["a directory holding a cmd.exe that prints planted, and a program run from it that captures cmd /c echo from the system"])
+  step(ctx, "it prints from the system, and the cmd.exe in the directory does not run", "st_pg_exec_search")
+  vm_noops(ctx, ["a directory with a four-byte file written first, a seven-byte file written 50 ms later, and a subdirectory", "dir_files reads it, and a path with no directory at it"])
+  step(ctx, "it gives the two files by name with their sizes, the later one's written the larger, no subdirectory, and [] for the missing path", "st_pg_dir_files")
+  vm_noops(ctx, ["a program, not a quiet file, that calls runtime_state, mem_load and rt_alloc, and another that names rt_str_alloc as apply's function", "each is built or interpreted"])
+  step(ctx, "each is refused before anything runs, naming every such call", "st_pg_runtime_only")
+  vm_noops(ctx, ["a program that makes the name rt_str_alloc at run time and applies it", "it runs on either engine"])
+  step(ctx, "the lines before it run, and it stops as for a name nothing declares, the same on both", "st_pg_runtime_by_name_made")
+  vm_noops(ctx, ["a NaN made by dividing 0.0 by itself, and ordinary floats, ints and strings", "each is compared with == != < <= > and >="])
+  step(ctx, "every comparison with the NaN is false but !=, which is true, and the others compare as before", "st_pg_nan_order")
+  vm_noops(ctx, ["a class defining only <=, two classes each defining > with a different answer, and a class defining only <", "objects of each are compared"])
+  step(ctx, "<= is sent as itself, a > b goes to a's class, and > on the class with only < stops the program naming > and the class", "st_pg_operator_dispatch")
+  vm_noops(ctx, ["a class declaring a method named ==", "the program is built or interpreted"])
+  step(ctx, "it is refused before anything runs, saying objects compare by identity", "st_pg_eq_method")
+  vm_noops(ctx, ["clock_ms read across a 50 ms sleep, and 1000 times in a row", "the readings are compared"])
+  step(ctx, "the sleep moved it forward by at least 50, no reading is less than the one before, and now_ms is the wall clock", "st_pg_clock_ms")
+  vm_noops(ctx, ["a match with the cases *.txt, img* and *fred*, in a program that includes nothing, and glob_match called with * and ? patterns", "names, a name with a two-byte character and an int are matched"])
+  step(ctx, "each takes the case its glob describes, ? is one character, and the int matches no glob", "st_pg_glob_match")
+  vm_noops(ctx, ["host_caps() read in a native build and in a browser", "the lists are compared"])
+  step(ctx, "the native one is x64, subprocess, tcp and fs, and the browser's is wasm alone", "st_pg_host_caps")
+  vm_noops(ctx, ["a chain of 300 next facts with a recursive reach rule, and a rule that leads back to itself", "reach from n0 to n100 and to n250 is solved, and then the rule that leads back to itself"])
+  step(ctx, "both reaches have their one answer, and the third stops the program naming the goal, nothing after it running", "st_pg_solve_depth")
+  vm_noops(ctx, ["cmd typing a 300 KB file and then echoing its input with findstr, given 300 KB of input", "exec_capture_io runs it with a 60 second timeout"])
+  step(ctx, "it succeeds, both outputs are there whole, and it took well under the timeout", "st_pg_io_both")
+  vm_noops(ctx, ["not a == b, not a < b, not a == b and false, not a == 1 or true, and the bracketed forms", "each is evaluated with a 1 and b 2"])
+  step(ctx, "not applies to the whole comparison, and and and or to the not", "st_pg_not_precedence")
+  vm_noops(ctx, ["a call's result, a list element and a bracketed closure, each followed by arguments"])
+  step(ctx, "each gives what its closure returns", "st_pg_call_any")
+  vm_noops(ctx, ["a program using an undefined variable on line 6, a program dividing 7 by 0, and an operation given a float, a modint and an interval it does not take", "each is built and run"])
+  step(ctx, "the first is refused naming line 6, the second stops with division by zero, and the others name the type the operation does not take", "st_pg_error_terms")
+  vm_noops(ctx, ["a string opened on line 4 and never closed, a string over three lines followed by a stray ) on line 8, and numbers with exponents", "each is built"])
+  step(ctx, "the first is refused at line 4 saying the string is never closed, the second names line 8, and 1e3, 2.5e-2 and 4E+1 are numbers", "st_pg_lexer")
+  vm_noops(ctx, ["a program that calls tokenize, which nothing it reaches declares", "v2 builds it"])
+  step(ctx, "the build succeeds and warns that tokenize is called and nothing declares it", "st_pg_undeclared_warning")
+  vm_noops(ctx, ["an object named w1, in a program that declares nothing and in one that declares object_names_explicit()", "each reads it through object_named, reads w1.color or w1.length from the string, and deletes the object given the string"])
+  step(ctx, "object_named gives the object in both; without the declaration the string reaches the object and deletes it, and with it the string is only a string and deletes nothing", "st_pg_object_names")
+  vm_noops(ctx, ["an action whose step binds a text holding a comma and an int, and a closure bound to it", "the plan is made and activated"])
+  step(ctx, "the step's values are the text whole and the int as an int, its label writes both, and the closure is given exactly those two values", "st_pg_plan_steps")
+  vm_noops(ctx, ["8000 and 16000 virtual files written, read, and appended to one file 16 bytes at a time", "each phase is timed"])
+  step(ctx, "twice the files or appends take no more than about three times as long", "st_pg_vfs_scale")
+  vm_noops(ctx, ["a program the interpreter has run", "the cache of the runtime's declarations is read"])
+  step(ctx, "its key names each runtime file with its size and time of writing, and it ends with the count of the functions it holds", "st_pg_runtime_cache")
+  vm_noops(ctx, ["4000 facts, a rule pairing them, a store of two colours, and rules whose bodies have 400 and 800 goals", "solve_up_to and solve_up_to_in ask for the first few solutions of each"])
+  step(ctx, "each gives solve's first solutions in solve's order, none past n, the pair rule's first two of its 16 million, and the 800-goal body in no more than about three times the 400-goal body's time", "st_pg_solve_up_to")
+  vm_noops(ctx, ["chains of 500 and 1000 next facts and a recursive reach rule", "reach from the first to the last is solved on each"])
+  step(ctx, "the longer takes no more than about three times as long", "st_pg_solve_chain_scale")
   vm_noops(ctx, ["cpu_count, cpu_times and memory_status, cpu_times read 100 ms apart", "each is called"])
   step(ctx, "there is at least one processor, the times grow between the readings, and the free memory is no more than the total", "st_pg_machine_state")
   vm_noops(ctx, ["a store with one fact added twice through two holders, rules declared in a named store and read with from, two stores each holding q, a store solved into twice, a plan from a store's facts, a contract checked, the default store cleared and a named store deleted"])
@@ -1097,8 +1525,17 @@ make a function called register_values_and_memory_steps takes ctx returns done
   step(ctx, "both engines print what those calls give", "st_ea_anywhere")
   step(ctx, "both engines report that it cannot be read", "st_ea_no_program")
   step(ctx, "both engines report that the include cannot be read, and nothing of the program runs", "st_ea_no_include")
-  vm_noops(ctx, ["a program whose last statements are a call whose value nothing uses, and an int", "a function taking two arguments, and one taking one and rest, each called with too few or too many, and a closure called with nine", "the program is compiled", "a closure taking two parameters, called with two and then with one", "apply and parallel_map of a function taking two arguments and of one taking one and rest", "apply of a function taking two arguments, with one", "closures taking two parameters, none and a list, each spawned with that many arguments", "each thread's result is taken", "a closure taking two parameters, spawned with one"])
-  step(ctx, "it prints only what it printed itself", "st_pg_program_value")
+  vm_noops(ctx, ["a program whose statements are a call whose value nothing uses, a sum, a variable, and last a string and an int", "a function taking two arguments, and one taking one and rest, each called with too few or too many, and a closure called with nine", "the program is compiled", "a closure taking two parameters, called with two and then with one", "apply and parallel_map of a function taking two arguments and of one taking one and rest", "apply of a function taking two arguments, with one", "closures taking two parameters, none and a list, each spawned with that many arguments", "each thread's result is taken", "a closure taking two parameters, spawned with one"])
+  vm_noops(ctx, ["a let rebinding a variable to a call that takes it, of a closure held in a parameter, of a function ending in rest with further arguments, and of the program's own max", "a let rebinding a variable to a call of a function taking one argument, given three"])
+  step(ctx, "the closure is called, rest holds the further arguments, and the program's max runs, each as through a new name", "st_pg_let_giving_calls")
+  vm_noops(ctx, ["a virtual file that was never written, and one that was written and then deleted", "vfs_exists of each is a condition, and is printed"])
+  step(ctx, "the missing file takes the false branch and the written one the true, and it gives the bools false and true", "st_pg_vfs_exists")
+  vm_noops(ctx, ["arguments that are plain, hold a space, end in a backslash after a space, hold a quote after a backslash, are empty, and end in two backslashes", "a program that prints its argv is run with them"])
+  step(ctx, "it has eight arguments, each unchanged", "st_pg_argv_round_trip")
+  vm_noops(ctx, ["facts, queries, a rule declaration and a plan whose constants begin with capital letters, and variables made by logic_var and by capitalised names in the declaration"])
+  step(ctx, "a capitalised constant matches only itself, a variable matches any constant, and a logic variable is a value of its own type, equal to another of the same name and to no string", "st_pg_logic_constants")
+  step(ctx, "both engines refuse it, naming the function and both numbers, as for any call, and nothing runs", "st_pg_let_giving_arity")
+  step(ctx, "the call's value is not printed, and each bare value is, the last ones included", "st_pg_program_value")
   step(ctx, "both engines refuse it, naming the function and both numbers, and that a closure takes at most 8, and nothing runs", "st_pg_arity_named")
   vm_noops(ctx, ["a closure taking one parameter and rest, called through a variable with one and with three arguments, and on a thread with two", "a closure taking one parameter and rest, called with none"])
   step(ctx, "rest holds the further arguments as a list each time, as for a function", "st_pg_closure_rest")

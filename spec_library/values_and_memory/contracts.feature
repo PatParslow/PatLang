@@ -16,10 +16,16 @@ Feature: the runtime and compiler state their contracts (spec 2.4)
     When it is passed to a function requiring a live value
     Then the program stops at that call, naming the require clause
 
-  Scenario: contracts are checked in every build
+  Scenario: a program's contracts are checked in every build
     Given a program whose function has a require clause it breaks, built in the default way and in every other build mode
     When each build runs
     Then each stops at that call, naming the clause
+
+  Scenario: the runtime's ensures are checked when a build asks for them
+    Given a program built as IR in the default way, and again with --check-runtime
+    When the runtime's list_len is read in each
+    Then the default build checks its require and not its ensure, and the other checks both
+    And programs using threads, objects, logic and the virtual file system, built with --check-runtime, print what their default builds print
 
   Scenario: whether contracts are checked is one setting
     Given the compiler and runtime sources

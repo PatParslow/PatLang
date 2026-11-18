@@ -3,20 +3,91 @@
 # holder. Each is a counted block; a builder and a bool array keep their
 # bytes in a buffer block of their own (an uncounted rt_alloc block, freed
 # with them), a vec its list.
-#   string builder (class 11): 16 length, 24 capacity, 32 buffer
-#   vec (class 12): 16 its list
+#   string builder (class 11): 16 length, 24 capacity, 32 buffer, 40 its users
+#   vec (class 12): 16 its list, 32 its users, 40 its place in the registry
+#                   of blocks that can close a cycle (memory.patlang)
 #   bool array (class 13): 16 length in bits, 24 capacity in words,
-#                          32 buffer of 64-bit words
+#                          32 buffer of 64-bit words, 40 its users
 # A rule store (class 14) is a cell too; its layout is in logic.patlang.
+#
+# A cell belongs to one thread at a time (spec 1.8). Its users word counts the
+# threads inside it once a second thread has been started: 1 for each reading
+# it, 2^32 for one changing it. A thread that comes to change a cell another
+# is using, or to read one another is changing, stops the program saying so
+# (98): the alternative is a block freed twice. Threads that only read one
+# together are fine, and so is handing a cell from one thread to another. An
+# object's fields (objects.patlang) and a rule store (logic.patlang) are kept
+# the same way.
 quiet_operators()
+
+make a function called rt_cell_shared returns r
+  print("a vec, a string builder, a bool array, an object's fields or a rule store was changed by one thread while another was using it: each belongs to one thread at a time")
+  let r = rt_stop(98)
+  ensure false
+  return r
+end
+
+# Enters the cell whose users word is at `at` to read it: whether it counted
+# itself, for rt_cell_read_end.
+make a function called rt_cell_read takes at returns entered
+  require at != 0
+  if mem_load(runtime_state(), 4608) == 0 then
+    let entered = false
+    ensure value_class(entered) == 1
+    return entered
+  end
+  if atomic_add(at, 1) >= 4294967296 then
+    rt_cell_shared()
+  end
+  let entered = true
+  ensure value_class(entered) == 1
+  return entered
+end
+
+make a function called rt_cell_read_end takes at, entered returns r
+  require (at != 0) and (value_class(entered) == 1)
+  if entered then
+    atomic_add(at, 0 - 1)
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# Enters the cell to change it.
+make a function called rt_cell_write takes at returns entered
+  require at != 0
+  if mem_load(runtime_state(), 4608) == 0 then
+    let entered = false
+    ensure value_class(entered) == 1
+    return entered
+  end
+  if atomic_add(at, 4294967296) != 0 then
+    rt_cell_shared()
+  end
+  let entered = true
+  ensure value_class(entered) == 1
+  return entered
+end
+
+make a function called rt_cell_write_end takes at, entered returns r
+  require (at != 0) and (value_class(entered) == 1)
+  if entered then
+    atomic_add(at, 0 - 4294967296)
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
 
 # ---- string builders ----
 
 make a function called sb_new returns b
-  let block = rt_alloc(24)
+  let block = rt_alloc(32)
   mem_store(block, 16, 0)
   mem_store(block, 24, 32)
   mem_store(block, 32, rt_alloc(32))
+  mem_store(block, 40, 0)
   let b = value_make(4294967307, block)
   ensure (value_class(b) == 11) and (sb_len(b) == 0)
   return b
@@ -51,10 +122,12 @@ make a function called sb_push takes b, x returns r
   let text = to_s(x)
   let n = str_len(text)
   let block = value_data(b)
+  let e = rt_cell_write(block + 40)
   let len = mem_load(block, 16)
   rt_sb_reserve(block, len + n)
   rt_copy_bytes(mem_load(block, 32) + 16 + len, rt_str_bytes(text), n)
   mem_store(block, 16, len + n)
+  rt_cell_write_end(block + 40, e)
   let r = b
   ensure value_class(r) == 11
   return r
@@ -63,11 +136,13 @@ end
 make a function called sb_str takes b returns s
   require value_class(b) == 11
   let block = value_data(b)
+  let e = rt_cell_read(block + 40)
   let len = mem_load(block, 16)
   let out = rt_str_alloc(len)
   rt_copy_bytes(out + 32, mem_load(block, 32) + 16, len)
+  rt_cell_read_end(block + 40, e)
   let s = value_make(rt_string_heap_type(), out)
-  ensure (value_class(s) == 8) and (str_len(s) == sb_len(b))
+  ensure (value_class(s) == 8) and (str_len(s) == len)
   return s
 end
 
@@ -81,11 +156,14 @@ end
 # ---- vecs ----
 
 make a function called vec_new returns v
-  let block = rt_alloc(16)
+  let block = rt_alloc(32)
   mem_store(block, 16, 0)
   mem_store(block, 24, 0)
+  mem_store(block, 32, 0)
+  mem_store(block, 40, 0)
   mem_init_value(block, 16, [])
   let v = value_make(4294967308, block)
+  rt_cycle_register(4294967308, block)
   ensure (value_class(v) == 12) and (vec_len(v) == 0)
   return v
 end
@@ -95,9 +173,11 @@ end
 make a function called vec_push takes v, x returns r
   require (value_class(v) == 12) and value_live(x)
   let block = value_data(v)
+  let e = rt_cell_write(block + 32)
   let l = mem_take_value(block, 16)
   let l = list_push(l, x)
   mem_init_value(block, 16, l)
+  rt_cell_write_end(block + 32, e)
   let r = v
   ensure value_class(r) == 12
   return r
@@ -106,9 +186,11 @@ end
 make a function called vec_set takes v, i, x returns r
   require (value_class(v) == 12) and (value_class(i) == 2) and value_live(x)
   let block = value_data(v)
+  let e = rt_cell_write(block + 32)
   let l = mem_take_value(block, 16)
   let l = list_set(l, i, x)
   mem_init_value(block, 16, l)
+  rt_cell_write_end(block + 32, e)
   let r = v
   ensure value_class(r) == 12
   return r
@@ -120,6 +202,7 @@ end
 make a function called rt_vec_pop takes v returns x
   require (value_class(v) == 12) and (vec_len(v) > 0)
   let block = value_data(v)
+  let e = rt_cell_write(block + 32)
   let l = mem_take_value(block, 16)
   let n = list_len(l)
   if mem_load(value_data(l), 0) != 1 then
@@ -129,20 +212,25 @@ make a function called rt_vec_pop takes v returns x
   let x = mem_take_value(lb, 32 + 16 * (n - 1))
   mem_store(lb, 16, n - 1)
   mem_init_value(block, 16, l)
-  ensure value_live(x) and (vec_len(v) == n - 1)
+  rt_cell_write_end(block + 32, e)
+  ensure value_live(x)
   return x
 end
 
 make a function called vec_get takes v, i returns x
   require value_class(v) == 12
-  let x = list_get(mem_load_value(value_data(v), 16), i)
+  let block = value_data(v)
+  let e = rt_cell_read(block + 32)
+  let l = mem_load_value(block, 16)
+  rt_cell_read_end(block + 32, e)
+  let x = list_get(l, i)
   ensure value_live(x)
   return x
 end
 
 make a function called vec_len takes v returns n
   require value_class(v) == 12
-  let n = list_len(mem_load_value(value_data(v), 16))
+  let n = list_len(vec_to_list(v))
   ensure n >= 0
   return n
 end
@@ -154,6 +242,7 @@ end
 make a function called vec_extend takes v, items returns r
   require (value_class(v) == 12) and (value_class(items) == 9)
   let block = value_data(v)
+  let e = rt_cell_write(block + 32)
   let l = mem_take_value(block, 16)
   let m = list_len(items)
   let l = rt_list_reserve(l, m)
@@ -168,6 +257,7 @@ make a function called vec_extend takes v, items returns r
   end
   mem_store(lb, 16, n + m)
   mem_init_value(block, 16, l)
+  rt_cell_write_end(block + 32, e)
   let r = v
   ensure value_class(r) == 12
   return r
@@ -177,7 +267,10 @@ end
 # count makes the change copy.
 make a function called vec_to_list takes v returns l
   require value_class(v) == 12
-  let l = mem_load_value(value_data(v), 16)
+  let block = value_data(v)
+  let e = rt_cell_read(block + 32)
+  let l = mem_load_value(block, 16)
+  rt_cell_read_end(block + 32, e)
   ensure (value_class(l) == 9)
   return l
 end
@@ -190,9 +283,10 @@ make a function called bool_array_new takes n returns a
   if words < 1 then
     let words = 1
   end
-  let block = rt_alloc(24)
+  let block = rt_alloc(32)
   mem_store(block, 16, n)
   mem_store(block, 24, words)
+  mem_store(block, 40, 0)
   let buf = rt_alloc(8 * words)
   let k = 0
   while k < words do
@@ -215,8 +309,10 @@ end
 make a function called bool_array_get takes a, i returns v
   require value_class(a) == 13
   let block = value_data(a)
+  let e = rt_cell_read(block + 40)
   rt_check_index(i, mem_load(block, 16))
   let word = mem_load(mem_load(block, 32), 16 + 8 * word_shr(i, 6))
+  rt_cell_read_end(block + 40, e)
   let v = word_and(word_shr(word, word_and(i, 63)), 1) == 1
   ensure value_class(v) == 1
   return v
@@ -225,6 +321,17 @@ end
 make a function called bool_array_set takes a, i, v returns r
   require (value_class(a) == 13) and (value_class(v) == 1)
   let block = value_data(a)
+  let e = rt_cell_write(block + 40)
+  rt_bool_array_store(block, i, v)
+  rt_cell_write_end(block + 40, e)
+  let r = a
+  ensure value_class(r) == 13
+  return r
+end
+
+# One bit set in a bool array's block, by a caller that has entered it.
+make a function called rt_bool_array_store takes block, i, v returns r
+  require (block != 0) and (value_class(v) == 1)
   rt_check_index(i, mem_load(block, 16))
   let at = mem_load(block, 32) + 16 + 8 * word_shr(i, 6)
   let mask = word_shl(1, word_and(i, 63))
@@ -233,8 +340,8 @@ make a function called bool_array_set takes a, i, v returns r
   else
     mem_store(at, 0, word_and(mem_load(at, 0), word_xor(mask, 0 - 1)))
   end
-  let r = a
-  ensure value_class(r) == 13
+  let r = 0
+  ensure r == 0
   return r
 end
 
@@ -242,6 +349,7 @@ end
 make a function called bool_array_push takes a, v returns r
   require (value_class(a) == 13) and (value_class(v) == 1)
   let block = value_data(a)
+  let e = rt_cell_write(block + 40)
   let n = mem_load(block, 16)
   let words = mem_load(block, 24)
   if word_shr(n, 6) >= words then
@@ -262,7 +370,8 @@ make a function called bool_array_push takes a, v returns r
     mem_store(block, 24, new_words)
   end
   mem_store(block, 16, n + 1)
-  bool_array_set(a, n, v)
+  rt_bool_array_store(block, n, v)
+  rt_cell_write_end(block + 40, e)
   let r = a
   ensure (value_class(r) == 13) and (bool_array_len(r) == n + 1)
   return r

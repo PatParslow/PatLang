@@ -87,6 +87,37 @@ end
 # many arguments each call wrote.
 make a function called v2_reachable takes fns, runtime_names returns kept
   let table = v2_index_table(fns)
+  let reach = v2_reach(fns, runtime_names, table)
+  let seen = reach[0]
+  let undeclared = reach[1]
+  let out = vec_new()
+  let i = 0
+  while i < list_len(fns) do
+    if vec_get(seen, i) then
+      vec_push(out, v2_without_undeclared_args(fns[i], table))
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < vec_len(undeclared) do
+    vec_push(out, lw_undeclared_function(vec_get(undeclared, i)))
+    let i = i + 1
+  end
+  return vec_to_list(out)
+end
+
+# The names a program reaches that nothing declares, in the order reached
+# (--names): each is a call that stops the program when it is made.
+make a function called v2_undeclared_names takes fns, runtime_names returns names
+  let reach = v2_reach(fns, runtime_names, v2_index_table(fns))
+  let names = vec_to_list(reach[1])
+  ensure type_of(names) == "list"
+  return names
+end
+
+# The walk from the roots: [a vec of whether each function is reached, a vec of
+# the names reached that nothing declares].
+make a function called v2_reach takes fns, runtime_names, table returns reach
   let seen = vec_new()
   let i = 0
   while i < list_len(fns) do
@@ -120,20 +151,7 @@ make a function called v2_reachable takes fns, runtime_names returns kept
       end
     end
   end
-  let out = vec_new()
-  let i = 0
-  while i < list_len(fns) do
-    if vec_get(seen, i) then
-      vec_push(out, v2_without_undeclared_args(fns[i], table))
-    end
-    let i = i + 1
-  end
-  let i = 0
-  while i < vec_len(undeclared) do
-    vec_push(out, lw_undeclared_function(vec_get(undeclared, i)))
-    let i = i + 1
-  end
-  return vec_to_list(out)
+  return [seen, undeclared]
 end
 
 # func with each call of a name the table does not hold passing no arguments;
@@ -247,16 +265,24 @@ make a function called v2_times_text takes times returns text
   return sb_str(tb)
 end
 
-make a function called v2_compile takes src_path, out_path, workers, seed, cache returns result
+make a function called v2_compile takes src_path, out_path, workers, seed, cache, runtime_ensures returns result
   let times = vec_new()
   vec_push(times, now_ms())
-  let front = v2_front_end(src_path, "")
+  let front = v2_front_end(src_path, "", runtime_ensures)
   v2_mark(times, "front end", out_path)
   if front[0] == "error" then
     return front
   end
   let lowered = front[1]
   let fns = v2_reachable(lowered[0], lowered[3])
+  # a call of a name nothing declares compiles (spec 1.13), and is named here
+  # so a typo is seen before the call is reached
+  let undeclared = v2_undeclared_names(lowered[0], lowered[3])
+  let u = 0
+  while u < list_len(undeclared) do
+    print("v2 warning: " + undeclared[u] + " is called, and nothing declares it: the call stops the program when it is reached")
+    let u = u + 1
+  end
   write_file(out_path + ".facts", v2_facts_text(lowered[2]))
   let facts = lowered[2]
   let key = jb_compiler_key()
@@ -272,11 +298,11 @@ make a function called v2_compile takes src_path, out_path, workers, seed, cache
       exec_capture("cmd", "/c", "mkdir", "self_hosting" + chr(92) + "build" + chr(92) + "v2_artefacts")
     end
   end
-  let base = jb_mix_text(jb_hash_new(), key)
+  let base = key
   v2_mark(times, "compiler key", out_path)
   let table = jb_summaries(fns)
   let entry = xv_entry_asm()
-  let jobs = [[0, "asm", entry, facts, jb_key_text(jb_mix_text(base, entry)), dir]]
+  let jobs = [[0, "asm", entry, facts, jb_entry_key(base, entry), dir]]
   let i = 0
   while i < list_len(fns) do
     let jobs = list_push(jobs, [i + 1, "fn", fns[i], facts, jb_fn_key(base, fns[i], facts, table), dir])
@@ -345,8 +371,8 @@ end
 
 # The program's IR (docs/spec/ir.md): every function it can reach, the
 # runtime's included, after the ownership stage.
-make a function called v2_write_ir takes src_path, out_path returns result
-  let front = v2_front_end(src_path, "")
+make a function called v2_write_ir takes src_path, out_path, runtime_ensures returns result
+  let front = v2_front_end(src_path, "", runtime_ensures)
   if front[0] == "error" then
     return front
   end
@@ -359,7 +385,7 @@ end
 # program's time can depend on a modint's residue, printed, and an error when
 # there is any.
 make a function called v2_check_constant_time takes src_path returns result
-  let front = v2_front_end(src_path, "")
+  let front = v2_front_end(src_path, "", false)
   if front[0] == "error" then
     return front
   end
@@ -376,10 +402,32 @@ make a function called v2_check_constant_time takes src_path returns result
   return ["error", [list_len(lines) + " places where the time can depend on a modint's residue"]]
 end
 
+# The strict-names check: every name the program calls that neither it nor the
+# runtime declares, printed, and an error when there is any. Such a call
+# compiles, and stops the program only when it is reached (spec 1.13), so a
+# misspelt name or a function of some other engine goes unseen until then.
+make a function called v2_check_names takes src_path returns result
+  let front = v2_front_end(src_path, "", false)
+  if front[0] == "error" then
+    return front
+  end
+  let lowered = front[1]
+  let names = v2_undeclared_names(lowered[0], lowered[3])
+  if list_len(names) == 0 then
+    return ["ok", "every name called is declared"]
+  end
+  let i = 0
+  while i < list_len(names) do
+    print("v2 names: " + lw_source_name(names[i]) + " is called, and nothing declares it")
+    let i = i + 1
+  end
+  return ["error", [list_len(names) + " names called that nothing declares"]]
+end
+
 # The program as a WebAssembly module (docs/spec/ir.md, "The WASM form"),
 # built from the same IR as --ir writes.
-make a function called v2_write_wasm takes src_path, out_path returns result
-  let front = v2_front_end(src_path, "")
+make a function called v2_write_wasm takes src_path, out_path, runtime_ensures returns result
+  let front = v2_front_end(src_path, "", runtime_ensures)
   if front[0] == "error" then
     return front
   end
@@ -413,8 +461,21 @@ elif (list_len(args) == 2) and (args[1] == "--constant-time") then
     print("v2 error: " + r[1][0])
     exit_with(1)
   end
+elif (list_len(args) == 2) and (args[1] == "--names") then
+  let r = v2_check_names(args[0])
+  if r[0] == "ok" then
+    print("v2: " + r[1])
+  else
+    let i = 0
+    while i < list_len(r[1]) do
+      print("v2 error: " + r[1][i])
+      let i = i + 1
+    end
+    exit_with(1)
+  end
 elif list_len(args) < 2 then
   print("usage: compile.patlang SRC.patlang OUT.exe [--workers N] [--shuffle SEED] [--no-cache]")
+  print("       compile.patlang SRC.patlang --names")
   print("       compile.patlang SRC.patlang OUT.ir --ir")
   print("       compile.patlang SRC.patlang OUT.wasm --wasm")
   print("       compile.patlang SRC.patlang --constant-time")
@@ -424,6 +485,7 @@ else
   let workers = 1
   let seed = 0
   let cache = true
+  let runtime_ensures = false
   let ir = false
   let wasm = false
   let i = 2
@@ -434,6 +496,8 @@ else
     elif (args[i] == "--shuffle") and (i + 1 < list_len(args)) then
       let seed = to_num(args[i + 1])
       let i = i + 1
+    elif args[i] == "--check-runtime" then
+      let runtime_ensures = true
     elif args[i] == "--no-cache" then
       let cache = false
     elif args[i] == "--ir" then
@@ -445,11 +509,11 @@ else
   end
   let r = []
   if ir then
-    let r = v2_write_ir(args[0], args[1])
+    let r = v2_write_ir(args[0], args[1], runtime_ensures)
   elif wasm then
-    let r = v2_write_wasm(args[0], args[1])
+    let r = v2_write_wasm(args[0], args[1], runtime_ensures)
   else
-    let r = v2_compile(args[0], args[1], workers, seed, cache)
+    let r = v2_compile(args[0], args[1], workers, seed, cache, runtime_ensures)
   end
   if r[0] == "ok" then
     print("v2: " + r[1])

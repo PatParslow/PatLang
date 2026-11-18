@@ -165,6 +165,16 @@ A world holds a program's state: its named objects, classes, event handlers,
 functions reached by name, logic stores, contract facts and virtual files. A
 program starts in a world of its own, and can make more.
 
+A world isolates state, not authority. Code in a world can do whatever the
+program running it can: read and write real files, start processes, open
+sockets, and use as much time as the call takes (a step budget, 4.2, bounds
+only interpreted loops and calls; compiled code and one long call to `plan`,
+`solve` or `pow` spend none). What no program can do, in a world or not, is
+use the runtime's own primitives and `rt_` functions: only a file declaring
+`quiet_operators()` may, and the interpreter refuses them in the text it runs
+as the compiler does. Running another program's text in a world keeps its
+state apart from yours; it does not make that text safe to run.
+
 ### 4.1 Running code in a world
 
 ```patlang
@@ -176,7 +186,7 @@ let r = world_call(w, || do
 end)
 print(r)                      # [done, 42]
 print(world_output(w))        # inside the world
-print(vfs_exists("note.txt")) # 0: the caller's files are its own
+print(vfs_exists("note.txt")) # false: the caller's files are its own
 let again = world_call(w, || do
   return vfs_read("note.txt")
 end)
@@ -280,7 +290,7 @@ while i < list_len(r[3]) do
   print(r[3][i][0] + " = " + r[3][i][1])   # /w/a.txt = A, then /w/new.txt = n
   let i = i + 1
 end
-print(vfs_exists("/w/new.txt"))            # 0
+print(vfs_exists("/w/new.txt"))            # false
 ```
 
 File: `world_vfs.patlang`. The caller's files are not visible in the world, and
