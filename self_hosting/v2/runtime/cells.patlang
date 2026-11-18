@@ -1,4 +1,4 @@
-# v2 runtime: string builders, vecs and bool arrays (spec 1.5): mutable,
+# v2 runtime: string builders, vecs, bool arrays and bytes (spec 1.5): mutable,
 # with identity, so a change through one holder is seen through every
 # holder. Each is a counted block; a builder and a bool array keep their
 # bytes in a buffer block of their own (an uncounted rt_alloc block, freed
@@ -21,7 +21,7 @@
 quiet_operators()
 
 make a function called rt_cell_shared returns r
-  print("a vec, a string builder, a bool array, an object's fields or a rule store was changed by one thread while another was using it: each belongs to one thread at a time")
+  print("a vec, a string builder, a bool array, a bytes, an object's fields or a rule store was changed by one thread while another was using it: each belongs to one thread at a time")
   let r = rt_stop(98)
   ensure false
   return r
@@ -379,7 +379,7 @@ end
 
 # Frees what a freed cell holds (rt_finalize).
 make a function called rt_cell_finalize takes cls, block returns r
-  require (cls >= 11) and (cls <= 14) and (mem_load(block, 0) == 0)
+  require (((cls >= 11) and (cls <= 14)) or (cls == 18)) and (mem_load(block, 0) == 0)
   if cls == 12 then
     rt_release_value_at(block, 16)
   elif cls == 14 then
@@ -393,4 +393,227 @@ make a function called rt_cell_finalize takes cls, block returns r
   let r = 0
   ensure r == 0
   return r
+end
+
+# ---- bytes ----
+#
+# A buffer of bytes with identity, as a vec is (class 18): 16 length, 24
+# capacity, 32 the buffer (an uncounted block, its bytes from 16), 40 its
+# users. One byte of memory holds one byte, where a list of ints holds a
+# 16-byte value for each (review finding O9).
+
+make a function called rt_bytes_heap_type returns t
+  let t = 4294967314
+  ensure (word_and(t, 4294967295) == 18) and (word_and(t, 4294967296) != 0)
+  return t
+end
+
+# Where a bytes' first byte is: for the runtime, which copies to and from it.
+make a function called rt_bytes_addr takes b returns addr
+  require value_class(b) == 18
+  let addr = mem_load(value_data(b), 32) + 16
+  ensure addr != 0
+  return addr
+end
+
+make a function called bytes_new takes n returns b
+  require (value_class(n) == 2) and (n >= 0)
+  let cap = n
+  if cap < 16 then
+    let cap = 16
+  end
+  let block = rt_alloc(32)
+  mem_store(block, 16, n)
+  mem_store(block, 24, cap)
+  mem_store(block, 40, 0)
+  let buf = rt_alloc(cap)
+  let k = 0
+  while k < cap do
+    mem_store_byte(buf, 16 + k, 0)
+    let k = k + 1
+  end
+  mem_store(block, 32, buf)
+  let b = value_make(rt_bytes_heap_type(), block)
+  ensure (value_class(b) == 18) and (bytes_len(b) == n)
+  return b
+end
+
+make a function called bytes_len takes b returns n
+  require value_class(b) == 18
+  let n = mem_load(value_data(b), 16)
+  ensure n >= 0
+  return n
+end
+
+make a function called bytes_get takes b, i returns v
+  require value_class(b) == 18
+  let block = value_data(b)
+  let e = rt_cell_read(block + 40)
+  rt_check_index(i, mem_load(block, 16))
+  let v = mem_load_byte(mem_load(block, 32), 16 + i)
+  rt_cell_read_end(block + 40, e)
+  ensure (v >= 0) and (v <= 255)
+  return v
+end
+
+make a function called bytes_set takes b, i, v returns r
+  require (value_class(b) == 18) and (value_class(v) == 2) and (v >= 0) and (v <= 255)
+  let block = value_data(b)
+  let e = rt_cell_write(block + 40)
+  rt_check_index(i, mem_load(block, 16))
+  mem_store_byte(mem_load(block, 32), 16 + i, v)
+  rt_cell_write_end(block + 40, e)
+  let r = b
+  ensure value_class(r) == 18
+  return r
+end
+
+# Room for need bytes in a bytes' block, by a caller that has entered it:
+# the buffer at least doubles, so pushing n bytes copies O(n) in all.
+make a function called rt_bytes_reserve takes block, need returns r
+  require (block != 0) and (need >= 0)
+  let cap = mem_load(block, 24)
+  if need > cap then
+    let new_cap = cap * 2
+    if new_cap < need then
+      let new_cap = need
+    end
+    let old = mem_load(block, 32)
+    let buf = rt_alloc(new_cap)
+    rt_copy_bytes(buf + 16, old + 16, mem_load(block, 16))
+    rt_free(old)
+    mem_store(block, 32, buf)
+    mem_store(block, 24, new_cap)
+  end
+  let r = 0
+  ensure (r == 0) and (mem_load(block, 24) >= need)
+  return r
+end
+
+# Grows in place: the bytes stays the same bytes.
+make a function called bytes_push takes b, v returns r
+  require (value_class(b) == 18) and (value_class(v) == 2) and (v >= 0) and (v <= 255)
+  let block = value_data(b)
+  let e = rt_cell_write(block + 40)
+  let n = mem_load(block, 16)
+  rt_bytes_reserve(block, n + 1)
+  mem_store_byte(mem_load(block, 32), 16 + n, v)
+  mem_store(block, 16, n + 1)
+  rt_cell_write_end(block + 40, e)
+  let r = b
+  ensure (value_class(r) == 18) and (bytes_len(r) == n + 1)
+  return r
+end
+
+# Appends another bytes, copied whole, or a list of ints from 0 to 255.
+make a function called bytes_extend takes b, more returns r
+  require (value_class(b) == 18) and ((value_class(more) == 18) or (value_class(more) == 9))
+  let block = value_data(b)
+  let n = mem_load(block, 16)
+  if value_class(more) == 18 then
+    let m = bytes_len(more)
+    let e = rt_cell_write(block + 40)
+    rt_bytes_reserve(block, n + m)
+    # read after reserving: more may be b itself, its buffer just moved
+    rt_copy_bytes(mem_load(block, 32) + 16 + n, rt_bytes_addr(more), m)
+    mem_store(block, 16, n + m)
+    rt_cell_write_end(block + 40, e)
+  else
+    let m = list_len(more)
+    let e = rt_cell_write(block + 40)
+    rt_bytes_reserve(block, n + m)
+    let buf = mem_load(block, 32)
+    let k = 0
+    while k < m do
+      let v = more[k]
+      if (value_class(v) != 2) or (v < 0) or (v > 255) then
+        rt_cell_write_end(block + 40, e)
+        print("bytes_extend: " + to_s(v) + " is not a byte, an int from 0 to 255")
+        rt_stop(70)
+      end
+      mem_store_byte(buf, 16 + n + k, v)
+      let k = k + 1
+    end
+    mem_store(block, 16, n + m)
+    rt_cell_write_end(block + 40, e)
+  end
+  let r = b
+  ensure value_class(r) == 18
+  return r
+end
+
+# A new bytes holding n bytes of b from start.
+make a function called bytes_slice takes b, start, n returns s
+  require (value_class(b) == 18) and (value_class(start) == 2) and (value_class(n) == 2) and (start >= 0) and (n >= 0) and (start + n <= bytes_len(b))
+  let s = bytes_new(n)
+  rt_copy_bytes(rt_bytes_addr(s), rt_bytes_addr(b) + start, n)
+  ensure (value_class(s) == 18) and (bytes_len(s) == n)
+  return s
+end
+
+# Whether two bytes hold the same bytes (== asks whether they are the same
+# bytes, as for a vec).
+make a function called bytes_eq takes a, b returns yes
+  require (value_class(a) == 18) and (value_class(b) == 18)
+  let n = bytes_len(a)
+  if n != bytes_len(b) then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let pa = rt_bytes_addr(a)
+  let pb = rt_bytes_addr(b)
+  let k = 0
+  while k < n do
+    if mem_load_byte(pa, k) != mem_load_byte(pb, k) then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let k = k + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called bytes_from_list takes items returns b
+  require value_class(items) == 9
+  let b = bytes_new(0)
+  bytes_extend(b, items)
+  ensure (value_class(b) == 18) and (bytes_len(b) == list_len(items))
+  return b
+end
+
+make a function called bytes_to_list takes b returns items
+  require value_class(b) == 18
+  let n = bytes_len(b)
+  let items = rt_list_alloc(n)
+  let p = rt_bytes_addr(b)
+  let k = 0
+  while k < n do
+    let items = list_set(items, k, mem_load_byte(p, k))
+    let k = k + 1
+  end
+  ensure (value_class(items) == 9) and (list_len(items) == n)
+  return items
+end
+
+# A string's UTF-8 bytes.
+make a function called bytes_from_str takes s returns b
+  require value_class(s) == 8
+  let n = str_len(s)
+  let b = bytes_new(n)
+  rt_copy_bytes(rt_bytes_addr(b), rt_str_bytes(s), n)
+  ensure (value_class(b) == 18) and (bytes_len(b) == n)
+  return b
+end
+
+# The string whose UTF-8 bytes these are; a malformed sequence reads as U+FFFD
+# (spec 1.10).
+make a function called bytes_to_str takes b returns s
+  require value_class(b) == 18
+  let s = rt_str_from_bytes(rt_bytes_addr(b), bytes_len(b))
+  ensure (value_class(s) == 8) and (str_len(s) == bytes_len(b))
+  return s
 end

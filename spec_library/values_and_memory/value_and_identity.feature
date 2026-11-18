@@ -56,6 +56,11 @@ Feature: values and objects with identity (spec 1.5)
     When the vecs and the lists taken from them are read
     Then the first vec holds its elements twice in order, the lists taken earlier are unchanged, and the second vec holds 20000 numbers
 
+  Scenario: bytes is a buffer of bytes with identity
+    Given a bytes made, set, pushed to through a second holder, extended, sliced, compared, turned into text and lists and back, written to a file and read back, and pushed to a million times
+    When each is read
+    Then every byte is where it was put, a change through one holder is seen through the other, bytes_eq compares contents and == identity, the file holds the same bytes, and a million pushes take no more than about eight times as long as 250000
+
   Scenario: a bool array keeps its identity when it grows
     Given a = bool_array_new(0), b = a, then 100 bool_array_push calls on a
     When bool_array_len(b) is read

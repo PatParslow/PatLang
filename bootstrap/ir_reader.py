@@ -228,6 +228,9 @@ class Code:
 
 JL, JGE, JE, JNE, JLE, JG, JO, JZ, JP = 0xC, 0xD, 0x4, 0x5, 0xE, 0xF, 0x0, 0x4, 0xA
 CMP_JUMP = {"<": JL, ">": JG, "<=": JLE, ">=": JGE, "==": JE, "!=": JNE}
+# The highest built-in class value_live accepts: ir_last_builtin_class in
+# self_hosting/v2/ir.patlang, 18 being bytes.
+LAST_BUILTIN_CLASS = 18
 OP_FN = {"+": "op_add", "q+": "op_add_quiet", "a+": "op_add_taken", "-": "op_sub", "*": "op_mul",
          "/": "op_div", "%": "op_mod", "<": "op_lt", ">": "op_gt", "<=": "op_le", ">=": "op_ge",
          "==": "op_eq", "!=": "op_ne", "band": "op_band", "bor": "op_bor", "bxor": "op_bxor",
@@ -413,7 +416,7 @@ class FnGen:
             c.jcc(JNE, bad)
             c.mov_imm(RCX, 0xFFFFFFFF)
             c.alu("and", RCX, RAX)
-            c.alu_imm("cmp", RCX, 17)
+            c.alu_imm("cmp", RCX, LAST_BUILTIN_CLASS)
             c.jcc(JLE, known)
             c.alu_imm("cmp", RCX, 63)
             c.jcc(JL, bad)

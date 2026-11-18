@@ -91,7 +91,7 @@ any event is (`emit`, `when`), with nothing specific to operators.
   lists are equal when their contents are. Closure equality is not
   specified here.
 - **Objects with identity:** class instances, objects made by `new`,
-  string builders, vecs, bool arrays and rule stores. A change made through one holder
+  string builders, vecs, bool arrays, bytes and rule stores. A change made through one holder
   is seen through every holder, and `bool_array_push` keeps the same
   array when it grows. Two of them are equal only if they are the same
   object.
@@ -106,6 +106,16 @@ any event is (`emit`, `when`), with nothing specific to operators.
   missing file from an empty one. `vfs_exists` gives `true` or `false`, and
   `vfs_read` of a missing path stops the program. (`vfs_exists` gave the text `"1"` or
   `"0"`, both true as a condition, so `if vfs_exists(p)` always took its first branch.) `query` gives the number of matches, 0 for none.
+
+- **bytes** (class 18) is a buffer of bytes, one byte of memory each, where a list of
+  ints holds a 16-byte value for each. `bytes_new(n)` is `n` zero bytes; `bytes_len`,
+  `bytes_get(b, i)` and `bytes_set(b, i, v)` read and write them, each an int from 0 to
+  255, and an index outside it stops the program as a bool array's does. `bytes_push`
+  grows it in place; `bytes_extend(b, more)` appends a bytes, copied whole, or a list of
+  ints; `bytes_slice(b, start, n)` is a new bytes. `bytes_eq` compares contents.
+  `bytes_from_str` and `bytes_to_str` go through UTF-8, `bytes_from_list` and
+  `bytes_to_list` through lists of ints. `read_file_raw(path)` gives a file's bytes (none
+  for a file that cannot be read), and `write_file_bytes` takes a bytes or a list.
 
 ### 1.6 Memory
 
@@ -301,6 +311,11 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   never go back: for intervals and deadlines. The runtime's own deadlines (`budgeted`,
   `tcp_accept_timeout`, `tcp_read_timeout`, a process's timeout) use `clock_ms`, so changing
   the wall clock moves none of them.
+- `cpu_cycles()` counts the processor cycles this thread has run: for comparing the cost of
+  two pieces of work. The time the thread waits for a processor is not in it, as it is in
+  `clock_ms`; the processor's changing speed, and another thread sharing its core, still move
+  it by a third or more. It is a count, not a time, and never goes back. In a browser, which
+  counts no cycles, it is the clock in nanoseconds.
 - A `match` case may be a glob (`case *.txt then`, `case img* then`): the case is taken when
   `glob_match(subject, pattern)` holds, in any program. `glob_match` is whether the whole text
   matches: `*` matches any run of characters, none included, `?` any one character, and every

@@ -11,7 +11,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ir_reader import IRError, OP_FN, read_ir  # noqa: E402
+from ir_reader import IRError, LAST_BUILTIN_CLASS, OP_FN, read_ir  # noqa: E402
 
 # ---- the memory -------------------------------------------------------------
 
@@ -768,7 +768,7 @@ class Module:
             return self.set_unit(d)
         if pname == "value_live":
             a = args[0]
-            # no bit above 33, and a class of 17 or less or 63 or more
+            # no bit above 33, and a built-in class or one of 63 or more
             b.get(self.T(a))
             b.i64(34)
             b.op(I64_SHR_U, I64_EQZ)
@@ -776,7 +776,7 @@ class Module:
             b.i64(0xFFFFFFFF)
             b.op(I64_AND)
             b.tee(self.X)
-            b.i64(17)
+            b.i64(LAST_BUILTIN_CLASS)
             b.op(I64_LE_S)
             b.get(self.X)
             b.i64(63)

@@ -97,6 +97,18 @@ adding a file that breaks it, seeing it fail, and deleting the file.
   the change (grep for a new function's name).
 - Before fixing a suspected cost, take it away in a trial and time that: a real
   quadratic can still be no part of a real workload's time.
+- **A scaling check in a test counts `cpu_cycles()`, not `clock_ms()`.** The gates
+  run units on every core at once, and a clock reading counts the time a unit
+  waited for a processor: three checks comparing clock times failed there and
+  nowhere else. The clock is for what really is about time: deadlines, sleeps,
+  threads working together.
+- **A scaling check leaves room on both sides.** `cpu_cycles` still moves by a
+  third from one run to the next (the processor's speed, a busy core sibling).
+  Compare sizes four times apart against a bound of eight: linear work gives
+  four, quadratic sixteen, and eight is a factor of two from each. Twice the
+  size against a bound of three leaves a factor of 1.5, and 2.5 times against
+  three left 1.2, which failed. Time the two sizes in turn and keep the
+  cheapest of each.
 
 ## 6. Gates, docs, commit
 

@@ -229,6 +229,12 @@ function start(init) {
     },
     // clock_ms: a clock that never goes back. Each worker has its own
     // performance.now() origin, so the origin is added: every thread agrees.
+    // cpu_cycles: a browser counts no cycles, so the clock in nanoseconds
+    GetCurrentThread() { return -2; },
+    QueryThreadCycleTime(h, p) {
+      dv().setBigUint64(num(p), BigInt(Math.floor((performance.timeOrigin + performance.now()) * 1000000)), true);
+      return 1;
+    },
     QueryPerformanceFrequency(p) { dv().setBigUint64(num(p), 1000000n, true); return 1; },
     QueryPerformanceCounter(p) {
       dv().setBigUint64(num(p), BigInt(Math.floor((performance.timeOrigin + performance.now()) * 1000)), true);

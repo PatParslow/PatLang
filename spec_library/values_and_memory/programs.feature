@@ -91,6 +91,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When the program is built or interpreted
     Then it is refused before anything runs, saying objects compare by identity
 
+  Scenario: cpu_cycles counts this thread's work, not the time it waits
+    Given cpu_cycles read before and after some work, across a 200 ms sleep, and around four times the work
+    When the counts are compared
+    Then the count grows with work, a sleep adds less than a tenth of what the work did, and four times the work counts no more than about eight times as many cycles
+
   Scenario: clock_ms measures intervals and never goes back
     Given clock_ms read across a 50 ms sleep, and 1000 times in a row
     When the readings are compared
@@ -154,7 +159,7 @@ Feature: what functions, commands and includes give (spec 1.13)
   Scenario: the virtual files' work grows with what each call needs
     Given 8000 and 16000 virtual files written, read, and appended to one file 16 bytes at a time
     When each phase is timed
-    Then twice the files or appends take no more than about three times as long
+    Then four times the files or appends take no more than about eight times as long
 
   Scenario: the interpreter reads the runtime's declarations from a cache
     Given a program the interpreter has run
@@ -167,14 +172,14 @@ Feature: what functions, commands and includes give (spec 1.13)
     Then there are two facts, the require's and the ensure's, both times
 
   Scenario: solve_up_to gives the first n solutions and stops there
-    Given 4000 facts, a rule pairing them, a store of two colours, and rules whose bodies have 400 and 800 goals
+    Given 4000 facts, a rule pairing them, a store of two colours, and rules whose bodies have 200 and 800 goals
     When solve_up_to and solve_up_to_in ask for the first few solutions of each
-    Then each gives solve's first solutions in solve's order, none past n, the pair rule's first two of its 16 million, and the 800-goal body in no more than about three times the 400-goal body's time
+    Then each gives solve's first solutions in solve's order, none past n, the pair rule's first two of its 16 million, and the 800-goal body in no more than about eight times the 200-goal body's time
 
   Scenario: following a chain of facts takes time growing as its length
     Given chains of 500 and 1000 next facts and a recursive reach rule
     When reach from the first to the last is solved on each
-    Then the longer takes no more than about three times as long
+    Then the four times longer takes no more than about eight times as long
 
   Scenario: a program reads how many processors the machine has, how busy they have been, and its memory
     Given cpu_count, cpu_times and memory_status, cpu_times read 100 ms apart
