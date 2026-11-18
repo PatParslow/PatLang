@@ -77,7 +77,26 @@ adding a file that breaks it, seeing it fail, and deleting the file.
 - Make a failure path fail once and read the exit code without a pipe after the
   command.
 - `self_hosting/build/v2_interp.exe self_hosting/tools/run_repository_checks.patlang`
-  (about a minute) catches unlisted selftests and retired-tool references.
+  (about a minute) catches unlisted selftests, unrun fixtures and retired-tool
+  references.
+
+## 5.5 Measuring a change (an optimisation, or a claim about cost)
+
+- Measure before and after at three or four sizes, and say which runs are
+  comparable: a trial compiler with a different cache key rebuilds everything on
+  its first run.
+- **A trial must be shown to differ before it is timed.** A trial build meant to
+  change generated code has `--ir` output that differs from the baseline's (`cmp`);
+  print the edited function before building it. A trial that changed nothing
+  times the same as the baseline, and reads as "this costs nothing".
+- **A baseline for a runtime change comes from the old sources.** A compiled
+  program reads the runtime from the working directory's
+  `self_hosting/v2/runtime/`, not from the compiler binary: two compilers run in
+  the edited tree build the same runtime. Build the baseline from a checkout of
+  the old sources (the gates snapshot, or a `git worktree`), and check it lacks
+  the change (grep for a new function's name).
+- Before fixing a suspected cost, take it away in a trial and time that: a real
+  quadratic can still be no part of a real workload's time.
 
 ## 6. Gates, docs, commit
 

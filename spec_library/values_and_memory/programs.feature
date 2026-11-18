@@ -161,6 +161,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When the cache of the runtime's declarations is read
     Then its key names each runtime file with its size and time of writing, and it ends with the count of the functions it holds
 
+  Scenario: a passing contract clause is one contract_holds fact however often it passes
+    Given a function with a require and an ensure, called once and then 100000 times
+    When contract_holds is solved for it after the first call and after the rest
+    Then there are two facts, the require's and the ensure's, both times
+
   Scenario: solve_up_to gives the first n solutions and stops there
     Given 4000 facts, a rule pairing them, a store of two colours, and rules whose bodies have 400 and 800 goals
     When solve_up_to and solve_up_to_in ask for the first few solutions of each

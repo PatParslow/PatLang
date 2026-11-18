@@ -176,6 +176,11 @@ On v2:
 
 - `v2.exe` reads the runtime relative to the working directory: run it from the
   repository root. The interpreter finds the root from its own path.
+- `and` and `or` short-circuit on both engines
+  (`spec_library/language/logical_operators.feature`): `(i < n) and xs[i] == 0`
+  is safe, with no nested `if` needed.
+- There is no `str_split`; a runtime function is in `self_hosting/v2/runtime/`
+  or it does not exist: grep for `make a function called NAME` before using one.
 - There is no `**`: use `pow(a, b)`. `/` of ints gives a rational when the result
   is not whole.
 - `thread_spawn` takes a closure (`thread_spawn(|| do ... end)`), read with

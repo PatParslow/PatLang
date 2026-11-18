@@ -20,6 +20,11 @@ Feature: the repository keeps its own rules
     When each is looked for in run_demos.patlang's list
     Then each is listed, and each listed demo exists and has its expected output in demos/expected/
 
+  Scenario: every fixture is run by something
+    Given every tracked fixture in self_hosting/v2/spec/fixtures/
+    When its name is looked for, quoted or as NAME.patlang, in the runners, tools, libraries and selftests, and in the other fixtures
+    Then each is named somewhere: a fixture nothing names is never run, and its test proves nothing
+
   Scenario: every package's files match its manifest
     Given every directory under packages/ that holds a manifest.pkg
     When packages/tools/verify_manifest.patlang checks it
