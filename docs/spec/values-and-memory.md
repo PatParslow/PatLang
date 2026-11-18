@@ -211,7 +211,10 @@ running it.
 
 A string holds characters, whatever bytes they take. `.length`, indexes, `substr`,
 `char_code`, `chr` and the string cursor (`str_intern`, `sc_len`, `sc_code`, `sc_char`,
-`sc_substr`) all count characters; `byte_length` and `hash_string` see the UTF-8 bytes.
+`sc_substr`) all count characters; `byte_length`, `hash_string` and `str_hash` see the UTF-8
+bytes. `str_hash(s)` is FNV-1a over them, its low 62 bits as a non-negative int, the same on
+every engine: for a program's own hash tables, where hashing a name a character at a time cost
+about 4 us.
 An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
 the cursor. `chr(n)` gives the character whose code is the int `n`; anything else, a
 surrogate code (U+D800 to U+DFFF) included, stops the program.

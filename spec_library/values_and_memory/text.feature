@@ -36,6 +36,11 @@ Feature: a program sees characters, whatever bytes they take
     When each is applied
     Then each gives what spec 1.10 says
 
+  Scenario: str_hash gives an int from a string's bytes
+    Given the empty string, a single letter, two equal strings built differently, a non-ASCII string, and 1000 different names
+    When str_hash hashes each
+    Then the empty string and the single letter give FNV-1a's values, equal strings hash equal, the non-ASCII one hashes its UTF-8 bytes, and the 1000 hashes are different
+
   Scenario: str_contains says whether text holds a needle
     Given text of plain and of two- and three-byte characters, a needle at its start, middle and end, a needle it lacks, an empty needle, and a needle longer than the text
     When str_contains looks for each

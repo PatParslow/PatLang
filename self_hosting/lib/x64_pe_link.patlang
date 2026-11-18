@@ -54,6 +54,14 @@ make a function called xpl_ascii_bytes takes s returns bytes
   return out
 end
 
+# Zeros pushed onto v until it holds n.
+make a function called xpl_vec_pad_to takes v, n returns done
+  while vec_len(v) < n do
+    vec_push(v, 0)
+  end
+  return true
+end
+
 make a function called xpl_pad_to takes lst, n returns out
   let out = lst
   while to_num(list_len(out)) < n do
@@ -98,114 +106,64 @@ make a function called xpl_list_lookup takes names, values, target returns v_or_
   return false
 end
 
-# ---- bucketed symbol index ----
+# ---- symbol index ----
 #
-# xpl_list_lookup above is a LINEAR scan, and the relocation loop calls
-# it once per relocation against the WHOLE merged symbol table. That is
-# quadratic in program size, and at real self-hosted-compiler-bundle
-# scale it stops being a footnote and becomes the entire build: linking
-# the ~330-function compiler (513 chunks, tens of thousands of symbols
-# and relocations) sat in that one loop for over an hour and 45 minutes,
-# single-threaded, while the per-function ASSEMBLY phase that precedes
-# it had finished in about 24 minutes. Measured, not assumed -- the
-# per-unit .chunk.json cache files stop being written the moment
-# assembly ends, so their newest timestamp dates the phase boundary
-# exactly.
-#
-# Fixed by bucketing the symbol table once up front and scanning only
-# the matching bucket. Deliberately hand-rolled over plain lists rather
-# than reaching for the Dict host type: Dict was found to silently lose
-# or misresolve entries when compiled at scale in this codebase (see
-# patlang-x64-selfhosted-assembler-phase1 memory), which is exactly why
-# the symbol table is a pair of parallel lists in the first place.
-# GitHub #197's own string-label fix (codegen_x64.patlang's
-# x64_string_label_for) made string-literal symbol names much longer
-# ("S_funcname_i" instead of "S42"), which exposed a pre-existing O(n^2)
-# trap here: char_code(s, i) re-checks s.is_ascii() over the WHOLE
-# string on EVERY call (rust-runtime/src/ir/hosts.rs), so hashing an
-# n-char name cost O(n^2), not O(n) -- harmless at "S42"'s length, not
-# at a full function name's. Fixed by interning once (str_intern, which
-# does the is_ascii/char-split work ONCE) and reading bytes via sc_code,
-# which is genuinely O(1) per character.
-make a function called xpl_hash_bucket takes s, nbuckets returns idx
-  let handle = str_intern(s)
-  let h = 5381
-  let n = to_num(sc_len(handle))
-  let i = 0
-  while i < n do
-    let h = (h * 33 + sc_code(handle, i)) % 999999937
-    let i = i + 1
-  end
-  return h % nbuckets
-end
-
-make a function called xpl_vec_lookup takes names_vec, values_vec, target returns v_or_false
-  let i = 0
-  let n = vec_len(names_vec)
-  while i < n do
-    if vec_get(names_vec, i) == target then
-      return vec_get(values_vec, i)
-    end
-    let i = i + 1
-  end
-  return false
-end
-
+# The linker looks a name up once per relocation, against a chunk's own
+# local names and against the whole symbol table, so the names are indexed
+# once: an open-addressing table in one vec, names at even places and their
+# values at odd ones, twice as many places as names, looked up by the
+# runtime's str_hash and the next place on along. A name added twice is
+# found where it was first added. (A table of buckets, two fresh vecs per
+# bucket, spent 4.3 s of a link of the compiler making them; a linear scan
+# per relocation once took the link over an hour and a half.)
 make a function called xpl_build_index takes names, values returns index
-  # The bucket lists stay short enough that the residual per-bucket
-  # linear scan is cheap.
-  #
-  # Each bucket is a vec_* handle (mutable, O(1)-amortized push), not a
-  # plain List. A plain List made this whole function O(n_buckets *
-  # n_symbols): list_set(bn, k, ...) copies the ENTIRE 4096-slot OUTER
-  # list on every single insertion (List's copy-on-write semantics),
-  # not just the one bucket being appended to. Confirmed as the
-  # dominant cost of EVERY --x64 compile, not just the self-hosted
-  # compiler's own ~330-function bundle this function's own header
-  # already profiled once before: a trivial, few-line user program pays
-  # the same ~100s+ cost here, since this scales with x64_runtime.obj's
-  # own total symbol count (tens of thousands), not the user program's
-  # size (confirmed via a live x64_build_status poll showing the build
-  # parked in "link-index-symbols" for the entire duration). Same
-  # List-in-a-hot-loop anti-pattern already documented for Strings
-  # (project CLAUDE.md's "String Building" section) and already fixed
-  # elsewhere for exactly this shape (bench_listbuild.patlang's own
-  # header) -- vec_* was already the established answer, just not
-  # applied here yet. Still deliberately not Dict, per this file's own
-  # header note just above.
-  #
-  # The bucket count grows with the names, one to two per bucket: the
-  # link indexes every chunk's own local names as well as the whole
-  # symbol table, hundreds of indexes, and a fixed 4096 buckets each
-  # spent a quarter of the link making and freeing empty buckets for
-  # chunks with a handful of locals. Doubling keeps to + * and <, which
-  # both compilers treat alike.
   let n = to_num(list_len(names))
-  let nbuckets = 1
-  while nbuckets * 2 <= n do
-    let nbuckets = nbuckets * 2
+  let cap = 2
+  while cap < 2 * n do
+    let cap = cap * 2
   end
-  let bn = vec_new()
-  let bv = vec_new()
-  let b = 0
-  while b < nbuckets do
-    vec_push(bn, vec_new())
-    vec_push(bv, vec_new())
-    let b = b + 1
+  let slots = vec_new()
+  let i = 0
+  while i < 2 * cap do
+    vec_push(slots, false)
+    let i = i + 1
   end
   let j = 0
   while j < n do
-    let k = xpl_hash_bucket(names[j], nbuckets)
-    vec_push(vec_get(bn, k), names[j])
-    vec_push(vec_get(bv, k), values[j])
+    let k = str_hash(names[j]) % cap
+    let placed = false
+    while not placed do
+      let there = vec_get(slots, 2 * k)
+      if there == false then
+        vec_set(slots, 2 * k, names[j])
+        vec_set(slots, 2 * k + 1, values[j])
+        let placed = true
+      elif there == names[j] then
+        let placed = true
+      else
+        let k = (k + 1) % cap
+      end
+    end
     let j = j + 1
   end
-  return [bn, bv, nbuckets]
+  return [slots, cap]
 end
 
+# A name's value, or false when the index lacks it.
 make a function called xpl_index_lookup takes index, target returns v_or_false
-  let k = xpl_hash_bucket(target, index[2])
-  return xpl_vec_lookup(vec_get(index[0], k), vec_get(index[1], k), target)
+  let slots = index[0]
+  let cap = index[1]
+  let k = str_hash(target) % cap
+  while true do
+    let there = vec_get(slots, 2 * k)
+    if there == false then
+      return false
+    end
+    if there == target then
+      return vec_get(slots, 2 * k + 1)
+    end
+    let k = (k + 1) % cap
+  end
 end
 
 # ---- layout + link ----
@@ -737,21 +695,22 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
     iat_region_start, iat_region_size,
     [reloc_rva, reloc_size, reloc_size_raw, reloc_file_offset])
 
-  # One conversion back to a plain List each, here at the very end where
-  # xa_emit_bytes needs List indexing -- a single O(n) copy, not one per
-  # byte, so none of the cost this whole function exists to avoid.
-  let merged_text_list = vec_to_list(merged_text)
-  let merged_data_list = vec_to_list(merged_data)
-  let out = xpl_pad_to(hdr, headers_size)
-  let out = xa_emit_bytes(out, thunks)
-  let out = xa_emit_bytes(out, merged_text_list)
-  let out = xpl_pad_to(out, headers_size + text_size)
-  let out = xa_emit_bytes(out, merged_data_list)
-  let out = xpl_pad_to(out, headers_size + text_size + data_size)
-  let out = xa_emit_bytes(out, idata)
-  let out = xpl_pad_to(out, headers_size + text_size + data_size + idata_size)
-  let out = xa_emit_bytes(out, relocs)
-  let out = xpl_pad_to(out, reloc_file_offset + reloc_size)
+  # The image is put together in one vec, each part appended whole
+  # (vec_extend): appending the 20 MB of a compiler's image a byte at a time
+  # took 5 s.
+  let image = vec_new()
+  vec_extend(image, hdr)
+  xpl_vec_pad_to(image, headers_size)
+  vec_extend(image, thunks)
+  vec_extend(image, vec_to_list(merged_text))
+  xpl_vec_pad_to(image, headers_size + text_size)
+  vec_extend(image, vec_to_list(merged_data))
+  xpl_vec_pad_to(image, headers_size + text_size + data_size)
+  vec_extend(image, idata)
+  xpl_vec_pad_to(image, headers_size + text_size + data_size + idata_size)
+  vec_extend(image, relocs)
+  xpl_vec_pad_to(image, reloc_file_offset + reloc_size)
+  let out = vec_to_list(image)
 
   let ok = write_file_bytes(out_path, out)
   if not ok then
