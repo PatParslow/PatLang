@@ -12,9 +12,9 @@ Feature: a program sees characters, whatever bytes they take
     Then what else holds each old string still sees it, and numbers and multi-byte characters add as ever
 
   Scenario: appending to a string nothing else holds does not copy all of it each time
-    Given a loop of let s = s + x, at 100,000 and at 200,000 appends
+    Given a loop of let s = s + x, at 25,000 and at 100,000 appends
     When a program times them
-    Then twice the appends take no more than about three times as long
+    Then four times the appends take no more than about eight times as long
 
   Scenario: chr of anything but an int stops the program
     Given chr of a float

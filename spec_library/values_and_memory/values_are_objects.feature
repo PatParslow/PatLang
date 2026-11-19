@@ -31,6 +31,11 @@ Feature: every value is an object of a class, and answers methods through it (sp
     When objects of each child are made and their inherited method called 2000 times
     Then each reads its own and its inherited field and method, the later costs no more than about four times the cycles of the first, and new finds the first class of the name, and a parent declared after its child gives the child's next object its field
 
+  Scenario: an object's field is found as fast wherever it is among its fields
+    Given an object given 512 fields one at a time, and a class whose objects start with 20
+    When its 4th and 512th fields are read, one is set again, another added, and the 20 read
+    Then each reads its value, a missing field reads as unit, a set keeps the field's place, and reading the 512th costs no more than about four times the cycles of the 4th
+
   Scenario: new takes a class and a name, and nothing more
     Given a call of new with further arguments after the name
     When the program runs

@@ -47,9 +47,9 @@ Feature: what functions, commands and includes give (spec 1.13)
     Then it gives the current directory followed by the path, or stops saying the system could not make it absolute
 
   Scenario: TCP connects only to this machine
-    Given a listener, and tcp_connect to 127.0.0.1, to localhost, to 10.0.0.1, to 1.2.3 and to 127.0.0.300
+    Given a listener, and tcp_connect to 127.0.0.1, to localhost, to 10.0.0.1, to 1.2.3 and to 127.0.0.300, and tcp_try_connect to the listener and to a port nothing listens on
     When each is tried
-    Then the first two connect and carry what is written, 10.0.0.1 stops the program saying it is not this machine, and the others stop it saying they are not addresses
+    Then the first two connect and carry what is written, 10.0.0.1 stops the program saying it is not this machine, the others stop it saying they are not addresses, and tcp_try_connect connects to the listener and gives -1 for the other
 
   Scenario: a child inherits its standard handles and nothing else
     Given a program that listens on a port, spawns a child that runs on for about six seconds, prints the port and ends
@@ -214,9 +214,9 @@ Feature: what functions, commands and includes give (spec 1.13)
     Then the builds come first and every goal is met, the unreachable goal gives [], the cheaper route is taken, and four times the goals take no more than about 32 times as long
 
   Scenario: the logic engine's work grows with what each call needs
-    Given 4,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 4,000 and 8,000 solutions
+    Given 2,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 2,000 and 8,000 solutions
     When a program times them
-    Then twice the rules take no more than about three times as long, the other predicate's rules cost the goal little, and twice the solutions take no more than about three times as long
+    Then four times the rules take no more than about eight times as long, the other predicate's rules cost the goal little, and four times the solutions take no more than about eight times as long
 
   Scenario: a file reached by two includes is included once
     Given a program whose two included files both include a third

@@ -23,8 +23,10 @@ quiet_operators()
 # object's fields from (rt_new_fields)].
 #
 # An object is a block holding its class id at 16, its name at 24 (unit
-# when unnamed) and its fields at 40: a list of [name, value]. Its type
-# word is its class id with the heap bit, so value_class gives the class.
+# when unnamed), its fields at 40: a list of [name, value], and at 72, once it
+# has more than 16 fields, where each name's field is (rt_field_index_*), unit
+# before. Its type word is its class id with the heap bit, so value_class
+# gives the class.
 
 # ---- the state lock ----
 #
@@ -337,7 +339,8 @@ make a function called rt_find_method takes rec, m returns f
   let methods = rec[4]
   let k = 0
   while k < list_len(methods) do
-    if methods[k][0] == m then
+    # a method's name is text: == of two values first asks what each is
+    if str_eq(methods[k][0], m) then
       let f = methods[k][1]
       ensure (f == false) or (value_class(f) == 10)
       return f
@@ -451,11 +454,109 @@ make a function called rt_pairs_set takes pairs, key, v returns out
   return out
 end
 
+# ---- where an object's fields are, by name (review finding O1) ----
+#
+# A field was found by looking at every field before it: the 512th read cost
+# about eighty times the 4th. An object with more than 16 fields keeps an
+# index: a list [capacity, bucket, ...], a power of two of buckets, each a list
+# of [name, position] holding a name's first field, by str_hash. Only a write
+# makes or changes it, under the object's cell, so readers never change it; a
+# reader checks the field it finds still has the name, and looks at every
+# field when it does not. A position never moves: a field is set in place or
+# added at the end, and none is taken away.
+
+make a function called rt_field_index_min returns n
+  let n = 16
+  ensure n > 0
+  return n
+end
+
+# The index of a list of fields: twice as many buckets as fields, at least 64.
+make a function called rt_field_index_build takes fields returns index
+  require value_class(fields) == 9
+  let n = list_len(fields)
+  let cap = 64
+  while cap < 2 * n do
+    let cap = cap * 2
+  end
+  let index = list_set(rt_list_alloc(cap + 1), 0, cap)
+  let b = 1
+  while b <= cap do
+    let index = list_set(index, b, [])
+    let b = b + 1
+  end
+  let p = 0
+  while p < n do
+    let index = rt_field_index_add(index, fields[p][0], p)
+    let p = p + 1
+  end
+  ensure (value_class(index) == 9) and (list_len(index) == cap + 1)
+  return index
+end
+
+# The index with a field's name at a position, when the name has none yet.
+make a function called rt_field_index_add takes index, name, pos returns out
+  require (value_class(index) == 9) and (value_class(name) == 8) and (pos >= 0)
+  let cap = index[0]
+  let b = 1 + word_and(str_hash(name), cap - 1)
+  let bucket = index[b]
+  let k = 0
+  while k < list_len(bucket) do
+    if str_eq(bucket[k][0], name) then
+      let out = index
+      ensure value_class(out) == 9
+      return out
+    end
+    let k = k + 1
+  end
+  let out = list_set(index, b, list_push(bucket, [name, pos]))
+  ensure (value_class(out) == 9) and (list_len(out) == cap + 1)
+  return out
+end
+
+# Where the field named key is, -1 when none is: through the index when there
+# is one and it is right about the field, else by a look at every field.
+make a function called rt_field_pos takes fields, index, key returns i
+  require (value_class(fields) == 9) and (value_class(key) == 8)
+  if value_class(index) == 9 then
+    let bucket = index[1 + word_and(str_hash(key), index[0] - 1)]
+    let k = 0
+    while k < list_len(bucket) do
+      if str_eq(bucket[k][0], key) then
+        let at = bucket[k][1]
+        if (at < list_len(fields)) and str_eq(fields[at][0], key) then
+          let i = at
+          ensure (i >= 0 - 1) and (i < list_len(fields))
+          return i
+        end
+        let k = list_len(bucket)
+      end
+      let k = k + 1
+    end
+  end
+  let i = rt_pairs_index(fields, key)
+  ensure (i >= 0 - 1) and (i < list_len(fields))
+  return i
+end
+
+# An object's index, read as its fields are (rt_fields).
+make a function called rt_field_index_of takes o returns index
+  require rt_is_object(o)
+  let block = value_data(o)
+  let e = (mem_load(runtime_state(), 4608) != 0) and rt_cell_read(block + 56)
+  let index = mem_load_value(block, 72)
+  if e then
+    rt_cell_read_end(block + 56, e)
+  end
+  ensure value_live(index)
+  return index
+end
+
 # ---- objects ----
 
 make a function called rt_object_alloc takes cid, name, fields returns o
   require (cid >= 63) and (value_class(fields) == 9)
-  let block = rt_alloc(56)
+  let block = rt_alloc(72)
   mem_store(block, 16, cid)
   mem_init_value(block, 24, name)
   mem_init_value(block, 40, fields)
@@ -463,6 +564,12 @@ make a function called rt_object_alloc takes cid, name, fields returns o
   # blocks that can close a cycle (memory.patlang)
   mem_store(block, 56, 0)
   mem_store(block, 64, 0)
+  # unit, or its fields' index (rt_field_index_build)
+  mem_store(block, 72, 0)
+  mem_store(block, 80, 0)
+  if list_len(fields) > rt_field_index_min() then
+    mem_init_value(block, 72, rt_field_index_build(fields))
+  end
   let o = value_make(word_or(cid, 4294967296), block)
   rt_cycle_register(word_or(cid, 4294967296), block)
   ensure value_class(o) == cid
@@ -706,12 +813,17 @@ make a function called object_delete takes v returns r
   return r
 end
 
+# An object's cell is entered only when a second thread exists, as a bytes's
+# is (cells.patlang, bytes_get): the two calls on every field read and write
+# were most of what a read cost.
 make a function called rt_fields takes o returns f
   require rt_is_object(o)
   let block = value_data(o)
-  let e = rt_cell_read(block + 56)
+  let e = (mem_load(runtime_state(), 4608) != 0) and rt_cell_read(block + 56)
   let f = mem_load_value(block, 40)
-  rt_cell_read_end(block + 56, e)
+  if e then
+    rt_cell_read_end(block + 56, e)
+  end
   ensure (value_class(f) == 9)
   return f
 end
@@ -727,7 +839,7 @@ make a function called get takes v, key returns r
     return r
   end
   let fields = rt_fields(o)
-  let i = rt_pairs_index(fields, key)
+  let i = rt_field_pos(fields, rt_field_index_of(o), key)
   if i < 0 then
     let r = unit
     ensure value_live(r)
@@ -744,11 +856,30 @@ make a function called rt_field_set takes v, key, x returns r
   # the fields are taken out while they change, so a list held nowhere else is
   # changed in place
   let block = value_data(o)
-  let e = rt_cell_write(block + 56)
+  let e = (mem_load(runtime_state(), 4608) != 0) and rt_cell_write(block + 56)
   let fields = mem_take_value(block, 40)
-  let fields = rt_pairs_set(fields, key, x)
+  let index = mem_take_value(block, 72)
+  let i = rt_field_pos(fields, index, key)
+  if i >= 0 then
+    let fields = list_set(fields, i, [key, x])
+  else
+    let fields = list_push(fields, [key, x])
+    let n = list_len(fields)
+    if value_class(index) == 9 then
+      if 2 * n > index[0] then
+        let index = rt_field_index_build(fields)
+      else
+        let index = rt_field_index_add(index, key, n - 1)
+      end
+    elif n > rt_field_index_min() then
+      let index = rt_field_index_build(fields)
+    end
+  end
   mem_init_value(block, 40, fields)
-  rt_cell_write_end(block + 56, e)
+  mem_init_value(block, 72, index)
+  if e then
+    rt_cell_write_end(block + 56, e)
+  end
   let r = x
   ensure value_live(r)
   return r
@@ -768,7 +899,7 @@ make a function called rt_member takes v, m returns r
   let o = rt_resolve(v)
   if rt_is_object(o) then
     let fields = rt_fields(o)
-    let i = rt_pairs_index(fields, m)
+    let i = rt_field_pos(fields, rt_field_index_of(o), m)
     if i >= 0 then
       let r = fields[i][1]
       ensure value_live(r)
@@ -785,7 +916,7 @@ end
 make a function called send takes v, m, rest returns r
   require value_live(v) and (value_class(m) == 8) and (value_class(rest) == 9)
   let o = rt_resolve(v)
-  if m == "set" then
+  if str_eq(m, "set") then
     let r = rt_field_set(o, rest[0], rest[1])
     ensure value_live(r)
     return r
@@ -797,12 +928,30 @@ make a function called send takes v, m, rest returns r
     ensure value_live(r)
     return r
   end
-  # the object, then the arguments, built in place: + on lists went through
-  # the operator's event machinery, the dearest step of a method call
-  let args = list_push(rt_list_alloc(0), o)
+  # a method of no arguments or one, taking exactly that many, is called
+  # straight away: making the list of the object and its arguments, and
+  # fitting it, cost as much as the rest of the call
+  let n = list_len(rest)
+  let fb = value_data(f)
+  if mem_load(fb, 40) == 0 then
+    if (n == 0) and (mem_load(fb, 32) == 1) then
+      let r = f(o)
+      ensure value_live(r)
+      return r
+    end
+    if (n == 1) and (mem_load(fb, 32) == 2) then
+      let r = f(o, rest[0])
+      ensure value_live(r)
+      return r
+    end
+  end
+  # else the object, then the arguments, set in place in a list made at its
+  # length: + on lists went through the operator's event machinery, and pushing
+  # onto an empty list grew it
+  let args = list_set(rt_list_alloc(n + 1), 0, o)
   let k = 0
-  while k < list_len(rest) do
-    let args = list_push(args, rest[k])
+  while k < n do
+    let args = list_set(args, k + 1, rest[k])
     let k = k + 1
   end
   let r = rt_apply_unchecked(f, rt_closure_fit(f, args, m))

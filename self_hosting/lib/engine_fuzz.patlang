@@ -1,0 +1,143 @@
+# Differential fuzzing of the two engines (review, test-suite recommendation
+# 3): programs made from a seed, run interpreted and compiled, whose outputs
+# must be the same. The programs are made of the calls B1 and B2 were about:
+# named functions, a closure in a variable and one passed as a parameter, a
+# last parameter named rest, a function shadowing a runtime name (max), a
+# recursive one, and `let x = f(x, ...)`. Each expression is safe by
+# construction (no division, no index past a list's end), so a run can only
+# differ, never fail, unless an engine is wrong.
+#
+#   ef_program(seed)           -> the program's text, the same for the same seed
+#   ef_check(dir, seed)        -> ["same", path] or ["differ", path, detail]
+#
+# The programs' files go in dir, one per seed (spec_out() in a test).
+
+# A seeded generator: a state, and the next one, an LCG modulo 2^31.
+make a function called ef_next takes state returns next
+  require (value_class(state) == 2) and (state >= 0)
+  let next = (state * 1103515245 + 12345) % 2147483648
+  ensure (next >= 0) and (next < 2147483648)
+  return next
+end
+
+# A number from 0 to n - 1, from a state.
+make a function called ef_pick takes state, n returns v
+  require n > 0
+  let v = word_shr(state, 8) % n
+  ensure (v >= 0) and (v < n)
+  return v
+end
+
+# An expression over the variables x0 .. x(vars - 1), at most depth deep:
+# [text, the state after].
+make a function called ef_expr takes state, vars, depth returns result
+  let s = ef_next(state)
+  let kind = ef_pick(s, 8)
+  if (depth <= 0) or (kind < 2) then
+    let s = ef_next(s)
+    if (vars > 0) and (ef_pick(s, 2) == 0) then
+      return ["x" + ef_pick(ef_next(s), vars), ef_next(ef_next(s))]
+    end
+    return ["" + ef_pick(s, 100), ef_next(s)]
+  end
+  let a = ef_expr(s, vars, depth - 1)
+  let b = ef_expr(a[1], vars, depth - 1)
+  let s = b[1]
+  if kind == 2 then
+    return ["fz_add(" + a[0] + ", " + b[0] + ")", s]
+  elif kind == 3 then
+    return ["fz_mix(" + a[0] + ", " + b[0] + ")", s]
+  elif kind == 4 then
+    return ["max(" + a[0] + ", " + b[0] + ")", s]
+  elif kind == 5 then
+    return ["fz_sum(" + a[0] + ", " + b[0] + ", 3)", s]
+  elif kind == 6 then
+    return ["fz_rec(" + ef_pick(s, 12) + ")", ef_next(s)]
+  end
+  return ["(" + a[0] + " + " + b[0] + ") % 997", s]
+end
+
+# The program a seed makes.
+make a function called ef_program takes seed returns text
+  require (value_class(seed) == 2) and (seed >= 0)
+  let b = sb_new()
+  sb_push(b, "# made by self_hosting/lib/engine_fuzz.patlang from seed " + seed + chr(10))
+  sb_push(b, "make a function called fz_add takes a, b returns r" + chr(10) + "  let r = a + b" + chr(10) + "  return r" + chr(10) + "end" + chr(10))
+  sb_push(b, "make a function called fz_mix takes a, b returns r" + chr(10) + "  let r = (a * 3 - b) % 1000" + chr(10) + "  return r" + chr(10) + "end" + chr(10))
+  sb_push(b, "make a function called fz_sum takes first, rest returns r" + chr(10) + "  let r = first" + chr(10) + "  let i = 0" + chr(10) + "  while i < list_len(rest) do" + chr(10) + "    let r = r + rest[i]" + chr(10) + "    let i = i + 1" + chr(10) + "  end" + chr(10) + "  return r" + chr(10) + "end" + chr(10))
+  # shadows the runtime's max: the program's own must run
+  sb_push(b, "make a function called max takes a, b returns r" + chr(10) + "  let r = a * 10 + b" + chr(10) + "  return r" + chr(10) + "end" + chr(10))
+  sb_push(b, "make a function called fz_rec takes n returns r" + chr(10) + "  if n <= 0 then" + chr(10) + "    return 0" + chr(10) + "  end" + chr(10) + "  return n + fz_rec(n - 1)" + chr(10) + "end" + chr(10))
+  # a closure parameter called with the value it rebinds: let v = f(v)
+  sb_push(b, "make a function called fz_apply takes f, v returns r" + chr(10) + "  let v = f(v)" + chr(10) + "  let v = f(v)" + chr(10) + "  return v" + chr(10) + "end" + chr(10))
+  let s = ef_next(seed + 7)
+  let vars = 0
+  let n = 8 + ef_pick(s, 8)
+  let k = 0
+  while k < n do
+    let s = ef_next(s)
+    let kind = ef_pick(s, 6)
+    if (vars == 0) or (kind == 0) then
+      let e = ef_expr(s, vars, 3)
+      let s = e[1]
+      sb_push(b, "let x" + vars + " = " + e[0] + chr(10))
+      let vars = vars + 1
+    elif kind == 1 then
+      # let x = f(x, ...)
+      let v = "x" + ef_pick(ef_next(s), vars)
+      let e = ef_expr(ef_next(ef_next(s)), vars, 2)
+      let s = e[1]
+      sb_push(b, "let " + v + " = fz_add(" + v + ", " + e[0] + ")" + chr(10))
+    elif kind == 2 then
+      # let x = g(x, 2, 3), g ending in rest
+      let v = "x" + ef_pick(ef_next(s), vars)
+      let s = ef_next(ef_next(s))
+      sb_push(b, "let " + v + " = fz_sum(" + v + ", 2, 3)" + chr(10))
+    elif kind == 3 then
+      # a closure in a variable, called directly and through a parameter
+      let v = "x" + ef_pick(ef_next(s), vars)
+      let c = ef_pick(ef_next(ef_next(s)), 50)
+      let s = ef_next(ef_next(ef_next(s)))
+      sb_push(b, "let c" + k + " = |p| do return (p * 2 + " + c + ") % 1009 end" + chr(10))
+      sb_push(b, "let " + v + " = c" + k + "(" + v + ")" + chr(10))
+      sb_push(b, "print(fz_apply(c" + k + ", " + v + "))" + chr(10))
+    elif kind == 4 then
+      # a list of values, read back
+      let e = ef_expr(s, vars, 2)
+      let s = e[1]
+      sb_push(b, "let l" + k + " = [" + e[0] + ", x0, " + k + "]" + chr(10))
+      sb_push(b, "print([list_len(l" + k + "), l" + k + "[0], l" + k + "[2]])" + chr(10))
+    else
+      let e = ef_expr(s, vars, 3)
+      let s = e[1]
+      sb_push(b, "print(" + chr(34) + "v " + chr(34) + " + (" + e[0] + "))" + chr(10))
+    end
+    let k = k + 1
+  end
+  let i = 0
+  while i < vars do
+    sb_push(b, "print(x" + i + ")" + chr(10))
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  ensure value_class(text) == 8
+  return text
+end
+
+# The program a seed makes, run on both engines: ["same", path], or
+# ["differ", path, what each gave].
+make a function called ef_check takes dir, seed returns result
+  require (value_class(dir) == 8) and (value_class(seed) == 2)
+  let path = dir + "/ef_" + seed + ".patlang"
+  write_file(path, ef_program(seed))
+  let a = run_interpreted(path)
+  let c = run_compiled(path, dir + "/ef_" + seed + ".exe")
+  if (a[0] == c[0]) and (a[1] == c[1]) and a[0] then
+    let result = ["same", path]
+    ensure list_len(result) == 2
+    return result
+  end
+  let result = ["differ", path, "interpreted [" + a[0] + "] " + a[1] + " | compiled [" + c[0] + "] " + c[1]]
+  ensure list_len(result) == 3
+  return result
+end

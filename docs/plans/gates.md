@@ -187,6 +187,10 @@ finished.
   exits 1 on a failure. They read `packages/` and `self_hosting/lib`, and call
   Python's oracle (`spec/oracle.py`) as their steps say. Until now they ran only
   by hand, and none was in a gate.
+- **The strict-names suite** (`names`, `self_hosting/tools/run_names_check.patlang`):
+  each demo and gated selftest is a unit, `v2.exe PROGRAM --names`, failing when the
+  program calls a name nothing declares. It found `lean_run.patlang` calling `to_str`
+  and `random_int`, which v2 has neither of, on a path no test took.
 - **Planning takes seconds:** the planner (`plan`, runtime `logic.patlang`)
   grew as the cube of the stale units, 546 s for 511 of them; it now grows as
   their square.

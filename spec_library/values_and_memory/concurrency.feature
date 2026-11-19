@@ -39,6 +39,11 @@ Feature: fibers, budgeted blocks and threads (spec 1.8)
     When the fiber is resumed, the program raises ping while the fiber waits, and the fiber is resumed again
     Then the handler ran for the fiber, for the program while the fiber waited, and for the program after
 
+  Scenario: a fiber is resumed as fast among 2000 paused fibers as among 125
+    Given 125 fibers, then 2000, each paused at its first yield
+    When each is resumed, then run to its end
+    Then each hands its values in and out and none is left alive, and a resume among the 2000 costs no more than about four times the cycles of one among the 125
+
   Scenario: a finished fiber cannot be resumed
     Given a fiber that has returned
     When it is resumed

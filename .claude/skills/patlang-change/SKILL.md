@@ -79,6 +79,17 @@ adding a file that breaks it, seeing it fail, and deleting the file.
 - `self_hosting/build/v2_interp.exe self_hosting/tools/run_repository_checks.patlang`
   (about a minute) catches unlisted selftests, unrun fixtures and retired-tool
   references.
+- **A runtime change on a common path** (indexing, lists, cells, numbers): run
+  `self_hosting/build/v2.exe self_hosting/v2/spec/fixtures/ct_curve25519.patlang --constant-time`
+  (a minute). The check cannot tell a branch on a value's class from another, so
+  a new branch that computes an address from a value (`value_data(v) + 40`) is
+  followed as if `v` were a modint, and spreads to everything it calls: a bytes
+  branch in `index_get` made it report 120 places. Mark what depends on a
+  block's use, not its contents, with `ct_public`.
+- **A spec runner, run as the gates run it:** interpreted, one feature file at a
+  time, with `PATLANG_SPEC_OUT` set to a fresh directory, from a checkout with no
+  `build` directories. Scratch paths come from `spec_out()`; the package specs
+  wrote to `packages/*/build/`, which only a hand run had made.
 
 ## 5.5 Measuring a change (an optimisation, or a claim about cost)
 

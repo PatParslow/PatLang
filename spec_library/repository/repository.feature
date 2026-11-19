@@ -25,6 +25,11 @@ Feature: the repository keeps its own rules
     When its name is looked for, quoted or as NAME.patlang, in the runners, tools, libraries and selftests, and in the other fixtures
     Then each is named somewhere: a fixture nothing names is never run, and its test proves nothing
 
+  Scenario: every package's specs run in the gates, from a fresh checkout
+    Given every package's spec runner, packages/NAME/spec/run_spec.patlang
+    When it and the gates' suites are read
+    Then each takes its scratch paths from spec_out() and is a gates suite (pkg_NAME)
+
   Scenario: every package's files match its manifest
     Given every directory under packages/ that holds a manifest.pkg
     When packages/tools/verify_manifest.patlang checks it

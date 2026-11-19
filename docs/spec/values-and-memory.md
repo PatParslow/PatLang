@@ -34,7 +34,9 @@ when none has it. `object_named` works whichever a program declares.
 `new` takes a class and a name and nothing more: further arguments stop the program,
 since inheritance and traits belong to a `class` declaration. A class is found by its
 name in one look, whatever else is declared: where two classes have one name, the first
-declared is the one `new`, an inheriting class and a trait find.
+declared is the one `new`, an inheriting class and a trait find. An object's field is
+found by its name in about the same time wherever it is among the object's fields: an
+object with more than 16 keeps an index of them, which only setting a field changes.
 
 ### 1.2 Methods on every value
 
@@ -157,6 +159,8 @@ running it.
   runs it until it yields or returns, handing it `v`, and gives what it yielded
   or returned. `fiber_yield(v)` goes back to whoever resumed it, and gives what
   the next resume hands it. `fiber_alive(id)` is true until it has returned.
+  A fiber is found by its id in a number of steps growing as the logarithm of the
+  fibers paused, so a resume among 2000 costs about what one among 125 does.
   Resuming a finished fiber, and yielding on no fiber, stop the program. A fiber
   runs on one thread at a time: resuming one that is running (from inside
   itself, or from a second thread while the first runs it) stops the program,
@@ -193,6 +197,8 @@ running it.
   or another, even one that sets `SO_REUSEADDR` (checked 2026-11-17). `tcp_connect` takes
   `localhost` or a `127.x.x.x` address; another address stops the program saying it is not this
   machine, and text that is not four numbers of 0 to 255 stops it saying it is not an address.
+  A connection nothing accepts stops it too; `tcp_try_connect` gives `-1` there instead, and
+  takes the same addresses.
 - The runtime's locks go to whichever waiting thread is running when the lock comes free, not
   to the waiters in turn, and a waiting thread spins briefly, then gives up the rest of its
   time slice each turn. So more threads than processors, or a machine busy with other work,
