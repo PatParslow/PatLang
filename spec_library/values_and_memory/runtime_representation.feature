@@ -21,6 +21,11 @@ Feature: a value is a type word and a data word (spec 2.1)
     When the list's buffer size is read
     Then it is 1000 slots of 16 bytes, plus the header
 
+  Scenario: an argument quoted for a child's command line is split back as it was
+    Given 300 argument lists made from a seed, of empty strings, spaces, tabs, quotes and backslashes, trailing ones too
+    When each argument is quoted as the runtime quotes a child's, and the line split as it splits its own
+    Then every list comes back as it was
+
   Scenario: an operator with no handler tests one flag
     Given a function adding two ints in a loop, with no handler registered for any event
     When its generated code is inspected

@@ -42,7 +42,11 @@ Run from the repository root: `v2.exe` reads the runtime from
   When a change alters the code the compiler generates, the first two differ, so it
   builds a third and checks that the second and third are identical.
 * WASM: `node self_hosting/v2/wasm/run_node.mjs [--files DIR] PROGRAM.wasm [ARGS...]`,
-  or `self_hosting/v2/wasm/run_browser.py` for headless Chrome.
+  or `self_hosting/v2/wasm/run_browser.py` for headless Chrome. `--real-files` puts the
+  program's file calls on the disk (the compiler built as WASM can then build programs),
+  and `--fail NAME:N` makes the Nth call to a host function fail.
+* Without Windows: `bash tools/ci_wasm.sh` builds the compiler from the bootstrap IR as
+  WASM and builds and runs the demos with it under Node (`.github/workflows/v2-wasm.yml`).
 * Scripted edits: `py -3 -I tools/edit_files.py SPEC [--check]` (§2.5).
 
 ---

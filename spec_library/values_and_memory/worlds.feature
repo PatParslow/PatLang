@@ -56,6 +56,11 @@ Feature: worlds (spec 1.15)
     When each adds a fact and reports what it sees
     Then each world sees only its own facts, and the inner world's output is in the inner world
 
+  Scenario: text run in a world has the program's authority, and not the runtime's
+    Given program text run in a world that writes the runtime's state with mem_store, and text that writes a file
+    When each is run
+    Then the first is refused, saying mem_store is for the runtime, and runs nothing; the second writes the file, as the program running it could
+
   Scenario: a world's step budget stops it
     Given a world with a budget of 1000 steps whose code spends a step on every iteration of a loop that never ends
     When it is called

@@ -1,10 +1,15 @@
 // Runs a v2 WASM module under Node, with the same host as the browser's:
 //
-//   node self_hosting/v2/wasm/run_node.mjs [--files DIR]... PROGRAM.wasm [ARGS...]
+//   node self_hosting/v2/wasm/run_node.mjs [--files DIR]... [--fail NAME:N] [--real-files] PROGRAM.wasm [ARGS...]
 //
 // Each --files DIR gives the program every file under DIR to read, at its path
-// relative to the current directory, as a page's file bundle does. The
-// program's output goes to stdout, and its exit code is this process's.
+// relative to the current directory, as a page's file bundle does.
+// --real-files instead puts its file calls on the disk, relative to the current
+// directory, so it can write: the compiler built as WebAssembly can then build
+// a program, on any machine with Node (review, test-suite recommendation 1). --fail
+// NAME:N makes the Nth call each worker makes to the host's NAME fail, as the
+// system's would, to test what the program does with it. The program's output
+// goes to stdout, and its exit code is this process's.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -20,9 +25,19 @@ function add(dir) {
     else files[relative(process.cwd(), full).split("\\").join("/")] = new Uint8Array(readFileSync(full));
   }
 }
-while (argv[0] === "--files") {
-  argv.shift();
-  add(argv.shift());
+// --fail NAME:N makes the Nth call to the host's NAME fail (launcher.mjs, fail);
+// --real-files puts the program's file calls on the disk (realFiles)
+let fail = null;
+let realFiles = false;
+while (argv[0] === "--files" || argv[0] === "--fail" || argv[0] === "--real-files") {
+  const flag = argv.shift();
+  if (flag === "--real-files") { realFiles = true; continue; }
+  const value = argv.shift();
+  if (flag === "--files") add(value);
+  else {
+    const [func, nth] = value.split(":");
+    fail = { func, nth: Number(nth) };
+  }
 }
 const [path, ...args] = argv;
 if (!path) {
@@ -34,6 +49,8 @@ const code = await run({
   bytes: readFileSync(path),
   args,
   files,
+  fail,
+  realFiles,
   name: path,
   newWorker() {
     const w = new Worker(executor);

@@ -47,9 +47,14 @@ Feature: what functions, commands and includes give (spec 1.13)
     Then it gives the current directory followed by the path, or stops saying the system could not make it absolute
 
   Scenario: TCP connects only to this machine
-    Given a listener, and tcp_connect to 127.0.0.1, to localhost, to 10.0.0.1, to 1.2.3 and to 127.0.0.300, and tcp_try_connect to the listener and to a port nothing listens on
+    Given a listener, and tcp_connect to 127.0.0.1, to localhost, to 10.0.0.1, to 1.2.3 and to 127.0.0.300, tcp_try_connect to the listener and to a port nothing listens on, and tcp_try_write to a peer that has closed
     When each is tried
-    Then the first two connect and carry what is written, 10.0.0.1 stops the program saying it is not this machine, the others stop it saying they are not addresses, and tcp_try_connect connects to the listener and gives -1 for the other
+    Then the first two connect and carry what is written, 10.0.0.1 stops the program saying it is not this machine, the others stop it saying they are not addresses, tcp_try_connect connects to the listener and gives -1 for the other, and tcp_try_write comes to give false while the program goes on
+
+  Scenario: the store forms, a bool array's elements and a builder's length give what they give
+    Given a bool array set at 3 and 69, a builder holding four characters in five bytes, a store given facts with fact_in, planned from with plan_with_state_in, and emptied with rules_clear_in
+    When each is read
+    Then the array reads true at 3 and 69 and false at 4, the builder holds 5 bytes, query_in counts the store's facts and not the default store's, the plan is one step reaching four facts, and the emptied store holds none while the default store keeps its rule
 
   Scenario: a child inherits its standard handles and nothing else
     Given a program that listens on a port, spawns a child that runs on for about six seconds, prints the port and ends

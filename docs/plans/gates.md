@@ -191,6 +191,20 @@ finished.
   each demo and gated selftest is a unit, `v2.exe PROGRAM --names`, failing when the
   program calls a name nothing declares. It found `lean_run.patlang` calling `to_str`
   and `random_int`, which v2 has neither of, on a path no test took.
+- **`ci_wasm`, v2 without Windows** (`tools/ci_wasm.sh`): the compiler built from the
+  bootstrap IR by `bootstrap/ir_wasm.py`, run under Node with the disk as its files
+  (`run_node.mjs --real-files`), builds each demo as WebAssembly, and each runs and
+  prints its expected output; the demos using sockets are skipped. The same script is
+  the Linux CI job, `.github/workflows/v2-wasm.yml`. It found the compiler built as
+  WebAssembly stopping on `v2_own_path`'s contract (a browser has no program path).
+- **Failure injection** (`self_hosting/wasm_fail_selftest.patlang`): the browser's
+  host makes the nth call to a named system function fail (`run_node.mjs --fail
+  NAME:N`), and a program reading a file with its open, size or read made to fail
+  gives what `read_file` gives for a file that cannot be read. The selftests suite
+  reads the host's directory for it.
+- **Engine fuzzing** (`self_hosting/engine_fuzz_selftest.patlang`,
+  `lib/engine_fuzz.patlang`): programs made from seeds, of the calls findings B1 and B2
+  were about, print the same interpreted and compiled.
 - **Planning takes seconds:** the planner (`plan`, runtime `logic.patlang`)
   grew as the cube of the stale units, 546 s for 511 of them; it now grows as
   their square.

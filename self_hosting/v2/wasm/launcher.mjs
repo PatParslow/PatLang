@@ -15,7 +15,13 @@ function quote(a) {
   return '"' + a.replace(/"/g, '\\"') + '"';
 }
 
-export async function run({ bytes, args = [], env = {}, files = {}, newWorker, onOutput, onError = onOutput, name = "program" }) {
+// fail: null, or { func, nth }: the nth call each worker makes to the host's
+// func fails, as the system's would (executor.mjs), to test what a program
+// does with a call's failure (review, test-suite recommendation 5).
+// realFiles: under Node, the program's file calls are on the disk, relative to
+// the current directory, so it can write files (executor.mjs); a browser's
+// host ignores it.
+export async function run({ bytes, args = [], env = {}, files = {}, newWorker, onOutput, onError = onOutput, name = "program", fail = null, realFiles = false }) {
   const module = await WebAssembly.compile(bytes);
   // the data segment lies within the module, so this covers the constants
   const pages = Math.ceil((131072 + bytes.byteLength) / 65536);
@@ -68,7 +74,7 @@ export async function run({ bytes, args = [], env = {}, files = {}, newWorker, o
           finish(TRAP_CODE);
         }
       });
-      w.post({ module, memory, ctl, out, me: e, env, files, cmdline, ...init });
+      w.post({ module, memory, ctl, out, me: e, env, files, cmdline, fail, realFiles, ...init });
     }
     spawn(0, { kind: "main" });
   });

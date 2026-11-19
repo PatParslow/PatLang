@@ -6,6 +6,9 @@
 import { L, STD_IN, STD_OUT, STD_ERR, THREAD_H, FIBER_H, FILE_H, HOST_AREA, GB4 } from "./layout.mjs";
 
 const isNode = typeof process !== "undefined" && !!(process.versions && process.versions.node);
+// Node's files, for the real-file mode (launcher.mjs, realFiles)
+const fs = isNode ? await import("node:fs") : null;
+const nodePath = isNode ? await import("node:path") : null;
 let post;
 if (isNode) {
   const { parentPort } = await import("node:worker_threads");
@@ -249,8 +252,6 @@ function start(init) {
     },
     GetSystemTimes() { lastError = 50; return 0; },
     GlobalMemoryStatusEx() { lastError = 50; return 0; },
-    // a browser gives no figure for a program's own memory: memory_used() is -1
-    K32GetProcessMemoryInfo() { lastError = 50; return 0; },
     GetCommandLineA() { return HOST_AREA; },
     GetEnvironmentVariableA(name, buf, size) {
       const v = init.env[cstr(num(name))];
@@ -346,6 +347,133 @@ function start(init) {
     ResumeThread() { lastError = 6; return -1; },
     QueryInformationJobObject() { lastError = 6; return 0; },
   };
+
+  // The real-file mode (Node only; launcher.mjs, realFiles): the file calls on
+  // the disk, relative to the current directory, so a program, the compiler
+  // among them, can write what it makes (review, test-suite recommendation 1:
+  // the suites on Linux through WebAssembly). Each handle is this executor's;
+  // a file another worker writes is on the disk for every worker to read.
+  if (init.realFiles && fs) {
+    const realPath = (at) => cstr(at).replace(/\\/g, "/");
+    const failWith = (e) => {
+      const c = e && e.code;
+      lastError = c === "ENOENT" ? 2 : c === "ENOTDIR" ? 3 : c === "EEXIST" ? 183 : c === "ENOTEMPTY" ? 145 : 5;
+    };
+    // the standard handles and a bundle's files stay as they were
+    const base = { ReadFile: kernel.ReadFile, WriteFile: kernel.WriteFile, GetFileSize: kernel.GetFileSize, SetFilePointerEx: kernel.SetFilePointerEx };
+    Object.assign(kernel, {
+      // dispositions: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING,
+      // 4 OPEN_ALWAYS, 5 TRUNCATE_EXISTING
+      CreateFileA(name, access, share, sec, disposition) {
+        const path = realPath(num(name));
+        const write = (num(access) & 0x40000000) !== 0;
+        const d = num(disposition);
+        try {
+          if (fs.existsSync(path) && fs.statSync(path).isDirectory()) { lastError = 5; return -1; }
+          let flags = "r";
+          if (write) {
+            if (d === 1) flags = "wx+";
+            else if (d === 2 || d === 5) flags = "w+";
+            else if (d === 4) flags = fs.existsSync(path) ? "r+" : "w+";
+            else flags = "r+";
+          }
+          const fd = fs.openSync(path, flags);
+          const h = FILE_H + nextFile++;
+          opened.set(h, { fd, pos: 0 });
+          return h;
+        } catch (e) { failWith(e); return -1; }
+      },
+      ReadFile(h, buf, n, read) {
+        const f = opened.get(num(h));
+        if (!f || f.fd === undefined) return base.ReadFile(h, buf, n, read);
+        const tmp = Buffer.alloc(num(n));
+        const got = fs.readSync(f.fd, tmp, 0, num(n), f.pos);
+        u8().set(tmp.subarray(0, got), num(buf));
+        f.pos += got;
+        if (num(read) !== 0) dv().setUint32(num(read), got, true);
+        return 1;
+      },
+      WriteFile(h, buf, n, written) {
+        const f = opened.get(num(h));
+        if (!f || f.fd === undefined) return base.WriteFile(h, buf, n, written);
+        const len = num(n);
+        const put = fs.writeSync(f.fd, u8().slice(num(buf), num(buf) + len), 0, len, f.pos);
+        f.pos += put;
+        if (num(written) !== 0) dv().setUint32(num(written), put, true);
+        return 1;
+      },
+      GetFileSize(h, high) {
+        const f = opened.get(num(h));
+        if (!f || f.fd === undefined) return base.GetFileSize(h, high);
+        if (num(high) !== 0) dv().setUint32(num(high), 0, true);
+        return fs.fstatSync(f.fd).size;
+      },
+      SetFilePointerEx(h, distance, newPos, method) {
+        const f = opened.get(num(h));
+        if (!f || f.fd === undefined) return base.SetFilePointerEx(h, distance, newPos, method);
+        const d = Number(BigInt.asIntN(64, distance));
+        const m = num(method);
+        const at = m === 0 ? d : m === 1 ? f.pos + d : fs.fstatSync(f.fd).size + d;
+        if (at < 0) { lastError = 131; return 0; }
+        f.pos = at;
+        if (num(newPos) !== 0) dv().setBigInt64(num(newPos), BigInt(at), true);
+        return 1;
+      },
+      CloseHandle(h) {
+        const f = opened.get(num(h));
+        if (f && f.fd !== undefined) fs.closeSync(f.fd);
+        opened.delete(num(h));
+        return 1;
+      },
+      GetFileAttributesA(name) {
+        try { return fs.statSync(realPath(num(name))).isDirectory() ? 16 : 128; }
+        catch (e) { failWith(e); return 0xFFFFFFFF; }
+      },
+      FindFirstFileA(pattern, data) {
+        const p = realPath(num(pattern));
+        if (!p.endsWith("*")) { lastError = 2; return -1; }
+        const dir = p.slice(0, -1) || ".";
+        let list;
+        try {
+          list = fs.readdirSync(dir, { withFileTypes: true }).map((e) => e.isDirectory() ? e.name + "/" : e.name);
+        } catch (e) { failWith(e); return -1; }
+        if (list.length === 0) { lastError = 2; return -1; }
+        const h = FILE_H + nextFile++;
+        opened.set(h, { list, next: 1 });
+        findData(num(data), list[0]);
+        return h;
+      },
+      DeleteFileA(name) {
+        try { fs.unlinkSync(realPath(num(name))); return 1; } catch (e) { failWith(e); return 0; }
+      },
+      RemoveDirectoryA(name) {
+        try { fs.rmdirSync(realPath(num(name))); return 1; } catch (e) { failWith(e); return 0; }
+      },
+      CreateDirectoryA(name) {
+        try { fs.mkdirSync(realPath(num(name))); return 1; } catch (e) { failWith(e); return 0; }
+      },
+      // MOVEFILE_REPLACE_EXISTING is 1
+      MoveFileExA(from, to, flags) {
+        const a = realPath(num(from)), b = realPath(num(to));
+        if ((num(flags) & 1) === 0 && fs.existsSync(b)) { lastError = 183; return 0; }
+        try { fs.renameSync(a, b); return 1; } catch (e) { failWith(e); return 0; }
+      },
+      CopyFileA(from, to, failIfExists) {
+        try {
+          fs.copyFileSync(realPath(num(from)), realPath(num(to)), num(failIfExists) !== 0 ? fs.constants.COPYFILE_EXCL : 0);
+          return 1;
+        } catch (e) { failWith(e); return 0; }
+      },
+      GetFullPathNameA(name, size, buf) {
+        const raw = new TextEncoder().encode(nodePath.resolve(realPath(num(name))).replace(/\\/g, "/"));
+        if (raw.length + 1 > num(size)) return raw.length + 1;
+        const m = u8();
+        m.set(raw, num(buf));
+        m[num(buf) + raw.length] = 0;
+        return raw.length;
+      },
+    });
+  }
   const winsock = {
     WSAStartup() { return 10091; },
     WSAGetLastError() { return 10050; },
@@ -384,7 +512,20 @@ function start(init) {
       imports[lib][func] = crt[func];
       continue;
     }
-    const impl = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : lib === "BCRYPT.DLL" ? bcrypt[func] : undefined;
+    const found = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : lib === "BCRYPT.DLL" ? bcrypt[func] : undefined;
+    // failure injection (launcher.mjs, run's fail): the nth call this worker
+    // makes to the named function fails as the system's does, -1 for one
+    // that gives a handle and 0 for the rest, ERROR_IO_DEVICE its last error
+    let impl = found;
+    if (found && init.fail && init.fail.func === func) {
+      let calls = 0;
+      const failed = (func === "CreateFileA" || func === "FindFirstFileA") ? -1 : 0;
+      impl = (...args) => {
+        calls += 1;
+        if (calls === init.fail.nth) { lastError = 1117; return failed; }
+        return found(...args);
+      };
+    }
     imports[lib][func] = impl
       ? (...args) => { const r = impl(...args); return typeof r === "bigint" ? r : BigInt(r); }
       : () => { throw new Error(lib + "!" + func + " is not available on this host"); };
