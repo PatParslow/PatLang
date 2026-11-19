@@ -1,22 +1,67 @@
 Feature: function definition and return
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: return exits immediately with the given value
-    Given a function with an if-guarded `return "negative"` before any later statement
-    When called with an input that satisfies the guard
-    Then the function returns immediately, never reaching code after the if-block
+    Given the program
+      """
+      make a function called guarded takes n returns msg
+        if n < 0 then
+          return "negative"
+        end
+        print("not reached for a negative n")
+        return "non-negative"
+      end
+      print(guarded(-5))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      negative
+      """
 
   Scenario: a function with no explicit return implicitly returns its last statement's value
-    Given a function whose body ends in a plain `let x = n + 1` with no explicit `return` anywhere
-    When it is called
-    Then it returns that last statement's value (an int), the same as Ruby/Rust block semantics -- not Unit
+    Given the program
+      """
+      make a function called no_return takes n returns done
+        let x = n + 1
+      end
+      print(no_return(1))
+      print(type_of(no_return(1)))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      2
+      int
+      """
 
   Scenario: a function whose last statement produces no value of its own still returns Unit
-    Given a function whose body ends in a bare `print(...)` call (print's own return value is Unit) with no explicit `return`
-    When its result is printed
-    Then a single BLANK line is printed -- NOT the text "nil"/"undefined", and NOT silently nothing at all; a function's implicit return is genuinely Unit only when its tail statement's own value IS Unit
-
+    Given the program
+      """
+      make a function called tail_is_unit takes n returns done
+        print("a side effect, not its return value")
+      end
+      print(type_of(tail_is_unit(1)))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      a side effect, not its return value
+      unit
+      """
 
   Scenario: a function declared `takes none` takes no parameters
-    Given a function declared `takes none` that returns 7
-    When it is called with no arguments
-    Then it returns 7, a call with no arguments fitting a function with no parameters
+    Given the program
+      """
+      make a function called seven takes none returns r
+        return 7
+      end
+      print(seven())
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      7
+      """

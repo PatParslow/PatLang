@@ -1,17 +1,43 @@
 Feature: action_add / plan (GOAP -- Goal-Oriented Action Planning)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: A multi-step plan is found when no single action suffices
-    Given action_add("gather_wood", [], [["have",["wood"]]], [], 1) and action_add("build_house", [["have",["wood"]]], [["have",["house"]]], [], 1)
-    When plan([["have",["house"]]]) is called
-    Then the result is ["gather_wood", "build_house"], in that exact order -- a real search, not a single-action lookup
+    Given the program
+      """
+      action_add("gather_wood", [], [["have", ["wood"]]], [], 1)
+      action_add("build_house", [["have", ["wood"]]], [["have", ["house"]]], [], 1)
+      print(plan_labels(plan([["have", ["house"]]])))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [gather_wood, build_house]
+      """
 
   Scenario: An unreachable goal returns an empty plan
-    Given a goal no registered action (or chain of actions) can produce
-    When plan is called
-    Then the result is an empty list, not an error
+    Given the program
+      """
+      action_add("gather_wood", [], [["have", ["wood"]]], [], 1)
+      print(plan_labels(plan([["nothing_produces_this", ["x"]]])))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      []
+      """
 
-  Note: plan() performs uniform-cost (Dijkstra) search, so a cheaper
-  multi-step plan is preferred over a pricier direct one when both
-  exist -- this spec doesn't yet cover that cost-preference case with
-  a competing pair of plans; a good candidate for a follow-up scenario.
-
+  Scenario: A cheaper plan of more steps is preferred over a dearer direct one
+    Given the program
+      """
+      action_add("direct", [], [["at", ["far"]]], [], 10)
+      action_add("step1", [], [["at", ["near"]]], [], 1)
+      action_add("step2", [["at", ["near"]]], [["at", ["far"]]], [], 1)
+      print(plan_labels(plan([["at", ["far"]]])))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [step1, step2]
+      """

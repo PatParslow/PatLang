@@ -1,21 +1,82 @@
 Feature: Gherkin-driven contract clauses for GOAP synthesis (require/ensure steps)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang). The programs drive the Gherkin
+  runner's clause checking (lib/gherkin.patlang) directly.
+
   Scenario: A require/ensure clause checked against a hand-written function's own bound value
-    Given `Given an integer x` binds the global variable x, and a scenario adds `And require x < 10` / `And ensure x < 20`
-    When the scenario runs against a hand-written "brilliant" transformation (returns 2*x)
-    Then both clauses are evaluated immediately against the bound value of x, exactly like an ordinary require/ensure statement would be
+    Given the program
+      """
+      include "{lib}/gherkin.patlang"
+      let c = ctx_new()
+      ctx_set(c, "x", 5)
+      ctx_contract_step(c, "require", "x < 10")
+      ctx_contract_step(c, "ensure", "x < 20")
+      print(ctx_failed(c))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+        ok: require x < 10
+        ok: ensure x < 20
+      0
+      """
 
   Scenario: A require/ensure clause checked against a GOAP-synthesized action's own binding
-    Given an action `scale(X)` requiring `input(X)`, producing `scaled(X)`, and a scenario clause `And require X < 10` / `And ensure X < 20`
-    When `plan([["scaled", ["5"]]])` synthesizes the candidate `scale(X=5)`
-    Then both clauses are evaluated against X's bound value as parsed out of that plan step's own label, before the candidate is accepted -- not encoded as a GOAP GroundFact (a scalar comparison like `X < 10` isn't a unifiable ground predicate the way action_add's preconditions are)
+    Given the program
+      """
+      include "{lib}/gherkin.patlang"
+      let c = ctx_new()
+      action_add("scale", [["input", [logic_var("X")]]], [["scaled", [logic_var("X")]]], [], 1)
+      rule_add("input", ["5"], [])
+      ctx_contract_step(c, "require", "X < 10")
+      ctx_contract_step(c, "ensure", "X < 20")
+      let labels = plan_labels(plan([["scaled", ["5"]]]))
+      print(labels)
+      print(goap_verify_contracts(ctx_pending_contracts(c), labels))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+        (deferred) require X < 10
+        (deferred) ensure X < 20
+      [scale(X=5)]
+        ok: require X < 10 (from scale(X=5))
+        ok: ensure X < 20 (from scale(X=5))
+      true
+      """
 
   Scenario: A synthesized candidate that violates its contract clause is correctly rejected, not silently accepted
-    Given the same `scale(X)` action, but `plan([["scaled", ["15"]]])` synthesizes `scale(X=15)`
-    When the scenario's `And require X < 10` clause is checked against that binding
-    Then the violation is detected and reported -- the scenario's own meta-check ("a contract-violating candidate is correctly rejected") is what passes, honestly distinguishing "the feature works" from "the underlying candidate happened to satisfy its contract"
+    Given the program
+      """
+      include "{lib}/gherkin.patlang"
+      let c = ctx_new()
+      action_add("scale", [["input", [logic_var("X")]]], [["scaled", [logic_var("X")]]], [], 1)
+      rule_add("input", ["15"], [])
+      ctx_contract_step(c, "require", "X < 10")
+      let labels = plan_labels(plan([["scaled", ["15"]]]))
+      print(labels)
+      print(goap_verify_contracts(ctx_pending_contracts(c), labels))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+        (deferred) require X < 10
+      [scale(X=15)]
+        FAIL: require violated by synthesized plan: scale(X=15)
+      false
+      """
 
   Scenario: The contract-checking mechanism never becomes a runtime assertion itself
-    Given the library that implements require/ensure clause checking (self_hosting/lib/gherkin.patlang, gherkin_clauses.patlang)
-    When its own source text is inspected directly
-    Then it contains no call to contract_check(...) -- the host primitive require/ensure/assert always lower to elsewhere in the language -- confirming the guard is genuinely separate from (and happens before) any code that would run the checked action for real
+    Given the program
+      """
+      let src = read_file("self_hosting/lib/gherkin.patlang") + read_file("self_hosting/lib/gherkin_clauses.patlang")
+      print(src.length > 0)
+      print(str_contains(src, "contract_check("))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      true
+      false
+      """

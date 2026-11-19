@@ -29,11 +29,12 @@ code is written.
 The `patlang-change` skill is the checklist from scenario to commit, including
 what a new runtime function, selftest or gates suite also needs.
 
-Formal feature work lives in `spec_library/**/*.feature`, wired through
-`self_hosting/lib/gherkin.patlang`'s Gherkin runner and (for language-level
-semantics) `self_hosting/lib/spec_steps_language.patlang`'s `step()`
-registrations, or `gherkin.patlang`'s `ensure` steps for
-representation/type invariants. Run the whole language gate with:
+Formal feature work lives in `spec_library/**/*.feature`, run by
+`self_hosting/lib/gherkin.patlang`'s Gherkin runner. A language scenario
+carries its program in a doc string and says what both engines print
+(`Given the program`, `When it runs interpreted and compiled`, `Then both
+print`: `self_hosting/lib/spec_steps_program.patlang`), so no step is
+narration that checks nothing. Run the whole language gate with:
 
 ```
 bash self_hosting/v2/tools/gates.sh --only language

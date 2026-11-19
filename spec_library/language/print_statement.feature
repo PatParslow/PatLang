@@ -1,12 +1,36 @@
 Feature: print
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: print writes a value followed by a newline
-    Given any value
-    When print(value) is called
-    Then its display text is written, followed by a newline -- confirmed across many other specs in this same file, each of which depends on print's output landing on its own line
+    Given the program
+      """
+      let r = print("a line")
+      print(type_of(r))
+      print(42)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      a line
+      unit
+      42
+      """
 
   Scenario: printing Unit writes a blank line, not zero bytes
-    Given an expression that evaluates to Unit (e.g. a function with no return statement, or set_var's own return value)
-    When printed
-    Then exactly one blank line is written, not nothing at all
+    Given the program
+      """
+      make a function called nothing takes none returns done
+        print("before")
+      end
+      print(nothing())
+      print("after")
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      before
 
+      after
+      """

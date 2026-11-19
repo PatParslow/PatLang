@@ -1,18 +1,46 @@
 Feature: signals full round trip (signal_send/signal_query/signal_reply, two real concurrent processes)
 
-  Scenario: A query reaches the primary and its reply reaches the secondary, verbatim
-    Given a detached primary process (launched via `start /B`) with `when status do signal_reply("uptime: 42") end` registered
-    When a separate, synchronous secondary process calls signal_query(port, "status", "")
-    Then it receives exactly "uptime: 42" -- the primary's own handler's reply text, round-tripped over the real TCP connection between two real OS processes
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang). The program is the secondary: it
+  spawns the primary (self_hosting/tools/spec_fixtures/signal_primary.patlang)
+  on the v2 interpreter, waits for the "port N" line the primary writes to its
+  log once it holds a port, and talks to it over loopback TCP.
 
-  Scenario: A fire-and-forget quit signal stops the primary's poll loop early
-    Given the secondary also calls signal_send(port, "quit", "") afterward
-    When the primary's own log is inspected after the fact
-    Then it shows the primary exited via the quit path, not by running its full bounded iteration count
+  Scenario: A query reaches the primary and its reply comes back verbatim, and a quit signal stops it early
+    Given the program
+      """
+      include "{lib}/v2_engines.patlang"
+      include "{lib}/signals.patlang"
+      let log_path = "self_hosting/tools/spec_fixtures/signal_primary.log"
+      write_file(log_path, "")
+      let pid = spawn(v2_interpreter(), "self_hosting/tools/spec_fixtures/signal_primary.patlang")
+      let port = 0 - 1
+      let looking = true
+      while looking do
+        let text = read_file(log_path)
+        let n = text.length
+        if (n > 6) and (substr(text, 0, 5) == "port ") and (char_code(text, n - 1) == 10) then
+          let port = to_num(substr(text, 5, n - 6))
+          let looking = false
+        elif not is_alive(pid) then
+          let looking = false
+        else
+          sleep_ms(20)
+        end
+      end
+      print(signal_query(port, "status", ""))
+      signal_send(port, "quit", "")
+      while is_alive(pid) do
+        sleep_ms(50)
+      end
+      print(read_file(log_path))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      uptime: 42
+      exited via quit path
+      """
 
-  This closes the gap [[patlang-language-instruction-specs]]'s earlier
-  single-process signals spec explicitly left open (the full round trip
-  needs two genuinely concurrent processes, which a single synchronous
-  script cannot provide) -- a batch file with `start /B` supplies the
-  real concurrency PatLang itself has no host function for yet.
-
+  The primary stops by itself after 200 polls of 100 ms, so the wait for it
+  to exit ends either way; its log says which way it went.

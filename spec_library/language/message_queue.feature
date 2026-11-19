@@ -1,24 +1,44 @@
 Feature: message queue (queue_publish/consume/ack/pending, self_hosting/lib/queue.patlang)
 
-  Scenario: A fresh topic starts with nothing pending -- guarded, not assumed
-    Given a scratch-only topic name never used elsewhere
-    When `require to_num(list_len(queue_pending(topic))) == 0` runs first
-    Then it passes -- confirming this is genuinely a clean start, not a leftover from a previous failed run
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang). Each program removes its topic
+  first and last: the queue is real files (.patlang_queue/<topic>.log), so its
+  state persists across process runs.
 
-  Scenario: consume returns the oldest pending message without acking it
-    Given two published messages ("first message", "second message")
-    When queue_consume is called
-    Then it returns "first message" -- FIFO order, and it remains pending until explicitly acked
+  Scenario: A fresh topic starts with nothing pending
+    Given the program
+      """
+      include "{lib}/queue.patlang"
+      queue_remove_topic("spec_scratch_mq_fresh")
+      print(list_len(queue_pending("spec_scratch_mq_fresh")))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      0
+      """
 
-  Scenario: ack removes exactly the acked message from pending
-    Given the first message is acked by its id
-    When queue_pending is read afterward
-    Then only the SECOND message's id remains -- confirmed via an ensure guard on the exact remaining id, not just a count
-
-  IMPORTANT (unlike the SQL/RDBMS specs above): this subsystem is
-  backed by REAL disk files (.patlang_queue/<topic>.log via write_file/
-  read_file), not the auto-isolated in-memory VFS -- state genuinely
-  persists across process runs and needs EXPLICIT teardown (deleting
-  the real log file), confirmed actually gone afterward, not just
-  attempted.
-
+  Scenario: consume returns the oldest pending message without acking it, and ack removes exactly that one
+    Given the program
+      """
+      include "{lib}/queue.patlang"
+      let t = "spec_scratch_mq_topic"
+      queue_remove_topic(t)
+      let id1 = queue_publish(t, "first message")
+      let id2 = queue_publish(t, "second message")
+      print(queue_consume(t))
+      print(list_len(queue_pending(t)))
+      queue_ack(t, id1)
+      let pending = queue_pending(t)
+      print(list_len(pending))
+      print(("" + pending[0]) == ("" + id2))
+      queue_remove_topic(t)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      first message
+      2
+      1
+      true
+      """

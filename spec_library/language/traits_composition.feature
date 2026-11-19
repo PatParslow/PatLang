@@ -1,17 +1,75 @@
 Feature: traits (composable mixins, last-listed wins on collision)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: A colliding method name resolves to the LAST-listed trait
-    Given `traits Nameable, Serializable`, both defining a "label" method
-    When send(obj, "label") is called
-    Then Serializable's label runs (listed last), not Nameable's
+    Given the program
+      """
+      class Nameable {
+        make a function called label takes self returns msg
+          return "name:" + get(self, "name")
+        end
+      }
+      class Serializable {
+        make a function called label takes self returns msg
+          return "serialized:" + get(self, "name")
+        end
+      }
+      class Widget {
+        traits Nameable, Serializable
+      }
+      print(send(new("Widget", "w1"), "label"))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      serialized:w1
+      """
 
   Scenario: A non-colliding trait method is still composed in
-    Given Serializable also defines "to_str", which Nameable does not
-    When send(obj, "to_str") is called
-    Then it runs correctly -- traits compose the UNION of methods, only colliding names follow last-wins
+    Given the program
+      """
+      class Nameable {
+        make a function called label takes self returns msg
+          return "name:" + get(self, "name")
+        end
+      }
+      class Serializable {
+        make a function called to_str takes self returns msg
+          return "<obj " + get(self, "name") + ">"
+        end
+      }
+      class Widget {
+        traits Nameable, Serializable
+      }
+      let w = new("Widget", "w1")
+      print(send(w, "to_str"))
+      print(send(w, "label"))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      <obj w1>
+      name:w1
+      """
 
   Scenario: The class's own field declarations work unaffected
-    Given Widget also declares `field kind = "widget"`
-    When get(obj, "kind") is read
-    Then it is "widget", regardless of the traits list
-
+    Given the program
+      """
+      class Nameable {
+        make a function called label takes self returns msg
+          return "name:" + get(self, "name")
+        end
+      }
+      class Widget {
+        traits Nameable
+        field kind = "widget"
+      }
+      print(get(new("Widget", "w1"), "kind"))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      widget
+      """

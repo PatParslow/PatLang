@@ -7,15 +7,60 @@ Feature: string builders and vecs are values (docs/plans/general-refcounting.md,
   program made stayed allocated until it exited.
 
   Scenario: a string builder and a vec have their own type and identity, under both backends
-    Given a builder pushed to through two names, a vec pushed to through two names, identity comparisons, and a vec_to_list snapshot taken before a vec_set
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same nine lines: the shared contents, "string_builder" and "vec" from type_of, true for a copy and false for another builder, and the snapshot unchanged
+    Given the program
+      """
+      let b = sb_new()
+      sb_push(b, "ab")
+      let b2 = b
+      sb_push(b2, "cd")
+      print(sb_str(b))
+      print(type_of(b))
+      print(b == b2)
+      print(b == sb_new())
+      let v = vec_new()
+      vec_push(v, 1)
+      let w = v
+      vec_push(w, 2)
+      print(vec_len(v))
+      print(type_of(v))
+      let snap = vec_to_list(v)
+      vec_set(v, 0, 9)
+      print(snap)
+      print(vec_to_list(v))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      abcd
+      string_builder
+      true
+      false
+      2
+      vec
+      [1, 2]
+      [9, 2]
+      """
 
   `str_intern(s)` returns `s` itself: the string, not an integer handle into a
   table that only grew. What `sc_len`, `sc_code`, `sc_char` and `sc_substr` need
   to stay O(1) per call is cached per string and freed with it.
 
   Scenario: an interned string is a string, under both backends
-    Given a string built by + and interned, then compared, concatenated, and read with sc_len and sc_char
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same six lines, starting with "string" from type_of
+    Given the program
+      """
+      let h = str_intern("ab" + "cd")
+      print(type_of(h))
+      print(h == "abcd")
+      print(h + "!")
+      print(sc_len(h))
+      print(sc_char(h, 2))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      string
+      true
+      abcd!
+      4
+      c
+      """

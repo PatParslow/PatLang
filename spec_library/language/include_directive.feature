@@ -1,13 +1,21 @@
 Feature: include (preprocessor directive)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: include splices a file's functions into scope, transitively
-    Given an entry script that includes includer.patlang, which itself includes a SIBLING file helper.patlang by bare filename
-    When the entry script calls a function from includer.patlang that itself calls a function from helper.patlang
-    Then it works -- confirming both the direct splice and the transitive one resolved correctly
+    Given the program
+      """
+      include "{root}/self_hosting/tools/spec_fixtures/include_sibling/includer.patlang"
+      print("result=" + includer_double_plus_one(10))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      result=21
+      """
 
   Note: include paths resolve relative to the INCLUDING file's own
-  directory, not the entry script's directory -- helper.patlang's bare-
-  filename include only works because it and includer.patlang are
-  siblings; the entry script (elsewhere) correctly does NOT need to
-  know helper.patlang exists at all.
-
+  directory, not the entry script's directory: includer.patlang includes
+  its sibling helper.patlang by bare filename, and the program, written
+  elsewhere, does not need to know helper.patlang exists at all.

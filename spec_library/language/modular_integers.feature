@@ -1,21 +1,77 @@
 Feature: integers modulo n are a number class of their own
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: Arithmetic on modints stays modulo n, and an integer operand is reduced
-    Given `let a = mod_make(3, 7)`
-    When a is added to, multiplied by, divided by and raised to powers, alone and with integers
-    Then each result is a modint modulo 7 with the residue the arithmetic of residues gives
+    Given the program
+      """
+      let a = mod_make(3, 7)
+      print(type_of(a))
+      print(a + 5)
+      print(a * mod_make(5, 7))
+      print(a / 2)
+      print(pow(a, 0 - 1))
+      print(a == 10)
+      print(type_of(1 - a))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      modint
+      1 mod 7
+      1 mod 7
+      5 mod 7
+      5 mod 7
+      true
+      modint
+      """
 
   Scenario: A modint modulo 2^k is a k-bit word for the bit operators and rotations
-    Given `let w = mod_make(200, 256)`
-    When band, bor, bxor, bnot, shl, shr, rotl and rotr are applied to it
-    Then each result is the 8-bit word the operation gives, still a modint modulo 256
+    Given the program
+      """
+      let w = mod_make(200, 256)
+      print([mod_value(w band 15), mod_value(w bor 7), mod_value(w bxor 255), mod_value(bnot w)])
+      print([mod_value(w shl 1), mod_value(w shr 3), mod_value(rotl(w, 1)), mod_value(rotr(mod_make(201, 256), 1))])
+      print(mod_modulus(w shl 1))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [8, 207, 55, 55]
+      [144, 25, 145, 228]
+      256
+      """
 
   Scenario: A modint modulo 2^64 is a 64-bit word
-    Given `let z = mod_make(0 - 1, 18446744073709551616)`
-    When bnot, shl, shr, rotl and bxor are applied to it, with counts up to 64
-    Then each result is the 64-bit word the operation gives
+    Given the program
+      """
+      let z = mod_make(0 - 1, 18446744073709551616)
+      print([mod_value(z), mod_value(bnot z), mod_value(z shl 64), mod_value(z shr 63)])
+      print([mod_value(rotl(mod_make(1, 18446744073709551616), 63)), mod_value(rotr(mod_make(3, 18446744073709551616), 1)), mod_value(z bxor 1)])
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [18446744073709551615, 0, 0, 1]
+      [9223372036854775808, 9223372036854775809, 18446744073709551614]
+      """
 
   Scenario: mod_make of a modint reduces its residue modulo the new modulus
-    Given `let a = mod_make(300, 1000)`
-    When mod_make(a, 256), mod_make(a, 7) and mod_make(a, 2^255 - 19) are made
-    Then each is a's residue 300 reduced modulo the new modulus
+    Given the program
+      """
+      let a = mod_make(300, 1000)
+      let p = 57896044618658097711785492504343953926634992332820282019728792003956564819949
+      print(mod_make(a, 256))
+      print(mod_make(a, 7))
+      print(mod_value(mod_make(a, p)))
+      print(mod_modulus(mod_make(a, p)) == p)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      44 mod 256
+      6 mod 7
+      300
+      true
+      """

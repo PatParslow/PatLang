@@ -18,9 +18,32 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   unsupported case.
 
   Scenario: BigInt modulo, mixed signs and a BigInt divisor, matches the interpreter
-    Given a value that overflows into BigInt, reduced by a small positive divisor, a small negative divisor, a negated dividend, and by another BigInt (including an exact multiple)
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same nine lines
+    Given the program
+      """
+      let s = 2000000000
+      let big = s * 1103515245 + 12345
+      print(big)
+      print(big % 2147483648)
+      print(0 - big % 2147483648)
+      print(big % (0 - 2147483648))
+      let bigger = big * big
+      print(bigger % 999999937)
+      print(bigger % big)
+      print(big % 999999937)
+      print((0 - big) % 999999937)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      2207030490000012345
+      216544313
+      -216544313
+      216544313
+      75421603
+      0
+      42941972
+      -42941972
+      """
 
   A second, related class of gap (GitHub #187), found chasing a real crash in
   `utf8_selftest.patlang`: `v.to_s` (a paren-less Member access) lowers to
@@ -46,9 +69,46 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   both engines.
 
   Scenario: v.to_s on primitives, chr() of a floored quotient, and Rational %, match the interpreter
-    Given int, Rational, Bool and List values stringified with .to_s, a byte built via chr() on a quotient floored to an int, several Rational % combinations including negative operands, and chr() of a Float
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same twelve lines, then stop at chr of the Float
+    Given the program
+      """
+      print(233.to_s)
+      print((7 / 2).to_s)
+      print(true.to_s)
+      print([1, 2].to_s)
+      let cp = 233
+      let b0 = 192 + floor(cp / 64)
+      let b1 = 128 + (cp % 64)
+      print(chr(b0).length)
+      print(char_code(chr(b0), 0))
+      print(char_code(chr(b1), 0))
+      print((117 / 4) % 64)
+      print(64 % (7 / 2))
+      print((7 / 2) % (5 / 2))
+      print(((0 - 117) / 4) % 64)
+      print(((0 - 7) / 2) % 3)
+      print(char_code(chr(66.9), 0))
+      print("after")
+      """
+    When it runs interpreted and compiled
+    Then both print, before stopping
+      """
+      233
+      7/2
+      true
+      [1, 2]
+      1
+      195
+      169
+      117/4
+      1
+      1
+      -117/4
+      -1/2
+      """
+    And both stop, saying
+      """
+      precondition failed in chr()
+      """
 
   A third, unrelated gap (GitHub #188), found writing a fixture for the second:
   the self-hosted lexer (used only by `patc1 --x64`, not the interpreter) reads
@@ -60,9 +120,22 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   float literal when a digit genuinely follows the dot.
 
   Scenario: an int literal immediately followed by .member parses and runs, matching the interpreter
-    Given 233.to_s, 4.to_s, [1, 2, 3].length, and n.to_s through a variable
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same five lines
+    Given the program
+      """
+      print(233.to_s)
+      print(4.to_s)
+      print([1, 2, 3].length)
+      let n = 5
+      print(n.to_s)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      233
+      4
+      3
+      5
+      """
 
   A fourth gap (GitHub #186), found once the previous three were fixed: an
   exact Rational result never demoted back to Int/BigInt on native x64, even
@@ -78,9 +151,37 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   reported type.
 
   Scenario: an exact Rational result demotes to int, an inexact one stays Rational, matching the interpreter
-    Given exact and inexact sums, an exact and inexact product, an exact subtraction, exact and inexact division, and an exact modulo, all built from Rationals
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same twelve lines
+    Given the program
+      """
+      let half = 1 / 2
+      let third = 1 / 3
+      print(type_of(half + half))
+      print(half + half)
+      print(type_of(half + third))
+      print(half + third)
+      print(type_of(half * 2))
+      print(type_of((10 / 3) - (1 / 3)))
+      print((10 / 3) - (1 / 3))
+      print(type_of(10 / 2))
+      print(type_of(10 / 3))
+      print(type_of(64 % (7 / 2)))
+      print(64 % (7 / 2))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      int
+      1
+      rational
+      5/6
+      int
+      int
+      3
+      int
+      rational
+      int
+      1
+      """
 
   A fifth gap (GitHub #189), found testing #187's own .to_s fix against a
   float value directly: type_of() and .to_s only ever recognized a BOXED
@@ -100,9 +201,25 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   moment it's created.
 
   Scenario: type_of and .to_s recognize a genuine unboxed float, whether from a bare literal or sqrt()'s direct result
-    Given a bare float literal and the direct, un-promoted result of sqrt()
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same six lines: float, its string form, float again, the sqrt result's string form, the literal's own correct print, and "after"
+    Given the program
+      """
+      let y = 2.5
+      print(type_of(y))
+      print(y.to_s)
+      let z = sqrt(9.0)
+      print(type_of(z))
+      print(z.to_s)
+      print(y)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      float
+      2.5
+      float
+      3
+      2.5
+      """
 
   A sixth gap (GitHub #50/#102), found reviewing #50's own scheduled
   design question about the tagging representation: mixing a genuine int
@@ -125,9 +242,21 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   Bin at all in its own body).
 
   Scenario: an ordinary int local mixed with a float literal in one Bin converts correctly on either side
-    Given `x + 2.5` where x is an int local, and `a + x` where a is a float local and x an int local
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print true for both comparisons against 7.5
+    Given the program
+      """
+      let x = 5
+      let y = x + 2.5
+      print(y == 7.5)
+      let a = 2.5
+      let b = a + x
+      print(b == 7.5)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      true
+      true
+      """
 
   A seventh gap (GitHub #194, a follow-up to #50's own scheduled design
   review): a genuinely polymorphic function (no float literal anywhere in
@@ -156,9 +285,21 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   and both engines run it.
 
   Scenario: a float the call cannot see reaching a non-float-mode function's dynamic arithmetic computes and reports its type correctly
-    Given plus(a, b) with no float literal in its own body, called with 1.5 read from a list and a plain int 2
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print 3.5 and then float, not a segfault
+    Given the program
+      """
+      make a function called plus takes a, b returns r
+        return a + b
+      end
+      let xs = [1.5]
+      print(plus(xs[0], 2))
+      print(type_of(plus(xs[0], 2)))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      3.5
+      float
+      """
 
   An eighth gap (GitHub #195, the cross-compilation-unit half of #50's
   own design review): a float-returning function, compiled as its own
@@ -181,9 +322,20 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   instruction (x64_bm_unpack_value_callee).
 
   Scenario: a float-returning function proves float across the per-unit compilation boundary
-    Given make_half() returning 1.0/2.0, with no caller-side float evidence of its own
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both report type_of "float" and both confirm the value equals 0.5
+    Given the program
+      """
+      make a function called make_half returns h
+        return 1.0 / 2.0
+      end
+      print(type_of(make_half()))
+      print(make_half() == 0.5)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      float
+      true
+      """
 
   A ninth gap, closing #194's own remaining half (the first half, the
   core dynamic-dispatch segfault, was fixed in the "boxed 1.5" scenario
@@ -201,11 +353,39 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   each flagged position, immediately before the call itself.
 
   Scenario: a float literal argument at an ordinary call site is auto-boxed, no manual boxing needed
-    Given plus(a, b) with no float literal in its own body, called directly as plus(1.5, 2)
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print 3.5, with no manual rt_box_float call anywhere in the source
+    Given the program
+      """
+      make a function called plus takes a, b returns r
+        let r = a + b
+        return r
+      end
+      print(plus(1.5, 2))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      3.5
+      """
 
   Scenario: an integral float prints as the integer it is, however large (GitHub #230)
-    Given 2^1023, -2^1000, 2^70, 2^62 and 3 * 2^64 as floats (pow(2.0, n)), 4.0, and "" + 2^66
-    When the integral float file is run on the v2 interpreter and compiled and run by v2
-    Then both print each value's exact integer text, never the saturated 9223372036854775807
+    Given the program
+      """
+      print(pow(2.0, 1023))
+      print(0.0 - pow(2.0, 1000))
+      print(pow(2.0, 70))
+      print(pow(2.0, 62))
+      print(3.0 * pow(2.0, 64))
+      print(4.0)
+      print("" + pow(2.0, 66))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      89884656743115795386465259539451236680898848947115328636715040578866337902750481566354238661203768010560056939935696678829394884407208311246423715319737062188883946712432742638151109800623047059726541476042502884419075341171231440736956555270413618581675255342293149119973622969239858152417678164812112068608
+      -10715086071862673209484250490600018105614048117055336074437503883703510511249361224931983788156958581275946729175531468251871452856923140435984577574698574803934567774824230985421074605062371141877954182153046474983581941267398767559165543946077062914571196477686542167660429831652624386837205668069376
+      1180591620717411303424
+      4611686018427387904
+      55340232221128654848
+      4
+      73786976294838206464
+      """

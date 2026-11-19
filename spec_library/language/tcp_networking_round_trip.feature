@@ -1,12 +1,40 @@
 Feature: TCP networking (tcp_listen/connect/accept/read/write/close)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: A client can connect before the server calls accept
-    Given `require port > 0` after tcp_listen(0)
-    When tcp_connect is called immediately, with no tcp_accept having run yet
-    Then it succeeds (the OS backlog queues it) -- confirmed via a passing require, not assumed
+    Given the program
+      """
+      let port = tcp_listen(0)
+      print(port > 0)
+      let client = tcp_connect("127.0.0.1", port)
+      print(client >= 0)
+      tcp_close(client)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      true
+      true
+      """
 
   Scenario: Both directions of a round trip genuinely transfer bytes
-    Given a connected client/server pair
-    When the client writes "hello from client" and the server writes "hello from server"
-    Then the server's tcp_read returns exactly the client's message, and the client's tcp_read returns exactly the server's message
-
+    Given the program
+      """
+      let port = tcp_listen(0)
+      let client = tcp_connect("127.0.0.1", port)
+      let server_conn = tcp_accept(port)
+      tcp_write(client, "hello from client")
+      tcp_write(server_conn, "hello from server")
+      print(tcp_read(server_conn))
+      print(tcp_read(client))
+      tcp_close(client)
+      tcp_close(server_conn)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      hello from client
+      hello from server
+      """

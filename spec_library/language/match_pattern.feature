@@ -1,81 +1,260 @@
-Feature: match / case pattern matching (issue #44, self-hosted toolchain only)
+Feature: match / case pattern matching (issue #44)
 
-  Scenario: A literal pattern matches on equality
-    Given a match over the number 0 with cases for 0, "hi", a comparison, and a binding
-    When the match is evaluated
-    Then the literal-0 arm's body runs
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print, or what both say as they stop (spec_steps_program.patlang).
 
-  Scenario: A wildcard/binding-name pattern binds the scrutinee
-    Given a match over the number 3 against the same case list
-    When the match is evaluated
-    Then the bare-identifier arm runs with the identifier bound to 3
+  Scenario: Literal, binding and comparison patterns
+    Given the program
+      """
+      make a function called classify takes x returns r
+        match x do
+          case 0 then
+            return "lit0"
+          case "hi" then
+            return "greeting"
+          case > 10 then
+            return "big"
+          case n then
+            return "bound:" + n
+        end
+      end
+      print(classify(0))
+      print(classify("hi"))
+      print(classify(3))
+      print(classify(20))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      lit0
+      greeting
+      bound:3
+      big
+      """
 
-  Scenario: A comparison-guard pattern matches by relation, not equality
-    Given a match over the number 20 against the same case list
-    When the match is evaluated
-    Then the `> 10` arm's body runs
+  Scenario: Tagged-list patterns destructure and bind, through two levels, and fall through to the wildcard
+    Given the program
+      """
+      make a function called describe takes pair returns r
+        match pair do
+          case ["Ok", v] then
+            return "ok:" + v
+          case ["Err", ["Nested", m]] then
+            return "nested-err:" + m
+          case _ then
+            return "unknown"
+        end
+      end
+      print(describe(["Ok", 5]))
+      print(describe(["Err", ["Nested", "boom"]]))
+      print(describe(["Err", "flat"]))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      ok:5
+      nested-err:boom
+      unknown
+      """
 
-  Scenario: A tagged-list pattern destructures and binds its elements
-    Given a match over ["Ok", 5] with cases ["Ok", v], ["Err", ["Nested", m]], and _
-    When the match is evaluated
-    Then the ["Ok", v] arm runs with v bound to 5
-
-  Scenario: A nested tagged-list pattern destructures through two levels
-    Given a match over ["Err", ["Nested", "boom"]] against the same case list
-    When the match is evaluated
-    Then the ["Err", ["Nested", m]] arm runs with m bound to "boom"
-
-  Scenario: A shape that matches no non-wildcard arm falls through to wildcard
-    Given a match over ["Err", "flat"] against the same case list
-    When the match is evaluated
-    Then the wildcard arm runs, not the nested-list arm
-
-  Scenario: A `when` guard can reject an otherwise-matching pattern
-    Given a match over the number 12 with a binding pattern guarded by `when n > 100`
-    When the match is evaluated
-    Then the guarded arm's test fails and a later arm runs instead
-
-  Scenario: A `when` guard can accept, using its own pattern's binding
-    Given a match over the number 200 against the same guarded case list
-    When the match is evaluated
-    Then the guarded arm's test succeeds, using its own pattern's binding
+  Scenario: A `when` guard rejects or accepts, using its own pattern's binding
+    Given the program
+      """
+      make a function called guarded takes x returns r
+        match x do
+          case n when n > 100 then
+            return "big-bound:" + n
+          case n then
+            return "small-bound:" + n
+        end
+      end
+      print(guarded(12))
+      print(guarded(200))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      small-bound:12
+      big-bound:200
+      """
 
   Scenario: A string glob pattern matches via substring/prefix wildcards
-    Given a match over "alfred smith" with a `*fred*` case
-    When the match is evaluated
-    Then the glob arm's body runs
+    Given the program
+      """
+      make a function called glob takes s returns r
+        match s do
+          case *fred* then
+            return "glob-hit"
+          case _ then
+            return "glob-miss"
+        end
+      end
+      print(glob("alfred smith"))
+      print(glob("alice"))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      glob-hit
+      glob-miss
+      """
 
-  Scenario: A scrutinee that matches nothing, with no wildcard arm, is a runtime error
-    Given a match with only literal cases for 1 and 2, no wildcard
-    When the match is evaluated against 99
-    Then the program halts with a fatal "no case matched" error, not a silent no-op
+  Scenario: A scrutinee that matches nothing, with no wildcard arm, stops the program
+    Given the program
+      """
+      make a function called pick takes x returns r
+        match x do
+          case 1 then
+            return "one"
+          case 2 then
+            return "two"
+        end
+      end
+      print(pick(1))
+      print(pick(99))
+      print("not reached")
+      """
+    When it runs interpreted and compiled
+    Then both print, before stopping
+      """
+      one
+      """
+    And both stop, saying
+      """
+      no case matched
+      """
 
-  Scenario: A matched arm with no `return` falls through past the match, not back into it
-    Given a match where the matching arm has no `return`, with more arms and code after it
-    When the match is evaluated
-    Then a matched arm with no `return` correctly jumps past the remaining arms, not back into the match
+  Scenario: A matched arm with no `return` goes on past the match, not back into it
+    Given the program
+      """
+      make a function called side takes x returns r
+        match x do
+          case 1 then
+            return "one"
+          case > 2 then
+            print("two-plus-side-effect")
+          case > 10 then
+            return "lots"
+        end
+        return "fell-through"
+      end
+      print(side(99))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      two-plus-side-effect
+      fell-through
+      """
 
-  Scenario: A match that ends a function gives the function its value
-    Given a function whose last statement is a match, each arm ending in a value
-    When the match is evaluated
-    Then the function returns the taken arm's value
-
-  Scenario: An arm's let assigns the function's named result
-    Given a function returning r, each arm of its match assigning r from the pattern's bindings
-    When the match is evaluated
-    Then the function returns what the taken arm assigned
+  Scenario: A match that ends a function gives the function its value, and an arm's let assigns its named result
+    Given the program
+      """
+      make a function called tail_value takes x returns r
+        match x do
+          case 1 then
+            "one"
+          case _ then
+            "other"
+        end
+      end
+      make a function called assign_result takes pair returns r
+        match pair do
+          case [a, b] then
+            let r = a + b
+          case _ then
+            let r = 0
+        end
+      end
+      print([tail_value(1), tail_value(2)])
+      print([assign_result([2, 3]), assign_result(9)])
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [one, other]
+      [5, 0]
+      """
 
   Scenario: A closure's match sees what the closure captured
-    Given a closure whose match compares against and guards with a captured variable
-    When the match is evaluated
-    Then the captured value decides the arm
+    Given the program
+      """
+      make a function called captured takes limit, x returns r
+        let f = |y| {
+          match y do
+            case > limit then
+              return "over"
+            case n when n == limit then
+              return "at"
+            case _ then
+              return "under"
+          end
+        }
+        return f(x)
+      end
+      print([captured(10, 11), captured(10, 10), captured(10, 9)])
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [over, at, under]
+      """
 
   Scenario: The scrutinee is evaluated once
-    Given a match whose scrutinee calls a function that counts its calls, with several arms tested
-    When the match is evaluated
-    Then the function was called once
+    Given the program
+      """
+      make a function called once takes counter returns r
+        let scrutinee = |c| {
+          vec_set(c, 0, vec_get(c, 0) + 1)
+          return 5
+        }
+        match scrutinee(counter) do
+          case 1 then
+            return "one"
+          case 2 then
+            return "two"
+          case > 3 then
+            return "many"
+        end
+      end
+      let counter = vec_new()
+      vec_push(counter, 0)
+      print(once(counter))
+      print(vec_get(counter, 0))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      many
+      1
+      """
 
   Scenario: A value of another type does not match a literal or a list pattern
-    Given a match over a number with string and list cases first, and over a string with number and list cases first
-    When the match is evaluated
-    Then each falls through to its wildcard arm
+    Given the program
+      """
+      make a function called other_type takes x returns r
+        match x do
+          case "7" then
+            return "text"
+          case 7 then
+            return "seven"
+          case [a] then
+            return "list"
+          case _ then
+            return "other"
+        end
+      end
+      print([other_type(8), other_type("x"), other_type([1, 2]), other_type([1]), other_type(7), other_type("7")])
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [other, other, other, list, seven, text]
+      """
+
+  Note: an arm whose body does not end in `return` once jumped back to the
+  start of the function instead of past the match, looping forever (the
+  old self-hosted lowering never patched that jump); and a `when` guard
+  was once tested before its pattern's bindings were stored, so it always
+  failed. The no-`return` and guard-accepts scenarios are the ones that
+  caught them.

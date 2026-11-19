@@ -44,3 +44,8 @@ Feature: the repository keeps its own rules
     Given every tracked PatLang file
     When its code is searched for "" + get(
     Then there are none: a missing field reads as unit, so the test is == unit (spec 1.5)
+
+  Scenario: every file a language scenario includes by its path from the root is a gates input
+    Given every spec_library/language feature's lines of the form include "{root}/PATH"
+    When gates.patlang is searched for PATH, or for a directory holding it
+    Then each is there, so a change to the file makes the language suites stale

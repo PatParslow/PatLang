@@ -156,13 +156,19 @@ so a runtime edit waits for a running gates run to finish.
    - `spec_library/repository/`: `self_hosting/tools/run_repository_checks.patlang`
      checks the repository's own rules over every tracked file.
 
-   Step registrations are in `self_hosting/lib/spec_steps_*.patlang`, on the Gherkin
-   runner `self_hosting/lib/gherkin.patlang`. A runner lists its feature files with
+   A language scenario carries its program in a doc string and says what it prints:
+   `Given the program` / `When it runs interpreted and compiled` / `Then both print`
+   (or `both stop, saying`, `both print, before stopping`, `both print the same,
+   ending`), from `self_hosting/lib/spec_steps_program.patlang`. A program includes
+   a library as `include "{lib}/NAME.patlang"`, and another file by its path from
+   the root as `include "{root}/PATH"`; a `{root}` file goes in the language suites'
+   inputs in `gates.patlang`. Step registrations for the other suites are in
+   `self_hosting/lib/spec_steps_*.patlang`, on the Gherkin runner
+   `self_hosting/lib/gherkin.patlang`. A runner lists its feature files with
    `--list`, and takes its scratch paths from `PATLANG_SPEC_OUT` (`spec_out()`).
 
    Any language-semantics change needs a scenario, RED before and GREEN after. For
-   representation invariants, use `And ensure <var> == <literal>` against
-   `numeric_kind(x)` or `type_of(x)`.
+   representation invariants, print `numeric_kind(x)` or `type_of(x)`.
 
 ---
 

@@ -1,17 +1,56 @@
 Feature: when / emit (event system)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang). A handler is declared at the top
+  level, where handlers are registered once, statically.
+
   Scenario: emit runs the matching handler, once per call
-    Given `when tick do ... end` incrementing a counter
-    When emit("tick", 5) then emit("tick", 7) are both called
-    Then the counter is 2 -- the handler ran once per emit
+    Given the program
+      """
+      class Log {
+        field ticks = 0
+      }
+      new("Log", "log")
+      when tick do
+        send("log", "set", "ticks", get("log", "ticks") + 1)
+      end
+      emit("tick", 5)
+      emit("tick", 7)
+      print(get("log", "ticks"))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      2
+      """
 
   Scenario: event_name and event_data are implicit handler parameters
-    Given the handler body reads `event_name` and `event_data` directly, with no declaration
-    When an event fires
-    Then event_name is the string passed as emit's first argument, event_data is the payload (second argument)
+    Given the program
+      """
+      when ping do
+        print([event_name, event_data])
+      end
+      emit("ping", "payload42")
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [ping, payload42]
+      """
 
   Scenario: the handler is a real closure, capturing enclosing lets
-    Given `let base = 100` declared before the when-block, referenced inside it
-    When the handler runs
-    Then it sees the real captured value of base (100), combined correctly with the live event_data each time (100+5=105 on the first call, 100+7=107 on the second) -- not a stale or hardcoded value
-
+    Given the program
+      """
+      let base = 100
+      when combine do
+        print(base + to_num(event_data))
+      end
+      emit("combine", "5")
+      emit("combine", "7")
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      105
+      107
+      """

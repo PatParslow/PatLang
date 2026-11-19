@@ -43,7 +43,9 @@ Current packages:
 deflate and zip take their data as a `bytes` or a list of ints from 0 to 255,
 and give a `bytes` (one byte of memory a byte, where a list holds sixteen):
 from 0.2.0, which changed what they give; 0.1.x gave lists. On 2 MB, the
-deflate benchmark's peak memory went from 301 MB to 93 MB.
+deflate benchmark's peak working set went from 301 MB to 93 MB, and is 56 MB
+since the runtime commits pages 16 MB at a time (measured 2026-11-19, three
+runs, no gates running).
 
 ## Manifest format (draft)
 

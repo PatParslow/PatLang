@@ -35,16 +35,82 @@ Feature: Native x64 process spawning, timeouts and out-of-range access agree wit
      the interpreter does.
 
   Scenario: out-of-range list and string access, and list_len of a non-list, match the interpreter
-    Given an empty list, a three-element list, and out-of-range and negative indexes into them
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same nine lines, with Unit for the list reads and 0 for list_len of Unit
+    Given the program
+      """
+      let e = []
+      let l = [1, 2, 3]
+      print(type_of(e[0]))
+      print(type_of(l[10]))
+      print(type_of(l[0 - 1]))
+      print("abc"[10] == "")
+      print(list_len(e[0]))
+      print(list_len(5))
+      print(list_len(l[10]))
+      print(l[2])
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      unit
+      unit
+      unit
+      true
+      0
+      0
+      0
+      3
+      """
 
   Scenario: a program path with a directory separator but no ./ prefix launches on both exec forms
-    Given exec_capture and exec_capture_io called with "self_hosting/build/v2_interp.exe"
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same four lines, with the child's output captured
+    Given the program
+      """
+      include "{lib}/v2_engines.patlang"
+      let probe = spec_out() + "/exec_rel_probe.patlang"
+      write_file(probe, "print(" + chr(34) + "probe" + chr(34) + ")" + chr(10))
+      let a = exec_capture("self_hosting/build/v2_interp.exe", probe)
+      print(str_contains(a, "probe"))
+      let b = exec_capture_io("self_hosting/build/v2_interp.exe", [probe], "", 0)
+      print(str_contains(b[0], "probe"))
+      print(b[2])
+      remove_file(probe)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      true
+      true
+      true
+      """
 
   Scenario: exec_capture_io kills a child that outlives timeout_ms and leaves a quick child alone
-    Given an infinite-loop child with a 400 ms timeout and a quick child with a 30000 ms timeout
-    When the file is run on the v2 interpreter and compiled and run by v2
-    Then both print the same seven lines: the infinite child reports failure and "timeout after 400 ms" well inside the guard, the quick child succeeds untimed
+    Given the program
+      """
+      include "{lib}/v2_engines.patlang"
+      let interp = "./self_hosting/build/v2_interp.exe"
+      let spin = spec_out() + "/exec_timeout_spin.patlang"
+      let quick_src = spec_out() + "/exec_timeout_quick.patlang"
+      write_file(spin, "while true do" + chr(10) + "end" + chr(10))
+      write_file(quick_src, "print(" + chr(34) + "quick" + chr(34) + ")" + chr(10))
+      let t0 = now_ms()
+      let spun = exec_capture_io(interp, [spin], "", 400)
+      let elapsed = now_ms() - t0
+      print(spun[2])
+      print(str_contains(spun[1], "timeout after 400 ms"))
+      print(elapsed < 6000)
+      let quick = exec_capture_io(interp, [quick_src], "", 30000)
+      print(quick[2])
+      print(str_contains(quick[0], "quick"))
+      print(str_contains(quick[1], "timeout"))
+      remove_file(spin)
+      remove_file(quick_src)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      false
+      true
+      true
+      true
+      true
+      false
+      """

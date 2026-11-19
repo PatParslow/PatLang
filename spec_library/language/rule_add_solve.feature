@@ -1,24 +1,45 @@
 Feature: rule_add / solve (real backward-chaining logic engine)
 
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
+
   Scenario: A ground fact is a rule with an empty body
-    Given rule_add("parent", ["alice","bob"], [])
-    When solve("parent", ["alice","bob"]) is called
-    Then the result is a list with exactly 1 solution
+    Given the program
+      """
+      rule_add("parent", ["alice", "bob"], [])
+      print(list_len(solve("parent", ["alice", "bob"])))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      1
+      """
 
   Scenario: A chained rule resolves an unbound variable via multiple facts
-    Given rule_add("grandparent", ["X","Z"], [["parent",["X","Y"]], ["parent",["Y","Z"]]]) plus parent(alice,bob) and parent(bob,carol)
-    When solve("grandparent", ["alice","Z"]) is called
-    Then Z resolves to "carol" -- confirmed via real chained unification, not a flat lookup
+    Given the program
+      """
+      rule_add("parent", ["alice", "bob"], [])
+      rule_add("parent", ["bob", "carol"], [])
+      rule_add("grandparent", [logic_var("X"), logic_var("Z")], [["parent", [logic_var("X"), logic_var("Y")]], ["parent", [logic_var("Y"), logic_var("Z")]]])
+      print(solve("grandparent", ["alice", logic_var("Z")]))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [[alice, carol]]
+      """
 
   Scenario: No matching rule or fact returns an empty list
-    Given a query with no possible proof
-    When solve is called
-    Then the result is an empty list, not an error
+    Given the program
+      """
+      print(solve("no_such_relation_at_all", ["x", "y"]))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      []
+      """
 
-  Note: any argument string starting with an UPPERCASE letter (e.g.
-  "X", "Z") is treated as a logic VARIABLE, not a ground constant --
-  a real, previously-documented gotcha (see [[patlang-stage0-gotchas]])
-  now folded into this instruction's own contract: passing arbitrary
-  string data through rule_add/solve must ground it first (e.g. a
-  lowercase marker) if it isn't guaranteed lowercase-first.
-
+  Note: a variable is a logic_var("X") value, never a string: a string
+  holding "X", capitalised or not, is data and matches only itself
+  (review finding S1).

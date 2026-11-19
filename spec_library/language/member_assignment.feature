@@ -1,7 +1,20 @@
 Feature: obj.prop = value (member-assignment sugar)
 
-  Scenario: Dot-assignment writes the same store dot-read and get() both read from
-    Given `o.color = "blue"` on an object with no color field previously set
-    When o.color and get(o, "color") are both read afterward
-    Then both return "blue" -- confirming dot-assignment, dot-read, and get() all agree on the same underlying field store
+  Each scenario carries its program, runs it interpreted and compiled, and says
+  what both print (spec_steps_program.patlang).
 
+  Scenario: Dot-assignment writes the same store dot-read and get() both read from
+    Given the program
+      """
+      class Holder {
+        field placeholder = 0
+      }
+      let o = new("Holder", "o1")
+      o.color = "blue"
+      print([o.color, get(o, "color")])
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      [blue, blue]
+      """
