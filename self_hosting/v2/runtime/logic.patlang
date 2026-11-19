@@ -1158,9 +1158,130 @@ make a function called rt_state_contains takes state, f returns yes
   return yes
 end
 
+# ---- fact sets: a state's facts found by value, without a scan ----
+#
+# A fact whose arguments are all ints and strings is found by its text
+# (rt_fact_text): two such facts that are == have the same text, since an
+# int's text and a string's text each name one value. Any other fact (a
+# float, which is == to an int of another text, a list, a variable) is kept
+# in a list that every look-up also reads. A look-up gives the positions of
+# the facts that may be equal, in order, and the caller decides with == or
+# unification, as a scan decides: the set changes how fast, never what.
+
+# Whether f is a fact the set finds by its text: [a name, a list of ints and
+# strings]. Anything else is looked for by a scan, as it always was.
+make a function called rt_fact_simple takes f returns yes
+  require value_live(f)
+  let yes = (value_class(f) == 9) and (list_len(f) == 2)
+  if yes then
+    let yes = (value_class(f[0]) == 8) and (value_class(f[1]) == 9)
+  end
+  let i = 0
+  while yes and (i < list_len(f[1])) do
+    let c = value_class(f[1][i])
+    let yes = (c == 2) or (c == 8)
+    let i = i + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# [mask, buckets, the other facts' positions]: buckets a vec of lists of
+# [text, position], position order within each.
+make a function called rt_fs_new takes facts returns fs
+  require value_class(facts) == 9
+  let n = list_len(facts)
+  let cap = 16
+  while cap < 2 * n do
+    let cap = cap * 2
+  end
+  let buckets = vec_new()
+  let i = 0
+  while i < cap do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  let other = []
+  let p = 0
+  while p < n do
+    if rt_fact_simple(facts[p]) then
+      let t = rt_fact_text(facts[p])
+      let h = word_and(str_hash(t), cap - 1)
+      vec_set(buckets, h, list_push(vec_get(buckets, h), [t, p]))
+    else
+      let other = list_push(other, p)
+    end
+    let p = p + 1
+  end
+  let fs = [cap - 1, buckets, other]
+  ensure list_len(fs) == 3
+  return fs
+end
+
+# The positions, in order, of the facts that may be equal to f; false when f
+# is not a fact the set finds by its text (look at every fact).
+make a function called rt_fs_candidates takes fs, f returns positions
+  require (list_len(fs) == 3) and (value_class(f) == 9)
+  if not rt_fact_simple(f) then
+    let positions = false
+    ensure value_class(positions) == 1
+    return positions
+  end
+  let t = rt_fact_text(f)
+  let bucket = vec_get(fs[1], word_and(str_hash(t), fs[0]))
+  let other = fs[2]
+  # merged in position order: the bucket's and the others' are each in order
+  let out = []
+  let a = 0
+  let b = 0
+  let going = true
+  while going do
+    while (a < list_len(bucket)) and (bucket[a][0] != t) do
+      let a = a + 1
+    end
+    if (a < list_len(bucket)) and ((b >= list_len(other)) or (bucket[a][1] < other[b])) then
+      let out = list_push(out, bucket[a][1])
+      let a = a + 1
+    elif b < list_len(other) then
+      let out = list_push(out, other[b])
+      let b = b + 1
+    else
+      let going = false
+    end
+  end
+  let positions = out
+  ensure value_class(positions) == 9
+  return positions
+end
+
+# Whether the facts hold f, by ==, found through their set.
+make a function called rt_fs_contains takes fs, facts, f returns yes
+  require (list_len(fs) == 3) and (value_class(facts) == 9)
+  let cands = rt_fs_candidates(fs, f)
+  if cands == false then
+    let yes = rt_state_contains(facts, f)
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let i = 0
+  while i < list_len(cands) do
+    if facts[cands[i]] == f then
+      let yes = true
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let i = i + 1
+  end
+  let yes = false
+  ensure value_class(yes) == 1
+  return yes
+end
+
 # Every substitution under which all of the preconditions hold in the state:
-# added to `out`, starting at precondition k.
-make a function called rt_instances takes preconds, k, state, subst, out returns all
+# added to `out`, starting at precondition k. fs is the state's fact set: a
+# precondition with no variable left looks only at the facts it may equal, in
+# the order a scan meets them, so the substitutions come out as a scan gives.
+make a function called rt_instances takes preconds, k, state, fs, subst, out returns all
   require (value_class(preconds) == 9) and (value_class(state) == 9) and (value_class(subst) == 9) and (value_class(out) == 9) and (value_class(k) == 2)
   if k >= list_len(preconds) then
     let all = list_push(out, subst)
@@ -1170,15 +1291,27 @@ make a function called rt_instances takes preconds, k, state, subst, out returns
   let goal = preconds[k]
   let applied = apply_subst(goal[1], subst)
   let cur = out
-  let i = 0
-  while i < list_len(state) do
+  let cands = false
+  if rt_is_ground(applied) then
+    let cands = rt_fs_candidates(fs, [goal[0], applied])
+  end
+  let n = list_len(state)
+  if cands != false then
+    let n = list_len(cands)
+  end
+  let j = 0
+  while j < n do
+    let i = j
+    if cands != false then
+      let i = cands[j]
+    end
     if state[i][0] == goal[0] then
       let u = unify_args(applied, state[i][1], subst)
       if u[0] == "Ok" then
-        let cur = rt_instances(preconds, k + 1, state, u[1], cur)
+        let cur = rt_instances(preconds, k + 1, state, fs, u[1], cur)
       end
     end
-    let i = i + 1
+    let j = j + 1
   end
   let all = cur
   ensure list_len(all) >= list_len(out)
@@ -1359,16 +1492,22 @@ end
 
 # ---- the plan search ----
 #
-# A* from the stores' ground facts (spec 1.13). A node is [f, g, seq, state,
-# path, unmet]: g the cost so far, f that plus the estimate below, seq the
-# order it was made in, unmet how many goals its state does not meet. The frontier is a binary heap in a vec, the node to expand
-# first at index 0: least f, then most g (deeper first, so a run of equally
-# good steps is followed to its end), then least seq. A state is expanded
-# once, the first time it is taken from the frontier; the search ends with
-# the first state taken that meets the goals, or with [] when the frontier
-# is empty, every reachable state having been tried. Each expansion makes a
-# child for every applicable step, each a copy of the state, so for n
-# independent goals the search takes time growing about as n cubed.
+# A* from the stores' ground facts (spec 1.13). A node is [f, g, seq, base,
+# edit, unmet]: g the cost so far, f that plus the estimate below, seq the
+# order it was made in, unmet how many goals its state does not meet. Its
+# state and path are made only when it is taken from the frontier: base is
+# its parent's [state, path] and edit the [action, substitution] taken from
+# there (the start node's base is its own, and its edit false). A path is
+# linked, [the path before, step], [] at the start. The frontier is a binary
+# heap in a vec, the node to expand first at index 0: least f, then most g
+# (deeper first, so a run of equally good steps is followed to its end), then
+# least seq. A state is expanded once, the first time it is taken from the
+# frontier; the search ends with the first state taken that meets the goals,
+# or with [] when the frontier is empty, every reachable state having been
+# tried. An expansion finds each action's instances and each step's effects
+# through the state's fact set, so for n independent goals the search takes
+# time growing about as n squared: making every child's state as it was made
+# and testing every action against every fact made it n cubed.
 
 # How many of the goals the state does not meet.
 make a function called rt_plan_unmet takes state, goals returns unmet
@@ -1546,6 +1685,70 @@ make a function called rt_key_set_add takes set, key returns added
   return added
 end
 
+# A linked path ([the path before, step], [] at the start) as a list of steps,
+# first to last.
+make a function called rt_path_steps takes path returns steps
+  require value_class(path) == 9
+  let back = []
+  let p = path
+  while list_len(p) == 2 do
+    let back = list_push(back, p[1])
+    let p = p[0]
+  end
+  let steps = []
+  let i = list_len(back) - 1
+  while i >= 0 do
+    let steps = list_push(steps, back[i])
+    let i = i - 1
+  end
+  ensure list_len(steps) == list_len(back)
+  return steps
+end
+
+# What a step does to a state, without making the state it leads to:
+# [whether it changes the state, the goals it leaves unmet], as making it and
+# comparing (`next != state`, rt_plan_unmet_after) gives. A step that deletes
+# a fact the state holds is made and compared; one that does not changes the
+# state only by adding a fact the state lacks, and meets a goal by adding it.
+make a function called rt_step_outcome takes state, fs, action, subst, unmet, goal_facts, goal_fs returns outcome
+  require (value_class(state) == 9) and (list_len(fs) == 3) and (value_class(goal_facts) == 9)
+  let dels = action[3]
+  let adds = action[2]
+  let deleting = false
+  let i = 0
+  while (not deleting) and (i < list_len(dels)) do
+    if rt_fs_contains(fs, state, [dels[i][0], apply_subst(dels[i][1], subst)]) then
+      let deleting = true
+    end
+    let i = i + 1
+  end
+  if deleting then
+    let mid = rt_state_effects(state, dels, subst, false)
+    let next = rt_state_effects(mid, adds, subst, true)
+    let left = rt_plan_unmet_after(unmet, state, dels, subst, false, goal_facts)
+    let left = rt_plan_unmet_after(left, mid, adds, subst, true, goal_facts)
+    let outcome = [next != state, left]
+    ensure list_len(outcome) == 2
+    return outcome
+  end
+  let changes = false
+  let left = unmet
+  let i = 0
+  while i < list_len(adds) do
+    let f = [adds[i][0], apply_subst(adds[i][1], subst)]
+    if not rt_fs_contains(fs, state, f) then
+      let changes = true
+      if rt_fs_contains(goal_fs, goal_facts, f) then
+        let left = left - 1
+      end
+    end
+    let i = i + 1
+  end
+  let outcome = [changes, left]
+  ensure (list_len(outcome) == 2) and (outcome[1] >= 0)
+  return outcome
+end
+
 # [path, the state it reaches], or [[], []] when no plan is found, starting
 # from the ground facts of a list of stores.
 make a function called rt_plan_from takes stores, goal_facts returns result
@@ -1553,36 +1756,45 @@ make a function called rt_plan_from takes stores, goal_facts returns result
   let actions = rt_global_get(4240)
   let shape = rt_plan_shape(actions)
   let start = rt_ground_facts(stores)
+  let goal_fs = rt_fs_new(goal_facts)
   let heap = vec_new()
   let unmet = rt_plan_unmet(start, goal_facts)
-  rt_pq_push(heap, [rt_plan_estimate(unmet, shape[0], shape[1]), 0, 0, start, [], unmet])
+  rt_pq_push(heap, [rt_plan_estimate(unmet, shape[0], shape[1]), 0, 0, [start, []], false, unmet])
   let seq = 1
   let expanded = rt_key_set_new()
   while vec_len(heap) > 0 do
     let node = rt_pq_pop(heap)
-    let state = node[3]
+    let base = node[3]
+    let edit = node[4]
+    let state = base[0]
+    let path = base[1]
+    if edit != false then
+      let taken = edit[0]
+      let mid = rt_state_effects(state, taken[3], edit[1], false)
+      let state = rt_state_effects(mid, taken[2], edit[1], true)
+      let path = [path, action_instance_step(taken[0], taken[1], edit[1])]
+    end
     if node[5] == 0 then
-      let result = [node[4], state]
+      let result = [rt_path_steps(path), state]
       ensure list_len(result) == 2
       return result
     end
     if rt_key_set_add(expanded, rt_state_key(state)) then
+      let fs = rt_fs_new(state)
+      let here = [state, path]
       let a = 0
       while a < list_len(actions) do
         let action = actions[a]
-        let insts = rt_instances(action[1], 0, state, [], [])
+        let insts = rt_instances(action[1], 0, state, fs, [], [])
         let k = 0
         while k < list_len(insts) do
           let subst = insts[k]
-          let mid = rt_state_effects(state, action[3], subst, false)
-          let next = rt_state_effects(mid, action[2], subst, true)
+          let outcome = rt_step_outcome(state, fs, action, subst, node[5], goal_facts, goal_fs)
           # a step that changes nothing leads nowhere new
-          if next != state then
-            let left = rt_plan_unmet_after(node[5], state, action[3], subst, false, goal_facts)
-            let left = rt_plan_unmet_after(left, mid, action[2], subst, true, goal_facts)
+          if outcome[0] then
+            let left = outcome[1]
             let g = node[1] + action[4]
-            let path = list_push(node[4], action_instance_step(action[0], action[1], subst))
-            rt_pq_push(heap, [g + rt_plan_estimate(left, shape[0], shape[1]), g, seq, next, path, left])
+            rt_pq_push(heap, [g + rt_plan_estimate(left, shape[0], shape[1]), g, seq, here, [action, subst], left])
             let seq = seq + 1
           end
           let k = k + 1

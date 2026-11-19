@@ -10,7 +10,8 @@ Feature: Native x64 process spawning, timeouts and out-of-range access agree wit
      read, was dereferenced as if it were a list: a segfault, or garbage that
      happened not to crash. The interpreter's contract: an out-of-range list
      index is Unit, an out-of-range string index is "", and list_len of
-     anything that is neither a list nor a string is 0.
+     anything that is neither a list nor a string is 0. (A bytes, added
+     later, is indexed and measured as a list is: spec 1.5.)
 
   2. CreateProcessA is called with a NULL application name, so it only treats
      the first token of the command line as a path when it is prefixed with

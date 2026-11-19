@@ -26,6 +26,11 @@ Feature: every value is an object of a class, and answers methods through it (sp
     When a program reads and assigns the field through the string
     Then it sees the same field the object has, and the string still answers length
 
+  Scenario: a class declared after 400 others is made and its inherited methods called as fast
+    Given a class and its child declared first, the same two declared after 400 more classes, and a second class declared with the child's name
+    When objects of each child are made and their inherited method called 2000 times
+    Then each reads its own and its inherited field and method, the later costs no more than about four times the cycles of the first, and new finds the first class of the name, and a parent declared after its child gives the child's next object its field
+
   Scenario: new takes a class and a name, and nothing more
     Given a call of new with further arguments after the name
     When the program runs

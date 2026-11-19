@@ -56,6 +56,11 @@ Feature: values and objects with identity (spec 1.5)
     When the vecs and the lists taken from them are read
     Then the first vec holds its elements twice in order, the lists taken earlier are unchanged, and the second vec holds 20000 numbers
 
+  Scenario: a bytes is indexed and measured as a list is
+    Given a bytes of three bytes, read by b[i] in range, past each end and with a string index, and measured with list_len before and after a push
+    When each is read
+    Then b[i] is the byte, unit wherever a list's index would give unit, and list_len is how many bytes it holds
+
   Scenario: bytes is a buffer of bytes with identity
     Given a bytes made, set, pushed to through a second holder, extended, sliced, compared, turned into text and lists and back, written to a file and read back, and pushed to a million times
     When each is read

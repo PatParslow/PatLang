@@ -23,7 +23,7 @@ Feature: resolve package: reading manifests
   Scenario: The real deflate manifest reads
     Given the manifest "packages/deflate/manifest.pkg"
     When it is read
-    Then it reads as package "deflate" version "0.1.0"
+    Then it reads as package "deflate" version "0.2.0"
     And its entry is "deflate.patlang"
     And it has 5 includes and 5 files
     And its dependencies are ""
@@ -31,14 +31,14 @@ Feature: resolve package: reading manifests
   Scenario: The real zip manifest reads
     Given the manifest "packages/zip/manifest.pkg"
     When it is read
-    Then it reads as package "zip" version "0.1.0"
+    Then it reads as package "zip" version "0.2.0"
     And it has 1 include and 1 file
-    And its dependencies are "deflate >= 0.1.0, < 0.2.0"
+    And its dependencies are "deflate >= 0.2.0, < 0.3.0"
 
   Scenario: The real sha256 manifest reads
     Given the manifest "packages/sha256/manifest.pkg"
     When it is read
-    Then it reads as package "sha256" version "0.1.0"
+    Then it reads as package "sha256" version "0.1.1"
     And its entry is "sha256.patlang"
     And it has 4 includes and 4 files
     And its dependencies are ""

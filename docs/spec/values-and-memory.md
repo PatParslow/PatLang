@@ -32,7 +32,9 @@ string in its world (text from a file or a socket that equals a name reaches
 nothing), and `object_named(name)` gives the object with that name, or `unit`
 when none has it. `object_named` works whichever a program declares.
 `new` takes a class and a name and nothing more: further arguments stop the program,
-since inheritance and traits belong to a `class` declaration.
+since inheritance and traits belong to a `class` declaration. A class is found by its
+name in one look, whatever else is declared: where two classes have one name, the first
+declared is the one `new`, an inheriting class and a trait find.
 
 ### 1.2 Methods on every value
 
@@ -110,7 +112,9 @@ any event is (`emit`, `when`), with nothing specific to operators.
 - **bytes** (class 18) is a buffer of bytes, one byte of memory each, where a list of
   ints holds a 16-byte value for each. `bytes_new(n)` is `n` zero bytes; `bytes_len`,
   `bytes_get(b, i)` and `bytes_set(b, i, v)` read and write them, each an int from 0 to
-  255, and an index outside it stops the program as a bool array's does. `bytes_push`
+  255, and an index outside it stops the program as a bool array's does. `b[i]` reads as
+  a list's index does, the byte or unit past either end, and `list_len(b)` is its length.
+  `bytes_push`
   grows it in place; `bytes_extend(b, more)` appends a bytes, copied whole, or a list of
   ints; `bytes_slice(b, start, n)` is a new bytes. `bytes_eq` compares contents.
   `bytes_from_str` and `bytes_to_str` go through UTF-8, `bytes_from_list` and
@@ -224,7 +228,8 @@ A string holds characters, whatever bytes they take. `.length`, indexes, `substr
 `sc_substr`) all count characters; `byte_length`, `hash_string` and `str_hash` see the UTF-8
 bytes. `str_hash(s)` is FNV-1a over them, its low 62 bits as a non-negative int, the same on
 every engine: for a program's own hash tables, where hashing a name a character at a time cost
-about 4 us.
+about 4 us. `bytes_hash(b)` is the same over a bytes's bytes, so it gives a bytes the hash
+`str_hash` gives a string of those bytes: for checking that stored bytes are the ones stored.
 An ASCII string indexes in O(1). Any other walks from its start, so a scan of one uses
 the cursor. `chr(n)` gives the character whose code is the int `n`; anything else, a
 surrogate code (U+D800 to U+DFFF) included, stops the program.
@@ -406,6 +411,8 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   milliseconds; how busy the machine was between two readings is in their differences.
   `memory_status()` gives `[total, available]`, the physical memory in bytes. Where the system
   gives no figures, as in a browser, `cpu_times` and `memory_status` give `[-1, -1]`.
+  `memory_used()` gives the program's own committed private memory in bytes, `-1` in a
+  browser: for a long-running program to report, and for a test of what it holds.
 - A file reached by several includes is included once, before the files that include it.
 - The runtime has the stage-0 shims: `add(a, b)`, `multiply(a, b)` and `subtract(a, b)` give
   `a + b`, `a * b` and `a - b`; `calculate`, `calculate_result` and `get_value` of anything give
@@ -417,7 +424,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - `plan(goals)` gives a cheapest sequence of the actions' steps from the stores' ground facts to
   a state meeting every goal, and `[]` only when no sequence reaches one: the search has no
   limit that gives up early. For n goals that independent steps meet, it takes time growing
-  about as n cubed (40 goals in about 0.2 s, 160 in about 9 s, compiled).
+  about as n squared (40 goals in about 70 ms, 160 in about 1.1 s, 511 in about 12 s,
+  compiled; it grew as n cubed, 511 taking 546 s, before a state's facts were found by value
+  and a step's state was made only when the search took it).
 - A plan's step is `[name, values, names]`: the action's name, its preconditions' variables'
   values as bound, in the order the preconditions first name them, and those variables'
   names. A value keeps its type: an int stays an int, a text holding a comma stays one value.
@@ -644,17 +653,23 @@ call that may give the mark has no unwind code.
 ### 2.3 Memory manager
 
 - The heap reserves one large address range once, and commits pages from
-  the system in chunks, only as needed.
+  the system in steps of 16 MB, only as needed: a small program commits
+  about 18 MB, where steps of 256 MB made it 270 MB.
 - A block's size is rounded up to a size class: 8-byte steps to 256 bytes,
-  then four classes per power of two. A freed block of any size goes to a
-  free list.
+  then four classes per power of two. A freed block up to an allocation
+  chunk's size (1 MB) goes to a free list.
+- A block larger than a chunk is memory of its own: taken from the system
+  for it alone, as many pages as it needs with no size class's rounding,
+  and given back when it is freed. A browser's memory only grows, so there
+  it comes from the range as any other block does.
 - **Each thread** has its own free lists and its own bump chunk, taken
   from the reservation with one atomic add. A thread allocates and frees
   on its own lists with no lock and no atomic.
 - A block freed by another thread goes onto the freeing thread's lists.
   Past a threshold, a thread trades a batch of blocks with a shared pool,
   taking one lock per batch.
-- Freed memory is never returned to the system.
+- Freed memory up to a chunk is never returned to the system; larger blocks
+  are (above).
 - Reference counts are atomic. Making them plain where the ownership
   summaries prove a value never leaves its thread is an allowed
   optimisation, not a requirement.

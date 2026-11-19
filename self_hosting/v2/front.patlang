@@ -201,17 +201,36 @@ make a function called v2_front_end takes src_path, runtime_root, runtime_ensure
   end
   v2_expand_syntax(collected, runtime_count)
   let files = vec_to_list(collected)
+  # the runtime's files parsed as a build before parsed them, when nothing
+  # they depend on has changed (v2_runtime_parsed)
+  let cache_key = v2_parsed_key(files, runtime_count)
+  let cache = runtime_root + "self_hosting/build/v2_runtime_parsed.bin"
+  let cached = []
+  if cache_key != "" then
+    let cached = v2_read_parsed(cache, cache_key, runtime_count)
+  end
   let parsed_files = []
+  let runtime_stmts = []
   let errors = []
   let i = 0
   while i < list_len(files) do
-    let parsed = v2_parse_file(files[i][0], files[i][1])
+    if (i < runtime_count) and (list_len(cached) == runtime_count) then
+      let parsed = [cached[i], []]
+    else
+      let parsed = v2_parse_file(files[i][0], files[i][1])
+    end
+    if i < runtime_count then
+      let runtime_stmts = list_push(runtime_stmts, parsed[0])
+    end
     let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0]), i < runtime_count, runtime_ensures])
     let errors = v2_concat(errors, parsed[1])
     let i = i + 1
   end
   if list_len(errors) > 0 then
     return ["error", errors]
+  end
+  if (cache_key != "") and (list_len(cached) != runtime_count) then
+    v2_write_parsed(cache, cache_key, runtime_stmts)
   end
   let lowered = lw_program(parsed_files)
   if list_len(lowered[1]) > 0 then
@@ -229,6 +248,227 @@ make a function called v2_own_path returns path
   let path = program_path()
   ensure (type_of(path) == "string") and (path.length > 0)
   return path
+end
+
+# ---- the runtime's files, parsed once (review finding O10) ----
+#
+# Parsing the runtime's 20 files took half of every compile's front end (about
+# 2.5 s of 5 s for a one-line program), and a runtime file's statements depend
+# on its text and on the parser alone: syntax definitions are expanded in a
+# program's files, never the runtime's (v2_expand_syntax). So they are kept in
+# self_hosting/build/v2_runtime_parsed.bin, keyed by the compiler's own key
+# (which changes with the parser) and each runtime file's path, length and
+# hash. A compiler with no key beside it keeps none. The file is only a saving:
+# one that is missing, of another key, or damaged is parsed again and written
+# again.
+
+# The key of the runtime's parsed files, or "" when this compiler has no key.
+make a function called v2_parsed_key takes files, runtime_count returns key
+  require runtime_count <= list_len(files)
+  let path = v2_own_path() + ".key"
+  if not file_exists(path) then
+    let key = ""
+    ensure key == ""
+    return key
+  end
+  let b = sb_new()
+  sb_push(b, "v2 parsed runtime 1 " + str_trim(read_file(path)))
+  let i = 0
+  while i < runtime_count do
+    sb_push(b, " " + files[i][0] + " " + str_len(files[i][1]) + " " + str_hash(files[i][1]))
+    let i = i + 1
+  end
+  let key = sb_str(b)
+  ensure value_class(key) == 8
+  return key
+end
+
+# A count, as LEB128: seven bits a byte, low first, the high bit set on all
+# but the last.
+make a function called v2_put_count takes b, n returns ok
+  require (value_class(n) == 2) and (n >= 0)
+  let x = n
+  while x >= 128 do
+    bytes_push(b, (x band 127) bor 128)
+    let x = x shr 7
+  end
+  bytes_push(b, x)
+  let ok = true
+  ensure ok
+  return ok
+end
+
+# v appended to b: a list (L, its count, its items), a string (S, its length
+# in bytes, its UTF-8 bytes), an int (I or N for a negative, its magnitude),
+# true (T) or false (F). False when v holds anything else, or a string that
+# would not read back as itself: such a value is not kept.
+make a function called v2_ast_put takes b, v returns ok
+  let c = value_class(v)
+  if c == 9 then
+    bytes_push(b, 76)
+    v2_put_count(b, list_len(v))
+    let i = 0
+    while i < list_len(v) do
+      if not v2_ast_put(b, v[i]) then
+        return false
+      end
+      let i = i + 1
+    end
+    return true
+  end
+  if c == 8 then
+    let raw = bytes_from_str(v)
+    if bytes_to_str(raw) != v then
+      return false
+    end
+    bytes_push(b, 83)
+    v2_put_count(b, bytes_len(raw))
+    bytes_extend(b, raw)
+    return true
+  end
+  if c == 2 then
+    if v >= 0 then
+      bytes_push(b, 73)
+      v2_put_count(b, v)
+    else
+      bytes_push(b, 78)
+      v2_put_count(b, 0 - v)
+    end
+    return true
+  end
+  if c == 1 then
+    if v then
+      bytes_push(b, 84)
+    else
+      bytes_push(b, 70)
+    end
+    return true
+  end
+  return false
+end
+
+# Reading: st is a vec [position, still good]; a read past the end, or a tag
+# that is none of the above, marks it bad and gives 0.
+make a function called v2_get_byte takes b, st returns v
+  let p = vec_get(st, 0)
+  if p >= bytes_len(b) then
+    vec_set(st, 1, false)
+    return 0
+  end
+  vec_set(st, 0, p + 1)
+  return bytes_get(b, p)
+end
+
+make a function called v2_get_count takes b, st returns n
+  let n = 0
+  let shift = 0
+  let going = true
+  while going and vec_get(st, 1) do
+    let x = v2_get_byte(b, st)
+    let n = n bor ((x band 127) shl shift)
+    let shift = shift + 7
+    let going = (x >= 128) and (shift < 63)
+  end
+  return n
+end
+
+make a function called v2_ast_get takes b, st returns v
+  let tag = v2_get_byte(b, st)
+  if not vec_get(st, 1) then
+    return 0
+  end
+  if tag == 76 then
+    let n = v2_get_count(b, st)
+    let out = []
+    let i = 0
+    while (i < n) and vec_get(st, 1) do
+      let out = list_push(out, v2_ast_get(b, st))
+      let i = i + 1
+    end
+    return out
+  end
+  if tag == 83 then
+    let n = v2_get_count(b, st)
+    let p = vec_get(st, 0)
+    if (not vec_get(st, 1)) or (p + n > bytes_len(b)) then
+      vec_set(st, 1, false)
+      return ""
+    end
+    vec_set(st, 0, p + n)
+    return bytes_to_str(bytes_slice(b, p, n))
+  end
+  if tag == 73 then
+    return v2_get_count(b, st)
+  end
+  if tag == 78 then
+    return 0 - v2_get_count(b, st)
+  end
+  if tag == 84 then
+    return true
+  end
+  if tag == 70 then
+    return false
+  end
+  vec_set(st, 1, false)
+  return 0
+end
+
+# The runtime files' statements kept under this key, n of them, or [] when
+# the file is missing, of another key, or damaged. The file is the key, the
+# statements' bytes_hash, then the statements: a changed byte that still
+# decodes is caught by the hash.
+make a function called v2_read_parsed takes cache, key, n returns stmts
+  if not file_exists(cache) then
+    return []
+  end
+  let b = read_file_raw(cache)
+  let st = vec_new()
+  vec_push(st, 0)
+  vec_push(st, true)
+  let stored_key = v2_ast_get(b, st)
+  if (not vec_get(st, 1)) or (stored_key != key) then
+    return []
+  end
+  let h = v2_get_count(b, st)
+  let at = vec_get(st, 0)
+  if (not vec_get(st, 1)) or (at > bytes_len(b)) then
+    return []
+  end
+  let rest = bytes_slice(b, at, bytes_len(b) - at)
+  if bytes_hash(rest) != h then
+    return []
+  end
+  let st = vec_new()
+  vec_push(st, 0)
+  vec_push(st, true)
+  let all = v2_ast_get(rest, st)
+  if (not vec_get(st, 1)) or (vec_get(st, 0) != bytes_len(rest)) or (value_class(all) != 9) or (list_len(all) != n) then
+    return []
+  end
+  let stmts = all
+  ensure list_len(stmts) == n
+  return stmts
+end
+
+# Keeps the runtime files' statements under key: written whole under a name of
+# its own, then moved over the cache, as the declarations are
+# (v2_write_declarations). Nothing is kept when a value cannot be.
+make a function called v2_write_parsed takes cache, key, stmts returns done
+  let payload = bytes_new(0)
+  if not v2_ast_put(payload, stmts) then
+    return false
+  end
+  let b = bytes_new(0)
+  v2_ast_put(b, key)
+  v2_put_count(b, bytes_hash(payload))
+  bytes_extend(b, payload)
+  let temp = cache + "." + v2_hex(random_bytes(8)) + ".tmp"
+  if write_file_bytes(temp, b) then
+    if not try_rename_file(temp, cache) then
+      remove_file(temp)
+    end
+  end
+  return true
 end
 
 # The runtime as an interpreted program needs it, read and parsed once: its

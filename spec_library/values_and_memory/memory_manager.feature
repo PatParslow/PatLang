@@ -26,7 +26,12 @@ Feature: PatLang manages its own memory, per thread (spec 2.3)
     When the run ends
     Then A's memory came partly from batches B handed back, and the peak stays within twice the live data
 
-  Scenario: freed memory stays with PatLang
-    Given a program that allocates 500 MB, frees it, then allocates 500 MB again
-    When its committed memory is read
-    Then it is about 500 MB, not 1 GB, and nothing was returned to the system
+  Scenario: freed small blocks stay with PatLang for reuse
+    Given a program that fills its heap with 6 million small strings, frees them, then fills it again
+    When its committed range is read
+    Then the second fill commits nothing more, the first having committed over 200 MB
+
+  Scenario: a block larger than a chunk goes back to the system when freed
+    Given a program holding a 320 MB bytes, then letting it go
+    When its committed memory is read before, while and after
+    Then holding it adds at least 300 MB, and letting it go takes all but 16 MB off again

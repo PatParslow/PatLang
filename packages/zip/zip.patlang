@@ -3,11 +3,13 @@
 # entries stored (method 0) or deflated (method 8), each CRC-32 checked on
 # reading.
 #
-#   zip_build(entries)  -> the archive's bytes
+#   zip_build(entries)  -> the archive, a bytes
 #       entries: a list of [name, bytes, method], method "stored" or
-#       "deflated"; a name ending in "/" is a directory (give it no bytes)
+#       "deflated"; a name ending in "/" is a directory (give it no bytes).
+#       An entry's bytes may be a bytes or a list of ints from 0 to 255.
 #   zip_read(archive)   -> ["ok", entries] | ["err", message]
-#       entries as zip_build takes them, in central-directory order
+#       entries as zip_build takes them, each entry's bytes a bytes, in
+#       central-directory order; the archive a bytes or a list
 #   zip_directory(archive) -> ["ok", records] | ["err", message]
 #       one record per entry, without reading its data:
 #       [name, method number, crc32, compressed size, size, local header
@@ -26,40 +28,18 @@ include "../deflate/deflate.patlang"
 
 # ---- names ----
 
-# A string's UTF-8 bytes. Names are short, so indexing the string per
-# character is fine here.
+# A string's UTF-8 bytes, which is how a string is held.
 make a function called zip_name_bytes takes name returns bytes
   require value_class(name) == 8
-  let out = []
-  let i = 0
-  while i < name.length do
-    let c = char_code(name, i)
-    if c < 128 then
-      let out = list_push(out, c)
-    elif c < 2048 then
-      let out = list_push(out, 192 bor (c shr 6))
-      let out = list_push(out, 128 bor (c band 63))
-    elif c < 65536 then
-      let out = list_push(out, 224 bor (c shr 12))
-      let out = list_push(out, 128 bor ((c shr 6) band 63))
-      let out = list_push(out, 128 bor (c band 63))
-    else
-      let out = list_push(out, 240 bor (c shr 18))
-      let out = list_push(out, 128 bor ((c shr 12) band 63))
-      let out = list_push(out, 128 bor ((c shr 6) band 63))
-      let out = list_push(out, 128 bor (c band 63))
-    end
-    let i = i + 1
-  end
-  let bytes = out
-  ensure list_len(bytes) >= name.length
+  let bytes = bytes_from_str(name)
+  ensure bytes_len(bytes) == str_len(name)
   return bytes
 end
 
 # A string from UTF-8 bytes; a malformed sequence's lead byte is taken as
 # one character.
 make a function called zip_name_from_bytes takes bytes returns name
-  require value_class(bytes) == 9
+  require pkg_byte_source(bytes)
   let b = sb_new()
   let n = list_len(bytes)
   let i = 0
@@ -128,8 +108,8 @@ end
 
 make a function called zip_put16 takes out, v returns ok
   require (v >= 0) and (v < 65536)
-  vec_push(out, v band 255)
-  vec_push(out, v shr 8)
+  bytes_push(out, v band 255)
+  bytes_push(out, v shr 8)
   let ok = true
   ensure ok
   return ok
@@ -137,22 +117,18 @@ end
 
 make a function called zip_put32 takes out, v returns ok
   require (v >= 0) and (v <= 4294967295)
-  vec_push(out, v band 255)
-  vec_push(out, (v shr 8) band 255)
-  vec_push(out, (v shr 16) band 255)
-  vec_push(out, (v shr 24) band 255)
+  bytes_push(out, v band 255)
+  bytes_push(out, (v shr 8) band 255)
+  bytes_push(out, (v shr 16) band 255)
+  bytes_push(out, (v shr 24) band 255)
   let ok = true
   ensure ok
   return ok
 end
 
 make a function called zip_put_all takes out, bytes returns ok
-  require value_class(bytes) == 9
-  let i = 0
-  while i < list_len(bytes) do
-    vec_push(out, bytes[i])
-    let i = i + 1
-  end
+  require (value_class(out) == 18) and pkg_byte_source(bytes)
+  bytes_extend(out, bytes)
   let ok = true
   ensure ok
   return ok
@@ -175,7 +151,7 @@ end
 # ---- writing ----
 
 make a function called zip_is_ascii takes bytes returns yes
-  require value_class(bytes) == 9
+  require pkg_byte_source(bytes)
   let yes = true
   let i = 0
   while yes and (i < list_len(bytes)) do
@@ -191,7 +167,7 @@ end
 make a function called zip_build takes entries returns z
   require value_class(entries) == 9
   require list_len(entries) < 65535
-  let out = vec_new()
+  let out = bytes_new(0)
   let table = crc32_table()
   # Per entry: [name bytes, method number, crc, compressed size, size,
   # local header offset, flags, is a directory]
@@ -212,7 +188,7 @@ make a function called zip_build takes entries returns z
       let flags = 2048
     end
     let crc = crc32_update(0, table, data, 0, list_len(data))
-    let offset = vec_len(out)
+    let offset = bytes_len(out)
     let is_dir = (list_len(nb) > 0) and (nb[list_len(nb) - 1] == 47)
     let records = list_push(records, [nb, method, crc, list_len(body), list_len(data), offset, flags, is_dir])
     zip_put32(out, 67324752)
@@ -230,7 +206,7 @@ make a function called zip_build takes entries returns z
     zip_put_all(out, body)
     let i = i + 1
   end
-  let cd_start = vec_len(out)
+  let cd_start = bytes_len(out)
   let i = 0
   while i < list_len(records) do
     let r = records[i]
@@ -259,7 +235,7 @@ make a function called zip_build takes entries returns z
     zip_put_all(out, r[0])
     let i = i + 1
   end
-  let cd_size = vec_len(out) - cd_start
+  let cd_size = bytes_len(out) - cd_start
   zip_put32(out, 101010256)
   zip_put16(out, 0)
   zip_put16(out, 0)
@@ -268,8 +244,8 @@ make a function called zip_build takes entries returns z
   zip_put32(out, cd_size)
   zip_put32(out, cd_start)
   zip_put16(out, 0)
-  let z = vec_to_list(out)
-  ensure list_len(z) >= 22
+  let z = out
+  ensure (value_class(z) == 18) and (bytes_len(z) >= 22)
   return z
 end
 
@@ -279,7 +255,7 @@ end
 # backwards over at most the 22-byte record plus the longest comment, and
 # must account for the archive's last byte.
 make a function called zip_find_eocd takes z returns at
-  require value_class(z) == 9
+  require pkg_byte_source(z)
   let n = list_len(z)
   let at = 0 - 1
   let p = n - 22
@@ -307,7 +283,7 @@ make a function called zip_err takes message returns r
 end
 
 make a function called zip_directory takes z returns r
-  require value_class(z) == 9
+  require pkg_byte_source(z)
   let n = list_len(z)
   let e = zip_find_eocd(z)
   if e < 0 then
@@ -378,15 +354,9 @@ make a function called zip_entry_data takes z, rec, table returns r
   if at + rec[3] > list_len(z) then
     return zip_err("truncated: data of " + name)
   end
-  let data = []
+  let data = bytes_new(0)
   if rec[1] == 0 then
-    let buf = []
-    let i = at
-    while i < at + rec[3] do
-      let buf = list_push(buf, z[i])
-      let i = i + 1
-    end
-    let data = buf
+    pkg_append_range(data, z, at, rec[3])
   elif rec[1] == 8 then
     let inf = inflate_raw(z, at)
     if inf[0] != "ok" then
@@ -411,7 +381,7 @@ make a function called zip_entry_data takes z, rec, table returns r
 end
 
 make a function called zip_read takes z returns r
-  require value_class(z) == 9
+  require pkg_byte_source(z)
   let d = zip_directory(z)
   if d[0] != "ok" then
     return d

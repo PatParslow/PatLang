@@ -178,3 +178,15 @@ finished.
   interpreted and compiled, and both outputs are compared with
   `demos/expected/NAME.txt`. The repository suite checks that every program in
   `demos/` is listed and has its expected output.
+
+2026-11-19:
+
+- **The packages' specs are suites,** `pkg_deflate`, `pkg_zip`, `pkg_sha256`,
+  `pkg_resolve` and `pkg_trust`: each package's `spec/run_spec.patlang` on the
+  interpreter, which lists its feature files with `--list` (`run_suite`) and
+  exits 1 on a failure. They read `packages/` and `self_hosting/lib`, and call
+  Python's oracle (`spec/oracle.py`) as their steps say. Until now they ran only
+  by hand, and none was in a gate.
+- **Planning takes seconds:** the planner (`plan`, runtime `logic.patlang`)
+  grew as the cube of the stale units, 546 s for 511 of them; it now grows as
+  their square.

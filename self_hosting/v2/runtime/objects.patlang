@@ -11,14 +11,16 @@ quiet_operators()
 #   4144 the classes: a list of class records (rt_class_*)
 #   4160 named objects: the address of their table (rt_named_*), not a value
 #   4176 the next class id for a declared class
-#   4192 the named table's lock (rt_lock_take; 4200 unused)
+#   4192 the named table's lock (rt_lock_take)
+#   4200 the classes by name: a table's address, not a value (rt_class_by_name)
 # (4208 is threads.patlang's functions by name, 4464 logic.patlang's named
 # rule stores; 4112, fibers.patlang's jobs, is the engine's: rt_engine_get)
 # and, at 2048 + 8 * class id (ids below 256), each class's event flag:
 # nonzero once a handler is registered for an event its methods raise.
 #
 # A class record is [name, id, parent name, field defaults [[name, value]],
-# methods [[name, closure]], traits [names]].
+# methods [[name, closure]], traits [names], a vec holding what new() starts an
+# object's fields from (rt_new_fields)].
 #
 # An object is a block holding its class id at 16, its name at 24 (unit
 # when unnamed) and its fields at 40: a list of [name, value]. Its type
@@ -199,7 +201,7 @@ make a function called rt_objects_init returns r
   mem_store(st, 4232, 0)
   mem_init_value(st, 4224, vec_new())
   mem_store(st, 4192, 0)
-  mem_store(st, 4200, 0)
+  mem_store(st, 4200, rt_named_table_new(1024))
   mem_store(st, 4160, rt_named_table_new(64))
   mem_store(st, 4176, 0)
   mem_store(st, 4184, 0)
@@ -219,7 +221,10 @@ end
 
 make a function called rt_class_def takes name, id, parent, defaults, methods, traits returns r
   require (value_class(name) == 8) and (value_class(id) == 2) and (value_class(defaults) == 9) and (value_class(methods) == 9) and (value_class(traits) == 9)
-  let rec = [name, id, parent, defaults, methods, traits]
+  let start = vec_new()
+  vec_push(start, 0 - 1)
+  vec_push(start, [])
+  let rec = [name, id, parent, defaults, methods, traits, start]
   rt_global_push(4144, rec)
   # and at its id in the vec by id, under the state lock as the list's push is
   let held = rt_state_lock()
@@ -229,9 +234,39 @@ make a function called rt_class_def takes name, id, parent, defaults, methods, t
   end
   vec_set(by_id, id, rec)
   rt_global_put(4224, by_id)
+  rt_class_index_add(name, rec)
   rt_state_unlock(held)
   let r = id
   ensure r == id
+  return r
+end
+
+# The classes by name (4200): a table laid out as the named objects' is
+# (rt_named_table_new, rt_named_slot), each bucket a list of [name, record]
+# holding the first class of each name, as a search of the class list finds
+# it. A search of the list compared every class's name with == and took most
+# of new()'s time, and the time of every method a class inherits: 62 000
+# cycles a new() with no classes of the program's own, 848 000 with 400
+# (review finding O2). Its caller holds the state lock.
+make a function called rt_class_index_add takes name, rec returns r
+  require (value_class(name) == 8) and (value_class(rec) == 9)
+  let table = mem_load(rt_world_base(), 4200)
+  let off = rt_named_slot(table, name)
+  let bucket = mem_take_value(table, off)
+  let found = false
+  let k = 0
+  while (not found) and (k < list_len(bucket)) do
+    if str_eq(bucket[k][0], name) then
+      let found = true
+    end
+    let k = word_add(k, 1)
+  end
+  if not found then
+    let bucket = list_push(bucket, [name, rec])
+  end
+  mem_init_value(table, off, bucket)
+  let r = 0
+  ensure r == 0
   return r
 end
 
@@ -254,11 +289,15 @@ end
 
 make a function called rt_class_by_name takes name returns rec
   require (value_class(name) == 8)
-  let classes = rt_global_get(4144)
+  let table = mem_load(rt_world_base(), 4200)
+  let off = rt_named_slot(table, name)
+  let held = rt_state_lock()
+  let bucket = mem_load_value(table, off)
+  rt_state_unlock(held)
   let k = 0
-  while k < list_len(classes) do
-    if classes[k][0] == name then
-      let rec = classes[k]
+  while k < list_len(bucket) do
+    if str_eq(bucket[k][0], name) then
+      let rec = bucket[k][1]
       ensure (rec == false) or (value_class(rec) == 9)
       return rec
     end
@@ -345,6 +384,34 @@ make a function called rt_class_defaults takes rec returns pairs
   end
   ensure (value_class(pairs) == 9)
   return pairs
+end
+
+# The fields an object of the class starts with: its own and its ancestors'
+# defaults, then its "type". Kept in the record (its last element, a vec of
+# [the next class id when made, the fields]) and made again only once another
+# class has been declared, which may be an ancestor declared after it: making
+# them for every new() was most of its time (34 000 of 54 000 cycles for a
+# class with a parent). Read and kept under the state lock, made outside it,
+# since rt_class_by_name takes it.
+make a function called rt_new_fields takes rec returns fields
+  require (value_class(rec) == 9) and (list_len(rec) == 7)
+  let now = rt_global_get(4176)
+  let held = rt_state_lock()
+  let kept = rec[6]
+  let made_at = vec_get(kept, 0)
+  let fields = vec_get(kept, 1)
+  rt_state_unlock(held)
+  if made_at == now then
+    ensure value_class(fields) == 9
+    return fields
+  end
+  let fields = rt_pairs_set(rt_class_defaults(rec), "type", rec[0])
+  let held = rt_state_lock()
+  vec_set(kept, 0, now)
+  vec_set(kept, 1, fields)
+  rt_state_unlock(held)
+  ensure value_class(fields) == 9
+  return fields
 end
 
 # ---- [name, value] lists ----
@@ -566,8 +633,7 @@ make a function called new takes class_name, rest returns o
     class_define(class_name, "", [], [], [], [])
     let rec = rt_class_by_name(class_name)
   end
-  let fields = rt_class_defaults(rec)
-  let fields = rt_pairs_set(fields, "type", class_name)
+  let fields = rt_new_fields(rec)
   if value_class(name) == 8 then
     let fields = rt_pairs_set(fields, "name", name)
   end

@@ -34,11 +34,16 @@ Current packages:
 
 | package | version | what it gives |
 |---------|---------|---------------|
-| deflate | 0.1.0   | DEFLATE (RFC 1951) inflate and deflate, the zlib wrapper (RFC 1950), Adler-32, CRC-32 |
-| zip     | 0.1.0   | zip archive reader and writer (stored and deflate entries, CRC-checked) |
+| deflate | 0.2.0   | DEFLATE (RFC 1951) inflate and deflate, the zlib wrapper (RFC 1950), Adler-32, CRC-32 |
+| zip     | 0.2.0   | zip archive reader and writer (stored and deflate entries, CRC-checked) |
 | sha256  | 0.1.1   | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104) over bytes, strings and files |
 | resolve | 0.1.0   | manifest reader, version constraints, and dependency resolution through `rule_add`/`solve` (`docs/plans/package-manager.md`, P1) |
 | trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in (`docs/plans/package-trust.md`, T1) |
+
+deflate and zip take their data as a `bytes` or a list of ints from 0 to 255,
+and give a `bytes` (one byte of memory a byte, where a list holds sixteen):
+from 0.2.0, which changed what they give; 0.1.x gave lists. On 2 MB, the
+deflate benchmark's peak memory went from 301 MB to 93 MB.
 
 ## Manifest format (draft)
 
@@ -50,12 +55,12 @@ meant. Every value is ASCII, so a PatLang program can parse a manifest with
 ```
 # packages/zip/manifest.pkg
 package zip
-version 0.1.0
+version 0.2.0
 summary zip archive reader and writer (stored and deflated entries, CRC-32 checked)
 entry zip.patlang
 include zip.patlang
-depends deflate >= 0.1.0, < 0.2.0
-file zip.patlang sha256 9fc97f0f52d5c63f6a5bba758245058a933d5c30fa4d37cca7f37ed1584d6d4c
+depends deflate >= 0.2.0, < 0.3.0
+file zip.patlang sha256 678f05c8b19ec0ab1443cdbdee930fa4b232eeaaefd666e74b4356ac9c684005
 ```
 
 | key       | count     | meaning |
@@ -80,7 +85,7 @@ A manifest is refused (by `packages/resolve`'s reader, naming the line) when:
   gives the same constraint twice, or ends a constraint list with a comma.
 
 A version constraint is an operator and a version: `=`, `>=`, `>`, `<=`, `<`.
-`depends deflate >= 0.1.0, < 0.2.0` means any 0.1.x from 0.1.0 up. There is
+`depends deflate >= 0.2.0, < 0.3.0` means any 0.2.x from 0.2.0 up. There is
 no caret or tilde shorthand: a range is written out, which keeps both the
 parser and the rules below to plain comparisons.
 
@@ -162,5 +167,6 @@ default` for KIND text, random and repetitive and N 262144, 524288,
 1048576 and 2097152, named `bench_KIND_N.bin` and `bench_KIND_N.z`.
 `packages/sha256/spec/bench.patlang` times SHA-256 the same way.
 
-PatLang has no built-in that gives a String's UTF-8 bytes, so the sha256
-package encodes them itself (`utf8_encode` in `packages/sha256/text.patlang`).
+A String is held as its UTF-8 bytes, and `bytes_from_str` copies them out
+whole; the sha256 package's `utf8_encode` (`packages/sha256/text.patlang`)
+gives them as the list of ints its functions take.

@@ -36,6 +36,11 @@ Feature: a program sees characters, whatever bytes they take
     When each is applied
     Then each gives what spec 1.10 says
 
+  Scenario: bytes_hash gives a bytes the hash str_hash gives the same bytes
+    Given a bytes made from a non-ASCII string, an empty bytes, and a copy with one byte changed
+    When bytes_hash hashes each
+    Then the first two hash as str_hash hashes their strings, the hash is a non-negative int, and the changed copy hashes differently
+
   Scenario: str_hash gives an int from a string's bytes
     Given the empty string, a single letter, two equal strings built differently, a non-ASCII string, and 1000 different names
     When str_hash hashes each

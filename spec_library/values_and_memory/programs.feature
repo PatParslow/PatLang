@@ -209,9 +209,9 @@ Feature: what functions, commands and includes give (spec 1.13)
     Then each prints what spec 1.13 says of stores
 
   Scenario: plan finds a cheapest plan for many goals, and says there is none only when none exists
-    Given a chain of two builds and 10 goals each needing the second, a goal no action reaches, two routes of different cost, and 40 then 80 goals timed
+    Given a chain of two builds and 10 goals each needing the second, a goal no action reaches, two routes of different cost, and 40 then 160 goals timed
     When plan is asked for each
-    Then the builds come first and every goal is met, the unreachable goal gives [], the cheaper route is taken, and twice the goals take no more than about nine times as long
+    Then the builds come first and every goal is met, the unreachable goal gives [], the cheaper route is taken, and four times the goals take no more than about 32 times as long
 
   Scenario: the logic engine's work grows with what each call needs
     Given 4,000 and then 8,000 rules added, a bound goal solved before and after 20,000 rules of another predicate are added, and goals with 4,000 and 8,000 solutions

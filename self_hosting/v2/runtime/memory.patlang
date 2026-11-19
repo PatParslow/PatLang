@@ -1,7 +1,7 @@
 # v2 runtime: the memory manager (docs/spec/values-and-memory.md 2.3).
 #
 # One address range is reserved at start; pages are committed from the
-# system in steps of 256 MB, only as the bump pointer passes the committed
+# system in steps of 16 MB, only as the bump pointer passes the committed
 # mark. A block is a 16-byte header, [count:8][size:8], then its payload;
 # size is the block's whole size, its size class (rt_size_class), so
 # freeing never recomputes it.
@@ -15,12 +15,21 @@
 # an empty list takes a batch from the pool before taking new memory. The
 # pool's lock is taken once per batch, never per block.
 #
+# A block larger than a chunk (rt_chunk_bytes) is memory of its own, taken
+# from the system for it alone and given back when it is freed (VirtualFree),
+# so a program that once held a large buffer does not keep its memory (review
+# finding O14). Only such a block is larger than a chunk, so its size says
+# which it is. In a browser, whose memory only grows, it comes from the
+# reserved range as any other block does.
+#
 # runtime_state() layout used here:
 #   128  reserved range's base       136  committed end (an address)
 #   144  global bump pointer         200  the TLS slot of thread contexts
 #   208  pool lock: next ticket      216  pool lock: ticket being served
 #   224  commits made                232  reservations made
 #   240  pool lock acquisitions       248  1 once the first thread's context is set
+#   256  1 when a block larger than a chunk is memory of its own (not in a
+#        browser)
 #   8192 the pool: 160 list heads, then at 9472 their lengths
 #   12288 the first thread's context
 # A thread context (rt_context_bytes): 0 chunk cursor, 8 chunk end,
@@ -48,7 +57,7 @@ make a function called rt_chunk_bytes returns n
 end
 
 make a function called rt_commit_step returns n
-  let n = 268435456
+  let n = 16777216
   ensure (n > 0) and (word_and(n, 4095) == 0)
   return n
 end
@@ -80,6 +89,13 @@ make a function called rt_memory_init returns r
   mem_store(st, 224, 0)
   mem_store(st, 232, 1)
   mem_store(st, 240, 0)
+  # a native program is a file, and a browser's has no path: GetModuleFileNameA
+  # writes into the state's own 64 bytes at 64, as nothing is allocated yet
+  let own = 0
+  if word_and(extern_call("KERNEL32.DLL", "GetModuleFileNameA", 0, st + 64, 64), 4294967295) != 0 then
+    let own = 1
+  end
+  mem_store(st, 256, own)
   let i = 0
   while i < 320 do
     mem_store(st, 8192 + 8 * i, 0)
@@ -356,11 +372,34 @@ end
 
 # ---- allocation ----
 
+# Whether a block of this size is memory of its own.
+make a function called rt_block_own takes size returns yes
+  require (value_class(size) == 2) and (size >= 24)
+  let yes = (size > rt_chunk_bytes()) and (mem_load(runtime_state(), 256) != 0)
+  ensure value_class(yes) == 1
+  return yes
+end
+
 # A block of the given payload size, its count 1.
 make a function called rt_alloc takes payload returns block
   require (value_class(payload) == 2) and (payload >= 0)
-  let ctx = rt_context()
   let size = rt_size_class(payload)
+  if rt_block_own(size) then
+    # as many pages as it needs, with no size class's rounding (a quarter of
+    # a power of two, so up to a quarter more): larger than a chunk still,
+    # since its header and payload are
+    let pages = word_and(16 + payload + 4095, 0 - 4096)
+    # MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    let block = extern_call("KERNEL32.DLL", "VirtualAlloc", 0, pages, 12288, 4)
+    if block == 0 then
+      rt_fail_memory()
+    end
+    mem_store(block, 0, 1)
+    mem_store(block, 8, pages)
+    ensure (mem_load(block, 0) == 1) and (mem_load(block, 8) >= 16 + payload) and rt_block_own(mem_load(block, 8))
+    return block
+  end
+  let ctx = rt_context()
   let idx = rt_class_index(size)
   let head_at = ctx + 16 + 8 * idx
   let len_at = ctx + 1296 + 8 * idx
@@ -399,6 +438,15 @@ end
 # half the list goes to the pool.
 make a function called rt_free takes block returns r
   require (block != 0) and (mem_load(block, 0) <= 1) and (mem_load(block, 8) >= 24)
+  if rt_block_own(mem_load(block, 8)) then
+    # MEM_RELEASE: the whole of what VirtualAlloc gave
+    if rt_i32(extern_call("KERNEL32.DLL", "VirtualFree", block, 0, 32768)) == 0 then
+      rt_fail_memory()
+    end
+    let r = 0
+    ensure r == 0
+    return r
+  end
   let ctx = rt_context()
   let idx = rt_class_index(mem_load(block, 8))
   let head_at = ctx + 16 + 8 * idx

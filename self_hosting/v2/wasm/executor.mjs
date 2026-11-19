@@ -249,6 +249,8 @@ function start(init) {
     },
     GetSystemTimes() { lastError = 50; return 0; },
     GlobalMemoryStatusEx() { lastError = 50; return 0; },
+    // a browser gives no figure for a program's own memory: memory_used() is -1
+    K32GetProcessMemoryInfo() { lastError = 50; return 0; },
     GetCommandLineA() { return HOST_AREA; },
     GetEnvironmentVariableA(name, buf, size) {
       const v = init.env[cstr(num(name))];
