@@ -92,7 +92,7 @@ Feature: resolve package: choosing one version per package
     When resolving "zip" from the real packages
     Then the choice is "deflate 0.1.0, zip 0.1.0"
     When resolving "sha256" from the real packages
-    Then the choice is "sha256 0.1.0"
+    Then the choice is "sha256 0.1.1"
     When resolving "zip" "> 0.1.0" from the real packages
     Then resolution fails on "zip"
     And the conflict lists "available 0.1.0"
