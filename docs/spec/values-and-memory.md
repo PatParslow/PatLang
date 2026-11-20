@@ -365,6 +365,12 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   WebAssembly's included, whatever arguments the call passes. The compiler names each such
   name as it builds (`v2 warning: NAME is called, and nothing declares it`), so a typo is seen
   before the call is reached; the build still succeeds.
+- A `let` has no block scope, so a loop's body that sets a name the loop's condition reads, from
+  a value that does not read it, and then counts an inner loop with that name, loses the loop's
+  own count. The compiler warns of each such loop in the program's own files (`v2 warning: FILE:
+  line N: this loop's body sets NAME, ...`), naming the loop's line; the build still succeeds and
+  the program runs as written. An inner loop that moves the shared index on (it reads the name it
+  sets) is not warned of.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
 - A child process inherits its own standard handles and nothing else this process holds: not
   the pipes another thread made for its own child, and not a socket. A program that spawns a
@@ -443,6 +449,17 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   values as one list. (Steps were their labels, and `activate` split a label at its commas and
   equals signs, so a value holding either was cut apart and every value arrived as text.)
   `action_base_name(label)` and `action_label_args(label)` still read a label a program holds.
+- Numeric fluents (PDDL 2.1): `fluent_set(name, value)` gives a fluent a number (or a number's
+  text), in the world's own store. `action_add_numeric(name, preconds, numeric_preconds,
+  add_effects, del_effects, numeric_effects, cost)` adds an action that also needs each
+  `[fluent, op, value]` condition (`<` `<=` `>` `>=` `==` `!=`) to hold and applies each
+  `[fluent, op, value]` effect (`=` `+=` `-=` `*=` `/=`); a value is a number, a number's text,
+  or a variable the fact preconditions bind. A condition on a fluent with no value fails; an
+  effect on one starts from 0; an instance whose effect divides by zero or reads an unbound
+  variable is not applicable. `plan_numeric(goal_facts, numeric_goals)` plans to both, as
+  `plan` does; a state is its facts and its fluents. Counting down from n takes time growing
+  as n (2000 steps in about 0.6 G cycles, compiled). Fluents that can grow without bound can
+  give states without end, and a goal none of them meets is then searched for without end.
 - A virtual file is found by a hashed look-up: writing, reading or checking one takes about the
   same time however many files there are, and appending to one copies nothing it already holds,
   so n appends take time in proportion to n.

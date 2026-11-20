@@ -1101,6 +1101,241 @@ make a function called action_add takes name, preconds, add_effects, del_effects
   return done
 end
 
+# ---- numeric fluents (PDDL 2.1) ----
+#
+# A fluent is a named number a plan can change. Its value is kept as the one
+# fact NAME(value) in the world's store "__fluents", so a world has its own.
+# An action added with action_add_numeric has, besides its facts, numeric
+# preconditions [fluent, op, value] (op < <= > >= == !=) and numeric effects
+# [fluent, op, value] (op = += -= *= /=). A value is a number, a number's
+# text, or a variable the action's fact preconditions bind.
+
+make a function called rt_fluent_store returns store
+  let store = logic_store_named("__fluents")
+  ensure value_class(store) == 14
+  return store
+end
+
+make a function called fluent_set takes name, value returns done
+  require (value_class(name) == 8) and (rt_is_number(value) or (value_class(value) == 8))
+  let v = to_num(value)
+  let store = rt_fluent_store()
+  let block = value_data(store)
+  let e = rt_cell_read(block + 80)
+  let rules = vec_to_list(mem_load_value(block, 16))
+  rt_cell_read_end(block + 80, e)
+  rules_clear_in(store)
+  let i = 0
+  while i < list_len(rules) do
+    if rules[i][0] != name then
+      rule_add_to(store, rules[i][0], rules[i][1], [])
+    end
+    let i = i + 1
+  end
+  rule_add_to(store, name, [v], [])
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# The fluents' values now: [[name, value]], sorted by name.
+make a function called rt_fluents_now returns fluents
+  let block = value_data(rt_fluent_store())
+  let e = rt_cell_read(block + 80)
+  let rules = vec_to_list(mem_load_value(block, 16))
+  rt_cell_read_end(block + 80, e)
+  let names = []
+  let i = 0
+  while i < list_len(rules) do
+    let names = list_push(names, rules[i][0])
+    let i = i + 1
+  end
+  let names = rt_sort_strings(names)
+  let fluents = []
+  let k = 0
+  while k < list_len(names) do
+    let j = 0
+    while j < list_len(rules) do
+      if rules[j][0] == names[k] then
+        let fluents = list_push(fluents, [names[k], rules[j][1][0]])
+      end
+      let j = j + 1
+    end
+    let k = k + 1
+  end
+  ensure list_len(fluents) == list_len(rules)
+  return fluents
+end
+
+make a function called action_add_numeric takes name, preconds, numeric_preconds, add_effects, del_effects, numeric_effects, cost returns done
+  require value_live(name) and value_live(cost) and (value_class(preconds) == 9) and (value_class(numeric_preconds) == 9) and (value_class(add_effects) == 9) and (value_class(del_effects) == 9) and (value_class(numeric_effects) == 9)
+  rt_global_push(4240, [name, preconds, add_effects, del_effects, cost, numeric_preconds, numeric_effects])
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# A numeric condition's or effect's value under a substitution: [true, the
+# number], or [false, 0] when it is a variable the substitution leaves unbound.
+make a function called rt_num_value takes v, subst returns r
+  require value_live(v) and (value_class(subst) == 9)
+  let x = logic_walk(v, subst)
+  if is_logic_var(x) then
+    let r = [false, 0]
+    ensure list_len(r) == 2
+    return r
+  end
+  let r = [true, to_num(x)]
+  ensure list_len(r) == 2
+  return r
+end
+
+# Where name is in the fluents, or -1.
+make a function called rt_fluent_index takes fluents, name returns i
+  require value_class(fluents) == 9
+  let i = 0
+  while i < list_len(fluents) do
+    if fluents[i][0] == name then
+      return i
+    end
+    let i = i + 1
+  end
+  let i = 0 - 1
+  ensure i == 0 - 1
+  return i
+end
+
+# Whether every condition holds: a fluent with no value meets none.
+make a function called rt_num_conds_hold takes conds, fluents, subst returns yes
+  require (value_class(conds) == 9) and (value_class(fluents) == 9)
+  let yes = true
+  let c = 0
+  while yes and (c < list_len(conds)) do
+    let cond = conds[c]
+    let at = rt_fluent_index(fluents, cond[0])
+    let rhs = [false, 0]
+    if at >= 0 then
+      let rhs = rt_num_value(cond[2], subst)
+    end
+    if not rhs[0] then
+      let yes = false
+    else
+      let yes = rt_num_cond_holds(fluents[at][1], cond[1], rhs[1])
+    end
+    let c = c + 1
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# One condition: lhs op rhs.
+make a function called rt_num_cond_holds takes lhs, op, rhs returns ok
+  require rt_is_number(lhs) and (value_class(op) == 8) and rt_is_number(rhs)
+  if op == "<" then
+    let ok = lhs < rhs
+  elif op == "<=" then
+    let ok = lhs <= rhs
+  elif op == ">" then
+    let ok = lhs > rhs
+  elif op == ">=" then
+    let ok = lhs >= rhs
+  elif op == "==" then
+    let ok = lhs == rhs
+  elif op == "!=" then
+    let ok = lhs != rhs
+  else
+    print("a numeric condition's operator is one of < <= > >= == !=, not " + op)
+    rt_stop(70)
+    let ok = false
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# The fluents after the effects: [true, fluents], or [false, []] when an effect
+# cannot apply (a variable unbound, or /= by zero). A fluent with no value
+# starts from 0.
+make a function called rt_num_effects takes effects, fluents, subst returns r
+  require (value_class(effects) == 9) and (value_class(fluents) == 9)
+  let out = fluents
+  let k = 0
+  while k < list_len(effects) do
+    let eff = effects[k]
+    let rhs = rt_num_value(eff[2], subst)
+    if not rhs[0] then
+      return [false, []]
+    end
+    let at = rt_fluent_index(out, eff[0])
+    let cur = 0
+    if at >= 0 then
+      let cur = out[at][1]
+    end
+    let op = eff[1]
+    if op == "=" then
+      let v = rhs[1]
+    elif op == "+=" then
+      let v = cur + rhs[1]
+    elif op == "-=" then
+      let v = cur - rhs[1]
+    elif op == "*=" then
+      let v = cur * rhs[1]
+    elif op == "/=" then
+      if rhs[1] == 0 then
+        return [false, []]
+      end
+      let v = cur / rhs[1]
+    else
+      print("a numeric effect's operator is one of = += -= *= /=, not " + op)
+      rt_stop(70)
+      let v = cur
+    end
+    if at >= 0 then
+      let out = list_set(out, at, [eff[0], v])
+    else
+      let out = rt_fluents_with(out, [eff[0], v])
+    end
+    let k = k + 1
+  end
+  let r = [true, out]
+  ensure list_len(r) == 2
+  return r
+end
+
+# The fluents with a new one, kept sorted by name.
+make a function called rt_fluents_with takes fluents, pair returns out
+  require value_class(fluents) == 9
+  let out = []
+  let placed = false
+  let i = 0
+  while i < list_len(fluents) do
+    if (not placed) and (str_cmp(pair[0], fluents[i][0]) < 0) then
+      let out = list_push(out, pair)
+      let placed = true
+    end
+    let out = list_push(out, fluents[i])
+    let i = i + 1
+  end
+  if not placed then
+    let out = list_push(out, pair)
+  end
+  ensure list_len(out) == list_len(fluents) + 1
+  return out
+end
+
+# The fluents as text for a state's key.
+make a function called rt_fluents_key takes fluents returns key
+  require value_class(fluents) == 9
+  let b = sb_new()
+  let i = 0
+  while i < list_len(fluents) do
+    sb_push(b, "#" + fluents[i][0] + "=" + to_s(fluents[i][1]))
+    let i = i + 1
+  end
+  let key = sb_str(b)
+  ensure value_class(key) == 8
+  return key
+end
+
 make a function called rt_is_ground takes args returns yes
   require (value_class(args) == 9)
   let i = 0
@@ -1749,17 +1984,37 @@ make a function called rt_step_outcome takes state, fs, action, subst, unmet, go
   return outcome
 end
 
+# The estimate, with numeric goals: a state that meets every goal fact but not
+# every numeric goal needs at least one more step, so the cheapest action's
+# cost; that still never overestimates.
+make a function called rt_plan_estimate_num takes unmet, num_met, shape returns h
+  require (unmet >= 0) and (list_len(shape) == 2)
+  let h = rt_plan_estimate(unmet, shape[0], shape[1])
+  if (h == 0) and (not num_met) then
+    let h = shape[1]
+  end
+  ensure h >= 0
+  return h
+end
+
 # [path, the state it reaches], or [[], []] when no plan is found, starting
-# from the ground facts of a list of stores.
-make a function called rt_plan_from takes stores, goal_facts returns result
-  require (value_class(stores) == 9) and (value_class(goal_facts) == 9)
+# from the ground facts of a list of stores and the fluents' values. A state is
+# its facts and its fluents; with no numeric goals and no numeric actions the
+# fluents never change, and the search is the one for facts alone. Fluents
+# that can grow without bound can make the states without end: a goal no state
+# meets is then searched for without end, as `solve` searches a rule that
+# recurses without end.
+make a function called rt_plan_from takes stores, goal_facts, goal_numeric returns result
+  require (value_class(stores) == 9) and (value_class(goal_facts) == 9) and (value_class(goal_numeric) == 9)
   let actions = rt_global_get(4240)
   let shape = rt_plan_shape(actions)
   let start = rt_ground_facts(stores)
+  let fluents = rt_fluents_now()
   let goal_fs = rt_fs_new(goal_facts)
   let heap = vec_new()
   let unmet = rt_plan_unmet(start, goal_facts)
-  rt_pq_push(heap, [rt_plan_estimate(unmet, shape[0], shape[1]), 0, 0, [start, []], false, unmet])
+  let num_met = rt_num_conds_hold(goal_numeric, fluents, [])
+  rt_pq_push(heap, [rt_plan_estimate_num(unmet, num_met, shape), 0, 0, [start, [], fluents], false, unmet])
   let seq = 1
   let expanded = rt_key_set_new()
   while vec_len(heap) > 0 do
@@ -1768,34 +2023,48 @@ make a function called rt_plan_from takes stores, goal_facts returns result
     let edit = node[4]
     let state = base[0]
     let path = base[1]
+    let fluents = base[2]
     if edit != false then
       let taken = edit[0]
       let mid = rt_state_effects(state, taken[3], edit[1], false)
       let state = rt_state_effects(mid, taken[2], edit[1], true)
       let path = [path, action_instance_step(taken[0], taken[1], edit[1])]
+      let fluents = edit[2]
     end
-    if node[5] == 0 then
+    if (node[5] == 0) and rt_num_conds_hold(goal_numeric, fluents, []) then
       let result = [rt_path_steps(path), state]
       ensure list_len(result) == 2
       return result
     end
-    if rt_key_set_add(expanded, rt_state_key(state)) then
+    if rt_key_set_add(expanded, rt_state_key(state) + rt_fluents_key(fluents)) then
       let fs = rt_fs_new(state)
-      let here = [state, path]
+      let here = [state, path, fluents]
       let a = 0
       while a < list_len(actions) do
         let action = actions[a]
+        let numeric = list_len(action) == 7
         let insts = rt_instances(action[1], 0, state, fs, [], [])
         let k = 0
         while k < list_len(insts) do
           let subst = insts[k]
-          let outcome = rt_step_outcome(state, fs, action, subst, node[5], goal_facts, goal_fs)
-          # a step that changes nothing leads nowhere new
-          if outcome[0] then
-            let left = outcome[1]
-            let g = node[1] + action[4]
-            rt_pq_push(heap, [g + rt_plan_estimate(left, shape[0], shape[1]), g, seq, here, [action, subst], left])
-            let seq = seq + 1
+          let next = [true, fluents]
+          if numeric then
+            if rt_num_conds_hold(action[5], fluents, subst) then
+              let next = rt_num_effects(action[6], fluents, subst)
+            else
+              let next = [false, []]
+            end
+          end
+          if next[0] then
+            let outcome = rt_step_outcome(state, fs, action, subst, node[5], goal_facts, goal_fs)
+            # a step that changes nothing leads nowhere new
+            if outcome[0] or (next[1] != fluents) then
+              let left = outcome[1]
+              let g = node[1] + action[4]
+              let met = rt_num_conds_hold(goal_numeric, next[1], [])
+              rt_pq_push(heap, [g + rt_plan_estimate_num(left, met, shape), g, seq, here, [action, subst, next[1]], left])
+              let seq = seq + 1
+            end
           end
           let k = k + 1
         end
@@ -1808,10 +2077,19 @@ make a function called rt_plan_from takes stores, goal_facts returns result
   return result
 end
 
+# A plan to the goal facts and the numeric goals ([fluent, op, value]), from the
+# default and contracts stores and the fluents' values.
+make a function called plan_numeric takes goal_facts, goal_numeric returns path
+  require (value_class(goal_facts) == 9) and (value_class(goal_numeric) == 9)
+  let path = rt_plan_from(rt_default_stores(), goal_facts, goal_numeric)[0]
+  ensure (value_class(path) == 9)
+  return path
+end
+
 # [path, the state it reaches] from the default and contracts stores.
 make a function called plan_with_state takes goal_facts returns result
   require (value_class(goal_facts) == 9)
-  let result = rt_plan_from(rt_default_stores(), goal_facts)
+  let result = rt_plan_from(rt_default_stores(), goal_facts, [])
   ensure list_len(result) == 2
   return result
 end
@@ -1819,14 +2097,14 @@ end
 # [path, the state it reaches] from the ground facts of a store, or a list of stores.
 make a function called plan_with_state_in takes stores, goal_facts returns result
   require rt_is_stores(stores) and (value_class(goal_facts) == 9)
-  let result = rt_plan_from(rt_store_list(stores), goal_facts)
+  let result = rt_plan_from(rt_store_list(stores), goal_facts, [])
   ensure list_len(result) == 2
   return result
 end
 
 make a function called plan takes goal_facts returns path
   require (value_class(goal_facts) == 9)
-  let path = rt_plan_from(rt_default_stores(), goal_facts)[0]
+  let path = rt_plan_from(rt_default_stores(), goal_facts, [])[0]
   ensure (value_class(path) == 9)
   return path
 end
@@ -1834,7 +2112,7 @@ end
 # A plan from the ground facts of a store, or a list of stores.
 make a function called plan_in takes stores, goal_facts returns path
   require rt_is_stores(stores) and (value_class(goal_facts) == 9)
-  let path = rt_plan_from(rt_store_list(stores), goal_facts)[0]
+  let path = rt_plan_from(rt_store_list(stores), goal_facts, [])[0]
   ensure (value_class(path) == 9)
   return path
 end

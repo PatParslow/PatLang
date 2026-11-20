@@ -50,7 +50,7 @@ make a function called v2_collect_text takes path, text, seen, files, errors ret
   while i < list_len(lines) do
     let t = str_trim(lines[i])
     if str_starts_with(t, "include ") then
-      v2_collect_files(path_join(path_dirname(path), strip_quotes(str_trim(substr(t, 8, t.length - 8)))), seen, files, errors)
+      v2_collect_files(path_join(path_dirname(path), include_path_of(t)), seen, files, errors)
     else
       sb_push(text, lines[i])
     end
@@ -115,6 +115,83 @@ make a function called v2_parse_file takes path, text returns result
     let i = i + 1
   end
   return [stmts, errors]
+end
+
+# ---- a loop body that takes the loop's counter for an inner loop (#267) ----
+#
+# A let has no block scope, so `let s = 1` in a loop's body, followed by an
+# inner loop counting with s, loses the outer loop's count (CLAUDE.md 4.6).
+# The warning is for exactly that shape: a let directly in the body that sets
+# a name the loop's condition reads, from a value that does not read it, and a
+# later loop in the same body whose condition reads it. An inner loop that
+# moves the shared index on (a lexer skipping spaces) reads the name it sets,
+# and is not warned of: over 851 files, this shape was only ever the bug.
+
+# The names a syntax tree reads, pushed onto acc.
+make a function called v2_reads_into takes node, acc returns done
+  if type_of(node) != "list" then
+    return false
+  end
+  if (list_len(node) == 2) and (node[0] == "Var") and (type_of(node[1]) == "string") then
+    vec_push(acc, node[1])
+    return true
+  end
+  let i = 0
+  while i < list_len(node) do
+    v2_reads_into(node[i], acc)
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called v2_reads takes node, name returns yes
+  let acc = vec_new()
+  v2_reads_into(node, acc)
+  let k = 0
+  while k < vec_len(acc) do
+    if vec_get(acc, k) == name then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# Pushes a warning onto out for each loop in node that has the shape above.
+make a function called v2_loop_rebinds_into takes path, node, out returns done
+  if type_of(node) != "list" then
+    return false
+  end
+  if (list_len(node) >= 4) and (node[0] == "While") and (type_of(node[2]) == "list") then
+    let body = node[2]
+    let j = 0
+    while j < list_len(body) do
+      let st = body[j]
+      if (type_of(st) == "list") and (list_len(st) >= 3) and (st[0] == "Let") and (type_of(st[1]) == "string") then
+        if v2_reads(node[1], st[1]) and (not v2_reads(st[2], st[1])) then
+          let later = j + 1
+          let found = false
+          while (later < list_len(body)) and (not found) do
+            let st2 = body[later]
+            if (type_of(st2) == "list") and (list_len(st2) >= 3) and (st2[0] == "While") and v2_reads(st2[1], st[1]) then
+              let found = true
+            end
+            let later = later + 1
+          end
+          if found then
+            vec_push(out, path + ": line " + node[3] + ": this loop's body sets " + st[1] + ", which the loop's condition reads, then counts an inner loop with it: a let has no block scope, so the loop's own count is lost")
+          end
+        end
+      end
+      let j = j + 1
+    end
+  end
+  let i = 0
+  while i < list_len(node) do
+    v2_loop_rebinds_into(path, node[i], out)
+    let i = i + 1
+  end
+  return true
 end
 
 # Pushes onto found each Err node in node, a syntax tree or a list of them,
@@ -212,6 +289,7 @@ make a function called v2_front_end takes src_path, runtime_root, runtime_ensure
   let parsed_files = []
   let runtime_stmts = []
   let errors = []
+  let warnings = vec_new()
   let i = 0
   while i < list_len(files) do
     if (i < runtime_count) and (list_len(cached) == runtime_count) then
@@ -221,6 +299,8 @@ make a function called v2_front_end takes src_path, runtime_root, runtime_ensure
     end
     if i < runtime_count then
       let runtime_stmts = list_push(runtime_stmts, parsed[0])
+    else
+      v2_loop_rebinds_into(files[i][0], parsed[0], warnings)
     end
     let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0]), i < runtime_count, runtime_ensures])
     let errors = v2_concat(errors, parsed[1])
@@ -240,7 +320,7 @@ make a function called v2_front_end takes src_path, runtime_root, runtime_ensure
   if list_len(dups) > 0 then
     return ["error", ["declared twice: " + dups]]
   end
-  return ["ok", lowered, files]
+  return ["ok", lowered, files, vec_to_list(warnings)]
 end
 
 # The path of the executable running; "" in a browser, where the compiler built

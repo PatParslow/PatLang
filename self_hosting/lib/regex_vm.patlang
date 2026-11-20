@@ -1,0 +1,652 @@
+# Regular expressions for programs: find, test, replace and list matches.
+#
+# A pattern is compiled to a small program and run by a Pike VM (Thompson's
+# construction with threads kept in priority order), so a match costs time in
+# proportion to the text's length times the program's, never more, and nothing
+# recurses once per character: a large page is no deeper than a small one.
+# Threads in priority order give the match a backtracking engine (Perl,
+# Python, JavaScript) gives: the leftmost, and among those the one the greedy
+# or lazy quantifiers prefer.
+#
+# Syntax: literals; . (any character but a newline); classes [abc] [a-z] [^...]
+# with escapes inside; \d \D \w \W \s \S; \b \B; \n \t \r \f \v; any other
+# escaped character is itself; ( ) groups; | alternation; * + ? {m} {m,} {m,n},
+# each followed by ? for the lazy form; ^ and $ for the text's start and end.
+# Groups only group: no captures are reported. Text is matched by character,
+# non-ASCII included (the string cursor, spec 1.10, reads each in O(1)).
+#
+# self_hosting/lib/regex.patlang is a different engine: the old route's, in the
+# fn { } dialect, kept as the fn-syntax selftest's real-world file.
+
+# ---- parsing: pattern text to a tree ----
+#
+# Nodes: ["char", code], ["any"], ["class", negate, items], ["cat", nodes],
+# ["alt", nodes], ["rep", node, min, max (-1 for no limit), greedy], ["bol"],
+# ["eol"], ["wordb", negate]. A class item is ["range", lo, hi] or
+# ["kind", letter] for \d \D \w \W \s \S.
+
+make a function called rx_codes takes s returns codes
+  let h = str_intern(s)
+  let n = sc_len(h)
+  let codes = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(codes, sc_code(h, i))
+    let i = i + 1
+  end
+  return codes
+end
+
+# The parser's state: [codes, pos, errors], pos and errors changed in place.
+make a function called rx_peek takes ps returns c
+  let pos = vec_get(ps, 1)
+  let codes = vec_get(ps, 0)
+  if pos >= vec_len(codes) then
+    return 0 - 1
+  end
+  return vec_get(codes, pos)
+end
+
+make a function called rx_advance takes ps returns done
+  vec_set(ps, 1, vec_get(ps, 1) + 1)
+  return true
+end
+
+make a function called rx_fail takes ps, text returns done
+  if vec_get(ps, 2) == "" then
+    vec_set(ps, 2, text)
+  end
+  return true
+end
+
+make a function called rx_parse_alt takes ps returns node
+  let branches = [rx_parse_cat(ps)]
+  while rx_peek(ps) == 124 do
+    rx_advance(ps)
+    let branches = list_push(branches, rx_parse_cat(ps))
+  end
+  if list_len(branches) == 1 then
+    return branches[0]
+  end
+  return ["alt", branches]
+end
+
+make a function called rx_parse_cat takes ps returns node
+  let nodes = []
+  let going = true
+  while going do
+    let c = rx_peek(ps)
+    if (c < 0) or (c == 124) or (c == 41) then
+      let going = false
+    else
+      let nodes = list_push(nodes, rx_parse_repeat(ps))
+      if vec_get(ps, 2) != "" then
+        let going = false
+      end
+    end
+  end
+  if list_len(nodes) == 1 then
+    return nodes[0]
+  end
+  return ["cat", nodes]
+end
+
+# A number in a counted repeat, or -1 when there are no digits.
+make a function called rx_parse_int takes ps returns n
+  let n = 0 - 1
+  let c = rx_peek(ps)
+  while (c >= 48) and (c <= 57) do
+    if n < 0 then
+      let n = 0
+    end
+    let n = n * 10 + (c - 48)
+    rx_advance(ps)
+    let c = rx_peek(ps)
+  end
+  return n
+end
+
+# {m}, {m,} or {m,n} at the parser's position: [min, max], or [] when the text
+# is not a counted repeat (the brace is then a literal), the position unchanged.
+make a function called rx_parse_count takes ps returns counts
+  let saved = vec_get(ps, 1)
+  rx_advance(ps)
+  let lo = rx_parse_int(ps)
+  if lo < 0 then
+    vec_set(ps, 1, saved)
+    return []
+  end
+  let hi = lo
+  if rx_peek(ps) == 44 then
+    rx_advance(ps)
+    let hi = rx_parse_int(ps)
+  end
+  if rx_peek(ps) != 125 then
+    vec_set(ps, 1, saved)
+    return []
+  end
+  rx_advance(ps)
+  if (hi >= 0) and (hi < lo) then
+    rx_fail(ps, "a counted repeat's most is less than its least")
+  end
+  return [lo, hi]
+end
+
+make a function called rx_parse_repeat takes ps returns node
+  let atom = rx_parse_atom(ps)
+  let going = true
+  while going do
+    let c = rx_peek(ps)
+    let counts = []
+    if c == 42 then
+      rx_advance(ps)
+      let counts = [0, 0 - 1]
+    elif c == 43 then
+      rx_advance(ps)
+      let counts = [1, 0 - 1]
+    elif c == 63 then
+      rx_advance(ps)
+      let counts = [0, 1]
+    elif c == 123 then
+      let counts = rx_parse_count(ps)
+    end
+    if list_len(counts) == 0 then
+      let going = false
+    else
+      let greedy = true
+      if rx_peek(ps) == 63 then
+        rx_advance(ps)
+        let greedy = false
+      end
+      let atom = ["rep", atom, counts[0], counts[1], greedy]
+    end
+  end
+  return atom
+end
+
+make a function called rx_escape_node takes c returns node
+  if (c == 100) or (c == 68) or (c == 119) or (c == 87) or (c == 115) or (c == 83) then
+    return ["class", false, [["kind", c]]]
+  elif c == 98 then
+    return ["wordb", false]
+  elif c == 66 then
+    return ["wordb", true]
+  end
+  return ["char", rx_escape_code(c)]
+end
+
+# The character an escape stands for: \n \t \r \f \v, else itself.
+make a function called rx_escape_code takes c returns code
+  if c == 110 then
+    return 10
+  elif c == 116 then
+    return 9
+  elif c == 114 then
+    return 13
+  elif c == 102 then
+    return 12
+  elif c == 118 then
+    return 11
+  end
+  return c
+end
+
+make a function called rx_parse_atom takes ps returns node
+  let c = rx_peek(ps)
+  if c == 40 then
+    rx_advance(ps)
+    let inner = rx_parse_alt(ps)
+    if rx_peek(ps) != 41 then
+      rx_fail(ps, "a group is never closed")
+      return ["cat", []]
+    end
+    rx_advance(ps)
+    return inner
+  elif c == 91 then
+    rx_advance(ps)
+    return rx_parse_class(ps)
+  elif c == 46 then
+    rx_advance(ps)
+    return ["any"]
+  elif c == 94 then
+    rx_advance(ps)
+    return ["bol"]
+  elif c == 36 then
+    rx_advance(ps)
+    return ["eol"]
+  elif c == 92 then
+    rx_advance(ps)
+    let e = rx_peek(ps)
+    if e < 0 then
+      rx_fail(ps, "the pattern ends in a backslash")
+      return ["cat", []]
+    end
+    rx_advance(ps)
+    return rx_escape_node(e)
+  elif (c == 42) or (c == 43) or (c == 63) then
+    rx_fail(ps, "a repeat follows nothing")
+    rx_advance(ps)
+    return ["cat", []]
+  end
+  rx_advance(ps)
+  return ["char", c]
+end
+
+# After the [ : items to the closing ].
+make a function called rx_parse_class takes ps returns node
+  let negate = false
+  if rx_peek(ps) == 94 then
+    let negate = true
+    rx_advance(ps)
+  end
+  let items = []
+  let first = true
+  let going = true
+  while going do
+    let c = rx_peek(ps)
+    if c < 0 then
+      rx_fail(ps, "a class [ is never closed")
+      let going = false
+    elif (c == 93) and (not first) then
+      rx_advance(ps)
+      let going = false
+    else
+      rx_advance(ps)
+      let lo = c
+      let kind = false
+      if c == 92 then
+        let e = rx_peek(ps)
+        rx_advance(ps)
+        if (e == 100) or (e == 68) or (e == 119) or (e == 87) or (e == 115) or (e == 83) then
+          let items = list_push(items, ["kind", e])
+          let kind = true
+        else
+          let lo = rx_escape_code(e)
+        end
+      end
+      if not kind then
+        let hi = lo
+        let codes = vec_get(ps, 0)
+        let at = vec_get(ps, 1)
+        if (rx_peek(ps) == 45) and (at + 1 < vec_len(codes)) and (vec_get(codes, at + 1) != 93) then
+          rx_advance(ps)
+          let hi = rx_peek(ps)
+          rx_advance(ps)
+          if hi == 92 then
+            let hi = rx_escape_code(rx_peek(ps))
+            rx_advance(ps)
+          end
+        end
+        let items = list_push(items, ["range", lo, hi])
+      end
+    end
+    let first = false
+  end
+  return ["class", negate, items]
+end
+
+# ---- compiling: a tree to instructions ----
+#
+# ["char", c], ["any"], ["class", negate, items], ["split", a, b] (a first),
+# ["jmp", a], ["match"], ["bol"], ["eol"], ["wordb", negate].
+
+make a function called rx_emit takes prog, node returns done
+  let kind = node[0]
+  if kind == "cat" then
+    let i = 0
+    while i < list_len(node[1]) do
+      rx_emit(prog, node[1][i])
+      let i = i + 1
+    end
+  elif kind == "alt" then
+    # split L1, L2; L1: a; jmp end; L2: split ...; last: z; end:
+    let jumps = []
+    let i = 0
+    let n = list_len(node[1])
+    while i < n do
+      if i < n - 1 then
+        let at = vec_len(prog)
+        vec_push(prog, ["split", 0, 0])
+        rx_emit(prog, node[1][i])
+        let jumps = list_push(jumps, vec_len(prog))
+        vec_push(prog, ["jmp", 0])
+        vec_set(prog, at, ["split", at + 1, vec_len(prog)])
+      else
+        rx_emit(prog, node[1][i])
+      end
+      let i = i + 1
+    end
+    let j = 0
+    while j < list_len(jumps) do
+      vec_set(prog, jumps[j], ["jmp", vec_len(prog)])
+      let j = j + 1
+    end
+  elif kind == "rep" then
+    rx_emit_repeat(prog, node[1], node[2], node[3], node[4])
+  else
+    vec_push(prog, node)
+  end
+  return true
+end
+
+make a function called rx_emit_repeat takes prog, body, lo, hi, greedy returns done
+  let k = 0
+  while k < lo do
+    rx_emit(prog, body)
+    let k = k + 1
+  end
+  if hi < 0 then
+    # L: split body, out; body; jmp L; out:
+    let top = vec_len(prog)
+    vec_push(prog, ["split", 0, 0])
+    rx_emit(prog, body)
+    vec_push(prog, ["jmp", top])
+    let out = vec_len(prog)
+    if greedy then
+      vec_set(prog, top, ["split", top + 1, out])
+    else
+      vec_set(prog, top, ["split", out, top + 1])
+    end
+    return true
+  end
+  # each optional copy: split body, out; body; out:
+  let splits = []
+  let k = lo
+  while k < hi do
+    let splits = list_push(splits, vec_len(prog))
+    vec_push(prog, ["split", 0, 0])
+    rx_emit(prog, body)
+    let k = k + 1
+  end
+  let out = vec_len(prog)
+  let s = 0
+  while s < list_len(splits) do
+    if greedy then
+      vec_set(prog, splits[s], ["split", splits[s] + 1, out])
+    else
+      vec_set(prog, splits[s], ["split", out, splits[s] + 1])
+    end
+    let s = s + 1
+  end
+  return true
+end
+
+# [true, program] or [false, why the pattern does not parse].
+make a function called regex_compile takes pattern returns result
+  require type_of(pattern) == "string"
+  let ps = vec_new()
+  vec_push(ps, rx_codes(pattern))
+  vec_push(ps, 0)
+  vec_push(ps, "")
+  let tree = rx_parse_alt(ps)
+  if (vec_get(ps, 2) == "") and (rx_peek(ps) == 41) then
+    rx_fail(ps, "a ) closes no group")
+  end
+  if vec_get(ps, 2) != "" then
+    return [false, vec_get(ps, 2) + ", in the pattern " + pattern]
+  end
+  let prog = vec_new()
+  rx_emit(prog, tree)
+  vec_push(prog, ["match"])
+  return [true, vec_to_list(prog)]
+end
+
+# ---- matching ----
+
+make a function called rx_is_word takes c returns yes
+  return ((c >= 48) and (c <= 57)) or ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or (c == 95)
+end
+
+make a function called rx_is_space takes c returns yes
+  return (c == 32) or ((c >= 9) and (c <= 13))
+end
+
+make a function called rx_kind_holds takes kind, c returns yes
+  if kind == 100 then
+    return (c >= 48) and (c <= 57)
+  elif kind == 68 then
+    return (c >= 0) and (not ((c >= 48) and (c <= 57)))
+  elif kind == 119 then
+    return rx_is_word(c)
+  elif kind == 87 then
+    return (c >= 0) and (not rx_is_word(c))
+  elif kind == 115 then
+    return rx_is_space(c)
+  end
+  return (c >= 0) and (not rx_is_space(c))
+end
+
+make a function called rx_class_holds takes ins, c returns yes
+  let items = ins[2]
+  let hit = false
+  let i = 0
+  while (not hit) and (i < list_len(items)) do
+    let it = items[i]
+    if it[0] == "range" then
+      if (c >= it[1]) and (c <= it[2]) then
+        let hit = true
+      end
+    elif rx_kind_holds(it[1], c) then
+      let hit = true
+    end
+    let i = i + 1
+  end
+  return hit != ins[1]
+end
+
+# Adds the thread at pc, which started at start, to list, following jumps,
+# splits and assertions at position pos, highest priority first; seen holds
+# the step's stamp for each instruction already added.
+make a function called rx_add_thread takes prog, list, seen, stamp, pc0, start, codes, pos returns done
+  let stack = [pc0]
+  while list_len(stack) > 0 do
+    let pc = stack[list_len(stack) - 1]
+    let stack = rx_list_take(stack, list_len(stack) - 1)
+    if vec_get(seen, pc) != stamp then
+      vec_set(seen, pc, stamp)
+      let ins = prog[pc]
+      let op = ins[0]
+      if op == "jmp" then
+        let stack = list_push(stack, ins[1])
+      elif op == "split" then
+        let stack = list_push(list_push(stack, ins[2]), ins[1])
+      elif op == "bol" then
+        if pos == 0 then
+          let stack = list_push(stack, pc + 1)
+        end
+      elif op == "eol" then
+        if pos == vec_len(codes) then
+          let stack = list_push(stack, pc + 1)
+        end
+      elif op == "wordb" then
+        let before = (pos > 0) and rx_is_word(vec_get(codes, pos - 1))
+        let after = (pos < vec_len(codes)) and rx_is_word(vec_get(codes, pos))
+        if (before != after) != ins[1] then
+          let stack = list_push(stack, pc + 1)
+        end
+      else
+        vec_push(list, [pc, start])
+      end
+    end
+  end
+  return true
+end
+
+make a function called rx_list_take takes items, n returns out
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, items[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# The first match at or after from in codes: [start, end], or [-1, -1].
+make a function called rx_run takes prog, codes, from returns span
+  let n = vec_len(codes)
+  let seen = vec_new()
+  let k = 0
+  while k < list_len(prog) do
+    vec_push(seen, 0 - 1)
+    let k = k + 1
+  end
+  let stamp = 0
+  let clist = vec_new()
+  let found = [0 - 1, 0 - 1]
+  let pos = from
+  let going = true
+  while going do
+    if found[0] < 0 then
+      rx_add_thread(prog, clist, seen, stamp, 0, pos, codes, pos)
+    end
+    if vec_len(clist) == 0 then
+      # nothing alive here: done once a match is found or the text is used
+      # up, else the search starts again at the next character
+      if (found[0] >= 0) or (pos >= n) then
+        let going = false
+      else
+        let stamp = stamp + 1
+        let pos = pos + 1
+      end
+    else
+      let c = 0 - 1
+      if pos < n then
+        let c = vec_get(codes, pos)
+      end
+      let stamp = stamp + 1
+      let nlist = vec_new()
+      let t = 0
+      let cut = false
+      while (not cut) and (t < vec_len(clist)) do
+        let th = vec_get(clist, t)
+        let ins = prog[th[0]]
+        let op = ins[0]
+        if op == "match" then
+          let found = [th[1], pos]
+          let cut = true
+        elif c >= 0 then
+          let ok = false
+          if op == "char" then
+            let ok = ins[1] == c
+          elif op == "any" then
+            let ok = c != 10
+          elif op == "class" then
+            let ok = rx_class_holds(ins, c)
+          end
+          if ok then
+            rx_add_thread(prog, nlist, seen, stamp, th[0] + 1, th[1], codes, pos + 1)
+          end
+        end
+        let t = t + 1
+      end
+      let clist = nlist
+      if pos >= n then
+        let going = false
+      else
+        let pos = pos + 1
+      end
+    end
+  end
+  return found
+end
+
+make a function called rx_program takes pattern returns prog
+  let r = regex_compile(pattern)
+  if not r[0] then
+    print("regex: " + r[1])
+    exit_with(1)
+  end
+  return r[1]
+end
+
+# The first match at or after start: [start, end] in characters, [-1, -1] for none.
+make a function called regex_find takes text, pattern, start returns span
+  require (type_of(text) == "string") and (type_of(pattern) == "string") and (start >= 0)
+  let span = rx_run(rx_program(pattern), rx_codes(text), start)
+  ensure list_len(span) == 2
+  return span
+end
+
+make a function called regex_test takes text, pattern returns yes
+  require (type_of(text) == "string") and (type_of(pattern) == "string")
+  let yes = rx_run(rx_program(pattern), rx_codes(text), 0)[0] >= 0
+  ensure type_of(yes) == "bool"
+  return yes
+end
+
+# The text with every match, left to right and not overlapping, replaced by
+# the replacement as it is written; an empty match puts the replacement before
+# the next character, which is kept.
+make a function called regex_replace takes text, pattern, replacement returns out
+  require (type_of(text) == "string") and (type_of(pattern) == "string") and (type_of(replacement) == "string")
+  let prog = rx_program(pattern)
+  let codes = rx_codes(text)
+  let h = str_intern(text)
+  let n = vec_len(codes)
+  let b = sb_new()
+  let pos = 0
+  let going = true
+  while going do
+    let span = rx_run(prog, codes, pos)
+    if span[0] < 0 then
+      rx_push_codes(b, h, pos, n)
+      let going = false
+    else
+      rx_push_codes(b, h, pos, span[0])
+      sb_push(b, replacement)
+      if span[1] > span[0] then
+        let pos = span[1]
+      else
+        if span[0] < n then
+          rx_push_codes(b, h, span[0], span[0] + 1)
+        end
+        let pos = span[0] + 1
+      end
+      if pos > n then
+        let going = false
+      end
+    end
+  end
+  let out = sb_str(b)
+  ensure type_of(out) == "string"
+  return out
+end
+
+# Every match's text, left to right and not overlapping.
+make a function called regex_find_all takes text, pattern returns found
+  require (type_of(text) == "string") and (type_of(pattern) == "string")
+  let prog = rx_program(pattern)
+  let codes = rx_codes(text)
+  let h = str_intern(text)
+  let n = vec_len(codes)
+  let found = []
+  let pos = 0
+  while pos <= n do
+    let span = rx_run(prog, codes, pos)
+    if span[0] < 0 then
+      let pos = n + 1
+    else
+      let b = sb_new()
+      rx_push_codes(b, h, span[0], span[1])
+      let found = list_push(found, sb_str(b))
+      if span[1] > span[0] then
+        let pos = span[1]
+      else
+        let pos = span[0] + 1
+      end
+    end
+  end
+  ensure type_of(found) == "list"
+  return found
+end
+
+# Pushes the characters from..to-1 of the interned text h.
+make a function called rx_push_codes takes b, h, from, to returns done
+  let i = from
+  while i < to do
+    sb_push(b, chr(sc_code(h, i)))
+    let i = i + 1
+  end
+  return true
+end

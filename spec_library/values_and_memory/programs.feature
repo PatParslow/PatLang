@@ -151,6 +151,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When v2 builds it
     Then the build succeeds and warns that tokenize is called and nothing declares it
 
+  Scenario: the compiler warns when a loop body takes the loop's counter for an inner loop
+    Given a loop on line 7 whose body sets its counter s, then counts an inner loop with s, and a loop whose inner loops move its index on
+    When v2 builds each
+    Then the first build warns naming line 7 and s, the second warns of nothing, and both programs run as written
+
   Scenario: a program declares whether a string stands for the object of that name
     Given an object named w1, in a program that declares nothing and in one that declares object_names_explicit()
     When each reads it through object_named, reads w1.color or w1.length from the string, and deletes the object given the string

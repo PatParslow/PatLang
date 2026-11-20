@@ -223,7 +223,8 @@ called` is not a value you can pass by its bare name from another function.
 * **A `let` in a loop body is the function's variable.** There is no block scope:
   `let s = 1` inside an inner loop rebinds an outer loop's `s` and breaks it,
   silently (the gates tool lost all but its first suite this way). Give each
-  loop's index a name of its own.
+  loop's index a name of its own. `v2.exe` warns of the shape that caused it
+  (`v2 warning: ... this loop's body sets NAME`); the interpreter does not.
 
 ---
 
