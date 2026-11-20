@@ -51,6 +51,10 @@ check that. Nothing needs Rust.
 - Interpret for the quick loop: `self_hosting/build/v2_interp.exe SRC.patlang`.
 - Compile: `self_hosting/build/v2.exe SRC.patlang OUT.exe --workers 4`, run from the
   repository root.
+- Linux: `v2.exe SRC OUT --linux` builds a static Linux executable; run it under WSL
+  with `MSYS_NO_PATHCONV=1 wsl -d Ubuntu-24.04 -e /mnt/d/PATH` from Git Bash. Code
+  that reaches the system goes in `runtime/os_windows.patlang` and, with the same
+  name, `runtime/os_linux.patlang` (a repository check holds them to the same names).
 - WASM: `v2.exe SRC OUT.wasm --wasm`, then
   `node self_hosting/v2/wasm/run_node.mjs OUT.wasm`, or
   `self_hosting/v2/wasm/run_browser.py` in headless Chrome. Compare against the

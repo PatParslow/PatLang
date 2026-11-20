@@ -127,6 +127,14 @@ function start(init) {
       const k = Number(BigInt.asIntN(32, n));
       return k === -10 ? STD_IN : k === -11 ? STD_OUT : k === -12 ? STD_ERR : -1;
     },
+    // a browser has no console: a line editor reads a line at a time instead
+    // (console_raw_enable gives -1)
+    GetConsoleMode() { return 0; },
+    SetConsoleMode() { return 0; },
+    SetConsoleOutputCP() { return 0; },
+    SetConsoleCP() { return 0; },
+    // the browser's files have no current directory to change
+    SetCurrentDirectoryA() { lastError = 50; return 0; },
     WriteFile(h, buf, n, written) {
       const hn = num(h);
       if (hn !== STD_OUT && hn !== STD_ERR) { lastError = 6; return 0; }
@@ -492,26 +500,13 @@ function start(init) {
       return 0;
     },
   };
-  const round = (x) => {
-    const r = Math.trunc(x);
-    return Math.abs(x - r) >= 0.5 ? r + Math.sign(x) : r;
-  };
-  const crt = {
-    sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, trunc: Math.trunc, round,
-    sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos,
-    atan: Math.atan, atan2: Math.atan2, exp: Math.exp, log: Math.log, pow: Math.pow,
-    fmod: (a, b) => a % b,
-  };
-
+  // The math functions are the runtime's own (runtime/libm.patlang), the same
+  // code on every target, so nothing here stands in for a C library.
   const imports = { env: { memory } };
   for (const im of WebAssembly.Module.imports(module)) {
     if (im.kind !== "function") continue;
     const lib = im.module, func = im.name;
     imports[lib] = imports[lib] || {};
-    if (lib === "UCRTBASE.DLL" && crt[func]) {
-      imports[lib][func] = crt[func];
-      continue;
-    }
     const found = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : lib === "BCRYPT.DLL" ? bcrypt[func] : undefined;
     // failure injection (launcher.mjs, run's fail): the nth call this worker
     // makes to the named function fails as the system's does, -1 for one

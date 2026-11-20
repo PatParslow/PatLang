@@ -1,0 +1,1847 @@
+# v2 runtime: the operating system, on Linux, by system calls alone (no libc,
+# no dynamic linker: the executable is static, lib/x64_elf_link.patlang).
+#
+# The same functions as runtime/os_windows.patlang, each giving what that one
+# gives (docs/spec/values-and-memory.md). A system call is
+# extern_call("LINUX", "syscall", number, arguments...): the number in rax, the
+# arguments in rdi, rsi, rdx, r10, r8 and r9, and the result in rax, -errno for
+# a failure. Threads, fibers, processes and sockets come in later stages; until
+# then each stops the program saying it is not on Linux yet (rt_lx_missing).
+#
+# runtime_state() here: 200 this thread's context (one thread until threads
+# come), 4712 the last error, 4720 the stack pointer the kernel started the
+# program with (argc, then argv, a 0, then envp), written by _start (x64.patlang).
+quiet_operators()
+
+# ---- system calls and their errors ----
+
+# A system call's result is a failure when it is -1 to -4095.
+make a function called rt_lx_failed takes r returns yes
+  require value_class(r) == 2
+  let yes = (r < 0) and (r > 0 - 4096)
+  if yes then
+    mem_store(runtime_state(), 4712, 0 - r)
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_lx_missing takes name returns r
+  require value_class(name) == 8
+  print("not on Linux yet: " + name)
+  let r = rt_stop(98)
+  ensure value_live(r) or rt_is_unwinding(r)
+  return r
+end
+
+make a function called rt_lx_close takes fd returns r
+  require value_class(fd) == 2
+  let r = extern_call("LINUX", "syscall", 3, fd)
+  ensure value_class(r) == 2
+  return r
+end
+
+# The system this build runs on, as a compiler target names it.
+make a function called os_target returns name
+  let name = "linux"
+  ensure value_class(name) == 8
+  return name
+end
+
+# ---- the console a key at a time (lib/line_edit.patlang) ----
+
+# Input a key at a time, with no echo (termios: ICANON and ECHO off, VMIN 1,
+# VTIME 0): the old settings' block, to give back to console_raw_disable, or
+# -1 when the input is not a terminal.
+make a function called console_raw_enable returns old_mode
+  let block = rt_alloc(128)
+  # TCGETS into the first 64 bytes
+  if rt_lx_failed(extern_call("LINUX", "syscall", 16, 0, 21505, block + 16)) then
+    rt_free(block)
+    let old_mode = 0 - 1
+    ensure value_class(old_mode) == 2
+    return old_mode
+  end
+  rt_copy_bytes(block + 80, block + 16, 60)
+  let lflag = word_and(mem_load(block, 80 + 12), 4294967295)
+  let lflag = word_and(lflag, word_xor(10, 4294967295))
+  mem_store(block, 80 + 12, word_or(word_and(mem_load(block, 80 + 12), word_shl(4294967295, 32)), lflag))
+  mem_store_byte(block, 80 + 17 + 5, 0)
+  mem_store_byte(block, 80 + 17 + 6, 1)
+  # TCSETS
+  extern_call("LINUX", "syscall", 16, 0, 21506, block + 80)
+  let old_mode = block
+  ensure value_class(old_mode) == 2
+  return old_mode
+end
+
+make a function called console_read_raw_byte returns byte
+  let cell = rt_alloc(8)
+  let byte = 0 - 1
+  if extern_call("LINUX", "syscall", 0, 0, cell + 16, 1) == 1 then
+    let byte = mem_load_byte(cell, 16)
+  end
+  rt_free(cell)
+  ensure (byte >= 0 - 1) and (byte < 256)
+  return byte
+end
+
+make a function called console_raw_disable takes old_mode returns done
+  require value_class(old_mode) == 2
+  if old_mode != 0 - 1 then
+    extern_call("LINUX", "syscall", 16, 0, 21506, old_mode + 16)
+    rt_free(old_mode)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# Makes path the directory the program runs in: whether it could.
+make a function called set_cwd takes path returns ok
+  require value_class(path) == 8
+  let c = rt_cstr(path)
+  let ok = not rt_lx_failed(extern_call("LINUX", "syscall", 80, c + 16))
+  rt_free(c)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# A Linux terminal takes UTF-8 as it is.
+make a function called console_set_utf8 returns done
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# Whether standard output takes ANSI colour sequences: it is a terminal.
+make a function called console_enable_colors returns yes
+  let buf = rt_alloc(64)
+  let yes = not rt_lx_failed(extern_call("LINUX", "syscall", 16, 1, 21505, buf + 16))
+  rt_free(buf)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# ---- memory ----
+
+make a function called os_reserve takes bytes returns base
+  require bytes > 0
+  # PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+  let base = extern_call("LINUX", "syscall", 9, 0, bytes, 0, 16418, 0 - 1, 0)
+  if rt_lx_failed(base) then
+    let base = 0
+  end
+  ensure value_class(base) == 2
+  return base
+end
+
+make a function called os_commit takes addr, bytes returns ok
+  require (addr != 0) and (bytes > 0)
+  # PROT_READ | PROT_WRITE
+  let ok = 0
+  if not rt_lx_failed(extern_call("LINUX", "syscall", 10, addr, bytes, 3)) then
+    let ok = 1
+  end
+  ensure value_class(ok) == 2
+  return ok
+end
+
+make a function called os_alloc_pages takes bytes returns addr
+  require bytes > 0
+  # PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+  let addr = extern_call("LINUX", "syscall", 9, 0, bytes, 3, 34, 0 - 1, 0)
+  if rt_lx_failed(addr) then
+    let addr = 0
+  end
+  ensure value_class(addr) == 2
+  return addr
+end
+
+make a function called os_free_pages takes addr, bytes returns ok
+  require (addr != 0) and (bytes > 0)
+  let ok = not rt_lx_failed(extern_call("LINUX", "syscall", 11, addr, bytes))
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# A Linux program is always a file.
+make a function called os_has_own_path takes buf, n returns yes
+  require (buf != 0) and (n > 0)
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# ---- this thread's block, at the fs register's base ----
+#
+# Each thread has a page of its own, its address in fs (arch_prctl for the
+# first thread, CLONE_SETTLS for the rest), read and written with fs_load and
+# fs_store (x64.patlang, xv_linux):
+#   0 its context   8 its id while it runs, 0 once it has ended (the kernel
+#   clears it and wakes a futex there)   16 the fiber it is running, 0 for none
+#   24 its stack's address   32 its stack's size (0 for the first thread's)
+
+make a function called rt_lx_thread_block returns block
+  let block = os_alloc_pages(4096)
+  if block == 0 then
+    rt_fail_memory()
+  end
+  ensure block != 0
+  return block
+end
+
+make a function called os_context_init takes ctx returns r
+  require ctx != 0
+  let block = rt_lx_thread_block()
+  mem_store(block, 0, ctx)
+  # arch_prctl(ARCH_SET_FS, block)
+  extern_call("LINUX", "syscall", 158, 4098, block)
+  # SIGPIPE ignored, so a write to a pipe or socket whose reader has gone
+  # fails with EPIPE, as on Windows, rather than ending the program: a
+  # kernel sigaction of SIG_IGN, in the block's spare words
+  mem_store(block, 64, 1)
+  mem_store(block, 72, 0)
+  mem_store(block, 80, 0)
+  mem_store(block, 88, 0)
+  extern_call("LINUX", "syscall", 13, 13, block + 64, 0, 8)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called os_context_get returns ctx
+  let ctx = extern_call("LINUX", "fs_load", 0)
+  ensure value_class(ctx) == 2
+  return ctx
+end
+
+make a function called os_context_set takes ctx returns r
+  require value_class(ctx) == 2
+  extern_call("LINUX", "fs_store", 0, ctx)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- the process ----
+
+make a function called os_yield returns r
+  extern_call("LINUX", "syscall", 24)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called os_exit takes code returns r
+  require value_class(code) == 2
+  # exit_group: every thread
+  let r = extern_call("LINUX", "syscall", 231, code)
+  ensure false
+  return r
+end
+
+make a function called os_stdout returns h
+  let h = 1
+  ensure value_class(h) == 2
+  return h
+end
+
+make a function called os_write takes h, addr, len returns r
+  require (value_class(addr) == 2) and (len >= 0)
+  let r = 0
+  if rt_write_all(h, addr, len) then
+    let r = 1
+  end
+  ensure value_class(r) == 2
+  return r
+end
+
+make a function called os_last_error_text returns text
+  let text = "Linux error " + mem_load(runtime_state(), 4712)
+  ensure value_class(text) == 8
+  return text
+end
+
+# ---- threads ----
+
+# A stack of its own: [its address, its size], the lowest page a guard that
+# stops a thread or fiber running off its end rather than into other memory.
+make a function called rt_lx_stack takes size returns stack
+  require (size > 8192) and (word_and(size, 4095) == 0)
+  # PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK
+  let base = extern_call("LINUX", "syscall", 9, 0, size, 3, 147490, 0 - 1, 0)
+  if rt_lx_failed(base) then
+    let stack = [0, 0]
+    ensure list_len(stack) == 2
+    return stack
+  end
+  extern_call("LINUX", "syscall", 10, base, 4096, 0)
+  let stack = [base, size]
+  ensure list_len(stack) == 2
+  return stack
+end
+
+# A thread running the job (rt_thread_main): its block, its handle, or 0. Each
+# has 64 MB of stack, used only as it is touched.
+make a function called os_thread_start takes job returns handle
+  require job != 0
+  let block = rt_lx_thread_block()
+  let stack = rt_lx_stack(67108864)
+  if stack[0] == 0 then
+    os_free_pages(block, 4096)
+    let handle = 0
+    ensure value_class(handle) == 2
+    return handle
+  end
+  mem_store(block, 24, stack[0])
+  mem_store(block, 32, stack[1])
+  # CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM | SETTLS |
+  # PARENT_SETTID | CHILD_CLEARTID
+  let tid = extern_call("LINUX", "clone_thread", 4001536, stack[0] + stack[1] - 16, block + 8, block, job)
+  if rt_lx_failed(tid) then
+    extern_call("LINUX", "syscall", 11, stack[0], stack[1])
+    os_free_pages(block, 4096)
+    let handle = 0
+    ensure value_class(handle) == 2
+    return handle
+  end
+  let handle = block
+  ensure value_class(handle) == 2
+  return handle
+end
+
+# Waits until the thread has ended (its id cleared, futex woken), then gives
+# back its stack and block.
+make a function called os_thread_join takes handle returns r
+  require handle != 0
+  let tid = mem_load(handle, 8)
+  while tid != 0 do
+    # FUTEX_WAIT on the id while it is still tid
+    extern_call("LINUX", "syscall", 202, handle + 8, 0, word_and(tid, 4294967295), 0, 0, 0)
+    let tid = mem_load(handle, 8)
+  end
+  extern_call("LINUX", "syscall", 11, mem_load(handle, 24), mem_load(handle, 32))
+  os_free_pages(handle, 4096)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- fibers: switched by the runtime itself, each on a stack of its own ----
+#
+# A fiber's record is the top 32 bytes of its stack: 0 the stack pointer it
+# last switched away at, 8 its job, 16 the stack's address, 24 its size. The
+# thread's own record (os_thread_to_fiber) is a page of its own with no stack.
+
+make a function called os_fiber_create takes job returns h
+  require job != 0
+  let stack = rt_lx_stack(1048576)
+  if stack[0] == 0 then
+    let h = 0
+    ensure value_class(h) == 2
+    return h
+  end
+  let h = stack[0] + stack[1] - 32
+  mem_store(h, 8, job)
+  mem_store(h, 16, stack[0])
+  mem_store(h, 24, stack[1])
+  # the first switch to it returns into v2_thread_entry, its start
+  let sp = h - 16
+  mem_store(sp, 0, thread_entry_address())
+  mem_store(h, 0, sp)
+  ensure value_class(h) == 2
+  return h
+end
+
+make a function called os_thread_to_fiber returns h
+  let h = os_alloc_pages(4096)
+  if h == 0 then
+    rt_fail_memory()
+  end
+  mem_store(h, 16, 0)
+  extern_call("LINUX", "fs_store", 16, h)
+  ensure value_class(h) == 2
+  return h
+end
+
+make a function called os_fiber_to_thread returns r
+  let h = extern_call("LINUX", "fs_load", 16)
+  extern_call("LINUX", "fs_store", 16, 0)
+  if (h != 0) and (mem_load(h, 16) == 0) then
+    os_free_pages(h, 4096)
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called os_fiber_switch takes h returns r
+  require h != 0
+  let from = extern_call("LINUX", "fs_load", 16)
+  extern_call("LINUX", "fiber_switch", from, h)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called os_fiber_delete takes h returns r
+  require h != 0
+  if mem_load(h, 16) != 0 then
+    extern_call("LINUX", "syscall", 11, mem_load(h, 16), mem_load(h, 24))
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- clocks ----
+
+# clock_gettime(clock): [seconds, nanoseconds].
+make a function called rt_lx_clock takes clock returns t
+  require value_class(clock) == 2
+  let buf = rt_alloc(16)
+  extern_call("LINUX", "syscall", 228, clock, buf + 16)
+  let t = [mem_load(buf, 16), mem_load(buf, 24)]
+  rt_free(buf)
+  ensure list_len(t) == 2
+  return t
+end
+
+make a function called clock_ms returns ms
+  let t = rt_lx_clock(1)
+  let ms = word_add(word_mul(t[0], 1000), word_div(t[1], 1000000))
+  ensure (value_class(ms) == 2) and (ms >= 0)
+  return ms
+end
+
+make a function called rt_clock_us returns us
+  let t = rt_lx_clock(1)
+  let us = word_add(word_mul(t[0], 1000000), word_div(t[1], 1000))
+  ensure (value_class(us) == 2) and (us >= 0)
+  return us
+end
+
+make a function called now_ms returns ms
+  let t = rt_lx_clock(0)
+  let ms = word_add(word_mul(t[0], 1000), word_div(t[1], 1000000))
+  ensure (value_class(ms) == 2)
+  return ms
+end
+
+# The thread's CPU time in nanoseconds (Linux has no cycle count for a thread;
+# a comparison of two counts is a comparison of times either way).
+make a function called cpu_cycles returns c
+  let t = rt_lx_clock(3)
+  let c = word_add(word_mul(t[0], 1000000000), t[1])
+  ensure (value_class(c) == 2) and (c >= 0)
+  return c
+end
+
+make a function called sleep_ms takes ms returns done
+  require (value_class(ms) == 2)
+  if ms > 0 then
+    let buf = rt_alloc(16)
+    mem_store(buf, 16, word_div(ms, 1000))
+    mem_store(buf, 24, word_mul(word_rem(ms, 1000), 1000000))
+    extern_call("LINUX", "syscall", 35, buf + 16, 0)
+    rt_free(buf)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# ---- the machine ----
+
+make a function called cpu_count returns n
+  let buf = rt_alloc(128)
+  let got = extern_call("LINUX", "syscall", 204, 0, 128, buf + 16)
+  let n = 0
+  if not rt_lx_failed(got) then
+    let i = 0
+    while i < got do
+      let byte = mem_load_byte(buf, 16 + i)
+      while byte > 0 do
+        let n = n + word_and(byte, 1)
+        let byte = word_shr(byte, 1)
+      end
+      let i = i + 1
+    end
+  end
+  rt_free(buf)
+  if n < 1 then
+    let n = 1
+  end
+  ensure (value_class(n) == 2) and (n >= 1)
+  return n
+end
+
+# The numbers on a line of a /proc file that starts with the key, or [].
+make a function called rt_lx_proc_numbers takes path, key returns nums
+  require (value_class(path) == 8) and (value_class(key) == 8)
+  let lines = rt_lx_lines(read_file(path))
+  let nums = []
+  let i = 0
+  while i < list_len(lines) do
+    if rt_lx_starts(lines[i], key) then
+      let nums = rt_lx_numbers(lines[i])
+      let i = list_len(lines)
+    end
+    let i = i + 1
+  end
+  ensure value_class(nums) == 9
+  return nums
+end
+
+make a function called rt_lx_starts takes s, prefix returns yes
+  require (value_class(s) == 8) and (value_class(prefix) == 8)
+  let yes = (str_len(s) >= str_len(prefix)) and (rt_byte_substr(s, 0, str_len(prefix)) == prefix)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_lx_lines takes text returns lines
+  require value_class(text) == 8
+  let lines = []
+  let start = 0
+  let i = 0
+  while i < str_len(text) do
+    if rt_byte_at(text, i) == 10 then
+      let lines = list_push(lines, rt_byte_substr(text, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start < str_len(text) then
+    let lines = list_push(lines, rt_byte_substr(text, start, str_len(text) - start))
+  end
+  ensure value_class(lines) == 9
+  return lines
+end
+
+# Every run of digits in the text, as ints.
+make a function called rt_lx_numbers takes text returns nums
+  require value_class(text) == 8
+  let nums = []
+  let n = 0
+  let in_num = false
+  let i = 0
+  while i <= str_len(text) do
+    let c = 0
+    if i < str_len(text) then
+      let c = rt_byte_at(text, i)
+    end
+    if (c >= 48) and (c <= 57) then
+      let n = n * 10 + (c - 48)
+      let in_num = true
+    elif in_num then
+      let nums = list_push(nums, n)
+      let n = 0
+      let in_num = false
+    end
+    let i = i + 1
+  end
+  ensure value_class(nums) == 9
+  return nums
+end
+
+# [idle, busy] milliseconds of every processor since boot (/proc/stat's
+# ticks, 100 a second).
+make a function called cpu_times returns times
+  let t = rt_lx_proc_numbers("/proc/stat", "cpu ")
+  if list_len(t) < 8 then
+    let times = [0 - 1, 0 - 1]
+  else
+    let idle = t[3] + t[4]
+    let busy = t[0] + t[1] + t[2] + t[5] + t[6] + t[7]
+    let times = [idle * 10, busy * 10]
+  end
+  ensure (list_len(times) == 2) and (value_class(times[0]) == 2) and (value_class(times[1]) == 2)
+  return times
+end
+
+# [total, available] bytes of memory (/proc/meminfo).
+make a function called memory_status returns m
+  let total = rt_lx_proc_numbers("/proc/meminfo", "MemTotal:")
+  let avail = rt_lx_proc_numbers("/proc/meminfo", "MemAvailable:")
+  if (list_len(total) == 0) or (list_len(avail) == 0) then
+    let m = [0 - 1, 0 - 1]
+  else
+    let m = [total[0] * 1024, avail[0] * 1024]
+  end
+  ensure (list_len(m) == 2) and (value_class(m[0]) == 2) and (value_class(m[1]) == 2)
+  return m
+end
+
+# The program's committed memory: its private writable pages (/proc/self/statm's
+# data field, in pages), as Windows' private usage.
+make a function called memory_used returns n
+  let f = rt_lx_numbers(read_file("/proc/self/statm"))
+  let n = 0 - 1
+  if list_len(f) >= 6 then
+    let n = f[5] * 4096
+  end
+  ensure (value_class(n) == 2) and (n >= (0 - 1))
+  return n
+end
+
+make a function called random_bytes takes n returns bytes
+  require (value_class(n) == 2) and (n >= 0) and (n <= 65536)
+  let buf = rt_alloc(n + 8)
+  let got = 0
+  while got < n do
+    let r = extern_call("LINUX", "syscall", 318, buf + 16 + got, n - got, 0)
+    if rt_lx_failed(r) then
+      rt_free(buf)
+      print("random_bytes: the system gave no random bytes")
+      let bytes = rt_stop(97)
+      ensure value_class(bytes) == 9
+      return bytes
+    end
+    let got = got + r
+  end
+  let out = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(out, mem_load_byte(buf, 16 + i))
+    let i = i + 1
+  end
+  rt_free(buf)
+  let bytes = vec_to_list(out)
+  ensure (value_class(bytes) == 9) and (list_len(bytes) == n)
+  return bytes
+end
+
+# ---- files ----
+
+# open(path, flags, mode): a file descriptor, or -1.
+make a function called rt_lx_open takes path, flags, mode returns fd
+  require (value_class(path) == 8) and (value_class(flags) == 2)
+  let cpath = rt_cstr(path)
+  let fd = extern_call("LINUX", "syscall", 2, cpath + 16, flags, mode)
+  rt_free(cpath)
+  if rt_lx_failed(fd) then
+    let fd = 0 - 1
+  end
+  ensure value_class(fd) == 2
+  return fd
+end
+
+# Everything left to read from fd: [true, block, count], the bytes from 16 into
+# a block the caller frees, or [false, 0, 0]. Read to the end, since a file in
+# /proc gives its size as 0.
+make a function called rt_lx_read_all takes fd returns got
+  require value_class(fd) == 2
+  let cap = 4096
+  let buf = rt_alloc(cap)
+  let n = 0
+  let reading = true
+  while reading do
+    if n == cap then
+      let bigger = rt_alloc(cap * 2)
+      rt_copy_bytes(bigger + 16, buf + 16, n)
+      rt_free(buf)
+      let buf = bigger
+      let cap = cap * 2
+    end
+    let r = extern_call("LINUX", "syscall", 0, fd, buf + 16 + n, cap - n)
+    if rt_lx_failed(r) then
+      rt_free(buf)
+      return [false, 0, 0]
+    end
+    if r == 0 then
+      let reading = false
+    else
+      let n = n + r
+    end
+  end
+  let got = [true, buf, n]
+  ensure list_len(got) == 3
+  return got
+end
+
+make a function called read_file takes path returns text
+  require (value_class(path) == 8)
+  # O_RDONLY | O_CLOEXEC
+  let fd = rt_lx_open(path, 524288, 0)
+  if fd < 0 then
+    let text = ""
+    ensure value_class(text) == 8
+    return text
+  end
+  let got = rt_lx_read_all(fd)
+  rt_lx_close(fd)
+  if not got[0] then
+    let text = ""
+    ensure value_class(text) == 8
+    return text
+  end
+  let text = rt_str_from_bytes(got[1] + 16, got[2])
+  rt_free(got[1])
+  ensure value_class(text) == 8
+  return text
+end
+
+make a function called read_file_bytes takes path, offset, length returns bytes
+  require (value_class(path) == 8) and (value_class(offset) == 2) and (value_class(length) == 2)
+  let fd = rt_lx_open(path, 524288, 0)
+  if fd < 0 then
+    let bytes = []
+    ensure list_len(bytes) <= length
+    return bytes
+  end
+  let size = rt_file_size(fd)
+  let want = length
+  if offset >= size then
+    let want = 0
+  elif offset + want > size then
+    let want = size - offset
+  end
+  let out = []
+  if want > 0 then
+    let buf = rt_alloc(want)
+    let got = 0
+    let reading = true
+    while reading and (got < want) do
+      # pread64: at the offset, wherever the file's own position is
+      let r = extern_call("LINUX", "syscall", 17, fd, buf + 16 + got, want - got, offset + got)
+      if rt_lx_failed(r) or (r == 0) then
+        let reading = false
+      else
+        let got = got + r
+      end
+    end
+    let k = 0
+    while k < got do
+      let out = list_push(out, mem_load_byte(buf, 16 + k))
+      let k = k + 1
+    end
+    rt_free(buf)
+  end
+  rt_lx_close(fd)
+  let bytes = out
+  ensure list_len(bytes) <= length
+  return bytes
+end
+
+# A file for writing, made and emptied, its directories made when they are
+# missing: a descriptor, or -1.
+make a function called rt_lx_create takes path returns fd
+  require value_class(path) == 8
+  # O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode 0644
+  let fd = rt_lx_open(path, 524865, 420)
+  if fd < 0 then
+    rt_make_parents(path)
+    let fd = rt_lx_open(path, 524865, 420)
+  end
+  ensure value_class(fd) == 2
+  return fd
+end
+
+make a function called write_file takes path, text returns ok
+  require (value_class(path) == 8) and value_live(text)
+  let fd = rt_lx_create(path)
+  if fd < 0 then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let t = to_s(text)
+  let ok = rt_write_all(fd, rt_str_bytes(t), str_len(t))
+  let closed = not rt_lx_failed(rt_lx_close(fd))
+  let ok = ok and closed
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called write_file_bytes takes path, items returns ok
+  require (value_class(path) == 8) and ((value_class(items) == 9) or (value_class(items) == 18))
+  let fd = rt_lx_create(path)
+  if fd < 0 then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  if value_class(items) == 18 then
+    let ok = rt_write_all(fd, rt_bytes_addr(items), bytes_len(items))
+  else
+    let n = list_len(items)
+    let buf = rt_alloc(n + 8)
+    let k = 0
+    while k < n do
+      mem_store_byte(buf, 16 + k, items[k])
+      let k = k + 1
+    end
+    let ok = rt_write_all(fd, buf + 16, n)
+    rt_free(buf)
+  end
+  let closed = not rt_lx_failed(rt_lx_close(fd))
+  let ok = ok and closed
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called rt_write_all takes h, addr, n returns ok
+  require n >= 0
+  let done = 0
+  while done < n do
+    let wrote = extern_call("LINUX", "syscall", 1, h, addr + done, n - done)
+    if rt_lx_failed(wrote) or (wrote == 0) then
+      let ok = false
+      ensure value_class(ok) == 1
+      return ok
+    end
+    let done = done + wrote
+  end
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# stat of a path or fstat of a descriptor into a block of 144 bytes from 16:
+# [true, block] or [false, 0]; the caller frees the block.
+make a function called rt_lx_stat takes path returns got
+  require value_class(path) == 8
+  let buf = rt_alloc(144)
+  let cpath = rt_cstr(path)
+  let r = extern_call("LINUX", "syscall", 4, cpath + 16, buf + 16)
+  rt_free(cpath)
+  if rt_lx_failed(r) then
+    rt_free(buf)
+    return [false, 0]
+  end
+  let got = [true, buf]
+  ensure list_len(got) == 2
+  return got
+end
+
+make a function called rt_file_size takes h returns size
+  require value_class(h) == 2
+  let buf = rt_alloc(144)
+  let size = 0 - 1
+  if not rt_lx_failed(extern_call("LINUX", "syscall", 5, h, buf + 16)) then
+    let size = mem_load(buf, 16 + 48)
+  end
+  rt_free(buf)
+  ensure size >= 0 - 1
+  return size
+end
+
+make a function called file_exists takes path returns yes
+  require (value_class(path) == 8)
+  let got = rt_lx_stat(path)
+  let yes = got[0]
+  if yes then
+    rt_free(got[1])
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Whether the C string names a directory.
+make a function called rt_is_directory takes cpath returns yes
+  require cpath != 0
+  let buf = rt_alloc(144)
+  let yes = false
+  if not rt_lx_failed(extern_call("LINUX", "syscall", 4, cpath + 16, buf + 16)) then
+    let yes = word_and(mem_load(buf, 16 + 24), 61440) == 16384
+  end
+  rt_free(buf)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called remove_file takes path returns result
+  require (value_class(path) == 8)
+  let cpath = rt_cstr(path)
+  if rt_is_directory(cpath) then
+    let r = extern_call("LINUX", "syscall", 84, cpath + 16)
+  else
+    let r = extern_call("LINUX", "syscall", 87, cpath + 16)
+  end
+  rt_free(cpath)
+  if not rt_lx_failed(r) then
+    let result = "OK"
+    ensure value_class(result) == 8
+    return result
+  end
+  let result = "ERR: " + os_last_error_text()
+  ensure value_class(result) == 8
+  return result
+end
+
+# Makes each directory the path names before its last part.
+make a function called rt_make_parents takes path returns done
+  require value_class(path) == 8
+  let k = 1
+  while k < str_len(path) do
+    if rt_byte_at(path, k) == 47 then
+      let dir = rt_cstr(rt_byte_substr(path, 0, k))
+      # mode 0755
+      extern_call("LINUX", "syscall", 83, dir + 16, 493)
+      rt_free(dir)
+    end
+    let k = k + 1
+  end
+  let done = true
+  ensure done
+  return done
+end
+
+# A directory's entries: [[name, is a directory]], . and .. left out, or [].
+make a function called rt_lx_entries takes path returns rows
+  require value_class(path) == 8
+  # O_RDONLY | O_DIRECTORY | O_CLOEXEC
+  let fd = rt_lx_open(path, 589824, 0)
+  let rows = []
+  if fd < 0 then
+    ensure value_class(rows) == 9
+    return rows
+  end
+  let buf = rt_alloc(8192)
+  let reading = true
+  while reading do
+    let got = extern_call("LINUX", "syscall", 217, fd, buf + 16, 8192)
+    if rt_lx_failed(got) or (got == 0) then
+      let reading = false
+    else
+      let at = 0
+      while at < got do
+        let rec = buf + 16 + at
+        let reclen = word_and(mem_load(rec, 16), 65535)
+        let dtype = mem_load_byte(rec, 18)
+        let n = 0
+        while mem_load_byte(rec, 19 + n) != 0 do
+          let n = n + 1
+        end
+        let name = rt_str_from_bytes(rec + 19, n)
+        if (name != ".") and (name != "..") then
+          let dir = dtype == 4
+          if dtype == 0 then
+            # the file system does not say: ask stat
+            let full = rt_cstr(path + "/" + name)
+            let dir = rt_is_directory(full)
+            rt_free(full)
+          end
+          let rows = list_push(rows, [name, dir])
+        end
+        let at = at + reclen
+      end
+    end
+  end
+  rt_free(buf)
+  rt_lx_close(fd)
+  ensure value_class(rows) == 9
+  return rows
+end
+
+make a function called list_dir takes path returns entries
+  require (value_class(path) == 8)
+  let rows = rt_lx_entries(path)
+  let names = []
+  let i = 0
+  while i < list_len(rows) do
+    if rows[i][1] then
+      let names = list_push(names, rows[i][0] + "/")
+    else
+      let names = list_push(names, rows[i][0])
+    end
+    let i = i + 1
+  end
+  let entries = rt_sort_strings(names)
+  ensure (value_class(entries) == 9)
+  return entries
+end
+
+# Each file's [name, bytes, written], written in Windows' FILETIME steps (100 ns
+# since 1601), as spec 1.13 gives it on every system.
+make a function called dir_files takes path returns files
+  require (value_class(path) == 8)
+  let entries = rt_lx_entries(path)
+  let rows = []
+  let i = 0
+  while i < list_len(entries) do
+    if not entries[i][1] then
+      let got = rt_lx_stat(path + "/" + entries[i][0])
+      if got[0] then
+        let size = mem_load(got[1], 16 + 48)
+        let sec = mem_load(got[1], 16 + 88)
+        let nsec = mem_load(got[1], 16 + 96)
+        rt_free(got[1])
+        let written = word_add(word_add(word_mul(sec, 10000000), word_div(nsec, 100)), 116444736000000000)
+        let rows = list_push(rows, [entries[i][0], size, written])
+      end
+    end
+    let i = i + 1
+  end
+  let files = rt_sort_rows(rows)
+  ensure (value_class(files) == 9) and (list_len(files) == list_len(rows))
+  return files
+end
+
+make a function called copy_file takes from, to returns result
+  require (value_class(from) == 8) and (value_class(to) == 8)
+  let fd = rt_lx_open(from, 524288, 0)
+  if fd < 0 then
+    let result = "ERR: copy_file: " + from + " -> " + to + ": failed"
+    ensure value_class(result) == 8
+    return result
+  end
+  let got = rt_lx_read_all(fd)
+  rt_lx_close(fd)
+  let out = 0 - 1
+  if got[0] then
+    let out = rt_lx_create(to)
+  end
+  let ok = false
+  if out >= 0 then
+    let ok = rt_write_all(out, got[1] + 16, got[2])
+    let ok = (not rt_lx_failed(rt_lx_close(out))) and ok
+  end
+  if got[0] then
+    rt_free(got[1])
+  end
+  if not ok then
+    let result = "ERR: copy_file: " + from + " -> " + to + ": failed"
+    ensure value_class(result) == 8
+    return result
+  end
+  let result = "OK " + path_absolute(to)
+  ensure value_class(result) == 8
+  return result
+end
+
+make a function called try_rename_file takes from, to returns ok
+  require (value_class(from) == 8) and (value_class(to) == 8)
+  rt_make_parents(to)
+  let a = rt_cstr(from)
+  let b = rt_cstr(to)
+  # rename replaces the file it moves over
+  let ok = not rt_lx_failed(extern_call("LINUX", "syscall", 82, a + 16, b + 16))
+  rt_free(a)
+  rt_free(b)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called read_line returns line
+  let cell = rt_alloc(8)
+  let b = sb_new()
+  let more = true
+  while more do
+    let r = extern_call("LINUX", "syscall", 0, 0, cell + 16, 1)
+    if rt_lx_failed(r) or (r == 0) then
+      let more = false
+    else
+      let c = mem_load_byte(cell, 16)
+      if c == 10 then
+        let more = false
+      elif c != 13 then
+        sb_push(b, chr(c))
+      end
+    end
+  end
+  rt_free(cell)
+  let line = sb_str(b)
+  ensure value_class(line) == 8
+  return line
+end
+
+# Copies n bytes, as memmove: the ranges may overlap.
+make a function called rt_copy_bytes takes dst, src, n returns r
+  require (n >= 0) and ((n == 0) or ((dst != 0) and (src != 0)))
+  if (dst > src) and (dst < src + n) then
+    let i = n - 1
+    while i >= 0 do
+      mem_store_byte(dst, i, mem_load_byte(src, i))
+      let i = i - 1
+    end
+  else
+    let i = 0
+    while i + 8 <= n do
+      mem_store(dst + i, 0, mem_load(src + i, 0))
+      let i = i + 8
+    end
+    while i < n do
+      mem_store_byte(dst, i, mem_load_byte(src, i))
+      let i = i + 1
+    end
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- the program's arguments, environment and paths ----
+
+# The C string at addr.
+make a function called rt_lx_cstring takes addr returns s
+  require addr != 0
+  let n = 0
+  while mem_load_byte(addr, n) != 0 do
+    let n = n + 1
+  end
+  let s = rt_str_from_bytes(addr, n)
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called argv returns args
+  let sp = mem_load(runtime_state(), 4720)
+  let argc = mem_load(sp, 0)
+  let out = []
+  let k = mem_load(runtime_state(), 4408)
+  while k < argc do
+    let out = list_push(out, rt_lx_cstring(mem_load(sp, 8 + 8 * k)))
+    let k = k + 1
+  end
+  let args = out
+  ensure (value_class(args) == 9)
+  return args
+end
+
+make a function called getenv takes name returns v
+  require (value_class(name) == 8)
+  let sp = mem_load(runtime_state(), 4720)
+  let argc = mem_load(sp, 0)
+  let at = sp + 8 * (argc + 2)
+  let want = name + "="
+  let v = ""
+  let looking = true
+  while looking and (mem_load(at, 0) != 0) do
+    let entry = rt_lx_cstring(mem_load(at, 0))
+    if rt_lx_starts(entry, want) then
+      let v = rt_byte_substr(entry, str_len(want), str_len(entry) - str_len(want))
+      let looking = false
+    end
+    let at = at + 8
+  end
+  ensure value_class(v) == 8
+  return v
+end
+
+make a function called program_path returns path
+  let buf = rt_alloc(4096)
+  let cpath = rt_cstr("/proc/self/exe")
+  let n = extern_call("LINUX", "syscall", 89, cpath + 16, buf + 16, 4096)
+  rt_free(cpath)
+  if rt_lx_failed(n) then
+    let n = 0
+  end
+  let path = rt_str_from_bytes(buf + 16, n)
+  rt_free(buf)
+  ensure value_class(path) == 8
+  return path
+end
+
+# The path in full, from the root, with . and .. worked out.
+make a function called path_absolute takes path returns full
+  require (value_class(path) == 8)
+  let whole = path
+  if not rt_lx_starts(path, "/") then
+    let buf = rt_alloc(4096)
+    let n = extern_call("LINUX", "syscall", 79, buf + 16, 4096)
+    if rt_lx_failed(n) then
+      rt_free(buf)
+      print("path_absolute: the system could not make " + path + " absolute")
+      let full = rt_stop(94)
+      ensure value_class(full) == 8
+      return full
+    end
+    # getcwd's count includes its NUL
+    let cwd = rt_str_from_bytes(buf + 16, n - 1)
+    rt_free(buf)
+    let whole = cwd + "/" + path
+  end
+  let parts = []
+  let start = 0
+  let i = 0
+  while i <= str_len(whole) do
+    if (i == str_len(whole)) or (rt_byte_at(whole, i) == 47) then
+      let part = rt_byte_substr(whole, start, i - start)
+      if part == ".." then
+        if list_len(parts) > 0 then
+          let parts = rt_list_without_last(parts)
+        end
+      elif (part != ".") and (part != "") then
+        let parts = list_push(parts, part)
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let b = sb_new()
+  let k = 0
+  while k < list_len(parts) do
+    sb_push(b, "/")
+    sb_push(b, parts[k])
+    let k = k + 1
+  end
+  let full = sb_str(b)
+  if full == "" then
+    let full = "/"
+  end
+  ensure value_class(full) == 8
+  return full
+end
+
+make a function called rt_list_without_last takes items returns out
+  require (value_class(items) == 9) and (list_len(items) > 0)
+  let out = []
+  let i = 0
+  while i < list_len(items) - 1 do
+    let out = list_push(out, items[i])
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(items) - 1
+  return out
+end
+
+# An executable on PATH for a bare name, or "".
+make a function called rt_search_path takes name returns full
+  require value_class(name) == 8
+  let dirs = getenv("PATH")
+  let start = 0
+  let i = 0
+  while i <= str_len(dirs) do
+    if (i == str_len(dirs)) or (rt_byte_at(dirs, i) == 58) then
+      let dir = rt_byte_substr(dirs, start, i - start)
+      if dir != "" then
+        let candidate = dir + "/" + name
+        if file_exists(candidate) then
+          let full = candidate
+          ensure value_class(full) == 8
+          return full
+        end
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let full = ""
+  ensure value_class(full) == 8
+  return full
+end
+
+# ---- processes ----
+#
+# A child starts by clone(CLONE_VM | CLONE_VFORK) and execve (x64.patlang,
+# spawn_exec), from a block made here; it keeps only the descriptors it is
+# given as 0, 1 and 2, since every pipe is made O_CLOEXEC. A handle is the pid.
+
+# The C strings for a list of texts, as a NULL-ended array of pointers in a
+# block from 16, and the blocks to free afterwards: [array block, blocks].
+make a function called rt_lx_cstrings takes texts returns made
+  require value_class(texts) == 9
+  let arr = rt_alloc(8 * (list_len(texts) + 1))
+  let blocks = [arr]
+  let i = 0
+  while i < list_len(texts) do
+    let c = rt_cstr(to_s(texts[i]))
+    mem_store(arr, 16 + 8 * i, c + 16)
+    let blocks = list_push(blocks, c)
+    let i = i + 1
+  end
+  mem_store(arr, 16 + 8 * list_len(texts), 0)
+  let made = [arr, blocks]
+  ensure list_len(made) == 2
+  return made
+end
+
+make a function called rt_lx_free_all takes blocks returns done
+  require value_class(blocks) == 9
+  let i = 0
+  while i < list_len(blocks) do
+    rt_free(blocks[i])
+    let i = i + 1
+  end
+  let done = true
+  ensure done
+  return done
+end
+
+# The program's path: as given when it has a /, else found on PATH, else "".
+make a function called rt_lx_program_path takes program returns path
+  require value_live(program)
+  let p = to_s(program)
+  let path = p
+  let i = 0
+  let slash = false
+  while i < str_len(p) do
+    if rt_byte_at(p, i) == 47 then
+      let slash = true
+    end
+    let i = i + 1
+  end
+  if not slash then
+    let path = rt_search_path(p)
+  end
+  ensure value_class(path) == 8
+  return path
+end
+
+# Starts the program with args, the descriptors in, out and err as its 0, 1
+# and 2 (-1 keeps this process's own); apart is 0 to stay in this process's
+# group, 1 for a process group of its own (a tree to end together), 2 for a
+# session of its own (spawn's: it outlives this one): its pid, or -1 when it
+# could not start.
+make a function called rt_lx_spawn takes program, args, fd_in, fd_out, fd_err, apart returns pid
+  require value_live(program) and (value_class(args) == 9) and (apart >= 0) and (apart <= 2)
+  let path = rt_lx_program_path(program)
+  if path == "" then
+    let pid = 0 - 1
+    ensure value_class(pid) == 2
+    return pid
+  end
+  let made = rt_lx_cstrings(rt_lx_concat([path], args))
+  let cpath = rt_cstr(path)
+  let params = rt_alloc(64)
+  mem_store(params, 16, cpath + 16)
+  mem_store(params, 24, made[0] + 16)
+  let sp = mem_load(runtime_state(), 4720)
+  mem_store(params, 32, sp + 8 * (mem_load(sp, 0) + 2))
+  mem_store(params, 40, fd_in)
+  mem_store(params, 48, fd_out)
+  mem_store(params, 56, fd_err)
+  mem_store(params, 64, apart)
+  let stack = os_alloc_pages(65536)
+  let pid = extern_call("LINUX", "spawn_exec", stack + 65536 - 16, params + 16)
+  os_free_pages(stack, 65536)
+  rt_free(params)
+  rt_free(cpath)
+  rt_lx_free_all(made[1])
+  if rt_lx_failed(pid) then
+    let pid = 0 - 1
+  end
+  ensure value_class(pid) == 2
+  return pid
+end
+
+make a function called rt_lx_concat takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let out = a
+  let i = 0
+  while i < list_len(b) do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(a) + list_len(b)
+  return out
+end
+
+# A pipe, both ends close-on-exec: [read end, write end], or [].
+make a function called rt_lx_pipe returns ends
+  let buf = rt_alloc(8)
+  let ends = []
+  if not rt_lx_failed(extern_call("LINUX", "syscall", 293, buf + 16, 524288)) then
+    let w = mem_load(buf, 16)
+    let ends = [word_and(w, 4294967295), word_shr(w, 32)]
+  end
+  rt_free(buf)
+  ensure value_class(ends) == 9
+  return ends
+end
+
+make a function called rt_lx_nonblocking takes fd returns done
+  require value_class(fd) == 2
+  # F_SETFL, O_NONBLOCK
+  extern_call("LINUX", "syscall", 72, fd, 4, 2048)
+  let done = true
+  ensure done
+  return done
+end
+
+# Reads what the descriptor has now into the string builder: whether it has
+# reached its end.
+make a function called rt_lx_drain takes fd, b returns ended
+  require value_class(fd) == 2
+  let buf = rt_alloc(65536)
+  let ended = false
+  let reading = true
+  while reading do
+    let n = extern_call("LINUX", "syscall", 0, fd, buf + 16, 65536)
+    if n > 0 then
+      sb_push(b, rt_str_from_bytes(buf + 16, n))
+    else
+      if n == 0 then
+        let ended = true
+      end
+      let reading = false
+    end
+  end
+  rt_free(buf)
+  ensure value_class(ended) == 1
+  return ended
+end
+
+# wait4 on pid, waiting when block: [ended, exit code, peak bytes]; the code
+# is 128 plus the signal for a child a signal ended, and 259 (as Windows'
+# STILL_ACTIVE) while it runs.
+make a function called rt_lx_wait takes pid, block returns w
+  require value_class(pid) == 2
+  let buf = rt_alloc(160)
+  let flags = 1
+  if block then
+    let flags = 0
+  end
+  let r = extern_call("LINUX", "syscall", 61, pid, buf + 16, flags, buf + 24)
+  if rt_lx_failed(r) or (r == 0) then
+    rt_free(buf)
+    if r == 0 then
+      return [false, 259, 0 - 1]
+    end
+    return [true, 0 - 1, 0 - 1]
+  end
+  let status = word_and(mem_load(buf, 16), 4294967295)
+  let code = 128 + word_and(status, 127)
+  if word_and(status, 127) == 0 then
+    let code = word_and(word_shr(status, 8), 255)
+  end
+  # struct rusage: ru_maxrss, in kilobytes, after the two timevals
+  let peak = mem_load(buf, 24 + 32) * 1024
+  rt_free(buf)
+  let w = [true, code, peak]
+  ensure list_len(w) == 3
+  return w
+end
+
+make a function called rt_run_process_tree takes program, args, stdin_text, timeout_ms, tree returns result
+  require value_live(program) and value_live(stdin_text) and (value_class(args) == 9) and (value_class(tree) == 1)
+  let in_p = rt_lx_pipe()
+  let out_p = rt_lx_pipe()
+  let err_p = rt_lx_pipe()
+  if (list_len(in_p) == 0) or (list_len(out_p) == 0) or (list_len(err_p) == 0) then
+    print("exec_capture_io: " + program + ": could not start (no pipe could be made: " + os_last_error_text() + ")")
+    let result = rt_stop(93)
+    ensure (list_len(result) == 4) and (value_class(result[2]) == 1)
+    return result
+  end
+  let apart = 0
+  if tree then
+    let apart = 1
+  end
+  let pid = rt_lx_spawn(program, args, in_p[0], out_p[1], err_p[1], apart)
+  rt_lx_close(in_p[0])
+  rt_lx_close(out_p[1])
+  rt_lx_close(err_p[1])
+  if pid < 0 then
+    rt_lx_close(in_p[1])
+    rt_lx_close(out_p[0])
+    rt_lx_close(err_p[0])
+    print("exec_capture_io: " + program + ": could not start")
+    let result = rt_stop(93)
+    ensure (list_len(result) == 4) and (value_class(result[2]) == 1)
+    return result
+  end
+  rt_lx_nonblocking(in_p[1])
+  rt_lx_nonblocking(out_p[0])
+  rt_lx_nonblocking(err_p[0])
+  let text = to_s(stdin_text)
+  let fed = 0
+  let left_open = true
+  if str_len(text) == 0 then
+    rt_lx_close(in_p[1])
+    let left_open = false
+  end
+  let limited = (value_class(timeout_ms) == 2) and (timeout_ms > 0)
+  let deadline = 0
+  if limited then
+    let deadline = clock_ms() + timeout_ms
+  end
+  let out_text = sb_new()
+  let err_text = sb_new()
+  let timed_out = false
+  let fds = rt_alloc(16)
+  let w = [false, 0, 0 - 1]
+  let running = true
+  while running do
+    if left_open then
+      let part = str_len(text) - fed
+      if part > 65536 then
+        let part = 65536
+      end
+      let wrote = extern_call("LINUX", "syscall", 1, in_p[1], rt_str_bytes(text) + fed, part)
+      if wrote > 0 then
+        let fed = fed + wrote
+      end
+      # all of it fed, or a child that has closed its input (EPIPE)
+      if (fed >= str_len(text)) or (wrote == 0 - 32) then
+        rt_lx_close(in_p[1])
+        let left_open = false
+      end
+    end
+    # poll the two output pipes for up to 2 ms
+    mem_store(fds, 16, word_or(out_p[0], word_shl(1, 32)))
+    mem_store(fds, 24, word_or(err_p[0], word_shl(1, 32)))
+    extern_call("LINUX", "syscall", 7, fds + 16, 2, 2)
+    rt_lx_drain(out_p[0], out_text)
+    rt_lx_drain(err_p[0], err_text)
+    let w = rt_lx_wait(pid, false)
+    if w[0] then
+      let running = false
+    elif limited and (clock_ms() >= deadline) then
+      let target = pid
+      if tree then
+        let target = 0 - pid
+      end
+      extern_call("LINUX", "syscall", 62, target, 9)
+      let w = rt_lx_wait(pid, true)
+      let timed_out = true
+      let running = false
+    end
+  end
+  rt_free(fds)
+  if left_open then
+    rt_lx_close(in_p[1])
+  end
+  # the child has ended, so all it wrote is in the pipes: read what is there
+  # (a process it started may hold a pipe open, so not to the pipes' ends)
+  rt_lx_drain(out_p[0], out_text)
+  rt_lx_drain(err_p[0], err_text)
+  rt_lx_close(out_p[0])
+  rt_lx_close(err_p[0])
+  let ok = (w[1] == 0) and (not timed_out)
+  if timed_out then
+    if sb_len(err_text) > 0 then
+      sb_push(err_text, chr(10))
+    end
+    sb_push(err_text, "timeout after " + timeout_ms + " ms")
+  end
+  let result = [sb_str(out_text), sb_str(err_text), ok, w[2]]
+  ensure (list_len(result) == 4) and (value_class(result[2]) == 1) and (value_class(result[3]) == 2)
+  return result
+end
+
+make a function called exec_capture takes program, rest returns out
+  require value_live(program) and (value_class(rest) == 9)
+  let p = rt_lx_pipe()
+  if list_len(p) == 0 then
+    let out = ""
+    ensure value_class(out) == 8
+    return out
+  end
+  # both streams to the one pipe
+  let pid = rt_lx_spawn(program, rest, 0 - 1, p[1], p[1], 0)
+  rt_lx_close(p[1])
+  let b = sb_new()
+  if pid >= 0 then
+    let buf = rt_alloc(4096)
+    let reading = true
+    while reading do
+      let n = extern_call("LINUX", "syscall", 0, p[0], buf + 16, 4096)
+      if n > 0 then
+        sb_push(b, rt_str_from_bytes(buf + 16, n))
+      else
+        let reading = false
+      end
+    end
+    rt_free(buf)
+    rt_lx_wait(pid, true)
+  end
+  rt_lx_close(p[0])
+  let out = sb_str(b)
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called spawn takes program, rest returns pid
+  require value_live(program) and (value_class(rest) == 9)
+  # its output and errors to /dev/null, its input this process's own
+  let null = rt_lx_open("/dev/null", 524289, 0)
+  let pid = rt_lx_spawn(program, rest, 0 - 1, null, null, 2)
+  if null >= 0 then
+    rt_lx_close(null)
+  end
+  if pid < 0 then
+    print("spawn: " + program + ": could not start")
+    let pid = rt_stop(93)
+    ensure (value_class(pid) == 2)
+    return pid
+  end
+  rt_engine_push(4304, [pid, pid])
+  ensure (value_class(pid) == 2)
+  return pid
+end
+
+make a function called kill takes pid returns done
+  require value_live(pid)
+  let h = rt_process_of(pid)
+  if h != 0 - 1 then
+    extern_call("LINUX", "syscall", 62, h, 9)
+    rt_lx_wait(h, true)
+    rt_process_forget(pid)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called wait takes pid returns code
+  require value_live(pid)
+  let h = rt_process_of(pid)
+  if h == 0 - 1 then
+    let code = 0 - 1
+    ensure (value_class(code) == 2)
+    return code
+  end
+  let code = rt_lx_wait(h, true)[1]
+  rt_process_forget(pid)
+  ensure (value_class(code) == 2)
+  return code
+end
+
+# 259 while the process runs, else its exit code (is_alive, hosts.patlang).
+make a function called rt_exit_code takes h returns code
+  require value_class(h) == 2
+  let code = rt_lx_wait(h, false)[1]
+  ensure value_class(code) == 2
+  return code
+end
+
+# The Windows handle plumbing the rest of the runtime does not reach on Linux:
+# rt_start_process (hosts.patlang) is called only from os_windows.patlang.
+
+make a function called rt_child_handles takes h_in, h_out, h_err returns hs
+  require value_class(h_in) == 2
+  let hs = rt_lx_missing("rt_child_handles")
+  ensure value_live(hs)
+  return hs
+end
+
+make a function called rt_close_ends takes ends returns done
+  require value_live(ends)
+  let done = rt_lx_missing("rt_close_ends")
+  ensure value_live(done)
+  return done
+end
+
+make a function called rt_drain_pipe takes h, b returns done
+  require value_class(h) == 2
+  let done = rt_lx_missing("rt_drain_pipe")
+  ensure value_live(done)
+  return done
+end
+
+make a function called rt_pipe takes child_reads returns ends
+  require value_live(child_reads)
+  let ends = rt_lx_missing("rt_pipe")
+  ensure value_live(ends)
+  return ends
+end
+
+make a function called rt_start_process_flags takes program, args, h_in, h_out, h_err, flags returns pi
+  require value_live(program) and (value_class(args) == 9)
+  let pi = rt_lx_missing("rt_start_process_flags")
+  ensure value_live(pi)
+  return pi
+end
+
+# ---- sockets: TCP on 127.0.0.1, as net.patlang gives it ----
+
+# Nothing to start on Linux.
+make a function called rt_wsa_start returns done
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_socket returns sock
+  # AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP
+  let sock = extern_call("LINUX", "syscall", 41, 2, 524289, 6)
+  if rt_lx_failed(sock) then
+    let sock = rt_net_fail("tcp: no socket could be made (" + os_last_error_text() + ")")
+    ensure (value_class(sock) == 2)
+    return sock
+  end
+  ensure (value_class(sock) == 2)
+  return sock
+end
+
+make a function called rt_set_nonblocking takes sock, on returns done
+  require (value_class(sock) == 2) and (value_class(on) == 2)
+  # F_GETFL, then F_SETFL with O_NONBLOCK set or cleared
+  let flags = extern_call("LINUX", "syscall", 72, sock, 3, 0)
+  if not rt_lx_failed(flags) then
+    if on != 0 then
+      let flags = word_or(flags, 2048)
+    else
+      let flags = word_and(flags, word_xor(2048, 0 - 1))
+    end
+    extern_call("LINUX", "syscall", 72, sock, 4, flags)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_set_recv_timeout takes sock, ms returns done
+  require (value_class(sock) == 2) and (value_class(ms) == 2) and (ms >= 0)
+  let tv = rt_alloc(16)
+  mem_store(tv, 16, word_div(ms, 1000))
+  mem_store(tv, 24, word_mul(word_rem(ms, 1000), 1000))
+  # SOL_SOCKET, SO_RCVTIMEO
+  extern_call("LINUX", "syscall", 54, sock, 1, 20, tv + 16, 16)
+  rt_free(tv)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_wait_readable takes sock, ms returns done
+  require (value_class(sock) == 2) and (value_class(ms) == 2) and (ms >= 0 - 1)
+  let fd = rt_alloc(8)
+  # struct pollfd: the descriptor, then POLLIN
+  mem_store(fd, 16, word_or(word_and(sock, 4294967295), word_shl(1, 32)))
+  extern_call("LINUX", "syscall", 7, fd + 16, 1, ms)
+  rt_free(fd)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_bind_listen takes sock, port returns actual
+  require (value_class(sock) == 2) and (value_class(port) == 2)
+  let addr = rt_sockaddr(127, 0, 0, 1, port)
+  let bound = extern_call("LINUX", "syscall", 49, sock, addr + 16, 16)
+  if rt_lx_failed(bound) then
+    rt_free(addr)
+    # EADDRINUSE: the port is taken
+    if (0 - bound) == 98 then
+      let actual = 0 - 1
+      ensure (actual >= 0 - 2) and (actual < 65536)
+      return actual
+    end
+    let actual = 0 - 2
+    ensure (actual >= 0 - 2) and (actual < 65536)
+    return actual
+  end
+  let size = rt_alloc(8)
+  mem_store(size, 16, 16)
+  extern_call("LINUX", "syscall", 51, sock, addr + 16, size + 16)
+  let actual = mem_load_byte(addr, 18) * 256 + mem_load_byte(addr, 19)
+  rt_free(size)
+  rt_free(addr)
+  if rt_lx_failed(extern_call("LINUX", "syscall", 50, sock, 128)) then
+    let actual = 0 - 2
+    ensure (actual >= 0 - 2) and (actual < 65536)
+    return actual
+  end
+  ensure (actual >= 0 - 2) and (actual < 65536)
+  return actual
+end
+
+make a function called rt_accept_waiting takes sock, port, what returns id
+  require (value_class(sock) == 2) and (value_class(port) == 2) and (value_class(what) == 8)
+  # accept4 with SOCK_CLOEXEC; EAGAIN when no client is waiting
+  let got = extern_call("LINUX", "syscall", 288, sock, 0, 0, 524288)
+  if rt_lx_failed(got) then
+    if (0 - got) != 11 then
+      let id = rt_net_fail(what + ": port " + port + ": accept failed")
+      ensure id >= 0 - 1
+      return id
+    end
+    let id = 0 - 1
+    ensure id >= 0 - 1
+    return id
+  end
+  rt_set_nonblocking(got, 0)
+  let id = rt_conn_add(got)
+  ensure id >= 1
+  return id
+end
+
+make a function called rt_recv takes conn returns result
+  require value_live(conn)
+  let sock = rt_conn_socket(conn)
+  let buf = rt_alloc(65536)
+  let n = extern_call("LINUX", "syscall", 45, sock, buf + 16, 65536, 0, 0, 0)
+  let text = ""
+  if n > 0 then
+    let text = rt_str_from_bytes(buf + 16, n)
+  end
+  rt_free(buf)
+  let result = [text, n < 0]
+  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1)
+  return result
+end
+
+make a function called tcp_try_write takes conn, data returns ok
+  require value_live(conn) and value_live(data)
+  let sock = rt_conn_socket(conn)
+  let text = to_s(data)
+  let at = rt_str_bytes(text)
+  let left = str_len(text)
+  while left > 0 do
+    # MSG_NOSIGNAL: a peer that has gone is an error here, not SIGPIPE
+    let sent = extern_call("LINUX", "syscall", 44, sock, at, left, 16384, 0, 0)
+    if sent <= 0 then
+      let ok = false
+      ensure value_class(ok) == 1
+      return ok
+    end
+    let at = at + sent
+    let left = left - sent
+  end
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called tcp_close takes conn returns done
+  require value_live(conn)
+  rt_lx_close(rt_conn_socket(conn))
+  rt_engine_drop(4336, conn)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called tcp_try_connect takes host, port returns id
+  require (value_class(host) == 8) and (value_class(port) == 2)
+  let b = rt_host_bytes(host)
+  if list_len(b) == 0 then
+    let id = rt_net_fail("tcp_connect: " + host + " is not an address: TCP connects to localhost or 127.x.x.x")
+    ensure (id >= 1) or (id == 0 - 1)
+    return id
+  end
+  if b[0] != 127 then
+    let id = rt_net_fail("tcp_connect: " + host + " is not this machine: TCP connects to localhost or 127.x.x.x")
+    ensure (id >= 1) or (id == 0 - 1)
+    return id
+  end
+  let sock = rt_socket()
+  let addr = rt_sockaddr(b[0], b[1], b[2], b[3], port)
+  let got = extern_call("LINUX", "syscall", 42, sock, addr + 16, 16)
+  rt_free(addr)
+  if rt_lx_failed(got) then
+    rt_lx_close(sock)
+    let id = 0 - 1
+    ensure (id >= 1) or (id == 0 - 1)
+    return id
+  end
+  let id = rt_conn_add(sock)
+  ensure (id >= 1) or (id == 0 - 1)
+  return id
+end
+
+make a function called tcp_try_listen takes port returns actual
+  require (value_class(port) == 2)
+  let sock = rt_socket()
+  let actual = rt_bind_listen(sock, port)
+  if actual == 0 - 2 then
+    let actual = rt_net_fail("tcp_try_listen: bind " + port + ": failed")
+    ensure (actual >= 0 - 1) and (actual < 65536)
+    return actual
+  end
+  if actual == 0 - 1 then
+    rt_lx_close(sock)
+    ensure (actual >= 0 - 1) and (actual < 65536)
+    return actual
+  end
+  # non-blocking for life: see rt_accept_waiting
+  rt_set_nonblocking(sock, 1)
+  rt_engine_push(4320, [actual, sock])
+  ensure (actual >= 0 - 1) and (actual < 65536)
+  return actual
+end

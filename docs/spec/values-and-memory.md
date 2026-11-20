@@ -264,7 +264,14 @@ it. When nothing else holds it, the time an append takes does not depend on the 
 
 `pow` of an exact base to a whole power is exact, and otherwise a float. `sin`, `cos`,
 `tan`, `asin`, `acos`, `atan`, `atan2`, `log` and `exp` give floats. `ceil`, `trunc` and
-`round` are exact for exact numbers; `round` takes a half away from zero. `abs` of a
+`round` are exact for exact numbers; `round` takes a half away from zero. The math functions
+are the runtime's own (`runtime/libm.patlang`, fdlibm's algorithms by way of musl), not the
+system's, so every target gives the same bits: each of the functions above is within one unit
+in the last place of the exact result, and `sqrt`, `floor`, `ceil`, `trunc`, `round` and `%` on
+floats are exact. `float_bits(x)` gives a number's IEEE 754 double bits as an int (the 64 bits
+read as signed), and `float_from_bits(n)` the float an int's bits are. A compiled `+`, `-`,
+`*`, `/` or comparison of two floats is one machine operation, about the cost of one on two ints
+(a float add took about 940 cycles through the runtime's operator function, and takes about 10). `abs` of a
 complex number is its modulus. `to_fixed` rounds the float's exact value, a tie to even.
 `max(a, b)` and `min(a, b)` give the larger and the smaller of two real numbers, keeping its kind.
 `bnot` of an int is its bitwise complement, so `bnot n` is `-1 - n`; of anything else it stops the
@@ -333,6 +340,14 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   other character itself. A subject that is not a string matches no glob.
 - `host_caps()` says what the host running the program can do: `["x64", "subprocess", "tcp",
   "fs"]` in a native build, and `["wasm"]` in a browser, which has none of those.
+- A native build is for Windows (a PE) or, with `--linux`, for Linux (a static PIE using no
+  libc); a program prints the same on both. Where the systems differ, Linux gives:
+  `cpu_cycles()` the thread's CPU time in nanoseconds (it has no cycle count for a thread),
+  so compare two counts, not a count with a constant; the peak `exec_peak_memory` and
+  `exec_measured` give, the child's peak resident set from `wait4` (not including the
+  processes it starts); and `dir_files`' times in Windows' FILETIME steps, as on Windows.
+  A path's separator is `/` alone. `os_target()` names the system a build runs on,
+  `"windows"` or `"linux"`; a compiler builds for its own unless told otherwise.
 - A statement that is only a value (a literal, a variable, operators on them, a list of them)
   prints that value, wherever it is, the program's last statement included: nothing takes its
   value. A call whose value nothing uses prints nothing, and a function's or closure's last
@@ -404,6 +419,20 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   moved; the system may refuse (the file it replaces is open elsewhere, or, in a browser, there
   are no files) and the program goes on. `rename_file` is the same, but a refusal stops the
   program.
+- `make_directory(path)` makes the directory and any missing above it, and gives whether it is
+  there afterwards.
+- `cwd()` gives the directory the program runs in, in full, as `path_absolute(".")` does, and
+  `set_cwd(path)` makes `path` that directory, giving whether it could (a browser has none to
+  change, so there it gives `false`).
+- The console a key at a time, for a line editor (`lib/line_edit.patlang`):
+  `console_raw_enable()` stops the console echoing and waiting for a line, and gives the mode
+  it had, to pass back to `console_raw_disable(old_mode)`; where standard input is not a
+  console or terminal (a pipe, a file, a browser) it changes nothing and gives -1, and the
+  caller reads a line at a time instead. `console_read_raw_byte()` gives the next byte typed, or
+  -1 at the input's end. `console_echo_byte(b)` and `console_echo_str(s)` write to standard
+  output with no line end after them. `console_set_utf8()` makes a Windows console read and
+  write UTF-8 (a Linux terminal does already), and `console_enable_colors()` gives whether
+  standard output takes ANSI colour sequences, turning them on in a Windows console.
 - `dir_files(path)` gives a directory's files, each `[name, bytes, written]`, sorted by name:
   `written` is when the file was last written, in 100-nanosecond steps since 1601 (Windows'
   FILETIME), so the larger is the later. Subdirectories are left out, and a path with no

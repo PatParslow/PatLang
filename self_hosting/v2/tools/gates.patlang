@@ -17,8 +17,11 @@
 # the WASM writers, the interpreter, a suite's executable) or one feature file
 # of one suite on one engine. Each unit has the units it needs, the files and
 # directories its result depends on, the cores it keeps busy, and a lane:
-# units in the same lane never run at once (the language suite's two engines
-# share ports, queue topics and files).
+# units in the same lane never run at once. A suite's lane is per feature
+# file: LANE/FEATURE. The language suites share the lane "language", so one
+# scenario never runs on two engines at once (a scenario's daemon holds a
+# fixed port, a queue topic and a file in the tree), while different
+# scenarios, which share none of those, run side by side.
 #
 # A unit's key is the hash of its inputs and of the keys of the units it
 # needs. A unit that passed with its current key is fresh, and is not run
@@ -209,6 +212,9 @@ make a function called gt_build_units takes cores returns units
   let units = list_push(units, gt_unit("bootstrap", ["compiler"], list_push(gt_compiler_inputs(), ["file", "bootstrap/ir_reader.py"]), cores, "", ["bootstrap", w], ""))
   let units = list_push(units, gt_unit("wasm", ["bootstrap"], list_push(gt_compiler_inputs(), ["file", "bootstrap/ir_wasm.py"]), 1, "", ["wasm"], ""))
   let units = list_push(units, gt_unit("interpreter", ["compiler"], [["program", "self_hosting/v2/interp.patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/v2/interp.patlang", b + "/v2_interp.exe", "--workers", w]], b + "/v2_interp.exe"))
+  # the interpreter as a Linux executable, for programs run under WSL that
+  # start the interpreter (v2_interpreter() names it on Linux)
+  let units = list_push(units, gt_unit("interpreter_linux", ["compiler"], [["program", "self_hosting/v2/interp.patlang"], ["dir", "self_hosting/v2/runtime"], ["file", "self_hosting/lib/x64_elf_link.patlang"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/v2/interp.patlang", b + "/v2_interp_linux", "--linux", "--workers", w]], b + "/v2_interp_linux"))
   let units = list_push(units, gt_unit("language_suite", ["compiler"], [["program", "self_hosting/tools/run_language_spec_suite.patlang"], ["dir", "self_hosting/v2/runtime"]], cores, "", ["cmd", b + "/v2.exe", ["self_hosting/tools/run_language_spec_suite.patlang", b + "/v2_language_suite.exe", "--workers", w]], b + "/v2_language_suite.exe"))
   # the repository's own tools, tested with the Python a fresh clone needs anyway
   let units = list_push(units, gt_unit("edit_tool", [], [["file", "tools/edit_files.py"], ["file", "tools/test_edit_files.py"]], 1, "", ["cmd", "py", ["-3", "-I", "tools/test_edit_files.py"]], ""))
@@ -242,12 +248,16 @@ make a function called gt_suites returns suites
   let wasm_host = ["dir", "self_hosting/v2/wasm"]
   return [["part1_v2", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "v2"], ["interpreter", "compiler"], [part1, lib], ""],
     ["part1_interp", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "interp"], ["interpreter", "compiler"], [part1, lib], ""],
+    # the same fixtures built with --linux and run under WSL (Ubuntu-24.04)
+    ["part1_linux", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "linux"], ["interpreter", "compiler"], [part1, lib, ["file", "self_hosting/lib/x64_elf_link.patlang"], ["file", "self_hosting/v2/spec/linux_peak.patlang"]], ""],
     ["engines_agree", i, ["self_hosting/v2/spec/run_values_and_memory.patlang", "both"], ["interpreter", "compiler"], [part1, lib], ""],
     ["part2", i, ["self_hosting/v2/spec/run_runtime.patlang"], ["interpreter", "compiler"], [part1, lib, wasm_host, ["dir_except", "self_hosting/v2", ["tools"]], ["file", "bootstrap/ir_reader.py"], ["file", "bootstrap/ir_wasm.py"]], ""],
     ["language_interp", i, ["self_hosting/tools/run_language_spec_suite.patlang"], ["interpreter", "compiler"], lang, "language"],
     ["language_v2", b + "/v2_language_suite.exe", [], ["language_suite", "interpreter", "compiler"], lang, "language"],
+    # the same scenarios, "compiled" meaning a Linux build run under WSL
+    ["language_linux", i, ["self_hosting/tools/run_language_spec_suite.patlang", "--linux"], ["interpreter", "compiler", "interpreter_linux"], list_push(lang, ["file", "self_hosting/lib/x64_elf_link.patlang"]), "language"],
     ["match", i, ["self_hosting/tools/run_match_spec_suite.patlang"], ["interpreter", "compiler"], lang, "language"],
-    ["selftests", i, ["self_hosting/tools/run_selftests.patlang"], ["interpreter", "compiler"], [lib, ["dir", "self_hosting/composite_library"], ["dir", "self_hosting/depgraph_selftest_fixture"], ["dir", "self_hosting/examples/zs"], ["dir", "docs/grammar"], ["program", "packages/tools/verify_manifest.patlang"], wasm_host, ["file", "self_hosting/v2/spec/fixtures/rt_fail_read.patlang"]], ""],
+    ["selftests", i, ["self_hosting/tools/run_selftests.patlang"], ["interpreter", "compiler"], [lib, ["dir", "self_hosting/composite_library"], ["dir", "self_hosting/depgraph_selftest_fixture"], ["dir", "self_hosting/examples/zs"], ["dir", "docs/grammar"], ["program", "packages/tools/verify_manifest.patlang"], wasm_host, ["file", "self_hosting/v2/spec/fixtures/rt_fail_read.patlang"], ["file", "self_hosting/v2/spec/libm_vectors.txt"]], ""],
     ["demos", i, ["self_hosting/tools/run_demos.patlang"], ["interpreter", "compiler"], [["dir", "demos"], lib], ""],
     ["repository", i, ["self_hosting/tools/run_repository_checks.patlang"], ["interpreter", "compiler"], gt_repository_inputs(), ""],
     # every demo and selftest calls only declared names (v2.exe --names)
@@ -375,7 +385,10 @@ make a function called gt_suite_units takes suites, rows returns units
     let suite = suites[s]
     let features = gt_features(suite)
     if list_len(features) == 0 then
+      # a suite that lists nothing would pass by running nothing: it fails
       print("gates: " + suite[0] + " lists no feature files")
+      let why = suite[0] + ": its runner (" + gt_suite_runner(suite) + ") listed no feature files or programs"
+      let units = list_push(units, gt_unit(suite[0] + "/listing", suite[3], [["program", gt_suite_runner(suite)], ["program", "self_hosting/v2/tools/gates_fail.patlang"]], 1, "", ["cmd", gt_build() + "/v2_interp.exe", ["self_hosting/v2/tools/gates_fail.patlang", why]], ""))
     end
     let f = 0
     while f < list_len(features) do
@@ -386,16 +399,22 @@ make a function called gt_suite_units takes suites, rows returns units
       end
       let inputs = v2_list_concat([["program", gt_suite_runner(suite)], item], suite[4])
       let name = suite[0] + "/" + gt_base_name(features[f])
+      # the suite's lane, per feature: the same feature on another engine
+      # waits, a different feature does not
+      let lane = suite[5]
+      if lane != "" then
+        let lane = lane + "/" + gt_base_name(features[f])
+      end
       if str_ends_with(features[f], ".feature") and gt_split_feature(rows, name) then
         # sc, not s: s is the suite loop's index
         let n = gt_scenario_count(features[f])
         let sc = 1
         while sc <= n do
-          let units = list_push(units, gt_unit(name + "@" + sc, suite[3], inputs, 1, suite[5], ["cmd", suite[1], list_push(suite[2], features[f] + "@" + sc)], ""))
+          let units = list_push(units, gt_unit(name + "@" + sc, suite[3], inputs, 1, lane,["cmd", suite[1], list_push(suite[2], features[f] + "@" + sc)], ""))
           let sc = sc + 1
         end
       else
-        let units = list_push(units, gt_unit(name, suite[3], inputs, 1, suite[5], ["cmd", suite[1], list_push(suite[2], features[f])], ""))
+        let units = list_push(units, gt_unit(name, suite[3], inputs, 1, lane,["cmd", suite[1], list_push(suite[2], features[f])], ""))
       end
       let f = f + 1
     end

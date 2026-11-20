@@ -1,0 +1,176 @@
+# Selftest for v2's math functions: each is checked against correctly rounded
+# results (self_hosting/v2/spec/libm_vectors.txt, made by
+# tools/gen_libm_vectors.py with mpmath at 300 bits).
+#
+# Given 6219 inputs across sin, cos, tan, asin, acos, atan, atan2, exp, log,
+# pow, fmod, sqrt, floor, ceil, trunc and round, among them NaN, infinities,
+# zeros, subnormals, arguments of 1e22 and 2^1000, and multiples of pi/2,
+# when each function is applied, then sqrt, floor, ceil, trunc, round and fmod
+# give the exact result, every other result is within one unit in the last
+# place of the correctly rounded one, a special result (NaN, an infinity, a
+# signed zero) is exactly C99's, and each function's count of correctly
+# rounded results is printed.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+
+make a function called lm_words takes line returns words
+  let words = []
+  let b = sb_new()
+  let have = false
+  let i = 0
+  while i < line.length do
+    let c = char_code(line, i)
+    if c == 32 then
+      if have then
+        let words = list_push(words, sb_str(b))
+        let b = sb_new()
+        let have = false
+      end
+    elif c != 13 then
+      sb_push(b, chr(c))
+      let have = true
+    end
+    let i = i + 1
+  end
+  if have then
+    let words = list_push(words, sb_str(b))
+  end
+  return words
+end
+
+make a function called lm_apply takes name, a, b returns r
+  if name == "sin" then
+    return sin(a)
+  elif name == "cos" then
+    return cos(a)
+  elif name == "tan" then
+    return tan(a)
+  elif name == "asin" then
+    return asin(a)
+  elif name == "acos" then
+    return acos(a)
+  elif name == "atan" then
+    return atan(a)
+  elif name == "atan2" then
+    return atan2(a, b)
+  elif name == "exp" then
+    return exp(a)
+  elif name == "log" then
+    return log(a)
+  elif name == "pow" then
+    return pow(a, b)
+  elif name == "fmod" then
+    # % on floats is C's fmod (spec 1.3)
+    return a % b
+  elif name == "sqrt" then
+    return sqrt(a)
+  elif name == "floor" then
+    return floor(a)
+  elif name == "ceil" then
+    return ceil(a)
+  elif name == "trunc" then
+    return trunc(a)
+  end
+  return round(a)
+end
+
+# A double's place in order: equal for equal values, one apart for neighbours,
+# -0 and +0 one apart.
+make a function called lm_order takes bits returns n
+  if bits >= 0 then
+    return bits
+  end
+  return 0 - 1 - word_and(bits, 9223372036854775807)
+end
+
+make a function called lm_exact takes name returns yes
+  return (name == "sqrt") or (name == "floor") or (name == "ceil") or (name == "trunc") or (name == "round") or (name == "fmod")
+end
+
+let ctx = ctx_new()
+let lines = split_lines(read_file("self_hosting/v2/spec/libm_vectors.txt"))
+# per function: [name, count, correctly rounded, worst ulps]
+let stats = []
+let bad = []
+let i = 0
+while i < list_len(lines) do
+  let w = lm_words(lines[i])
+  if (list_len(w) >= 3) and (w[0] != "#") then
+    let name = w[0]
+    let a = float_from_bits(to_num(w[1]))
+    let b = 0.0
+    if list_len(w) == 4 then
+      let b = float_from_bits(to_num(w[2]))
+    end
+    let want = w[list_len(w) - 1]
+    let r = lm_apply(name, a, b)
+    let ulps = 0
+    let ok = true
+    let got = 0
+    if (name == "sqrt") and (a < 0.0) then
+      # the square root of a negative number is complex (spec 1.3), not NaN
+      let ok = type_of(r) == "complex"
+    elif want == "nan" then
+      let got = float_bits(r * 1.0)
+      let g = float_from_bits(got)
+      let ok = g != g
+    else
+      let got = float_bits(r * 1.0)
+      let wb = to_num(want)
+      let wf = float_from_bits(wb)
+      let ulps = lm_order(got) - lm_order(wb)
+      if ulps < 0 then
+        let ulps = 0 - ulps
+      end
+      if lm_exact(name) or (wf == 0.0) or (wf != wf * 1.0) or (wf * 2.0 == wf) then
+        let ok = got == wb
+      else
+        let ok = ulps <= 1
+      end
+    end
+    if not ok then
+      let bad = list_push(bad, lines[i] + " got " + got)
+    end
+    let k = 0
+    let found = false
+    while k < list_len(stats) do
+      if stats[k][0] == name then
+        let s = stats[k]
+        let cr = s[2]
+        if ulps == 0 then
+          let cr = cr + 1
+        end
+        let worst = s[3]
+        if ulps > worst then
+          let worst = ulps
+        end
+        let stats = list_set(stats, k, [name, s[1] + 1, cr, worst])
+        let found = true
+      end
+      let k = k + 1
+    end
+    if not found then
+      let cr = 0
+      if ulps == 0 then
+        let cr = 1
+      end
+      let stats = list_push(stats, [name, 1, cr, ulps])
+    end
+  end
+  let i = i + 1
+end
+
+let k = 0
+while k < list_len(stats) do
+  print("  " + stats[k][0] + ": " + stats[k][1] + " inputs, " + stats[k][2] + " correctly rounded, worst " + stats[k][3] + " ulp")
+  let k = k + 1
+end
+let shown = 0
+while (shown < list_len(bad)) and (shown < 20) do
+  print("  off: " + bad[shown])
+  let shown = shown + 1
+end
+expect(ctx, "every result within an ulp, the exact ones and the special ones exact", list_len(bad), 0)
+expect(ctx, "every vector was read", list_len(lines) > 6000, true)
+ctx_report(ctx)

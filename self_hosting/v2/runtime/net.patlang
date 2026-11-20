@@ -34,36 +34,12 @@ make a function called rt_i32 takes w returns n
   return n
 end
 
-make a function called rt_wsa_start returns done
-  if atomic_add(runtime_state() + 4360, 1) == 0 then
-    let data = rt_alloc(512)
-    extern_call("WS2_32.DLL", "WSAStartup", 514, data + 16)
-    rt_free(data)
-  end
-  let done = true
-  ensure value_class(done) == 1
-  return done
-end
-
 make a function called rt_net_fail takes what returns r
   require (value_class(what) == 8)
   print(what)
   let r = rt_stop(96)
   ensure false
   return r
-end
-
-make a function called rt_socket returns sock
-  rt_wsa_start()
-  let sock = extern_call("WS2_32.DLL", "socket", 2, 1, 6)
-  if sock == 0 - 1 then
-    # INVALID_SOCKET: no socket to bind, connect or close
-    let sock = rt_net_fail("tcp: no socket could be made (Winsock error " + rt_i32(extern_call("WS2_32.DLL", "WSAGetLastError")) + ")")
-    ensure (value_class(sock) == 2)
-    return sock
-  end
-  ensure (value_class(sock) == 2)
-  return sock
 end
 
 # An IPv4 sockaddr for an address's four bytes and a port: an uncounted block,
@@ -82,60 +58,6 @@ make a function called rt_sockaddr takes a, b, c, d, port returns block
   mem_store_byte(block, 23, d)
   ensure mem_load_byte(block, 16) == 2
   return block
-end
-
-# Binds and listens on 127.0.0.1: the port it got, or -1 when the address is in
-# use, -2 on any other failure.
-make a function called rt_bind_listen takes sock, port returns actual
-  require (value_class(sock) == 2) and (value_class(port) == 2)
-  let addr = rt_sockaddr(127, 0, 0, 1, port)
-  let bound = rt_i32(extern_call("WS2_32.DLL", "bind", sock, addr + 16, 16))
-  if bound != 0 then
-    let reason = rt_i32(extern_call("WS2_32.DLL", "WSAGetLastError"))
-    rt_free(addr)
-    if reason == 10048 then
-      let actual = 0 - 1
-      ensure (actual >= 0 - 2) and (actual < 65536)
-      return actual
-    end
-    let actual = 0 - 2
-    ensure (actual >= 0 - 2) and (actual < 65536)
-    return actual
-  end
-  let size = rt_alloc(8)
-  mem_store(size, 16, 16)
-  extern_call("WS2_32.DLL", "getsockname", sock, addr + 16, size + 16)
-  let actual = mem_load_byte(addr, 18) * 256 + mem_load_byte(addr, 19)
-  rt_free(size)
-  rt_free(addr)
-  if rt_i32(extern_call("WS2_32.DLL", "listen", sock, 128)) != 0 then
-    let actual = 0 - 2
-    ensure (actual >= 0 - 2) and (actual < 65536)
-    return actual
-  end
-  ensure (actual >= 0 - 2) and (actual < 65536)
-  return actual
-end
-
-make a function called tcp_try_listen takes port returns actual
-  require (value_class(port) == 2)
-  let sock = rt_socket()
-  let actual = rt_bind_listen(sock, port)
-  if actual == 0 - 2 then
-    let actual = rt_net_fail("tcp_try_listen: bind " + port + ": failed")
-    ensure (actual >= 0 - 1) and (actual < 65536)
-    return actual
-  end
-  if actual == 0 - 1 then
-    extern_call("WS2_32.DLL", "closesocket", sock)
-    ensure (actual >= 0 - 1) and (actual < 65536)
-    return actual
-  end
-  # non-blocking for life: see rt_accept_waiting
-  rt_set_nonblocking(sock, 1)
-  rt_engine_push(4320, [actual, sock])
-  ensure (actual >= 0 - 1) and (actual < 65536)
-  return actual
 end
 
 make a function called tcp_listen takes port returns actual
@@ -224,38 +146,6 @@ make a function called tcp_connect takes host, port returns id
   return id
 end
 
-# A connection, or -1 when none is made (nothing listens there, or it refused):
-# for a client that has a use for the answer "not now", where tcp_connect
-# stops the program. A host that is not this machine, or not an address, still
-# stops it: TCP is on this machine only (review finding S15).
-make a function called tcp_try_connect takes host, port returns id
-  require (value_class(host) == 8) and (value_class(port) == 2)
-  let b = rt_host_bytes(host)
-  if list_len(b) == 0 then
-    let id = rt_net_fail("tcp_connect: " + host + " is not an address: TCP connects to localhost or 127.x.x.x")
-    ensure (id >= 1) or (id == 0 - 1)
-    return id
-  end
-  if b[0] != 127 then
-    let id = rt_net_fail("tcp_connect: " + host + " is not this machine: TCP connects to localhost or 127.x.x.x")
-    ensure (id >= 1) or (id == 0 - 1)
-    return id
-  end
-  let sock = rt_socket()
-  let addr = rt_sockaddr(b[0], b[1], b[2], b[3], port)
-  let got = rt_i32(extern_call("WS2_32.DLL", "connect", sock, addr + 16, 16))
-  rt_free(addr)
-  if got != 0 then
-    extern_call("WS2_32.DLL", "closesocket", sock)
-    let id = 0 - 1
-    ensure (id >= 1) or (id == 0 - 1)
-    return id
-  end
-  let id = rt_conn_add(sock)
-  ensure (id >= 1) or (id == 0 - 1)
-  return id
-end
-
 make a function called rt_listener_socket takes port, what returns sock
   require (value_class(port) == 2) and (value_class(what) == 8)
   let listeners = rt_engine_get(4320)
@@ -268,56 +158,6 @@ make a function called rt_listener_socket takes port, what returns sock
   let sock = listeners[i][1]
   ensure (value_class(sock) == 2)
   return sock
-end
-
-# FIONBIO: 1 non-blocking, 0 blocking.
-make a function called rt_set_nonblocking takes sock, on returns done
-  require (value_class(sock) == 2) and (value_class(on) == 2)
-  let arg = rt_alloc(8)
-  mem_store(arg, 16, on)
-  extern_call("WS2_32.DLL", "ioctlsocket", sock, 2147772030, arg + 16)
-  rt_free(arg)
-  let done = true
-  ensure value_class(done) == 1
-  return done
-end
-
-# Waits up to ms (-1: for ever) for the listener to have a connection waiting
-# (WSAPoll on one pollfd: the socket, then POLLRDNORM in events).
-make a function called rt_wait_readable takes sock, ms returns done
-  require (value_class(sock) == 2) and (value_class(ms) == 2) and (ms >= 0 - 1)
-  let fd = rt_alloc(16)
-  mem_store(fd, 16, sock)
-  mem_store(fd, 24, 256)
-  extern_call("WS2_32.DLL", "WSAPoll", fd + 16, 1, ms)
-  rt_free(fd)
-  let done = true
-  ensure value_class(done) == 1
-  return done
-end
-
-# A connection the listener had waiting, as an id, or -1 when none was. A
-# listener is non-blocking for its whole life, so threads waiting on it at
-# once never change its mode under each other: each waits with WSAPoll, and
-# one that finds the connection taken by another (WSAEWOULDBLOCK) waits again.
-# An accepted socket inherits the listener's mode, so it is made blocking.
-make a function called rt_accept_waiting takes sock, port, what returns id
-  require (value_class(sock) == 2) and (value_class(port) == 2) and (value_class(what) == 8)
-  let got = extern_call("WS2_32.DLL", "accept", sock, 0, 0)
-  if got == 0 - 1 then
-    if rt_i32(extern_call("WS2_32.DLL", "WSAGetLastError")) != 10035 then
-      let id = rt_net_fail(what + ": port " + port + ": accept failed")
-      ensure id >= 0 - 1
-      return id
-    end
-    let id = 0 - 1
-    ensure id >= 0 - 1
-    return id
-  end
-  rt_set_nonblocking(got, 0)
-  let id = rt_conn_add(got)
-  ensure id >= 1
-  return id
 end
 
 make a function called tcp_accept takes port returns id
@@ -360,35 +200,6 @@ make a function called tcp_accept_timeout takes port, ms returns id
   return id
 end
 
-# How long a recv on the socket waits, in ms; 0 is for ever (SOL_SOCKET,
-# SO_RCVTIMEO, a 32-bit count).
-make a function called rt_set_recv_timeout takes sock, ms returns done
-  require (value_class(sock) == 2) and (value_class(ms) == 2) and (ms >= 0)
-  let arg = rt_alloc(8)
-  mem_store(arg, 16, ms)
-  extern_call("WS2_32.DLL", "setsockopt", sock, 65535, 4102, arg + 16, 4)
-  rt_free(arg)
-  let done = true
-  ensure value_class(done) == 1
-  return done
-end
-
-# What one recv gave, "" at the end of the stream; [text, whether it failed].
-make a function called rt_recv takes conn returns result
-  require value_live(conn)
-  let sock = rt_conn_socket(conn)
-  let buf = rt_alloc(65536)
-  let n = rt_i32(extern_call("WS2_32.DLL", "recv", sock, buf + 16, 65536, 0))
-  let text = ""
-  if n > 0 then
-    let text = rt_str_from_bytes(buf + 16, n)
-  end
-  rt_free(buf)
-  let result = [text, n < 0]
-  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1)
-  return result
-end
-
 # What arrives on the connection within ms: "" when nothing does in that time,
 # when the peer has closed, and when the read fails. The program goes on in
 # each case: a peer that connects and sends nothing cannot hold it.
@@ -426,29 +237,6 @@ make a function called tcp_read_or_empty takes conn returns data
   return data
 end
 
-# Writes all of data: false when a send fails, as when the peer has gone, and
-# the program goes on.
-make a function called tcp_try_write takes conn, data returns ok
-  require value_live(conn) and value_live(data)
-  let sock = rt_conn_socket(conn)
-  let text = to_s(data)
-  let at = rt_str_bytes(text)
-  let left = str_len(text)
-  while left > 0 do
-    let sent = rt_i32(extern_call("WS2_32.DLL", "send", sock, at, left, 0))
-    if sent <= 0 then
-      let ok = false
-      ensure value_class(ok) == 1
-      return ok
-    end
-    let at = at + sent
-    let left = left - sent
-  end
-  let ok = true
-  ensure value_class(ok) == 1
-  return ok
-end
-
 make a function called tcp_write takes conn, data returns ok
   require value_live(conn) and value_live(data)
   if not tcp_try_write(conn, data) then
@@ -459,13 +247,4 @@ make a function called tcp_write takes conn, data returns ok
   let ok = true
   ensure value_class(ok) == 1
   return ok
-end
-
-make a function called tcp_close takes conn returns done
-  require value_live(conn)
-  extern_call("WS2_32.DLL", "closesocket", rt_conn_socket(conn))
-  rt_engine_drop(4336, conn)
-  let done = true
-  ensure value_class(done) == 1
-  return done
 end

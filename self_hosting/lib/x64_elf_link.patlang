@@ -1,0 +1,159 @@
+# Links assembled chunks into a static Linux x86-64 executable: no dynamic
+# linker and no libc, the program reaching the kernel by system calls
+# (runtime/os_linux.patlang). The chunks are merged as for Windows
+# (x64_pe_link.patlang, xpl_merge_chunks).
+#
+# It is a static PIE (ELF64, ET_DYN with no interpreter), so the kernel loads it
+# at an address of its choosing, different each run (ASLR, as the Windows build
+# asks for: review finding S14). The file, offset in the file = offset from the
+# load address:
+#   0        the ELF header, then three program headers, then at 232 the
+#            offset of the fix-up table
+#   4096     the text, then the fix-up table: a count, then the offset of each
+#            absolute address in the data
+#   page     the data, then the bss in memory only
+# Program headers: a PT_LOAD for the headers and text (read, execute), one for
+# the data and bss (read, write), and PT_GNU_STACK (a stack that does not
+# execute). A call or rip-relative reference is relative, and right wherever
+# the image is; an absolute address is written as its target's offset, and
+# _start (x64.patlang, xv_entry_asm_linux) adds the load address to each one
+# the table lists before anything else runs. The entry chunk is the text's
+# first, so _start is at 4096 and knows the load address from its own.
+include "x64_pe_link.patlang"
+
+make a function called xel_emit_header takes b, entry, data_off, data_size, mem_size, text_end, table_off returns out
+  let h = []
+  # e_ident: magic, 64-bit, little-endian, version 1, System V
+  let h = xa_emit_bytes(h, [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  # ET_DYN: a position-independent image
+  let h = xpl_emit_u16(h, 3)
+  let h = xpl_emit_u16(h, 62)
+  let h = xpl_emit_u32(h, 1)
+  let h = xpl_emit_u64(h, entry)
+  let h = xpl_emit_u64(h, 64)
+  let h = xpl_emit_u64(h, 0)
+  let h = xpl_emit_u32(h, 0)
+  let h = xpl_emit_u16(h, 64)
+  let h = xpl_emit_u16(h, 56)
+  let h = xpl_emit_u16(h, 3)
+  let h = xpl_emit_u16(h, 64)
+  let h = xpl_emit_u16(h, 0)
+  let h = xpl_emit_u16(h, 0)
+  # the headers and text: read and execute
+  let h = xel_emit_phdr(h, 1, 5, 0, b, text_end, text_end, 4096)
+  # the data and bss: read and write
+  let h = xel_emit_phdr(h, 1, 6, data_off, b + data_off, data_size, mem_size, 4096)
+  # the stack: read and write, not execute
+  let h = xel_emit_phdr(h, 1685382481, 6, 0, 0, 0, 0, 16)
+  # the fix-up table's offset, read by _start
+  let h = xpl_emit_u64(h, table_off)
+  ensure list_len(h) == 64 + 3 * 56 + 8
+  return h
+end
+
+make a function called xel_emit_phdr takes h0, ptype, flags, offset, vaddr, filesz, memsz, align returns h
+  let h = xpl_emit_u32(h0, ptype)
+  let h = xpl_emit_u32(h, flags)
+  let h = xpl_emit_u64(h, offset)
+  let h = xpl_emit_u64(h, vaddr)
+  let h = xpl_emit_u64(h, vaddr)
+  let h = xpl_emit_u64(h, filesz)
+  let h = xpl_emit_u64(h, memsz)
+  let h = xpl_emit_u64(h, align)
+  return h
+end
+
+# out_path on success, or "LINK ERROR: ..." saying why not.
+make a function called x64_link_elf takes chunks, entry_symbol, out_path returns result
+  let image_base = 0
+  let page = 4096
+  let merged = xpl_merge_chunks(chunks)
+  let merged_text = merged[0]
+  let merged_data = merged[1]
+  let merged_bss = merged[2]
+  let all_symbols = merged[3]
+  let all_relocs = merged[4]
+  let text_off = page
+  let text_size = bytes_len(merged_text)
+  # the fix-up table after the text: a count and one offset per absolute address
+  let abs_count = 0
+  let ri = 0
+  while ri < vec_len(all_relocs) do
+    if vec_get(all_relocs, ri)[3] == "ABS64" then
+      let abs_count = abs_count + 1
+    end
+    let ri = ri + 1
+  end
+  let table_off = xpl_round_up(text_off + text_size, 8)
+  let text_end = table_off + 8 * (abs_count + 1)
+  let data_off = xpl_round_up(text_end, page)
+  let data_size = bytes_len(merged_data)
+  let bss_off = data_off + xpl_round_up(data_size, 16)
+  let mem_size = (bss_off - data_off) + merged_bss
+
+  # every symbol at its offset from the load address; the globals by name
+  let names = []
+  let values = []
+  let offs = vec_new()
+  let si = 0
+  while si < vec_len(all_symbols) do
+    let sym = vec_get(all_symbols, si)
+    let base = text_off
+    if sym[1] == "data" then
+      let base = data_off
+    elif sym[1] == "bss" then
+      let base = bss_off
+    end
+    vec_push(offs, base + sym[2])
+    if sym[3] then
+      let names = list_push(names, sym[0])
+      let values = list_push(values, base + sym[2])
+    end
+    let si = si + 1
+  end
+  let index = xpl_build_index(names, values)
+
+  let table = bytes_new(0)
+  xpl_bytes_pad_to(table, 8 * (abs_count + 1))
+  xpl_put_le(table, 0, abs_count, 8)
+  let fixes = 0
+  let ri = 0
+  while ri < vec_len(all_relocs) do
+    let reloc = vec_get(all_relocs, ri)
+    let target_off = false
+    if reloc[5] > 0 then
+      let target_off = vec_get(offs, reloc[5] - 1)
+    else
+      let target_off = xpl_index_lookup(index, reloc[2])
+    end
+    if target_off == false then
+      return "LINK ERROR: undefined symbol '" + reloc[2] + "' (section " + reloc[0] + ", kind " + reloc[3] + ")"
+    end
+    if reloc[3] == "ABS64" then
+      xpl_put_le(merged_data, reloc[1], image_base + target_off + reloc[4], 8)
+      let fixes = fixes + 1
+      xpl_put_le(table, 8 * fixes, data_off + reloc[1], 8)
+    else
+      let at = text_off + reloc[1]
+      xpl_put_le(merged_text, reloc[1], (target_off + reloc[4]) - (at + 4), 4)
+    end
+    let ri = ri + 1
+  end
+  let entry_off = xpl_index_lookup(index, entry_symbol)
+  if entry_off == false then
+    return "LINK ERROR: entry symbol '" + entry_symbol + "' not defined"
+  end
+
+  let image = bytes_new(0)
+  bytes_extend(image, xel_emit_header(image_base, image_base + entry_off, data_off, data_size, mem_size, text_end, table_off))
+  xpl_bytes_pad_to(image, text_off)
+  bytes_extend(image, merged_text)
+  xpl_bytes_pad_to(image, table_off)
+  bytes_extend(image, table)
+  xpl_bytes_pad_to(image, data_off)
+  bytes_extend(image, merged_data)
+  if not write_file_bytes(out_path, image) then
+    return "LINK ERROR: write_file_bytes failed for " + out_path
+  end
+  return out_path
+end

@@ -1,0 +1,1415 @@
+# v2 runtime: the math library, in PatLang (docs/spec/values-and-memory.md 1.3).
+#
+# sin, cos, tan, asin, acos, atan, atan2, exp, log, pow, fmod, sqrt, floor,
+# ceil, trunc and round, written here so that every target (Windows, Linux, a
+# browser) computes the same bits: the algorithms are musl's, from Sun's
+# fdlibm (Copyright (C) 1993 by Sun Microsystems, Inc.; permission to use,
+# copy, modify and distribute this software is freely granted, provided that
+# this notice is preserved), each within one unit in the last place; sqrt,
+# floor, ceil, trunc, round and fmod are exact. A double's words are read and
+# made with rt_m_hi, rt_m_lo and rt_m_words; every value here is a float.
+# self_hosting/libm_selftest.patlang checks them against correctly rounded
+# results, and libm_targets_selftest.patlang that native and WebAssembly agree.
+quiet_operators()
+
+# ---- a double's words ----
+
+make a function called rt_m_hi takes x returns hi
+  let hi = word_and(word_shr(rt_float_bits_of(x), 32), 4294967295)
+  return hi
+end
+
+make a function called rt_m_lo takes x returns lo
+  let lo = word_and(rt_float_bits_of(x), 4294967295)
+  return lo
+end
+
+make a function called rt_m_words takes hi, lo returns x
+  let x = rt_float(word_or(word_shl(word_and(hi, 4294967295), 32), word_and(lo, 4294967295)))
+  return x
+end
+
+make a function called rt_m_set_lo takes x, lo returns y
+  return rt_m_words(rt_m_hi(x), lo)
+end
+
+make a function called rt_m_set_hi takes x, hi returns y
+  return rt_m_words(hi, rt_m_lo(x))
+end
+
+# A high word as fdlibm's signed int32 reads it.
+make a function called rt_m_signed takes w returns s
+  if w >= 2147483648 then
+    return w - 4294967296
+  end
+  return w
+end
+
+make a function called rt_m_neg takes x returns y
+  return rt_float(word_xor(rt_float_bits_of(x), word_shl(1, 63)))
+end
+
+make a function called rt_m_fabs takes x returns y
+  return rt_float(word_and(rt_float_bits_of(x), 9223372036854775807))
+end
+
+# A float's integer part as an int (C's cast: toward zero).
+make a function called rt_m_toint takes x returns n
+  return float_to_int(rt_float_bits_of(x))
+end
+
+make a function called rt_m_float takes n returns x
+  return rt_float(int_to_float(n))
+end
+
+make a function called rt_m_scalbn takes x, n0 returns r
+  let y = x
+  let n = n0
+  if n > 1023 then
+    let y = y * 8.98846567431158e307
+    let n = n - 1023
+    if n > 1023 then
+      let y = y * 8.98846567431158e307
+      let n = n - 1023
+      if n > 1023 then
+        let n = 1023
+      end
+    end
+  elif n < -1022 then
+    # 0x1p-1022 * 0x1p53
+    let y = y * 2.004168360008973e-292
+    let n = n + 969
+    if n < -1022 then
+      let y = y * 2.004168360008973e-292
+      let n = n + 969
+      if n < -1022 then
+        let n = -1022
+      end
+    end
+  end
+  return y * rt_float(word_shl(1023 + n, 52))
+end
+
+# ---- exact: floor, ceil, trunc, round, sqrt, fmod ----
+
+make a function called rt_m_floor takes x returns r
+  let bits = rt_float_bits_of(x)
+  let e = word_and(word_shr(bits, 52), 2047)
+  if (e >= 1023 + 52) or (x == 0.0) then
+    return x
+  end
+  let negative = bits < 0
+  if negative then
+    let y = x - 4503599627370496.0 + 4503599627370496.0 - x
+  else
+    let y = x + 4503599627370496.0 - 4503599627370496.0 - x
+  end
+  if e <= 1023 - 1 then
+    if negative then
+      return -1.0
+    end
+    return 0.0
+  end
+  if y > 0.0 then
+    return x + y - 1.0
+  end
+  return x + y
+end
+
+make a function called rt_m_ceil takes x returns r
+  let bits = rt_float_bits_of(x)
+  let e = word_and(word_shr(bits, 52), 2047)
+  if (e >= 1023 + 52) or (x == 0.0) then
+    return x
+  end
+  let negative = bits < 0
+  if negative then
+    let y = x - 4503599627370496.0 + 4503599627370496.0 - x
+  else
+    let y = x + 4503599627370496.0 - 4503599627370496.0 - x
+  end
+  if e <= 1023 - 1 then
+    if negative then
+      return rt_m_neg(0.0)
+    end
+    return 1.0
+  end
+  if y < 0.0 then
+    return x + y + 1.0
+  end
+  return x + y
+end
+
+make a function called rt_m_trunc takes x returns r
+  let bits = rt_float_bits_of(x)
+  let e = word_and(word_shr(bits, 52), 2047) - 1023 + 12
+  if e >= 52 + 12 then
+    return x
+  end
+  if e < 12 then
+    let e = 1
+  end
+  let m = word_shr(-1, e)
+  if word_and(bits, m) == 0 then
+    return x
+  end
+  return rt_float(word_and(bits, word_xor(m, -1)))
+end
+
+# Half away from zero, as C's round.
+make a function called rt_m_round takes x0 returns r
+  let bits = rt_float_bits_of(x0)
+  let e = word_and(word_shr(bits, 52), 2047)
+  if e >= 1023 + 52 then
+    return x0
+  end
+  let negative = bits < 0
+  let x = x0
+  if negative then
+    let x = rt_m_neg(x0)
+  end
+  if e < 1023 - 1 then
+    return 0.0 * x0
+  end
+  let y = x + 4503599627370496.0 - 4503599627370496.0 - x
+  if y > 0.5 then
+    let y = y + x - 1.0
+  elif y <= -0.5 then
+    let y = y + x + 1.0
+  else
+    let y = y + x
+  end
+  if negative then
+    return rt_m_neg(y)
+  end
+  return y
+end
+
+# fdlibm's bit-by-bit square root: correctly rounded.
+make a function called rt_m_sqrt takes x returns r
+  let sign = 2147483648
+  let ix0 = rt_m_signed(rt_m_hi(x))
+  let ix1 = rt_m_lo(x)
+  if word_and(ix0, 2146435072) == 2146435072 then
+    return x * x + x
+  end
+  if ix0 <= 0 then
+    if word_or(word_and(ix0, 2147483647), ix1) == 0 then
+      return x
+    end
+    if ix0 < 0 then
+      return (x - x) / (x - x)
+    end
+  end
+  let m = word_shr(ix0, 20)
+  if m == 0 then
+    while ix0 == 0 do
+      let m = m - 21
+      let ix0 = word_or(ix0, word_shr(ix1, 11))
+      let ix1 = word_and(word_shl(ix1, 21), 4294967295)
+    end
+    let i = 0
+    while word_and(ix0, 1048576) == 0 do
+      let ix0 = word_shl(ix0, 1)
+      let i = i + 1
+    end
+    let m = m - (i - 1)
+    if i > 0 then
+      let ix0 = word_or(ix0, word_shr(ix1, 32 - i))
+      let ix1 = word_and(word_shl(ix1, i), 4294967295)
+    end
+  end
+  let m = m - 1023
+  let ix0 = word_or(word_and(ix0, 1048575), 1048576)
+  if word_and(m, 1) == 1 then
+    let ix0 = ix0 + ix0 + word_shr(word_and(ix1, sign), 31)
+    let ix1 = word_and(ix1 + ix1, 4294967295)
+  end
+  # m >>= 1, arithmetic
+  if m < 0 then
+    let m = 0 - word_shr(1 - m, 1)
+  else
+    let m = word_shr(m, 1)
+  end
+  let ix0 = ix0 + ix0 + word_shr(word_and(ix1, sign), 31)
+  let ix1 = word_and(ix1 + ix1, 4294967295)
+  let q = 0
+  let q1 = 0
+  let s0 = 0
+  let s1 = 0
+  let r = 2097152
+  while r != 0 do
+    let t = s0 + r
+    if t <= ix0 then
+      let s0 = t + r
+      let ix0 = ix0 - t
+      let q = q + r
+    end
+    let ix0 = ix0 + ix0 + word_shr(word_and(ix1, sign), 31)
+    let ix1 = word_and(ix1 + ix1, 4294967295)
+    let r = word_shr(r, 1)
+  end
+  let r = sign
+  while r != 0 do
+    let t1 = word_and(s1 + r, 4294967295)
+    let t = s0
+    if (t < ix0) or ((t == ix0) and (t1 <= ix1)) then
+      let s1 = word_and(t1 + r, 4294967295)
+      if (word_and(t1, sign) == sign) and (word_and(s1, sign) == 0) then
+        let s0 = s0 + 1
+      end
+      let ix0 = ix0 - t
+      if ix1 < t1 then
+        let ix0 = ix0 - 1
+      end
+      let ix1 = word_and(ix1 - t1, 4294967295)
+      let q1 = q1 + r
+    end
+    let ix0 = ix0 + ix0 + word_shr(word_and(ix1, sign), 31)
+    let ix1 = word_and(ix1 + ix1, 4294967295)
+    let r = word_shr(r, 1)
+  end
+  # round to nearest: the remainder is not zero, so the result is not exact
+  if word_or(ix0, ix1) != 0 then
+    if q1 == 4294967295 then
+      let q1 = 0
+      let q = q + 1
+    else
+      let q1 = q1 + word_and(q1, 1)
+    end
+  end
+  let hi = word_shr(q, 1) + 1071644672
+  let lo = word_shr(q1, 1)
+  if word_and(q, 1) == 1 then
+    let lo = word_or(lo, sign)
+  end
+  let hi = hi + m * 1048576
+  return rt_m_words(hi, lo)
+end
+
+# Unsigned order of two 64-bit words.
+make a function called rt_m_ult takes a, b returns yes
+  let flip = word_shl(1, 63)
+  return word_xor(a, flip) < word_xor(b, flip)
+end
+
+# C's fmod: x - n*y with n x/y toward zero, exactly.
+make a function called rt_m_fmod takes x, y returns r
+  let uxi = rt_float_bits_of(x)
+  let uyi = rt_float_bits_of(y)
+  let ex = word_and(word_shr(uxi, 52), 2047)
+  let ey = word_and(word_shr(uyi, 52), 2047)
+  let sx = word_shr(uxi, 63)
+  if (word_shl(uyi, 1) == 0) or (y != y) or (ex == 2047) then
+    return (x * y) / (x * y)
+  end
+  let ax = word_shl(uxi, 1)
+  let ay = word_shl(uyi, 1)
+  if not rt_m_ult(ay, ax) then
+    if ax == ay then
+      return 0.0 * x
+    end
+    return x
+  end
+  if ex == 0 then
+    let i = word_shl(uxi, 12)
+    while i >= 0 do
+      let ex = ex - 1
+      let i = word_shl(i, 1)
+    end
+    let uxi = word_shl(uxi, 1 - ex)
+  else
+    let uxi = word_or(word_and(uxi, word_shr(-1, 12)), word_shl(1, 52))
+  end
+  if ey == 0 then
+    let i = word_shl(uyi, 12)
+    while i >= 0 do
+      let ey = ey - 1
+      let i = word_shl(i, 1)
+    end
+    let uyi = word_shl(uyi, 1 - ey)
+  else
+    let uyi = word_or(word_and(uyi, word_shr(-1, 12)), word_shl(1, 52))
+  end
+  while ex > ey do
+    let i = word_sub(uxi, uyi)
+    if i >= 0 then
+      if i == 0 then
+        return 0.0 * x
+      end
+      let uxi = i
+    end
+    let uxi = word_shl(uxi, 1)
+    let ex = ex - 1
+  end
+  let i = word_sub(uxi, uyi)
+  if i >= 0 then
+    if i == 0 then
+      return 0.0 * x
+    end
+    let uxi = i
+  end
+  while word_shr(uxi, 52) == 0 do
+    let uxi = word_shl(uxi, 1)
+    let ex = ex - 1
+  end
+  if ex > 0 then
+    let uxi = word_sub(uxi, word_shl(1, 52))
+    let uxi = word_or(uxi, word_shl(ex, 52))
+  else
+    let uxi = word_shr(uxi, 1 - ex)
+  end
+  let uxi = word_or(uxi, word_shl(sx, 63))
+  return rt_float(uxi)
+end
+
+# ---- exp and log ----
+
+# exp is ARM's optimized-routines algorithm, as musl has it (MIT licence,
+# Copyright (c) 2018 Arm Limited): x = k ln2/128 + r, exp(x) = 2^(k/128) exp(r),
+# 2^(k/128) from a table and exp(r) from a short polynomial; under 0.52 ulp.
+# The table is [T(k), H(k) - k * 2^45] for k in 0..127, where H(k) is 2^(k/128)
+# rounded and 2^(k/128) = H(k) (1 + T(k)), each as its double's bits
+# (tools/gen_libm_vectors.py's mpmath gives the same values).
+make a function called rt_m_exp_table returns t
+  return [0, 4607182418800017408, 4367149474599452526, 4607171688528556853, -4868004084858692515, 4607161091040444513, -4859280119576434991, 4607150627056680837, 4363093389540324883, 4607140297302181236, -4860564323061625094, 4607130102505797342, 4350749156061923425, 4607120043400338376, 4364168240100004761, 4607110120722592643, 4366128403083131757, 4607100335213349135, 4363624214708482044, 4607090687617419255, 4341116261916187857, 4607081178683658658, -4870076522866643445, 4607071809164989211, -4857881712154133234, 4607062579818421073, -4877256630102726059, 4607053491405074892, -4858881367677209578, 4607044544690204128, 4359717415120819631, 4607035740443217489, -4863857816615152824, 4607027079437701499, -4859630355816238531, 4607018562451443178, 4362731899485115327, 4607010190266452853, -4857455882053489882, 4607001963668987092, 4367063335334195040, 4606993883449571754, -4859410923963139939, 4606985950403025181, 4362421515177083789, 4606978165328481494, 4359618604155798653, 4606970529029414038, 4365834109879625876, 4606963042313658936, 4361558225371547773, 4606955705993438783, 4359562691856033778, 4606948520885386461, -4857492308587640738, 4606941487810569089, 4360319936817113905, 4606934607594512097, -4882709470952570886, 4606927881067223440, 4362641697437125300, 4606921309063217931, 4354440509323660175, 4606914892421541718, 4360414030434708406, 4606908631985796885, 4361245865020257356, 4606902528604166193, 4363949802402347082, 4606896583129437951, -4862018976549545212, 4606890796419031025, -4858738662784151448, 4606885169335019979, -4856841960950780530, 4606879702744160358, -4867878926798276910, 4606874397517914103, -4856823124960863467, 4606869254532475109, 4361066948569222253, 4606864274668794914, -4858519367427004022, 4606859458812608540, -4874962362796897957, 4606854807854460458, -4864964451502548453, 4606850322689730711, 4342424336897059857, 4606846004218661165, 4365789078613288175, 4606841853346381911, 4354643160121541497, 4606837870982937808, 4365113450260533808, 4606834058043315166, 4356828907110576048, 4606830415447468583, 4364865165386375287, 4606826944120347917, -4859502521842818162, 4606823644991925415, -4861672301267803319, 4606820518997222978, -4865894452217038753, 4606817567076339586, -4862178651875353354, 4606814790174478863, 4364890759862540174, 4606812189241976794, 4358244976955136773, 4606809765234329597, 4364097860734309385, 4606807519112221737, 4338311716453074666, 4606805451841554103, 4365169902980743221, 4606803564393472328, -4860258889723447649, 4606801857744395273, -4860452975632495192, 4606800332876043653, -4862669920490755666, 4606798990775468832, -4858312122400614312, 4606797832435081765, 4347962289735735652, 4606796858852682099, -4858341730713460184, 4606796071031487437, -4870059510540748414, 4606795469980162751, -4871936092595705362, 4606795056712849967, -4863645441585018799, 4606794832249197700, -4866104880896786737, 4606794797614391156, -4861936742874514000, 4606794953839182196, -4862171044651866486, 4606795301959919561, 4364160436192007379, 4606795843018579263, -4865239048860621539, 4606796578062795143, 4365374511615819883, 4606797508145889586, 4352143969406577749, 4606798634326904418, -4861457929465508030, 4606799957670631954, -4858423338550479052, 4606801479247646227, -4863783675556659426, 4606803200134334381, -4858024654332078226, 4606805121412928237, 4364178698342926848, 4606807244171536025, 4363345029737015988, 4606809569504174299, -4871286895867992065, 4606812098510800012, 4358348108421357380, 4606814832297342774, -4858529541450220157, 4606817771975737286, -4873552611666813399, 4606820918663955941, -4869477542650660519, 4606824273486041615, -4858747092350994006, 4606827837572140624, -4862257653857481141, 4606831612058535866, 4355455812241575463, 4606835598087680144, 4354367543587795899, 4606839796808229667, -4861700651175763357, 4606844209375077733, 4362612029712904661, 4606848836949388595, -4858896013081134315, 4606853680698631517, 4364212552380330450, 4606858741796615000, 4360726356711135923, 4606864021423521215, -4863078573502718540, 4606869520765940602, 4362891239881388935, 4606875241016906669, -4859248142566958598, 4606881183375930982, -4875775683326071110, 4606887349049038331, -4859203616861915584, 4606893739248802106, -4870406652589927628, 4606900355194379847, -4858839866725070283, 4606907198111549002, 4356388038631218637, 4606914269232742866, -4858893633017702228, 4606921569797086729, 4355946959017544883, 4606929101050434204, 4363674894410448276, 4606936864245403770, 4360857247493478828, 4606944860641415499, 4351547817417644647, 4606953091504727989, 4352565403421120872, 4606961558108475497, -4863735759665056302, 4606970261732705274, -4859474856892171665, 4606979203664415100, -4859368956010059447, 4606988385197591026, 4356286533989107623, 4606997807633245319, -4863164539274780145, 4607007472279454616, 4363524392198705836, 4607017380451398277, 4360674496013757259, 4607027533471396960, -4863090309766824417, 4607037932668951391, -4861307347717911095, 4607048579380781353, 4356306869484685523, 4607059474950864886, 4360546482996998769, 4607070620730477699, -4859393813814996496, 4607082018078232794, -4860036451210660739, 4607093668360120305, 4363640302291525640, 4607105572949547559, 4360658257139329842, 4607117733227379351, 4362409866909812206, 4607130150581978432, -4859885672053611539, 4607142826409246228, 4357102052301720989, 4607155762112663768, 4346824392926350473, 4607168959103332849]
+end
+
+# The engine's copy of exp's table, made once at start (runtime_init, before
+# any thread) and only read after: its address is at runtime_state() 4704, its
+# 256 words from 16 bytes into the block. Made as a list on each call, the
+# table took exp to about 15200 cycles a call; read from here, about 530.
+make a function called rt_m_init returns r
+  let src = rt_m_exp_table()
+  let table = rt_alloc(8 * 256)
+  let k = 0
+  while k < 256 do
+    mem_store(table, 16 + 8 * k, src[k])
+    let k = k + 1
+  end
+  mem_store(runtime_state(), 4704, table)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# exp's result when 2^k may leave the normal range: scaled into it, then out.
+make a function called rt_m_exp_special takes tmp, sbits, ki returns r
+  if word_and(ki, 2147483648) == 0 then
+    let scale = rt_float(word_sub(sbits, word_shl(1009, 52)))
+    return 5.486124068793689e+303 * (scale + scale * tmp)
+  end
+  let scale = rt_float(word_add(sbits, word_shl(1022, 52)))
+  let y = scale + scale * tmp
+  if y < 1.0 then
+    # round to the subnormal precision before scaling, so it is rounded once
+    let lo = scale - y + scale * tmp
+    let hi = 1.0 + y
+    let lo = 1.0 - hi + y + lo
+    let y = (hi + lo) - 1.0
+    if y == 0.0 then
+      let y = 0.0
+    end
+  end
+  return 2.2250738585072014e-308 * y
+end
+
+make a function called rt_m_exp takes x returns r
+  let bits = rt_float_bits_of(x)
+  let abstop = word_and(word_shr(bits, 52), 2047)
+  let special = false
+  if (abstop < 969) or (abstop >= 1032) then
+    if abstop < 969 then
+      # |x| < 2^-54
+      return 1.0 + x
+    end
+    if abstop >= 1033 then
+      # |x| >= 1024
+      if bits == -4503599627370496 then
+        return 0.0
+      end
+      if abstop >= 2047 then
+        return 1.0 + x
+      end
+      if bits < 0 then
+        return 0.0
+      end
+      return 1.0e300 * 1.0e300
+    end
+    let special = true
+  end
+  let z = 184.6649652337873 * x
+  let kd = z + 6755399441055744.0
+  let ki = rt_float_bits_of(kd)
+  let kd = kd - 6755399441055744.0
+  let rr = x + kd * -0.005415212348111709 + kd * -1.2864023111638346e-14
+  let table = mem_load(runtime_state(), 4704)
+  let idx = 2 * word_and(ki, 127)
+  let tail = rt_float(mem_load(table, 16 + 8 * idx))
+  let sbits = word_add(mem_load(table, 24 + 8 * idx), word_shl(ki, 45))
+  let r2 = rr * rr
+  let tmp = tail + rr + r2 * (0.49999999999996786 + rr * 0.16666666666665886) + r2 * r2 * (0.0416666808410674 + rr * 0.008333335853059549)
+  if special then
+    return rt_m_exp_special(tmp, sbits, ki)
+  end
+  let scale = rt_float(sbits)
+  return scale + scale * tmp
+end
+
+make a function called rt_m_log takes x0 returns r
+  let x = x0
+  let hx = rt_m_signed(rt_m_hi(x))
+  let lx = rt_m_lo(x)
+  let k = 0
+  if hx < 1048576 then
+    if word_or(word_and(hx, 2147483647), lx) == 0 then
+      return -1.80143985094819840000e+16 / 0.0
+    end
+    if hx < 0 then
+      return (x - x) / 0.0
+    end
+    let k = k - 54
+    let x = x * 1.80143985094819840000e+16
+    let hx = rt_m_signed(rt_m_hi(x))
+  end
+  if hx >= 2146435072 then
+    return x + x
+  end
+  let k = k + (word_shr(hx, 20) - 1023)
+  let hx = word_and(hx, 1048575)
+  let i = word_and(hx + 614244, 1048576)
+  let x = rt_m_set_hi(x, word_or(hx, word_xor(i, 1072693248)))
+  let k = k + word_shr(i, 20)
+  let f = x - 1.0
+  let dk = rt_m_float(k)
+  if word_and(1048575, 2 + hx) < 3 then
+    if f == 0.0 then
+      if k == 0 then
+        return 0.0
+      end
+      return dk * 6.93147180369123816490e-01 + dk * 1.90821492927058770002e-10
+    end
+    let rr = f * f * (0.5 - 0.33333333333333333 * f)
+    if k == 0 then
+      return f - rr
+    end
+    return dk * 6.93147180369123816490e-01 - ((rr - dk * 1.90821492927058770002e-10) - f)
+  end
+  let s = f / (2.0 + f)
+  let z = s * s
+  let i = hx - 398458
+  let w = z * z
+  let j = 440401 - hx
+  let t1 = w * (3.999999999940941908e-01 + w * (2.222219843214978396e-01 + w * 1.531383769920937332e-01))
+  let t2 = z * (6.666666666666735130e-01 + w * (2.857142874366239149e-01 + w * (1.818357216161805012e-01 + w * 1.479819860511658591e-01)))
+  let i = word_or(i, j)
+  let rr = t2 + t1
+  if i > 0 then
+    let hfsq = 0.5 * f * f
+    if k == 0 then
+      return f - (hfsq - s * (hfsq + rr))
+    end
+    return dk * 6.93147180369123816490e-01 - ((hfsq - (s * (hfsq + rr) + dk * 1.90821492927058770002e-10)) - f)
+  end
+  if k == 0 then
+    return f - s * (f - rr)
+  end
+  return dk * 6.93147180369123816490e-01 - ((s * (f - rr) - dk * 1.90821492927058770002e-10) - f)
+end
+
+# ---- pow ----
+
+make a function called rt_m_pow takes x, y returns result
+  let hx = rt_m_signed(rt_m_hi(x))
+  let lx = rt_m_lo(x)
+  let hy = rt_m_signed(rt_m_hi(y))
+  let ly = rt_m_lo(y)
+  let ix = word_and(hx, 2147483647)
+  let iy = word_and(hy, 2147483647)
+  if word_or(iy, ly) == 0 then
+    return 1.0
+  end
+  if (hx == 1072693248) and (lx == 0) then
+    return 1.0
+  end
+  if (ix > 2146435072) or ((ix == 2146435072) and (lx != 0)) or (iy > 2146435072) or ((iy == 2146435072) and (ly != 0)) then
+    return (x + 0.0) + (y + 0.0)
+  end
+  let yisint = 0
+  if hx < 0 then
+    if iy >= 1128267776 then
+      let yisint = 2
+    elif iy >= 1072693248 then
+      let k = word_shr(iy, 20) - 1023
+      if k > 20 then
+        let j = word_shr(ly, 52 - k)
+        if word_and(word_shl(j, 52 - k), 4294967295) == ly then
+          let yisint = 2 - word_and(j, 1)
+        end
+      elif ly == 0 then
+        let j = word_shr(iy, 20 - k)
+        if word_shl(j, 20 - k) == iy then
+          let yisint = 2 - word_and(j, 1)
+        end
+      end
+    end
+  end
+  if ly == 0 then
+    if iy == 2146435072 then
+      if word_or(ix - 1072693248, lx) == 0 then
+        return 1.0
+      elif ix >= 1072693248 then
+        if hy >= 0 then
+          return y
+        end
+        return 0.0
+      end
+      if hy < 0 then
+        return rt_m_neg(y)
+      end
+      return 0.0
+    end
+    if iy == 1072693248 then
+      if hy < 0 then
+        return 1.0 / x
+      end
+      return x
+    end
+    if hy == 1073741824 then
+      return x * x
+    end
+    if hy == 1071644672 then
+      if hx >= 0 then
+        return rt_m_sqrt(x)
+      end
+    end
+  end
+  let ax = rt_m_fabs(x)
+  if lx == 0 then
+    if (ix == 2146435072) or (ix == 0) or (ix == 1072693248) then
+      let z = ax
+      if hy < 0 then
+        let z = 1.0 / z
+      end
+      if hx < 0 then
+        if word_or(ix - 1072693248, yisint) == 0 then
+          let z = (z - z) / (z - z)
+        elif yisint == 1 then
+          let z = rt_m_neg(z)
+        end
+      end
+      return z
+    end
+  end
+  # n is -1 for x < 0, else 0 (fdlibm's ((uint32_t)hx >> 31) - 1, read as 0 or -1)
+  let n = 0 - 1
+  if hx < 0 then
+    let n = 0
+  end
+  if word_or(n, yisint) == 0 then
+    return (x - x) / (x - x)
+  end
+  let s = 1.0
+  if word_or(n, yisint - 1) == 0 then
+    let s = -1.0
+  end
+  let t1 = 0.0
+  let t2 = 0.0
+  if iy > 1105199104 then
+    if iy > 1139802112 then
+      if ix <= 1072693247 then
+        if hy < 0 then
+          return 1.0e300 * 1.0e300
+        end
+        return 1.0e-300 * 1.0e-300
+      end
+      if ix >= 1072693248 then
+        if hy > 0 then
+          return 1.0e300 * 1.0e300
+        end
+        return 1.0e-300 * 1.0e-300
+      end
+    end
+    if ix < 1072693247 then
+      if hy < 0 then
+        return s * 1.0e300 * 1.0e300
+      end
+      return s * 1.0e-300 * 1.0e-300
+    end
+    if ix > 1072693248 then
+      if hy > 0 then
+        return s * 1.0e300 * 1.0e300
+      end
+      return s * 1.0e-300 * 1.0e-300
+    end
+    let t = ax - 1.0
+    let w = (t * t) * (0.5 - t * (0.3333333333333333333333 - t * 0.25))
+    let u = 1.44269502162933349609e+00 * t
+    let v = t * 1.92596299112661746887e-08 - w * 1.44269504088896338700e+00
+    let t1 = rt_m_set_lo(u + v, 0)
+    let t2 = v - (t1 - u)
+  else
+    let n = 0
+    if ix < 1048576 then
+      let ax = ax * 9007199254740992.0
+      let n = n - 53
+      let ix = rt_m_hi(ax)
+    end
+    let n = n + word_shr(ix, 20) - 1023
+    let j = word_and(ix, 1048575)
+    let ix = word_or(j, 1072693248)
+    if j <= 235662 then
+      let k = 0
+    elif j < 767610 then
+      let k = 1
+    else
+      let k = 0
+      let n = n + 1
+      let ix = ix - 1048576
+    end
+    let ax = rt_m_set_hi(ax, ix)
+    let bp = 1.0
+    let dp_h = 0.0
+    let dp_l = 0.0
+    if k == 1 then
+      let bp = 1.5
+      let dp_h = 5.84962487220764160156e-01
+      let dp_l = 1.35003920212974897128e-08
+    end
+    let u = ax - bp
+    let v = 1.0 / (ax + bp)
+    let ss = u * v
+    let s_h = rt_m_set_lo(ss, 0)
+    let t_h = rt_m_words(word_or(word_shr(ix, 1), 536870912) + 524288 + k * 262144, 0)
+    let t_l = ax - (t_h - bp)
+    let s_l = v * ((u - s_h * t_h) - s_h * t_l)
+    let s2 = ss * ss
+    let r = s2 * s2 * (5.99999999999994648725e-01 + s2 * (4.28571428578550184252e-01 + s2 * (3.33333329818377432918e-01 + s2 * (2.72728123808534006489e-01 + s2 * (2.30660745775561754067e-01 + s2 * 2.06975017800338417784e-01)))))
+    let r = r + s_l * (s_h + ss)
+    let s2 = s_h * s_h
+    let t_h = rt_m_set_lo(3.0 + s2 + r, 0)
+    let t_l = r - ((t_h - 3.0) - s2)
+    let u = s_h * t_h
+    let v = s_l * t_h + t_l * ss
+    let p_h = rt_m_set_lo(u + v, 0)
+    let p_l = v - (p_h - u)
+    let z_h = 9.61796700954437255859e-01 * p_h
+    let z_l = -7.02846165095275826516e-09 * p_h + p_l * 9.61796693925975554329e-01 + dp_l
+    let t = rt_m_float(n)
+    let t1 = rt_m_set_lo(((z_h + z_l) + dp_h) + t, 0)
+    let t2 = z_l - (((t1 - t) - dp_h) - z_h)
+  end
+  let y1 = rt_m_set_lo(y, 0)
+  let p_l = (y - y1) * t1 + y * t2
+  let p_h = y1 * t1
+  let z = p_l + p_h
+  let j = rt_m_signed(rt_m_hi(z))
+  let i = rt_m_lo(z)
+  if j >= 1083179008 then
+    if (j != 1083179008) or (i != 0) then
+      return s * 1.0e300 * 1.0e300
+    end
+    if p_l + 8.0085662595372944372e-17 > z - p_h then
+      return s * 1.0e300 * 1.0e300
+    end
+  elif word_and(j, 2147483647) >= 1083231232 then
+    if (rt_m_hi(z) != 3230714880) or (i != 0) then
+      return s * 1.0e-300 * 1.0e-300
+    end
+    if p_l <= z - p_h then
+      return s * 1.0e-300 * 1.0e-300
+    end
+  end
+  let i = word_and(j, 2147483647)
+  let k = word_shr(i, 20) - 1023
+  let n = 0
+  let p_h2 = p_h
+  if i > 1071644672 then
+    let n = j + word_shr(1048576, k + 1)
+    let k = word_shr(word_and(n, 2147483647), 20) - 1023
+    let t = rt_m_words(word_and(n, word_xor(word_shr(1048575, k), 4294967295)), 0)
+    let n = word_shr(word_or(word_and(n, 1048575), 1048576), 20 - k)
+    if j < 0 then
+      let n = 0 - n
+    end
+    let p_h2 = p_h - t
+  end
+  let t = rt_m_set_lo(p_l + p_h2, 0)
+  let u = t * 6.93147182464599609375e-01
+  let v = (p_l - (t - p_h2)) * 6.93147180559945286227e-01 + t * -1.90465429995776804525e-09
+  let z = u + v
+  let w = v - (z - u)
+  let t = z * z
+  let t1 = z - t * (1.66666666666666019037e-01 + t * (-2.77777777770155933842e-03 + t * (6.61375632143793436117e-05 + t * (-1.65339022054652515390e-06 + t * 4.13813679705723846039e-08))))
+  let r = (z * t1) / (t1 - 2.0) - (w + z * w)
+  let z = 1.0 - (r - z)
+  let j = rt_m_signed(rt_m_hi(z)) + n * 1048576
+  if j < 1048576 then
+    let z = rt_m_scalbn(z, n)
+  else
+    let z = rt_m_set_hi(z, j)
+  end
+  return s * z
+end
+
+# ---- the trigonometric kernels, on [-pi/4, pi/4] ----
+
+make a function called rt_m_ksin takes x, y, iy returns r
+  let z = x * x
+  let w = z * z
+  let rr = 8.33333333332248946124e-03 + z * (-1.98412698298579493134e-04 + z * 2.75573137070700676789e-06) + z * w * (-2.50507602534068634195e-08 + z * 1.58969099521155010221e-10)
+  let v = z * x
+  if iy == 0 then
+    return x + v * (-1.66666666666666324348e-01 + z * rr)
+  end
+  return x - ((z * (0.5 * y - v * rr) - y) - v * -1.66666666666666324348e-01)
+end
+
+make a function called rt_m_kcos takes x, y returns r
+  let z = x * x
+  let w = z * z
+  let rr = z * (4.16666666666666019037e-02 + z * (-1.38888888888741095749e-03 + z * 2.48015872894767294178e-05)) + w * w * (-2.75573143513906633035e-07 + z * (2.08757232129817482790e-09 + z * -1.13596475577881948265e-11))
+  let hz = 0.5 * z
+  let w = 1.0 - hz
+  return w + (((1.0 - w) - hz) + (z * rr - x * y))
+end
+
+make a function called rt_m_ktan takes x0, y0, odd returns r
+  let x = x0
+  let y = y0
+  let hx = rt_m_hi(x)
+  let big = word_and(hx, 2147483647) >= 1072010280
+  let negative = false
+  if big then
+    if word_shr(hx, 31) == 1 then
+      let negative = true
+      let x = rt_m_neg(x)
+      let y = rt_m_neg(y)
+    end
+    let x = (7.85398163397448278999e-01 - x) + (3.06161699786838301793e-17 - y)
+    let y = 0.0
+  end
+  let z = x * x
+  let w = z * z
+  let rr = 1.33333333333201242699e-01 + w * (2.18694882948595424599e-02 + w * (3.59207910759131235356e-03 + w * (5.88041240820264096874e-04 + w * (7.81794442939557092300e-05 + w * -1.85586374855275456654e-05))))
+  let v = z * (5.39682539762260521377e-02 + w * (8.86323982359930005737e-03 + w * (1.45620945432529025516e-03 + w * (2.46463134818469906812e-04 + w * (7.14072491382608190305e-05 + w * 2.59073051863633712884e-05)))))
+  let s = z * x
+  let rr = y + z * (s * (rr + v) + y) + s * 3.33333333333334091986e-01
+  let w = x + rr
+  if big then
+    let s = rt_m_float(1 - 2 * odd)
+    let v = s - 2.0 * (x + (rr - w * w / (w + s)))
+    if negative then
+      return rt_m_neg(v)
+    end
+    return v
+  end
+  if odd == 0 then
+    return w
+  end
+  let w0 = rt_m_set_lo(w, 0)
+  let v = rr - (w0 - x)
+  let a = -1.0 / w
+  let a0 = rt_m_set_lo(a, 0)
+  return a0 + a * (1.0 + a0 * w0 + a0 * v)
+end
+
+# ---- argument reduction: x = n * pi/2 + (y0 + y1) ----
+
+# 2/pi, 24 bits at a time.
+make a function called rt_m_ipio2 returns digits
+  return [10680707, 7228996, 1387004, 2578385, 16069853, 12639074, 9804092, 4427841, 16666979, 11263675, 12935607, 2387514, 4345298, 14681673, 3074569, 13734428, 16653803, 1880361, 10960616, 8533493, 3062596, 8710556, 7349940, 6258241, 3772886, 3769171, 3798172, 8675211, 12450088, 3874808, 9961438, 366607, 15675153, 9132554, 7151469, 3571407, 2607881, 12013382, 4155038, 6285869, 7677882, 13102053, 15825725, 473591, 9065106, 15363067, 6271263, 9264392, 5636912, 4652155, 7056368, 13614112, 10155062, 1944035, 9527646, 15080200, 6658437, 6231200, 6832269, 16767104, 5075751, 3212806, 1398474, 7579849, 6349435, 12618859, 4703257, 12806093, 14477321, 2786137]
+end
+
+# pi/2 in pieces of 24 bits.
+make a function called rt_m_pio2_parts returns parts
+  return [rt_float(4609753056584663040), rt_float(4500296887714185216), rt_float(4393339057296375808), rt_float(4285399695318056960), rt_float(4174867106174599168), rt_float(4069606033725587456), rt_float(3955147982449410048), rt_float(3848874662444400640)]
+end
+
+make a function called rt_m_vec_zeros takes n returns v
+  let v = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(v, 0.0)
+    let i = i + 1
+  end
+  return v
+end
+
+# fdlibm's __kernel_rem_pio2 for doubles: x is the input in 24-bit pieces tx
+# (nx of them), e0 its exponent; gives [n mod 8, y0, y1].
+make a function called rt_m_rem_pio2_large takes tx, e0, nx returns result
+  let ipio2 = rt_m_ipio2()
+  let pio2 = rt_m_pio2_parts()
+  let jk = 4
+  let jp = jk
+  let jx = nx - 1
+  let jv = word_div(e0 - 3, 24)
+  if e0 - 3 < 0 then
+    let jv = 0
+  end
+  if jv < 0 then
+    let jv = 0
+  end
+  let q0 = e0 - 24 * (jv + 1)
+  let f = rt_m_vec_zeros(40)
+  let q = rt_m_vec_zeros(40)
+  let fq = rt_m_vec_zeros(40)
+  let iq = vec_new()
+  let i = 0
+  while i < 40 do
+    vec_push(iq, 0)
+    let i = i + 1
+  end
+  let j = jv - jx
+  let m = jx + jk
+  let i = 0
+  while i <= m do
+    if j < 0 then
+      vec_set(f, i, 0.0)
+    else
+      vec_set(f, i, rt_m_float(ipio2[j]))
+    end
+    let i = i + 1
+    let j = j + 1
+  end
+  let i = 0
+  while i <= jk do
+    let fw = 0.0
+    let jj = 0
+    while jj <= jx do
+      let fw = fw + vec_get(tx, jj) * vec_get(f, jx + i - jj)
+      let jj = jj + 1
+    end
+    vec_set(q, i, fw)
+    let i = i + 1
+  end
+  let jz = jk
+  let again = true
+  let n = 0
+  let ih = 0
+  let z = 0.0
+  while again do
+    let again = false
+    # distill q[] into iq[] reversingly
+    let i = 0
+    let jj = jz
+    let z = vec_get(q, jz)
+    while jj > 0 do
+      let fw = rt_m_float(rt_m_toint(5.9604644775390625e-08 * z))
+      vec_set(iq, i, rt_m_toint(z - 16777216.0 * fw))
+      let z = vec_get(q, jj - 1) + fw
+      let i = i + 1
+      let jj = jj - 1
+    end
+    let z = rt_m_scalbn(z, q0)
+    let z = z - 8.0 * rt_m_floor(z * 0.125)
+    let n = rt_m_toint(z)
+    let z = z - rt_m_float(n)
+    let ih = 0
+    if q0 > 0 then
+      let i = word_shr(vec_get(iq, jz - 1), 24 - q0)
+      let n = n + i
+      vec_set(iq, jz - 1, vec_get(iq, jz - 1) - word_shl(i, 24 - q0))
+      let ih = word_shr(vec_get(iq, jz - 1), 23 - q0)
+    elif q0 == 0 then
+      let ih = word_shr(vec_get(iq, jz - 1), 23)
+    elif z >= 0.5 then
+      let ih = 2
+    end
+    if ih > 0 then
+      let n = n + 1
+      let carry = 0
+      let i = 0
+      while i < jz do
+        let jj = vec_get(iq, i)
+        if carry == 0 then
+          if jj != 0 then
+            let carry = 1
+            vec_set(iq, i, 16777216 - jj)
+          end
+        else
+          vec_set(iq, i, 16777215 - jj)
+        end
+        let i = i + 1
+      end
+      if q0 == 1 then
+        vec_set(iq, jz - 1, word_and(vec_get(iq, jz - 1), 8388607))
+      elif q0 == 2 then
+        vec_set(iq, jz - 1, word_and(vec_get(iq, jz - 1), 4194303))
+      end
+      if ih == 2 then
+        let z = 1.0 - z
+        if carry != 0 then
+          let z = z - rt_m_scalbn(1.0, q0)
+        end
+      end
+    end
+    if z == 0.0 then
+      let jj = 0
+      let i = jz - 1
+      while i >= jk do
+        let jj = word_or(jj, vec_get(iq, i))
+        let i = i - 1
+      end
+      if jj == 0 then
+        let k = 1
+        while vec_get(iq, jk - k) == 0 do
+          let k = k + 1
+        end
+        let i = jz + 1
+        while i <= jz + k do
+          vec_set(f, jx + i, rt_m_float(ipio2[jv + i]))
+          let fw = 0.0
+          let jj = 0
+          while jj <= jx do
+            let fw = fw + vec_get(tx, jj) * vec_get(f, jx + i - jj)
+            let jj = jj + 1
+          end
+          vec_set(q, i, fw)
+          let i = i + 1
+        end
+        let jz = jz + k
+        let again = true
+      end
+    end
+  end
+  if z == 0.0 then
+    let jz = jz - 1
+    let q0 = q0 - 24
+    while vec_get(iq, jz) == 0 do
+      let jz = jz - 1
+      let q0 = q0 - 24
+    end
+  else
+    let z = rt_m_scalbn(z, 0 - q0)
+    if z >= 16777216.0 then
+      let fw = rt_m_float(rt_m_toint(5.9604644775390625e-08 * z))
+      vec_set(iq, jz, rt_m_toint(z - 16777216.0 * fw))
+      let jz = jz + 1
+      let q0 = q0 + 24
+      vec_set(iq, jz, rt_m_toint(fw))
+    else
+      vec_set(iq, jz, rt_m_toint(z))
+    end
+  end
+  let fw = rt_m_scalbn(1.0, q0)
+  let i = jz
+  while i >= 0 do
+    vec_set(q, i, fw * rt_m_float(vec_get(iq, i)))
+    let fw = fw * 5.9604644775390625e-08
+    let i = i - 1
+  end
+  let i = jz
+  while i >= 0 do
+    let fw = 0.0
+    let k = 0
+    while (k <= jp) and (k <= jz - i) do
+      let fw = fw + pio2[k] * vec_get(q, i + k)
+      let k = k + 1
+    end
+    vec_set(fq, jz - i, fw)
+    let i = i - 1
+  end
+  let fw = 0.0
+  let i = jz
+  while i >= 0 do
+    let fw = fw + vec_get(fq, i)
+    let i = i - 1
+  end
+  let y0 = fw
+  if ih != 0 then
+    let y0 = rt_m_neg(fw)
+  end
+  let fw = vec_get(fq, 0) - fw
+  let i = 1
+  while i <= jz do
+    let fw = fw + vec_get(fq, i)
+    let i = i + 1
+  end
+  let y1 = fw
+  if ih != 0 then
+    let y1 = rt_m_neg(fw)
+  end
+  return [word_and(n, 7), y0, y1]
+end
+
+# Medium arguments, |x| below about 2^20 * pi/2: n = round(x / (pi/2)) and up
+# to three rounds of subtracting n * pi/2.
+make a function called rt_m_rem_pio2_medium takes x, ix returns result
+  let fn = x * 6.36619772367581382433e-01 + 6755399441055744.0 - 6755399441055744.0
+  let n = rt_m_toint(fn)
+  let r = x - fn * 1.57079632673412561417e+00
+  let w = fn * 6.07710050650619224932e-11
+  if r - w < -7.85398163397448278999e-01 then
+    let n = n - 1
+    let fn = fn - 1.0
+    let r = x - fn * 1.57079632673412561417e+00
+    let w = fn * 6.07710050650619224932e-11
+  elif r - w > 7.85398163397448278999e-01 then
+    let n = n + 1
+    let fn = fn + 1.0
+    let r = x - fn * 1.57079632673412561417e+00
+    let w = fn * 6.07710050650619224932e-11
+  end
+  let y0 = r - w
+  let ey = word_and(word_shr(rt_float_bits_of(y0), 52), 2047)
+  let ex = word_shr(ix, 20)
+  if ex - ey > 16 then
+    let t = r
+    let w = fn * 6.07710050630396597660e-11
+    let r = t - w
+    let w = fn * 2.02226624879595063154e-21 - ((t - r) - w)
+    let y0 = r - w
+    let ey = word_and(word_shr(rt_float_bits_of(y0), 52), 2047)
+    if ex - ey > 49 then
+      let t = r
+      let w = fn * 2.02226624871116645580e-21
+      let r = t - w
+      let w = fn * 8.47842766036889956997e-32 - ((t - r) - w)
+      let y0 = r - w
+    end
+  end
+  let y1 = (r - y0) - w
+  return [n, y0, y1]
+end
+
+# [n, y0, y1]: x - n * pi/2 = y0 + y1, |y0 + y1| at most about pi/4.
+make a function called rt_m_rem_pio2 takes x returns result
+  let bits = rt_float_bits_of(x)
+  let negative = bits < 0
+  let ix = word_and(rt_m_hi(x), 2147483647)
+  if ix <= 1074752122 then
+    if word_and(ix, 1048575) == 598523 then
+      return rt_m_rem_pio2_medium(x, ix)
+    end
+    if ix <= 1073928572 then
+      if not negative then
+        let z = x - 1.57079632673412561417e+00
+        let y0 = z - 6.07710050650619224932e-11
+        return [1, y0, (z - y0) - 6.07710050650619224932e-11]
+      end
+      let z = x + 1.57079632673412561417e+00
+      let y0 = z + 6.07710050650619224932e-11
+      return [-1, y0, (z - y0) + 6.07710050650619224932e-11]
+    end
+    if not negative then
+      let z = x - 2.0 * 1.57079632673412561417e+00
+      let y0 = z - 2.0 * 6.07710050650619224932e-11
+      return [2, y0, (z - y0) - 2.0 * 6.07710050650619224932e-11]
+    end
+    let z = x + 2.0 * 1.57079632673412561417e+00
+    let y0 = z + 2.0 * 6.07710050650619224932e-11
+    return [-2, y0, (z - y0) + 2.0 * 6.07710050650619224932e-11]
+  end
+  if ix <= 1075594811 then
+    if ix <= 1075183036 then
+      if ix == 1074977148 then
+        return rt_m_rem_pio2_medium(x, ix)
+      end
+      if not negative then
+        let z = x - 3.0 * 1.57079632673412561417e+00
+        let y0 = z - 3.0 * 6.07710050650619224932e-11
+        return [3, y0, (z - y0) - 3.0 * 6.07710050650619224932e-11]
+      end
+      let z = x + 3.0 * 1.57079632673412561417e+00
+      let y0 = z + 3.0 * 6.07710050650619224932e-11
+      return [-3, y0, (z - y0) + 3.0 * 6.07710050650619224932e-11]
+    end
+    if ix == 1075388923 then
+      return rt_m_rem_pio2_medium(x, ix)
+    end
+    if not negative then
+      let z = x - 4.0 * 1.57079632673412561417e+00
+      let y0 = z - 4.0 * 6.07710050650619224932e-11
+      return [4, y0, (z - y0) - 4.0 * 6.07710050650619224932e-11]
+    end
+    let z = x + 4.0 * 1.57079632673412561417e+00
+    let y0 = z + 4.0 * 6.07710050650619224932e-11
+    return [-4, y0, (z - y0) + 4.0 * 6.07710050650619224932e-11]
+  end
+  if ix < 1094263291 then
+    return rt_m_rem_pio2_medium(x, ix)
+  end
+  if ix >= 2146435072 then
+    return [0, x - x, x - x]
+  end
+  # z = |x| scaled to [2^23, 2^24), cut into three 24-bit pieces
+  let z = rt_float(word_or(word_and(bits, word_shr(-1, 12)), word_shl(1023 + 23, 52)))
+  let tx = vec_new()
+  let i = 0
+  while i < 2 do
+    let piece = rt_m_float(rt_m_toint(z))
+    vec_push(tx, piece)
+    let z = (z - piece) * 16777216.0
+    let i = i + 1
+  end
+  vec_push(tx, z)
+  while vec_get(tx, i) == 0.0 do
+    let i = i - 1
+  end
+  let big = rt_m_rem_pio2_large(tx, word_shr(ix, 20) - (1023 + 23), i + 1)
+  if negative then
+    return [0 - big[0], rt_m_neg(big[1]), rt_m_neg(big[2])]
+  end
+  return big
+end
+
+# ---- sin, cos, tan ----
+
+make a function called rt_m_sin takes x returns r
+  let ix = word_and(rt_m_hi(x), 2147483647)
+  if ix <= 1072243195 then
+    if ix < 1045430272 then
+      return x
+    end
+    return rt_m_ksin(x, 0.0, 0)
+  end
+  if ix >= 2146435072 then
+    return x - x
+  end
+  let red = rt_m_rem_pio2(x)
+  let q = word_and(red[0], 3)
+  if q == 0 then
+    return rt_m_ksin(red[1], red[2], 1)
+  elif q == 1 then
+    return rt_m_kcos(red[1], red[2])
+  elif q == 2 then
+    return rt_m_neg(rt_m_ksin(red[1], red[2], 1))
+  end
+  return rt_m_neg(rt_m_kcos(red[1], red[2]))
+end
+
+make a function called rt_m_cos takes x returns r
+  let ix = word_and(rt_m_hi(x), 2147483647)
+  if ix <= 1072243195 then
+    if ix < 1044816030 then
+      return 1.0
+    end
+    return rt_m_kcos(x, 0.0)
+  end
+  if ix >= 2146435072 then
+    return x - x
+  end
+  let red = rt_m_rem_pio2(x)
+  let q = word_and(red[0], 3)
+  if q == 0 then
+    return rt_m_kcos(red[1], red[2])
+  elif q == 1 then
+    return rt_m_neg(rt_m_ksin(red[1], red[2], 1))
+  elif q == 2 then
+    return rt_m_neg(rt_m_kcos(red[1], red[2]))
+  end
+  return rt_m_ksin(red[1], red[2], 1)
+end
+
+make a function called rt_m_tan takes x returns r
+  let ix = word_and(rt_m_hi(x), 2147483647)
+  if ix <= 1072243195 then
+    if ix < 1044381696 then
+      return x
+    end
+    return rt_m_ktan(x, 0.0, 0)
+  end
+  if ix >= 2146435072 then
+    return x - x
+  end
+  let red = rt_m_rem_pio2(x)
+  return rt_m_ktan(red[1], red[2], word_and(red[0], 1))
+end
+
+# ---- asin, acos, atan, atan2 ----
+
+make a function called rt_m_asin_r takes z returns r
+  let p = z * (1.66666666666666657415e-01 + z * (-3.25565818622400915405e-01 + z * (2.01212532134862925881e-01 + z * (-4.00555345006794114027e-02 + z * (7.91534994289814532176e-04 + z * 3.47933107596021167570e-05)))))
+  let q = 1.0 + z * (-2.40339491173441421878e+00 + z * (2.02094576023350569471e+00 + z * (-6.88283971605453293030e-01 + z * 7.70381505559019352791e-02)))
+  return p / q
+end
+
+make a function called rt_m_asin takes x0 returns r
+  let x = x0
+  let hx = rt_m_hi(x)
+  let ix = word_and(hx, 2147483647)
+  if ix >= 1072693248 then
+    if word_or(ix - 1072693248, rt_m_lo(x)) == 0 then
+      return x * 1.57079632679489655800e+00
+    end
+    return 0.0 / (x - x)
+  end
+  if ix < 1071644672 then
+    if (ix < 1045430272) and (ix >= 1048576) then
+      return x
+    end
+    return x + x * rt_m_asin_r(x * x)
+  end
+  let z = (1.0 - rt_m_fabs(x)) * 0.5
+  let s = rt_m_sqrt(z)
+  let r = rt_m_asin_r(z)
+  if ix >= 1072640819 then
+    let x = 1.57079632679489655800e+00 - (2.0 * (s + s * r) - 6.12323399573676603587e-17)
+  else
+    let f = rt_m_set_lo(s, 0)
+    let c = (z - f * f) / (s + f)
+    let x = 0.5 * 1.57079632679489655800e+00 - (2.0 * s * r - (6.12323399573676603587e-17 - 2.0 * c) - (0.5 * 1.57079632679489655800e+00 - 2.0 * f))
+  end
+  if word_shr(hx, 31) == 1 then
+    return rt_m_neg(x)
+  end
+  return x
+end
+
+make a function called rt_m_acos takes x returns r
+  let hx = rt_m_hi(x)
+  let ix = word_and(hx, 2147483647)
+  if ix >= 1072693248 then
+    if word_or(ix - 1072693248, rt_m_lo(x)) == 0 then
+      if word_shr(hx, 31) == 1 then
+        return 2.0 * 1.57079632679489655800e+00
+      end
+      return 0.0
+    end
+    return 0.0 / (x - x)
+  end
+  if ix < 1071644672 then
+    if ix <= 1012924416 then
+      return 1.57079632679489655800e+00
+    end
+    return 1.57079632679489655800e+00 - (x - (6.12323399573676603587e-17 - x * rt_m_asin_r(x * x)))
+  end
+  if word_shr(hx, 31) == 1 then
+    let z = (1.0 + x) * 0.5
+    let s = rt_m_sqrt(z)
+    let w = rt_m_asin_r(z) * s - 6.12323399573676603587e-17
+    return 2.0 * (1.57079632679489655800e+00 - (s + w))
+  end
+  let z = (1.0 - x) * 0.5
+  let s = rt_m_sqrt(z)
+  let df = rt_m_set_lo(s, 0)
+  let c = (z - df * df) / (s + df)
+  let w = rt_m_asin_r(z) * s + c
+  return 2.0 * (df + w)
+end
+
+make a function called rt_m_atan takes x0 returns r
+  let x = x0
+  let hx = rt_m_hi(x)
+  let negative = word_shr(hx, 31) == 1
+  let ix = word_and(hx, 2147483647)
+  if ix >= 1141899264 then
+    if x != x then
+      return x
+    end
+    if negative then
+      return -1.57079632679489655800e+00
+    end
+    return 1.57079632679489655800e+00
+  end
+  let id = -1
+  if ix < 1071382528 then
+    if ix < 1044381696 then
+      return x
+    end
+  else
+    let x = rt_m_fabs(x)
+    if ix < 1072889856 then
+      if ix < 1072037888 then
+        let id = 0
+        let x = (2.0 * x - 1.0) / (2.0 + x)
+      else
+        let id = 1
+        let x = (x - 1.0) / (x + 1.0)
+      end
+    elif ix < 1073971200 then
+      let id = 2
+      let x = (x - 1.5) / (1.0 + 1.5 * x)
+    else
+      let id = 3
+      let x = -1.0 / x
+    end
+  end
+  let z = x * x
+  let w = z * z
+  let s1 = z * (3.33333333333329318027e-01 + w * (1.42857142725034663711e-01 + w * (9.09088713343650656196e-02 + w * (6.66107313738753120669e-02 + w * (4.97687799461593236017e-02 + w * 1.62858201153657823623e-02)))))
+  let s2 = w * (-1.99999999998764832476e-01 + w * (-1.11111104054623557880e-01 + w * (-7.69187620504482999495e-02 + w * (-5.83357013379057348645e-02 + w * -3.65315727442169155270e-02))))
+  if id < 0 then
+    return x - x * (s1 + s2)
+  end
+  let hi = [4.63647609000806093515e-01, 7.85398163397448278999e-01, 9.82793723247329054082e-01, 1.57079632679489655800e+00]
+  let lo = [2.26987774529616870924e-17, 3.06161699786838301793e-17, 1.39033110312309984516e-17, 6.12323399573676603587e-17]
+  let z = hi[id] - (x * (s1 + s2) - lo[id] - x)
+  if negative then
+    return rt_m_neg(z)
+  end
+  return z
+end
+
+make a function called rt_m_atan2 takes y, x returns r
+  let pi = 3.1415926535897931160E+00
+  let pi_lo = 1.2246467991473531772E-16
+  if (x != x) or (y != y) then
+    return x + y
+  end
+  let ix = rt_m_hi(x)
+  let lx = rt_m_lo(x)
+  let iy = rt_m_hi(y)
+  let ly = rt_m_lo(y)
+  if (ix == 1072693248) and (lx == 0) then
+    return rt_m_atan(y)
+  end
+  let m = word_or(word_and(word_shr(iy, 31), 1), word_and(word_shr(ix, 30), 2))
+  let ix = word_and(ix, 2147483647)
+  let iy = word_and(iy, 2147483647)
+  if word_or(iy, ly) == 0 then
+    if m <= 1 then
+      return y
+    elif m == 2 then
+      return pi
+    end
+    return rt_m_neg(pi)
+  end
+  if word_or(ix, lx) == 0 then
+    if word_and(m, 1) == 1 then
+      return rt_m_neg(pi / 2.0)
+    end
+    return pi / 2.0
+  end
+  if ix == 2146435072 then
+    if iy == 2146435072 then
+      if m == 0 then
+        return pi / 4.0
+      elif m == 1 then
+        return rt_m_neg(pi / 4.0)
+      elif m == 2 then
+        return 3.0 * pi / 4.0
+      end
+      return rt_m_neg(3.0 * pi / 4.0)
+    end
+    if m == 0 then
+      return 0.0
+    elif m == 1 then
+      return rt_m_neg(0.0)
+    elif m == 2 then
+      return pi
+    end
+    return rt_m_neg(pi)
+  end
+  if (ix + 67108864 < iy) or (iy == 2146435072) then
+    if word_and(m, 1) == 1 then
+      return rt_m_neg(pi / 2.0)
+    end
+    return pi / 2.0
+  end
+  if (word_and(m, 2) == 2) and (iy + 67108864 < ix) then
+    let z = 0.0
+  else
+    let z = rt_m_atan(rt_m_fabs(y / x))
+  end
+  if m == 0 then
+    return z
+  elif m == 1 then
+    return rt_m_neg(z)
+  elif m == 2 then
+    return pi - (z - pi_lo)
+  end
+  return (z - pi_lo) - pi
+end

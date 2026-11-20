@@ -45,6 +45,11 @@ Feature: the repository keeps its own rules
     When its code is searched for "" + get(
     Then there are none: a missing field reads as unit, so the test is == unit (spec 1.5)
 
+  Scenario: the runtime reaches the system only through its two OS files
+    Given every PatLang file under self_hosting/v2/runtime
+    When its code is searched for extern_call, and the two OS files for the functions they define
+    Then only os_windows.patlang calls a Windows library, only os_linux.patlang makes a system call, and the two define the same names
+
   Scenario: every file a language scenario includes by its path from the root is a gates input
     Given every spec_library/language feature's lines of the form include "{root}/PATH"
     When gates.patlang is searched for PATH, or for a directory holding it

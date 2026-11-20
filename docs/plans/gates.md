@@ -108,7 +108,11 @@ finished.
     (`spec_out()`, `lib/v2_engines.patlang`), and three fixtures that wrote fixed
     paths write there. Each runner runs a list of feature files, or lists its own
     with `--list` (`run_suite`, `lib/gherkin.patlang`), and exits 1 when a test
-    fails. The build-daemon feature backed up its shared history file in a step of
+    fails. A suite whose runner lists nothing becomes one failing unit,
+    `SUITE/listing` (`self_hosting/v2/tools/gates_fail.patlang`), so it cannot pass
+    by running nothing: `language_linux` once did, its runner's arguments put where
+    its source belongs (a suite's arguments start with the runner's source, which
+    is what lists it). The build-daemon feature backed up its shared history file in a step of
     the signals feature; it takes the backup itself now, so each feature runs alone.
   - `cpu_count`, `cpu_times`, `memory_status` and `exec_measured` are in the runtime
     (spec 1.13). `exec_measured` runs the command in a job object, so its peak is the
@@ -208,3 +212,26 @@ finished.
 - **Planning takes seconds:** the planner (`plan`, runtime `logic.patlang`)
   grew as the cube of the stale units, 546 s for 511 of them; it now grows as
   their square.
+
+2026-11-20:
+
+- **`part1_linux`** runs the part-1 fixtures as Linux executables: each is built
+  with `v2.exe --linux` (a static ELF, lib/x64_elf_link.patlang) and run under
+  WSL's Ubuntu-24.04 (`v2_linux_run`, lib/v2_engines.patlang), through
+  `spec/linux_peak.patlang`, itself a Linux build, which gives the fixture's
+  output and its peak resident set from `wait4` (wsl.exe's own peak would say
+  nothing about the fixture).
+- **`language_linux`** runs the language scenarios with `--linux` given to the
+  runner: "compiled" is then a Linux build run under WSL (`run_compiled_linux`,
+  lib/program_run.patlang). A scenario whose program starts the interpreter
+  starts the Linux build, `self_hosting/build/v2_interp_linux` (the unit
+  `interpreter_linux`), since a Windows interpreter started through WSL's
+  interop listens on a loopback the Linux program cannot reach.
+- **Lanes are per feature file.** A suite's lane names a set of resources its
+  scenarios hold (a fixed port, a queue topic, a file in the tree); unit
+  `SUITE/FEATURE` gets the lane `LANE/FEATURE`. `language_interp`,
+  `language_v2`, `language_linux` and `match` share the lane `language`, so
+  one feature never runs on two engines at once, and different features run
+  side by side. (`language_linux` first had a lane of its own: its
+  `build_daemon_exemplar` ran beside `language_v2`'s, and the two shared
+  port 9410, the task registry and the daemon's history file.)

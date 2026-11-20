@@ -22,6 +22,7 @@
 # with --wasm, the program as a WebAssembly module for the host in
 # self_hosting/v2/wasm/ (wasm.patlang), and nothing else.
 include "../lib/x64_pe_link.patlang"
+include "../lib/x64_elf_link.patlang"
 include "ir.patlang"
 include "lower.patlang"
 include "front.patlang"
@@ -190,7 +191,7 @@ make a function called v2_import_spec takes fns returns spec
     let k = 0
     while k < list_len(instrs) do
       let ins = instrs[k]
-      if (ins[0] == "extern") or (ins[0] == "externf") then
+      if ((ins[0] == "extern") or (ins[0] == "externf")) and (ins[2] != "LINUX") then
         let lib = ins[2]
         let fname = ins[3]
         let li = 0
@@ -265,10 +266,10 @@ make a function called v2_times_text takes times returns text
   return sb_str(tb)
 end
 
-make a function called v2_compile takes src_path, out_path, workers, seed, cache, runtime_ensures returns result
+make a function called v2_compile takes src_path, out_path, workers, seed, cache, runtime_ensures, target returns result
   let times = vec_new()
   vec_push(times, now_ms())
-  let front = v2_front_end(src_path, "", runtime_ensures)
+  let front = v2_front_end_for(src_path, "", runtime_ensures, target)
   v2_mark(times, "front end", out_path)
   if front[0] == "error" then
     return front
@@ -295,14 +296,13 @@ make a function called v2_compile takes src_path, out_path, workers, seed, cache
   if cache then
     let dir = v2_artefact_dir()
     if not file_exists(dir) then
-      # cmd reads / as a switch: the path with backslashes
-      exec_capture("cmd", "/c", "mkdir", "self_hosting" + chr(92) + "build" + chr(92) + "v2_artefacts")
+      make_directory(dir)
     end
   end
   let base = key
   v2_mark(times, "compiler key", out_path)
   let table = jb_summaries(fns)
-  let entry = xv_entry_asm()
+  let entry = xv_entry_asm_for(target)
   let jobs = [[0, "asm", entry, facts, jb_entry_key(base, entry), dir]]
   let i = 0
   while i < list_len(fns) do
@@ -342,7 +342,11 @@ make a function called v2_compile takes src_path, out_path, workers, seed, cache
   vec_push(times, ["jobs: assembling", job_ms[1]])
   vec_push(times, ["jobs: storing", job_ms[2]])
   vec_set(times, 0, now_ms())
-  let linked = x64_link(chunks, v2_import_spec(fns), "main", out_path)
+  if target == "linux" then
+    let linked = x64_link_elf(chunks, "_start", out_path)
+  else
+    let linked = x64_link(chunks, v2_import_spec(fns), "main", out_path)
+  end
   v2_mark(times, "link", out_path)
   write_file(out_path + ".timing", v2_times_text(times))
   if str_starts_with(linked, "LINK ERROR") then
@@ -488,7 +492,7 @@ elif (list_len(args) == 2) and (args[1] == "--names") then
     exit_with(1)
   end
 elif list_len(args) < 2 then
-  print("usage: compile.patlang SRC.patlang OUT.exe [--workers N] [--shuffle SEED] [--no-cache]")
+  print("usage: compile.patlang SRC.patlang OUT.exe [--workers N] [--shuffle SEED] [--no-cache] [--linux | --windows]")
   print("       compile.patlang SRC.patlang --names")
   print("       compile.patlang SRC.patlang OUT.ir --ir")
   print("       compile.patlang SRC.patlang OUT.wasm --wasm")
@@ -502,6 +506,8 @@ else
   let runtime_ensures = false
   let ir = false
   let wasm = false
+  # a build for the system the compiler runs on, unless told otherwise
+  let target = os_target()
   let i = 2
   while i < list_len(args) do
     if (args[i] == "--workers") and (i + 1 < list_len(args)) then
@@ -518,6 +524,10 @@ else
       let ir = true
     elif args[i] == "--wasm" then
       let wasm = true
+    elif args[i] == "--linux" then
+      let target = "linux"
+    elif args[i] == "--windows" then
+      let target = "windows"
     end
     let i = i + 1
   end
@@ -527,7 +537,7 @@ else
   elif wasm then
     let r = v2_write_wasm(args[0], args[1], runtime_ensures)
   else
-    let r = v2_compile(args[0], args[1], workers, seed, cache, runtime_ensures)
+    let r = v2_compile(args[0], args[1], workers, seed, cache, runtime_ensures, target)
   end
   if r[0] == "ok" then
     print("v2: " + r[1])

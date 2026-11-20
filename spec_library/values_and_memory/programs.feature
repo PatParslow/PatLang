@@ -31,6 +31,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When path_absolute reads each
     Then each gives the same full path, longer than the relative one, ending in it, naming a file that exists, with no backslash
 
+  Scenario: the console a key at a time, and the directory the program runs in
+    Given standard input that is not a console, and the directory the program starts in
+    When console_raw_enable, console_raw_disable, cwd and set_cwd run
+    Then raw mode gives -1 and changes nothing, the echoes write with no line end, and cwd follows set_cwd there and back, unchanged by a directory that is missing
+
   Scenario: a path holding the character with code 0 stops the program before the system sees it
     Given write_file of a path whose name is followed by code 0 and .tmp
     When it runs

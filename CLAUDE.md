@@ -34,6 +34,17 @@ Run from the repository root: `v2.exe` reads the runtime from
 * Compile: `self_hosting/build/v2.exe SRC.patlang OUT.exe [--workers N]`; also
   `OUT.ir --ir`, `OUT.wasm --wasm`, and `SRC --constant-time`. `--check-runtime` also checks
   the runtime's `ensure` clauses, which a build leaves out by default (spec 2.4).
+* Linux: `v2.exe SRC.patlang OUT --linux` builds a static Linux executable (a PIE, no
+  libc: `runtime/os_linux.patlang` by system calls, `lib/x64_elf_link.patlang`); a
+  compiler built so runs on Linux and builds for Linux by default (`--windows` for a
+  PE). Run one here under WSL: `MSYS_NO_PATHCONV=1 wsl -d Ubuntu-24.04 -e /mnt/d/...`
+  (from Git Bash the variable stops /mnt being rewritten), or `v2_linux_run`
+  (`lib/v2_engines.patlang`). The runtime reaches the system only in
+  `runtime/os_windows.patlang` and `os_linux.patlang`, which define the same functions.
+* Installing a compiler by hand: copy its `.key` beside it too (`v2.exe.key`), or it
+  reuses chunks the previous compiler made. A new runtime file needs a compiler that
+  lists it first: build from a wrapper including both (`compile.patlang` and the file),
+  then let that compiler build the next.
 * Interpret: `self_hosting/build/v2_interp.exe SRC.patlang [args...]`
 * Rebuild the interpreter after a runtime or interpreter change:
   `self_hosting/build/v2.exe self_hosting/v2/interp.patlang self_hosting/build/v2_interp.exe --workers 4`

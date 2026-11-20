@@ -20,3 +20,8 @@ Feature: powers, trigonometry, rounding, bits and the small file functions
     Given ints, floats, rationals and a bigint
     When a program applies max and min
     Then each gives the larger or the smaller, keeping its kind
+
+  Scenario: an operation on two floats costs about what one on two ints does
+    Given a loop of 200000 float additions and multiplications, and one of int ones
+    When each runs three times
+    Then the best float run takes no more than four times the best int run

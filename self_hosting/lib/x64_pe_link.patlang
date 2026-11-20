@@ -207,123 +207,12 @@ make a function called x64_link_ticking takes ctx, chunks, import_spec, entry_sy
   # dozen lines down (see its own comment there). Kept anyway: avoiding
   # one host-call dispatch per byte of a ~531KB buffer is a real,
   # independently worthwhile improvement, just not the dominant one here.
-  let merged_text = bytes_new(0)
-  let merged_data = bytes_new(0)
-  let merged_bss = 0
-  let all_symbols = vec_new()
-  let all_relocs = vec_new()
-  let ci = 0
-  let cn = to_num(list_len(chunks))
-  while ci < cn do
-    let chunk = chunks[ci]
-    let text_base = bytes_len(merged_text)
-    let data_base = bytes_len(merged_data)
-    let bss_base = merged_bss
-    bytes_extend(merged_text, chunk[1])
-    bytes_extend(merged_data, chunk[2])
-    let merged_bss = merged_bss + chunk[3]
-
-    # Real bug found (session 8, native-toolchain cutover): every chunk
-    # is assembled independently, and x64_string_label_for() (codegen_
-    # x64.patlang) derives its labels from THIS chunk's own func_name+
-    # instruction-index pairs, starting again from "S_<fn>_0" for every
-    # emit_program_x64() call -- meaning the runtime chunk's own string
-    # labels and the SEPARATE per-function program chunks' own string
-    # labels (each function is its own tiny "program" per x64_compile_
-    # unit.patlang's ensure_chunk_native) can still reuse the exact same
-    # bare names across chunks (same func_name, e.g. two chunks each
-    # defining their own "main"). None of these
-    # are ever declared `global` (only real cross-chunk references like
-    # function names are), so `is_global` (sym[3]) is false for all of
-    # them -- but this flat symbol table used to key EVERY symbol by its
-    # bare name regardless, so chunk B's own "S0" would silently
-    # OVERWRITE chunk A's "S0" in the shared Dict the moment both
-    # chunks' symbols were collected, corrupting any relocation in chunk
-    # A that referenced its own "S0" to point at chunk B's data instead.
-    # NASM never hits this because a real .obj file gives every non-
-    # `global` label real LOCAL (file-scoped) symbol visibility -- this
-    # simple linker's one flat table had no equivalent scoping. Fixed by
-    # giving every NON-global symbol (and every reloc target that
-    # resolves to one) a chunk-unique prefix, so same-named locals from
-    # different chunks never collide; only genuinely `global` names
-    # (still bare) are visible across chunk boundaries, matching real
-    # symbol-visibility semantics.
-    let syms = chunk[4]
-    let local_names = []
-    let local_at = []
-    let si = 0
-    let sn = to_num(list_len(syms))
-    while si < sn do
-      let sym = syms[si]
-      let name = sym[0]
-      let section = sym[1]
-      let offset = sym[2]
-      let is_global = sym[3]
-      let base = text_base
-      if section == "data" then
-        let base = data_base
-      else
-        if section == "bss" then
-          let base = bss_base
-        end
-      end
-      let key = name
-      if not is_global then
-        let key = "$L" + ci + "$" + name
-        let local_names = list_push(local_names, name)
-        let local_at = list_push(local_at, vec_len(all_symbols) + 1)
-      end
-      vec_push(all_symbols, [key, section, base + offset, is_global])
-      let si = si + 1
-    end
-
-    # Real bug found (2026-10-19, same investigation as the chunk-merge
-    # fix above): list_contains_str(local_names, target) below was a
-    # LINEAR SCAN over local_names, called once per RELOCATION -- for
-    # the runtime chunk specifically (tens of thousands of local symbols
-    # AND tens of thousands of relocations), that is tens of millions of
-    # string comparisons per --x64 compile, dominating the whole link
-    # step (confirmed via direct timing: ~98 of ~100 seconds, isolated
-    # precisely to this one loop). Completely unrelated to the chunk-
-    # merge/list_push issue above -- found only by instrumenting further
-    # once fixing that one didn't move the measured time at all. Fixed
-    # the same way xpl_build_index already fixes the equivalent problem
-    # for the full symbol table: index local_names ONCE per chunk,
-    # rather than linear-scanning it once per relocation. Values don't
-    # matter for a membership check -- local_names doubles as its own
-    # value list; xpl_index_lookup returning anything other than `false`
-    # means "found".
-    #
-    # The index gives a local name's place in all_symbols, plus one, so a
-    # relocation to a local is resolved here: it needs no key built for
-    # it and no second lookup, and the symbol table indexed below holds
-    # only the global names. A relocation's last field is that place plus
-    # one, or 0 for a global target looked up by name.
-    let local_names_index = xpl_build_index(local_names, local_at)
-    let relocs = chunk[5]
-    let ri = 0
-    let rn = to_num(list_len(relocs))
-    while ri < rn do
-      let reloc = relocs[ri]
-      let section = reloc[0]
-      let offset = reloc[1]
-      let target = reloc[2]
-      let kind = reloc[3]
-      let addend = reloc[4]
-      let base = text_base
-      if section == "data" then
-        let base = data_base
-      end
-      let local = xpl_index_lookup(local_names_index, target)
-      if local == false then
-        let local = 0
-      end
-      vec_push(all_relocs, [section, base + offset, target, kind, addend, local])
-      let ri = ri + 1
-    end
-    let ci = ci + 1
-  end
-
+  let merged = xpl_merge_chunks(chunks)
+  let merged_text = merged[0]
+  let merged_data = merged[1]
+  let merged_bss = merged[2]
+  let all_symbols = merged[3]
+  let all_relocs = merged[4]
   # ---- Import-thunk generation: one 6-byte `jmp [rel iat_slot]`
   # (FF 25 disp32) per imported function, placed at the START of .text
   # so their RVAs are known before user code offsets are rebased.
@@ -972,4 +861,130 @@ make a function called xpl_emit_section_header takes b, name, virtual_size, rva,
   let out = xpl_emit_u16(out, 0)
   let out = xpl_emit_u32(out, characteristics)
   return out
+end
+
+# The chunks merged: [text bytes, data bytes, bss size, symbols, relocations].
+# A symbol is [key, section, offset in its merged section, global]; a local
+# one's key is made unique to its chunk. A relocation is [section, offset,
+# target, kind, addend, the target's place in the symbols plus one or 0 for a
+# global looked up by name]. The PE and ELF writers both start from it.
+make a function called xpl_merge_chunks takes chunks returns merged
+  let merged_text = bytes_new(0)
+  let merged_data = bytes_new(0)
+  let merged_bss = 0
+  let all_symbols = vec_new()
+  let all_relocs = vec_new()
+  let ci = 0
+  let cn = to_num(list_len(chunks))
+  while ci < cn do
+    let chunk = chunks[ci]
+    let text_base = bytes_len(merged_text)
+    let data_base = bytes_len(merged_data)
+    let bss_base = merged_bss
+    bytes_extend(merged_text, chunk[1])
+    bytes_extend(merged_data, chunk[2])
+    let merged_bss = merged_bss + chunk[3]
+
+    # Real bug found (session 8, native-toolchain cutover): every chunk
+    # is assembled independently, and x64_string_label_for() (codegen_
+    # x64.patlang) derives its labels from THIS chunk's own func_name+
+    # instruction-index pairs, starting again from "S_<fn>_0" for every
+    # emit_program_x64() call -- meaning the runtime chunk's own string
+    # labels and the SEPARATE per-function program chunks' own string
+    # labels (each function is its own tiny "program" per x64_compile_
+    # unit.patlang's ensure_chunk_native) can still reuse the exact same
+    # bare names across chunks (same func_name, e.g. two chunks each
+    # defining their own "main"). None of these
+    # are ever declared `global` (only real cross-chunk references like
+    # function names are), so `is_global` (sym[3]) is false for all of
+    # them -- but this flat symbol table used to key EVERY symbol by its
+    # bare name regardless, so chunk B's own "S0" would silently
+    # OVERWRITE chunk A's "S0" in the shared Dict the moment both
+    # chunks' symbols were collected, corrupting any relocation in chunk
+    # A that referenced its own "S0" to point at chunk B's data instead.
+    # NASM never hits this because a real .obj file gives every non-
+    # `global` label real LOCAL (file-scoped) symbol visibility -- this
+    # simple linker's one flat table had no equivalent scoping. Fixed by
+    # giving every NON-global symbol (and every reloc target that
+    # resolves to one) a chunk-unique prefix, so same-named locals from
+    # different chunks never collide; only genuinely `global` names
+    # (still bare) are visible across chunk boundaries, matching real
+    # symbol-visibility semantics.
+    let syms = chunk[4]
+    let local_names = []
+    let local_at = []
+    let si = 0
+    let sn = to_num(list_len(syms))
+    while si < sn do
+      let sym = syms[si]
+      let name = sym[0]
+      let section = sym[1]
+      let offset = sym[2]
+      let is_global = sym[3]
+      let base = text_base
+      if section == "data" then
+        let base = data_base
+      else
+        if section == "bss" then
+          let base = bss_base
+        end
+      end
+      let key = name
+      if not is_global then
+        let key = "$L" + ci + "$" + name
+        let local_names = list_push(local_names, name)
+        let local_at = list_push(local_at, vec_len(all_symbols) + 1)
+      end
+      vec_push(all_symbols, [key, section, base + offset, is_global])
+      let si = si + 1
+    end
+
+    # Real bug found (2026-10-19, same investigation as the chunk-merge
+    # fix above): list_contains_str(local_names, target) below was a
+    # LINEAR SCAN over local_names, called once per RELOCATION -- for
+    # the runtime chunk specifically (tens of thousands of local symbols
+    # AND tens of thousands of relocations), that is tens of millions of
+    # string comparisons per --x64 compile, dominating the whole link
+    # step (confirmed via direct timing: ~98 of ~100 seconds, isolated
+    # precisely to this one loop). Completely unrelated to the chunk-
+    # merge/list_push issue above -- found only by instrumenting further
+    # once fixing that one didn't move the measured time at all. Fixed
+    # the same way xpl_build_index already fixes the equivalent problem
+    # for the full symbol table: index local_names ONCE per chunk,
+    # rather than linear-scanning it once per relocation. Values don't
+    # matter for a membership check -- local_names doubles as its own
+    # value list; xpl_index_lookup returning anything other than `false`
+    # means "found".
+    #
+    # The index gives a local name's place in all_symbols, plus one, so a
+    # relocation to a local is resolved here: it needs no key built for
+    # it and no second lookup, and the symbol table indexed below holds
+    # only the global names. A relocation's last field is that place plus
+    # one, or 0 for a global target looked up by name.
+    let local_names_index = xpl_build_index(local_names, local_at)
+    let relocs = chunk[5]
+    let ri = 0
+    let rn = to_num(list_len(relocs))
+    while ri < rn do
+      let reloc = relocs[ri]
+      let section = reloc[0]
+      let offset = reloc[1]
+      let target = reloc[2]
+      let kind = reloc[3]
+      let addend = reloc[4]
+      let base = text_base
+      if section == "data" then
+        let base = data_base
+      end
+      let local = xpl_index_lookup(local_names_index, target)
+      if local == false then
+        let local = 0
+      end
+      vec_push(all_relocs, [section, base + offset, target, kind, addend, local])
+      let ri = ri + 1
+    end
+    let ci = ci + 1
+  end
+
+  return [merged_text, merged_data, merged_bss, all_symbols, all_relocs]
 end

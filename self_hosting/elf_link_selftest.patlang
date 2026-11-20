@@ -1,0 +1,88 @@
+# Selftest for self_hosting/lib/x64_elf_link.patlang: a static Linux
+# executable from assembled chunks.
+#
+# Given two chunks, one with _start (which writes a line held in another
+# chunk's data through a call, then exits with status 0 by exit_group) and one
+# with the function it calls, when they are linked as ELF and the file is run
+# under WSL, then it prints the line, by system calls alone; its header says
+# ELF64, x86-64, an executable, with the entry where _start is; an undefined
+# symbol and a missing entry are each refused with a LINK ERROR naming them.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/v2_engines.patlang"
+include "lib/program_run.patlang"
+include "lib/x64_elf_link.patlang"
+
+# A Windows path as WSL sees it: D:/x/y is /mnt/d/x/y.
+make a function called el_wsl_path takes p returns q
+  let a = path_absolute(p)
+  let drive = chr(char_code(a, 0) + 32)
+  if (char_code(a, 0) >= 97) then
+    let drive = chr(char_code(a, 0))
+  end
+  return "/mnt/" + drive + substr(a, 2, a.length - 2)
+end
+
+let ctx = ctx_new()
+expect(ctx, "wsl is on the PATH", has_program("wsl"), true)
+
+let main_asm = "section .text
+global _start
+_start:
+  mov rdi, 1
+  lea rsi, [rel msg]
+  mov rdx, 15
+  call say
+  mov rax, 231
+  mov rdi, 0
+  syscall
+section .data
+msg:
+  db 104, 101, 108, 108, 111, 32, 102, 114, 111, 109, 32, 69, 76, 70, 10
+"
+let say_asm = "section .text
+global say
+say:
+  mov rax, 1
+  syscall
+  ret
+"
+let chunks = [x64_assemble_chunk(main_asm), x64_assemble_chunk(say_asm)]
+let out = spec_out() + "/elf_hello"
+let r = x64_link_elf(chunks, "_start", out)
+expect(ctx, "the link succeeds", r, out)
+
+let bytes = read_file_bytes(out, 0, 64)
+expect(ctx, "the file starts with the ELF magic", [bytes[0], bytes[1], bytes[2], bytes[3]], [127, 69, 76, 70])
+expect(ctx, "ELF64, little-endian", [bytes[4], bytes[5]], [2, 1])
+expect(ctx, "a position-independent image (ET_DYN) for x86-64", [bytes[16], bytes[18]], [3, 62])
+expect(ctx, "the entry is the text's start, where _start is", bytes[24] + 256 * bytes[25] + 65536 * bytes[26], 4096)
+
+let run = exec_measured("wsl", ["-d", "Ubuntu-24.04", "-e", el_wsl_path(out)])
+expect(ctx, "it runs and exits 0", run[2], true)
+expect(ctx, "and prints the line", run[0], "hello from ELF" + chr(10))
+
+let bad = x64_link_elf([x64_assemble_chunk("section .text
+global _start
+_start:
+  call nowhere
+")], "_start", spec_out() + "/elf_bad")
+expect(ctx, "an undefined symbol is refused, named", str_contains(bad, "LINK ERROR: undefined symbol 'nowhere'"), true)
+let noentry = x64_link_elf([x64_assemble_chunk(say_asm)], "_start", spec_out() + "/elf_noentry")
+expect(ctx, "a missing entry is refused, named", str_contains(noentry, "entry symbol '_start'"), true)
+
+# A compiled program, whose data holds absolute addresses (its functions, its
+# strings): it runs only if _start fixed each up, and it is loaded at another
+# address each run (ASLR), its first mapping's start read from /proc/self/maps.
+let src = spec_out() + "/elf_aslr.patlang"
+write_file(src, "let m = read_file(" + chr(34) + "/proc/self/maps" + chr(34) + ")" + chr(10) + "let b = sb_new()" + chr(10) + "let i = 0" + chr(10) + "while (i < m.length) and (m[i] != " + chr(34) + "-" + chr(34) + ") do" + chr(10) + "  sb_push(b, m[i])" + chr(10) + "  let i = i + 1" + chr(10) + "end" + chr(10) + "print(sb_str(b))" + chr(10) + "print([" + chr(34) + "lists" + chr(34) + ", 2, 3.5])" + chr(10))
+let built = v2_compile([src, spec_out() + "/elf_aslr", "--linux"])
+expect(ctx, "the compiled program builds", built[1], true)
+let one = v2_linux_run(spec_out() + "/elf_aslr", [])
+let two = v2_linux_run(spec_out() + "/elf_aslr", [])
+let l1 = split_lines(one[0])
+let l2 = split_lines(two[0])
+expect(ctx, "it runs, its data's addresses fixed up", [one[1], list_len(l1) >= 2 and (l1[1] == "[lists, 2, 3.5]")], [true, true])
+expect(ctx, "and is loaded at a different address each run", (list_len(l2) >= 1) and (l1[0] != l2[0]) and (l1[0] != "400000"), true)
+ctx_report(ctx)
