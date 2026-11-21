@@ -1,0 +1,520 @@
+# An HTTP/1.1 client (GitHub #272).
+#
+#   http_request(method, url, headers, body, options)
+#       -> ["ok", status, response_headers, body] or ["err", code, detail]
+#   http_get(url)                         http_request("GET", url, [], "", [])
+#   http_post(url, body, content_type)    a POST of body with that type
+#   http_header(response, name)           a response header's value, "" if none
+#
+# headers and response_headers are lists of [name, value]. A body is text
+# holding the bytes as they came (bytes_from_str gives them back exactly).
+# options is a list of [name, value] pairs, each optional:
+#   "max_redirects"  redirects followed before ["err", "redirects", ...] (5)
+#   "timeout_ms"     the longest wait for the next bytes (30000)
+#   "max_bytes"      the longest response, headers and body (67108864)
+# Error codes: "url", "connect", "timeout", "protocol", "too-large",
+# "redirects", and "scheme" for a URL that is not http://.
+#
+# A request asks for Connection: close, so each request has a connection of
+# its own. A body is read by its Content-Length, as chunks, or to the end of
+# the connection. Redirects (301, 302, 303, 307, 308) follow Location, and a
+# 303, or a 301 or 302 after a POST, goes on as a GET with no body.
+#
+# A host that is not this machine needs the program to have declared
+# tcp_allow_remote() (spec 1.8): without it, tcp_connect stops the program.
+
+# A URL's parts: ["ok", scheme, host, port, target] or ["err", "url", detail].
+# Only http and https, a host name or IPv4 address, an optional port, and a
+# path with its query (no fragment); "/" when there is none.
+make a function called hc_parse_url takes url returns parts
+  let b = bytes_from_str(url)
+  let n = bytes_len(b)
+  let scheme = ""
+  let at = 0
+  if (n >= 7) and (bytes_to_str(bytes_slice(b, 0, 7)) == "http://") then
+    let scheme = "http"
+    let at = 7
+  elif (n >= 8) and (bytes_to_str(bytes_slice(b, 0, 8)) == "https://") then
+    let scheme = "https"
+    let at = 8
+  else
+    return ["err", "url", url + ": not an http:// or https:// URL"]
+  end
+  let host_start = at
+  while (at < n) and (bytes_get(b, at) != 47) and (bytes_get(b, at) != 58) and (bytes_get(b, at) != 63) and (bytes_get(b, at) != 35) do
+    let at = at + 1
+  end
+  let host = bytes_to_str(bytes_slice(b, host_start, at - host_start))
+  if host == "" then
+    return ["err", "url", url + ": no host"]
+  end
+  let port = 80
+  if scheme == "https" then
+    let port = 443
+  end
+  if (at < n) and (bytes_get(b, at) == 58) then
+    let at = at + 1
+    let port_start = at
+    let value = 0
+    while (at < n) and (bytes_get(b, at) >= 48) and (bytes_get(b, at) <= 57) do
+      let value = value * 10 + bytes_get(b, at) - 48
+      let at = at + 1
+    end
+    if (at == port_start) or (value < 1) or (value > 65535) then
+      return ["err", "url", url + ": not a port"]
+    end
+    let port = value
+  end
+  let target_start = at
+  while (at < n) and (bytes_get(b, at) != 35) do
+    let at = at + 1
+  end
+  let target = bytes_to_str(bytes_slice(b, target_start, at - target_start))
+  if target == "" then
+    let target = "/"
+  elif substr(target, 0, 1) == "?" then
+    let target = "/" + target
+  end
+  if substr(target, 0, 1) != "/" then
+    return ["err", "url", url + ": the host is followed by neither a port nor a path"]
+  end
+  return ["ok", scheme, host, port, target]
+end
+
+# An option's value, or the default when options does not give it.
+make a function called hc_option takes options, name, default returns value
+  let i = 0
+  while i < list_len(options) do
+    if options[i][0] == name then
+      return options[i][1]
+    end
+    let i = i + 1
+  end
+  return default
+end
+
+# The value of the first header of that name, ignoring case, or "".
+make a function called hc_header_in takes headers, name returns value
+  let want = hc_lower(name)
+  let i = 0
+  while i < list_len(headers) do
+    if hc_lower(headers[i][0]) == want then
+      return headers[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called http_header takes response, name returns value
+  if (list_len(response) < 3) or (response[0] != "ok") then
+    return ""
+  end
+  return hc_header_in(response[2], name)
+end
+
+# ASCII letters made lower case; other bytes as they are.
+make a function called hc_lower takes text returns out
+  let b = bytes_from_str(text)
+  let i = 0
+  while i < bytes_len(b) do
+    let c = bytes_get(b, i)
+    if (c >= 65) and (c <= 90) then
+      bytes_set(b, i, c + 32)
+    end
+    let i = i + 1
+  end
+  return bytes_to_str(b)
+end
+
+# Text with the spaces and tabs at its ends taken off.
+make a function called hc_trim takes text returns out
+  let b = bytes_from_str(text)
+  let lo = 0
+  let hi = bytes_len(b)
+  while (lo < hi) and ((bytes_get(b, lo) == 32) or (bytes_get(b, lo) == 9)) do
+    let lo = lo + 1
+  end
+  while (hi > lo) and ((bytes_get(b, hi - 1) == 32) or (bytes_get(b, hi - 1) == 9)) do
+    let hi = hi - 1
+  end
+  return bytes_to_str(bytes_slice(b, lo, hi - lo))
+end
+
+# Where "\r\n\r\n" starts in b at or after from, or -1.
+make a function called hc_find_blank_line takes b, from returns at
+  let i = from
+  if i < 0 then
+    let i = 0
+  end
+  let n = bytes_len(b)
+  while i + 3 < n do
+    if (bytes_get(b, i) == 13) and (bytes_get(b, i + 1) == 10) and (bytes_get(b, i + 2) == 13) and (bytes_get(b, i + 3) == 10) then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# Where "\r\n" starts in b at or after from, or -1.
+make a function called hc_find_crlf takes b, from returns at
+  let i = from
+  let n = bytes_len(b)
+  while i + 1 < n do
+    if (bytes_get(b, i) == 13) and (bytes_get(b, i + 1) == 10) then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# The head of a response, its bytes before the blank line: ["ok", status,
+# headers] or ["err", "protocol", detail].
+make a function called hc_parse_head takes head returns parsed
+  let b = bytes_from_str(head)
+  let lines = []
+  let start = 0
+  let at = hc_find_crlf(b, 0)
+  while at >= 0 do
+    let lines = list_push(lines, bytes_to_str(bytes_slice(b, start, at - start)))
+    let start = at + 2
+    let at = hc_find_crlf(b, start)
+  end
+  let lines = list_push(lines, bytes_to_str(bytes_slice(b, start, bytes_len(b) - start)))
+  let first = bytes_from_str(lines[0])
+  # "HTTP/1.x NNN reason"
+  if (bytes_len(first) < 12) or (bytes_to_str(bytes_slice(first, 0, 7)) != "HTTP/1.") or (bytes_get(first, 8) != 32) then
+    return ["err", "protocol", "not an HTTP/1 status line: " + lines[0]]
+  end
+  let status = 0
+  let k = 9
+  while k < 12 do
+    let c = bytes_get(first, k)
+    if (c < 48) or (c > 57) then
+      return ["err", "protocol", "not an HTTP/1 status line: " + lines[0]]
+    end
+    let status = status * 10 + c - 48
+    let k = k + 1
+  end
+  let headers = []
+  let i = 1
+  while i < list_len(lines) do
+    let line = bytes_from_str(lines[i])
+    let colon = 0 - 1
+    let j = 0
+    while (j < bytes_len(line)) and (colon < 0) do
+      if bytes_get(line, j) == 58 then
+        let colon = j
+      end
+      let j = j + 1
+    end
+    if colon <= 0 then
+      return ["err", "protocol", "a header line with no name: " + lines[i]]
+    end
+    let name = bytes_to_str(bytes_slice(line, 0, colon))
+    let value = hc_trim(bytes_to_str(bytes_slice(line, colon + 1, bytes_len(line) - colon - 1)))
+    let headers = list_push(headers, [name, value])
+    let i = i + 1
+  end
+  return ["ok", status, headers]
+end
+
+# A hex number's value, or -1 when text is not one (a chunk size; anything
+# after a ";" is a chunk extension, left out).
+make a function called hc_hex_value takes text returns value
+  let b = bytes_from_str(text)
+  let value = 0
+  let digits = 0
+  let i = 0
+  let going = true
+  while going and (i < bytes_len(b)) do
+    let c = bytes_get(b, i)
+    let d = 0 - 1
+    if (c >= 48) and (c <= 57) then
+      let d = c - 48
+    elif (c >= 97) and (c <= 102) then
+      let d = c - 87
+    elif (c >= 65) and (c <= 70) then
+      let d = c - 55
+    end
+    if d >= 0 then
+      let value = value * 16 + d
+      let digits = digits + 1
+    elif (c == 59) or (c == 32) or (c == 9) then
+      let going = false
+    else
+      return 0 - 1
+    end
+    let i = i + 1
+  end
+  if digits == 0 then
+    return 0 - 1
+  end
+  return value
+end
+
+# Reads on through a chunked body in b, from where the last call stopped:
+# st is a vec [position, body so far], changed in place, so each byte is
+# looked at once however the body arrives. Gives ["ok", ended], ended once
+# the last chunk and the trailers have all arrived, or ["err", "protocol",
+# detail] for a malformed one.
+make a function called hc_unchunk takes b, st returns got
+  let n = bytes_len(b)
+  while true do
+    let at = vec_get(st, 0)
+    let eol = hc_find_crlf(b, at)
+    if eol < 0 then
+      return ["ok", false]
+    end
+    let size = hc_hex_value(bytes_to_str(bytes_slice(b, at, eol - at)))
+    if size < 0 then
+      return ["err", "protocol", "a chunk size that is not a hex number"]
+    end
+    let data = eol + 2
+    if size == 0 then
+      # the trailers, up to a blank line
+      let t = data
+      let t_end = hc_find_crlf(b, t)
+      while t_end > t do
+        let t = t_end + 2
+        let t_end = hc_find_crlf(b, t)
+      end
+      if t_end < 0 then
+        return ["ok", false]
+      end
+      return ["ok", true]
+    end
+    if data + size + 2 > n then
+      return ["ok", false]
+    end
+    bytes_extend(vec_get(st, 1), bytes_slice(b, data, size))
+    vec_set(st, 0, data + size + 2)
+  end
+  return ["ok", false]
+end
+
+# One request on a connection of its own, no redirects followed:
+# ["ok", status, headers, body] or ["err", code, detail].
+make a function called hc_exchange takes method, parts, headers, body, options returns got
+  let host = parts[2]
+  let port = parts[3]
+  let conn = tcp_try_connect(host, port)
+  if conn < 0 then
+    return ["err", "connect", "no connection to " + host + ":" + port]
+  end
+  let req = sb_new()
+  sb_push(req, method + " " + parts[4] + " HTTP/1.1" + chr(13) + chr(10))
+  let host_header = host
+  if ((parts[1] == "http") and (port != 80)) or ((parts[1] == "https") and (port != 443)) then
+    let host_header = host + ":" + port
+  end
+  sb_push(req, "Host: " + host_header + chr(13) + chr(10))
+  sb_push(req, "Connection: close" + chr(13) + chr(10))
+  if hc_header_in(headers, "User-Agent") == "" then
+    sb_push(req, "User-Agent: PatLang-http_client" + chr(13) + chr(10))
+  end
+  if (body != "") or (method == "POST") or (method == "PUT") then
+    sb_push(req, "Content-Length: " + str_len(body) + chr(13) + chr(10))
+  end
+  let i = 0
+  while i < list_len(headers) do
+    sb_push(req, headers[i][0] + ": " + headers[i][1] + chr(13) + chr(10))
+    let i = i + 1
+  end
+  sb_push(req, chr(13) + chr(10))
+  sb_push(req, body)
+  if not tcp_try_write(conn, sb_str(req)) then
+    tcp_close(conn)
+    return ["err", "connect", "the request could not be sent to " + host + ":" + port]
+  end
+  let got = hc_read_response(conn, method, options)
+  tcp_close(conn)
+  return got
+end
+
+# Reads a response from conn, to its end: ["ok", status, headers, body] or
+# ["err", code, detail].
+make a function called hc_read_response takes conn, method, options returns got
+  let timeout = hc_option(options, "timeout_ms", 30000)
+  let limit = hc_option(options, "max_bytes", 67108864)
+  let buf = bytes_new(0)
+  let head_end = 0 - 1
+  let status = 0
+  let resp_headers = []
+  let framing = ""
+  let length = 0
+  let scanned = 0
+  let ended = false
+  # a chunked body's reader: where it is (-1 before the body), what it has
+  let chunks = vec_new()
+  vec_push(chunks, 0 - 1)
+  vec_push(chunks, bytes_new(0))
+  while true do
+    if head_end >= 0 then
+      let body_start = head_end + 4
+      if framing == "length" then
+        if bytes_len(buf) - body_start >= length then
+          return ["ok", status, resp_headers, bytes_to_str(bytes_slice(buf, body_start, length))]
+        end
+      elif framing == "chunked" then
+        if vec_get(chunks, 0) < 0 then
+          vec_set(chunks, 0, body_start)
+        end
+        let un = hc_unchunk(buf, chunks)
+        if un[0] != "ok" then
+          return un
+        end
+        if un[1] then
+          return ["ok", status, resp_headers, bytes_to_str(vec_get(chunks, 1))]
+        end
+      elif framing == "none" then
+        return ["ok", status, resp_headers, ""]
+      end
+      if ended then
+        if framing == "close" then
+          return ["ok", status, resp_headers, bytes_to_str(bytes_slice(buf, body_start, bytes_len(buf) - body_start))]
+        end
+        return ["err", "protocol", "the connection ended inside the body"]
+      end
+    elif ended then
+      return ["err", "protocol", "the connection ended before the response's head"]
+    end
+    let r = tcp_read_status(conn, timeout)
+    if r[1] == "data" then
+      bytes_extend(buf, bytes_from_str(r[0]))
+      if bytes_len(buf) > limit then
+        return ["err", "too-large", "the response is over " + limit + " bytes"]
+      end
+    elif r[1] == "end" then
+      let ended = true
+    elif r[1] == "wait" then
+      return ["err", "timeout", "nothing came for " + timeout + " ms"]
+    else
+      return ["err", "connect", "the connection failed"]
+    end
+    if head_end < 0 then
+      let head_end = hc_find_blank_line(buf, scanned - 3)
+      let scanned = bytes_len(buf)
+      if head_end >= 0 then
+        let parsed = hc_parse_head(bytes_to_str(bytes_slice(buf, 0, head_end)))
+        if parsed[0] != "ok" then
+          return parsed
+        end
+        let status = parsed[1]
+        let resp_headers = parsed[2]
+        let te = hc_lower(hc_header_in(resp_headers, "Transfer-Encoding"))
+        let cl = hc_header_in(resp_headers, "Content-Length")
+        if (method == "HEAD") or (status == 204) or (status == 304) or ((status >= 100) and (status < 200)) then
+          let framing = "none"
+        elif str_contains(te, "chunked") then
+          let framing = "chunked"
+        elif cl != "" then
+          let length = hc_decimal(cl)
+          if length < 0 then
+            return ["err", "protocol", "a Content-Length that is not a number: " + cl]
+          end
+          let framing = "length"
+        else
+          let framing = "close"
+        end
+      end
+    end
+  end
+  return ["err", "protocol", "unreachable"]
+end
+
+# A decimal number's value, or -1 when text is not one.
+make a function called hc_decimal takes text returns value
+  let b = bytes_from_str(text)
+  if bytes_len(b) == 0 then
+    return 0 - 1
+  end
+  let value = 0
+  let i = 0
+  while i < bytes_len(b) do
+    let c = bytes_get(b, i)
+    if (c < 48) or (c > 57) then
+      return 0 - 1
+    end
+    let value = value * 10 + c - 48
+    let i = i + 1
+  end
+  return value
+end
+
+# Where a Location sends a request made for parts: a full URL, an absolute
+# path on the same host, or a path relative to the request's directory.
+make a function called hc_resolve_location takes parts, location returns url
+  let origin = parts[1] + "://" + parts[2]
+  if ((parts[1] == "http") and (parts[3] != 80)) or ((parts[1] == "https") and (parts[3] != 443)) then
+    let origin = origin + ":" + parts[3]
+  end
+  if (substr(location, 0, 7) == "http://") or (substr(location, 0, 8) == "https://") then
+    return location
+  end
+  if substr(location, 0, 2) == "//" then
+    return parts[1] + ":" + location
+  end
+  if substr(location, 0, 1) == "/" then
+    return origin + location
+  end
+  # relative: the request's path up to its last "/"
+  let path = bytes_from_str(parts[4])
+  let last = 0
+  let i = 0
+  while (i < bytes_len(path)) and (bytes_get(path, i) != 63) do
+    if bytes_get(path, i) == 47 then
+      let last = i
+    end
+    let i = i + 1
+  end
+  return origin + bytes_to_str(bytes_slice(path, 0, last + 1)) + location
+end
+
+make a function called http_request takes method, url, headers, body, options returns got
+  let max_redirects = hc_option(options, "max_redirects", 5)
+  let current = url
+  let m = method
+  let b = body
+  let hs = headers
+  let followed = 0
+  while true do
+    let parts = hc_parse_url(current)
+    if parts[0] != "ok" then
+      return parts
+    end
+    if parts[1] != "http" then
+      return ["err", "scheme", current + ": only http:// is supported so far"]
+    end
+    let got = hc_exchange(m, parts, hs, b, options)
+    if got[0] != "ok" then
+      return got
+    end
+    let status = got[1]
+    let location = hc_header_in(got[2], "Location")
+    if ((status == 301) or (status == 302) or (status == 303) or (status == 307) or (status == 308)) and (location != "") then
+      if followed >= max_redirects then
+        return ["err", "redirects", "more than " + max_redirects + " redirects, the last to " + location]
+      end
+      let followed = followed + 1
+      let current = hc_resolve_location(parts, location)
+      if (status == 303) or (((status == 301) or (status == 302)) and (m == "POST")) then
+        let m = "GET"
+        let b = ""
+      end
+    else
+      return got
+    end
+  end
+  return ["err", "protocol", "unreachable"]
+end
+
+make a function called http_get takes url returns got
+  return http_request("GET", url, [], "", [])
+end
+
+make a function called http_post takes url, body, content_type returns got
+  return http_request("POST", url, [["Content-Type", content_type]], body, [])
+end

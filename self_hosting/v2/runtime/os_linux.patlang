@@ -1909,8 +1909,9 @@ make a function called rt_recv takes conn returns result
     let text = rt_str_from_bytes(buf + 16, n)
   end
   rt_free(buf)
-  let result = [text, n < 0]
-  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1)
+  # the receive timeout running out is EAGAIN (11)
+  let result = [text, n < 0, n == 0 - 11]
+  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1) and (value_class(result[2]) == 1)
   return result
 end
 
@@ -1947,14 +1948,9 @@ end
 
 make a function called tcp_try_connect takes host, port returns id
   require (value_class(host) == 8) and (value_class(port) == 2)
-  let b = rt_host_bytes(host)
+  let b = rt_connect_bytes(host)
   if list_len(b) == 0 then
-    let id = rt_net_fail("tcp_connect: " + host + " is not an address: TCP connects to localhost or 127.x.x.x")
-    ensure (id >= 1) or (id == 0 - 1)
-    return id
-  end
-  if b[0] != 127 then
-    let id = rt_net_fail("tcp_connect: " + host + " is not this machine: TCP connects to localhost or 127.x.x.x")
+    let id = 0 - 1
     ensure (id >= 1) or (id == 0 - 1)
     return id
   end
@@ -1971,6 +1967,176 @@ make a function called tcp_try_connect takes host, port returns id
   let id = rt_conn_add(sock)
   ensure (id >= 1) or (id == 0 - 1)
   return id
+end
+
+# A name's IPv4 addresses, as text, with no libc: /etc/hosts first, then an A
+# query to each nameserver /etc/resolv.conf names in turn (5 seconds, twice,
+# resolv.conf's defaults), until one gives addresses. [] when none does.
+make a function called os_resolve takes name returns addrs
+  require value_class(name) == 8
+  let addrs = []
+  let hosts = rt_lx_file_words("/etc/hosts")
+  let i = 0
+  while i < list_len(hosts) do
+    let words = hosts[i]
+    if list_len(rt_host_bytes(words[0])) == 4 then
+      let j = 1
+      while j < list_len(words) do
+        if rt_lx_same_fold(words[j], name) then
+          let addrs = list_push(addrs, words[0])
+        end
+        let j = j + 1
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(addrs) > 0 then
+    ensure value_class(addrs) == 9
+    return addrs
+  end
+  let conf = rt_lx_file_words("/etc/resolv.conf")
+  let c = 0
+  while (c < list_len(conf)) and (list_len(addrs) == 0) do
+    let words = conf[c]
+    if (list_len(words) >= 2) and (words[0] == "nameserver") and (list_len(rt_host_bytes(words[1])) == 4) then
+      let addrs = dns_query(words[1], 53, name, 5000)
+    end
+    let c = c + 1
+  end
+  ensure value_class(addrs) == 9
+  return addrs
+end
+
+# A text file's lines as lists of words (split at spaces and tabs), a "#"
+# ending a line, blank lines left out; [] when the file cannot be read.
+make a function called rt_lx_file_words takes path returns lines
+  require value_class(path) == 8
+  let lines = []
+  if file_exists(path) != true then
+    ensure value_class(lines) == 9
+    return lines
+  end
+  # its bytes, so a non-ASCII character does not make each index a walk
+  let bs = bytes_from_str(read_file(path))
+  let n = bytes_len(bs)
+  let words = []
+  let word = sb_new()
+  let in_comment = false
+  let i = 0
+  while i <= n do
+    let c = 10
+    if i < n then
+      let c = bytes_get(bs, i)
+    end
+    if (c == 10) or (c == 13) then
+      if sb_len(word) > 0 then
+        let words = list_push(words, sb_str(word))
+        let word = sb_new()
+      end
+      if list_len(words) > 0 then
+        let lines = list_push(lines, words)
+      end
+      let words = []
+      let in_comment = false
+    elif in_comment then
+      # the rest of the line is a comment
+      let i = i
+    elif c == 35 then
+      let in_comment = true
+      if sb_len(word) > 0 then
+        let words = list_push(words, sb_str(word))
+        let word = sb_new()
+      end
+    elif (c == 32) or (c == 9) then
+      if sb_len(word) > 0 then
+        let words = list_push(words, sb_str(word))
+        let word = sb_new()
+      end
+    else
+      sb_push(word, chr(c))
+    end
+    let i = i + 1
+  end
+  ensure value_class(lines) == 9
+  return lines
+end
+
+# Whether two ASCII texts are the same, ignoring the case of letters (as DNS
+# names are compared).
+make a function called rt_lx_same_fold takes a, b returns yes
+  require (value_class(a) == 8) and (value_class(b) == 8)
+  if str_len(a) != str_len(b) then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let i = 0
+  while i < str_len(a) do
+    let x = rt_byte_at(a, i)
+    let y = rt_byte_at(b, i)
+    if (x >= 65) and (x <= 90) then
+      let x = x + 32
+    end
+    if (y >= 65) and (y <= 90) then
+      let y = y + 32
+    end
+    if x != y then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let i = i + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A UDP socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP), or -1.
+make a function called os_udp_open returns fd
+  let fd = extern_call("LINUX", "syscall", 41, 2, 524290, 17)
+  if rt_lx_failed(fd) then
+    let fd = 0 - 1
+  end
+  ensure value_class(fd) == 2
+  return fd
+end
+
+# Sends packet (a list of bytes) to the address's four bytes and port.
+make a function called os_udp_send takes fd, b, port, packet returns ok
+  require (value_class(fd) == 2) and (value_class(b) == 9) and (list_len(b) == 4) and (value_class(packet) == 9)
+  let addr = rt_sockaddr(b[0], b[1], b[2], b[3], port)
+  let buf = rt_bytes_block(packet)
+  let sent = extern_call("LINUX", "syscall", 44, fd, buf + 16, list_len(packet), 0, addr + 16, 16)
+  rt_free(buf)
+  rt_free(addr)
+  let ok = sent == list_len(packet)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# One datagram, waiting up to ms for it: its bytes, or [] when none came.
+make a function called os_udp_recv takes fd, ms returns bytes
+  require (value_class(fd) == 2) and (value_class(ms) == 2) and (ms >= 0)
+  rt_wait_readable(fd, ms)
+  let buf = rt_alloc(4096)
+  # recvfrom with MSG_DONTWAIT: nothing waiting gives EAGAIN, not a wait
+  let n = extern_call("LINUX", "syscall", 45, fd, buf + 16, 4096, 64, 0, 0)
+  let bytes = []
+  if not rt_lx_failed(n) then
+    let bytes = rt_block_bytes(buf, n)
+  end
+  rt_free(buf)
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+make a function called os_udp_close takes fd returns done
+  require value_class(fd) == 2
+  rt_lx_close(fd)
+  let done = true
+  ensure value_class(done) == 1
+  return done
 end
 
 make a function called tcp_try_listen takes port returns actual

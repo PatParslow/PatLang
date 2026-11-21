@@ -76,6 +76,16 @@ Feature: what functions, commands and includes give (spec 1.13)
     When another program listens on that port straight after, and a third tries a port its own listener holds
     Then the second gets the port, and the third is refused
 
+  Scenario: TCP and names beyond this machine only once the program declares tcp_allow_remote()
+    Given a program that asks dns_resolve for a name, one that first declares tcp_allow_remote(), and a DNS server on this machine
+    When each resolves names and connects
+    Then the first is stopped, the second resolves names and connects to one, and dns_query reads the server's records, its NXDOMAIN and its CNAME, and gives no addresses where nothing answers
+
+  Scenario: tcp_read_status tells data, a wait and the peer's end apart
+    Given a connection whose peer writes one byte, waits for an answer, then closes
+    When tcp_read_status reads it three times
+    Then it gives the byte as data, a wait while the peer waits, and the end once the peer has closed
+
   Scenario: a program named with no directory is found through PATH alone
     Given a directory holding a cmd.exe that prints planted, and a program run from it that captures cmd /c echo from the system
     When the program runs

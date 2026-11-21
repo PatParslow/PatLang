@@ -1,0 +1,236 @@
+# Selftest for lib/http_client.patlang (GitHub #272).
+#
+# Given an HTTP server on this machine, on a thread of this program, that
+# answers each path its own way, when the client asks it for each, then:
+# URLs are taken apart as RFC 3986 says for http and https; a body comes by
+# its Content-Length, as chunks, or to the connection's end; redirects are
+# followed up to the limit given, a 303 going on as a GET; a server that goes
+# quiet gives a timeout; a POST carries its body; a refused connection and an
+# https URL (until the TLS client is in) give errors, not stops; and reading
+# a body four times as long costs at most eight times as much, for a length
+# and for chunks (cpu_cycles of this thread alone, the server's not counted).
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/http_client.patlang"
+
+make a function called crlf returns t
+  return chr(13) + chr(10)
+end
+
+# A request's method, path and body, read from conn: [method, path, body].
+make a function called read_request takes conn returns req
+  let buf = bytes_new(0)
+  let head_end = 0 - 1
+  while head_end < 0 do
+    let r = tcp_read_status(conn, 10000)
+    if r[1] != "data" then
+      return ["", "", ""]
+    end
+    bytes_extend(buf, bytes_from_str(r[0]))
+    let head_end = hc_find_blank_line(buf, 0)
+  end
+  # "METHOD PATH HTTP/1.1": the words before the first two spaces
+  let eol = hc_find_crlf(buf, 0)
+  let sp1 = 0
+  while bytes_get(buf, sp1) != 32 do
+    let sp1 = sp1 + 1
+  end
+  let sp2 = sp1 + 1
+  while (sp2 < eol) and (bytes_get(buf, sp2) != 32) do
+    let sp2 = sp2 + 1
+  end
+  let words = [bytes_to_str(bytes_slice(buf, 0, sp1)), bytes_to_str(bytes_slice(buf, sp1 + 1, sp2 - sp1 - 1))]
+  let length = 0
+  let at = eol + 2
+  while at < head_end do
+    let line_end = hc_find_crlf(buf, at)
+    let line = bytes_to_str(bytes_slice(buf, at, line_end - at))
+    if hc_lower(substr(line, 0, 15)) == "content-length:" then
+      let length = hc_decimal(hc_trim(substr(line, 15, str_len(line) - 15)))
+    end
+    let at = line_end + 2
+  end
+  while bytes_len(buf) - head_end - 4 < length do
+    let r = tcp_read_status(conn, 10000)
+    if r[1] != "data" then
+      return [words[0], words[1], ""]
+    end
+    bytes_extend(buf, bytes_from_str(r[0]))
+  end
+  return [words[0], words[1], bytes_to_str(bytes_slice(buf, head_end + 4, length))]
+end
+
+make a function called respond takes conn, status, headers, body returns done
+  let b = sb_new()
+  sb_push(b, "HTTP/1.1 " + status + crlf())
+  let i = 0
+  while i < list_len(headers) do
+    sb_push(b, headers[i] + crlf())
+    let i = i + 1
+  end
+  sb_push(b, crlf())
+  sb_push(b, body)
+  tcp_try_write(conn, sb_str(b))
+  return true
+end
+
+make a function called x_text takes n returns t
+  let b = sb_new()
+  let i = 0
+  while i < n do
+    sb_push(b, "x")
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# n bytes of x in chunks of 1000.
+make a function called chunked_text takes n returns t
+  let b = sb_new()
+  let left = n
+  while left > 0 do
+    let size = 1000
+    if left < size then
+      let size = left
+    end
+    sb_push(b, to_hex_lower(size) + crlf() + x_text(size) + crlf())
+    let left = left - size
+  end
+  sb_push(b, "0" + crlf() + crlf())
+  return sb_str(b)
+end
+
+make a function called to_hex_lower takes n returns t
+  let digits = "0123456789abcdef"
+  if n == 0 then
+    return "0"
+  end
+  # the digits, least significant first, then joined in reverse
+  let parts = []
+  let v = n
+  while v > 0 do
+    let q = floor(v / 16)
+    let parts = list_push(parts, substr(digits, v - q * 16, 1))
+    let v = q
+  end
+  let b = sb_new()
+  let i = list_len(parts) - 1
+  while i >= 0 do
+    sb_push(b, parts[i])
+    let i = i - 1
+  end
+  return sb_str(b)
+end
+
+# Answers one request: false once it was /stop.
+make a function called serve_one takes conn returns more
+  let req = read_request(conn)
+  let path = req[1]
+  if path == "/len" then
+    respond(conn, "200 OK", ["Content-Length: 13", "Content-Type: text/plain"], "hello, length")
+  elif path == "/chunked" then
+    respond(conn, "200 OK", ["Transfer-Encoding: chunked"], "3" + crlf() + "hel" + crlf() + "4" + crlf() + "lo, " + crlf() + "6;ext=1" + crlf() + "chunks" + crlf() + "0" + crlf() + "Trailer-X: 1" + crlf() + crlf())
+  elif path == "/close" then
+    respond(conn, "200 OK", ["Content-Type: text/plain"], "to the end")
+  elif path == "/redir1" then
+    respond(conn, "302 Found", ["Location: /redir2", "Content-Length: 0"], "")
+  elif path == "/redir2" then
+    respond(conn, "301 Moved Permanently", ["Location: len", "Content-Length: 0"], "")
+  elif path == "/loop" then
+    respond(conn, "302 Found", ["Location: /loop", "Content-Length: 0"], "")
+  elif path == "/slow" then
+    respond(conn, "200 OK", ["Content-Length: 10"], "abc")
+    sleep_ms(1500)
+  elif path == "/echo" then
+    respond(conn, "200 OK", ["Content-Length: " + str_len(req[0] + " " + req[2])], req[0] + " " + req[2])
+  elif path == "/see-other" then
+    respond(conn, "303 See Other", ["Location: /method", "Content-Length: 0"], "")
+  elif path == "/method" then
+    respond(conn, "200 OK", ["Content-Length: " + str_len(req[0])], req[0])
+  elif substr(path, 0, 5) == "/big/" then
+    let n = to_num(substr(path, 5, str_len(path) - 5))
+    respond(conn, "200 OK", ["Content-Length: " + n], x_text(n))
+  elif substr(path, 0, 8) == "/bigchk/" then
+    let n = to_num(substr(path, 8, str_len(path) - 8))
+    respond(conn, "200 OK", ["Transfer-Encoding: chunked"], chunked_text(n))
+  elif path == "/stop" then
+    respond(conn, "200 OK", ["Content-Length: 4"], "done")
+    tcp_close(conn)
+    return false
+  else
+    respond(conn, "404 Not Found", ["Content-Length: 8"], "not here")
+  end
+  tcp_close(conn)
+  return true
+end
+
+# The cheapest of three readings of a body of n bytes at path, in cycles.
+make a function called read_cost takes base, path returns cycles
+  let best = 0 - 1
+  let k = 0
+  while k < 3 do
+    let t = cpu_cycles()
+    let got = http_get(base + path)
+    let c = cpu_cycles() - t
+    if (best < 0) or (c < best) then
+      let best = c
+    end
+    let k = k + 1
+  end
+  return best
+end
+
+let ctx = ctx_new()
+let port = tcp_listen(0)
+let server = thread_spawn(|| do
+  let going = true
+  while going do
+    let conn = tcp_accept(port)
+    let going = serve_one(conn)
+  end
+  return true
+end)
+let base = "http://127.0.0.1:" + port
+
+expect(ctx, "a URL with no path", hc_parse_url("http://example.org"), ["ok", "http", "example.org", 80, "/"])
+expect(ctx, "a URL with a port, a query and a fragment", hc_parse_url("https://h.example:8443/a/b?c=1#top"), ["ok", "https", "h.example", 8443, "/a/b?c=1"])
+expect(ctx, "a query with no path", hc_parse_url("http://h?q=1"), ["ok", "http", "h", 80, "/?q=1"])
+let r = hc_parse_url("ftp://h/x")
+expect(ctx, "another scheme is refused", [r[0], r[1]], ["err", "url"])
+let r = hc_parse_url("http://h:99999/")
+expect(ctx, "a port out of range is refused", [r[0], r[1]], ["err", "url"])
+
+let r = http_get(base + "/len")
+expect(ctx, "a body by its Content-Length", [r[0], r[1], r[3], http_header(r, "content-type")], ["ok", 200, "hello, length", "text/plain"])
+let r = http_get(base + "/chunked")
+expect(ctx, "a body in chunks, with an extension and a trailer", [r[0], r[1], r[3]], ["ok", 200, "hello, chunks"])
+let r = http_get(base + "/close")
+expect(ctx, "a body to the connection's end", [r[0], r[1], r[3]], ["ok", 200, "to the end"])
+let r = http_get(base + "/redir1")
+expect(ctx, "two redirects, an absolute path then a relative one", [r[0], r[1], r[3]], ["ok", 200, "hello, length"])
+let r = http_request("GET", base + "/loop", [], "", [["max_redirects", 2]])
+expect(ctx, "a redirect loop stops at the limit given", [r[0], r[1]], ["err", "redirects"])
+let r = http_request("GET", base + "/slow", [], "", [["timeout_ms", 300]])
+expect(ctx, "a server that goes quiet gives a timeout", [r[0], r[1]], ["err", "timeout"])
+let r = http_post(base + "/echo", "a=1", "application/x-www-form-urlencoded")
+expect(ctx, "a POST carries its body", [r[0], r[1], r[3]], ["ok", 200, "POST a=1"])
+let r = http_post(base + "/see-other", "a=1", "text/plain")
+expect(ctx, "a 303 goes on as a GET", [r[0], r[1], r[3]], ["ok", 200, "GET"])
+let r = http_get(base + "/missing")
+expect(ctx, "a 404 is a response, not an error", [r[0], r[1], r[3]], ["ok", 404, "not here"])
+let r = http_get("http://127.0.0.1:1/")
+expect(ctx, "a refused connection is an error, not a stop", [r[0], r[1]], ["err", "connect"])
+let r = http_get("https://127.0.0.1:" + port + "/len")
+expect(ctx, "https waits for the TLS client", [r[0], r[1]], ["err", "scheme"])
+
+let small = read_cost(base, "/big/65536")
+let large = read_cost(base, "/big/262144")
+expect(ctx, "a body four times as long costs at most eight times as much (Content-Length; " + small + " and " + large + " cycles)", large <= 8 * small, true)
+let small = read_cost(base, "/bigchk/65536")
+let large = read_cost(base, "/bigchk/262144")
+expect(ctx, "the same in chunks (" + small + " and " + large + " cycles)", large <= 8 * small, true)
+
+http_get(base + "/stop")
+expect(ctx, "the server ends when asked", thread_result(server), true)
+ctx_report(ctx)

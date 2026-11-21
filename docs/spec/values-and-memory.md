@@ -208,6 +208,16 @@ running it.
   is not refused for it, while one on a port another socket listens on still is. `tcp_connect` takes
   `localhost` or a `127.x.x.x` address; another address stops the program saying it is not this
   machine, and text that is not four numbers of 0 to 255 stops it saying it is not an address.
+  A program that declares `tcp_allow_remote()` (once, like `object_names_explicit()`, for
+  its world) reaches beyond this machine: `tcp_connect` then takes any IPv4 address or a
+  name, a name with no address giving `-1` to `tcp_try_connect`. `dns_resolve(name)` gives
+  a name's IPv4 addresses as text, none twice, `[]` for none (an address gives itself), from
+  `getaddrinfo` on Windows and, on Linux, `/etc/hosts` and then an A query to each
+  `nameserver` of `/etc/resolv.conf`, 5 seconds twice. `dns_query(server, port, name,
+  wait_ms)` asks one DNS server over UDP for a name's A records, following a CNAME the
+  answer gives, and gives `[]` for a name the server says is not there or when no answer
+  comes within `wait_ms`, twice. Both stop a program that has not declared
+  `tcp_allow_remote()`. IPv6 is not covered.
   A connection nothing accepts stops it too; `tcp_try_connect` gives `-1` there instead, and
   takes the same addresses.
 - The runtime's locks go to whichever waiting thread is running when the lock comes free, not
@@ -220,7 +230,10 @@ running it.
   one listener at once, with either call: each connection goes to one of them, and each timed
   wait still gives -1 when its time is up.
   `tcp_read_timeout(conn, ms)` gives what arrives within `ms`, and `""` when nothing does,
-  when the peer has closed, or when the read fails. `tcp_try_write(conn, data)` gives `false`
+  when the peer has closed, or when the read fails; `tcp_read_status(conn, ms)` tells those
+  apart, giving `[text, "data"]`, `["", "wait"]`, `["", "end"]` or `["", "error"]`. Text
+  read keeps the bytes as they came, so `bytes_from_str` gives them back exactly, binary
+  data included. `tcp_try_write(conn, data)` gives `false`
   when the peer has gone, where `tcp_write` stops the program. `random_bytes(n)` gives `n`
   bytes, each 0 to 255, from the system's random source, fit for a secret.
 - A fiber's and a thread's memory is given back when it has ended and, for a thread,
@@ -359,7 +372,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   matches: `*` matches any run of characters, none included, `?` any one character, and every
   other character itself. A subject that is not a string matches no glob.
 - `host_caps()` says what the host running the program can do: `["x64", "subprocess", "tcp",
-  "fs"]` in a native build, and `["wasm"]` in a browser, which has none of those.
+  "tcp_remote", "fs"]` in a native build, and `["wasm"]` in a browser, which has none of
+  those. `tcp_remote` means TCP can reach beyond this machine once the program declares
+  `tcp_allow_remote()` (1.8).
 - A native build is for Windows (a PE) or, with `--linux`, for Linux (a static PIE using no
   libc); a program prints the same on both. Where the systems differ, Linux gives:
   `cpu_cycles()` the thread's CPU time in nanoseconds (it has no cycle count for a thread),

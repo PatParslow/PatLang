@@ -134,6 +134,344 @@ make a function called rt_host_bytes takes host returns bytes
   return bytes
 end
 
+# ---- beyond this machine (spec 1.8; review finding S15) ----
+
+# A program declares that it connects beyond this machine: from then on, in
+# its world, tcp_connect takes any IPv4 address or a name, and dns_resolve and
+# dns_query work. A program that declares nothing connects only to 127.x.x.x.
+# The flag is at 4544 of the world's state (worlds.patlang).
+make a function called tcp_allow_remote returns done
+  mem_store(rt_world_base(), 4544, 1)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_remote_allowed returns yes
+  let yes = mem_load(rt_world_base(), 4544) == 1
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Stops the program unless it has declared tcp_allow_remote().
+make a function called rt_require_remote takes what returns done
+  require value_class(what) == 8
+  if not rt_remote_allowed() then
+    print(what + ": the program has not declared tcp_allow_remote(), so it reaches only this machine")
+    let done = rt_stop(96)
+    ensure false
+    return done
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# Where tcp_connect goes for host: an address's four bytes, or [] when a name
+# has no address. Without tcp_allow_remote(), a host that is not an address
+# or not this machine stops the program, as it always has.
+make a function called rt_connect_bytes takes host returns bytes
+  require value_class(host) == 8
+  let b = rt_host_bytes(host)
+  if rt_remote_allowed() then
+    if list_len(b) == 0 then
+      let found = dns_resolve(host)
+      if list_len(found) > 0 then
+        let b = rt_host_bytes(found[0])
+      end
+    end
+    let bytes = b
+    ensure (list_len(bytes) == 4) or (list_len(bytes) == 0)
+    return bytes
+  end
+  if list_len(b) == 0 then
+    let bytes = rt_net_fail("tcp_connect: " + host + " is not an address: TCP connects to localhost or 127.x.x.x")
+    ensure false
+    return bytes
+  end
+  if b[0] != 127 then
+    let bytes = rt_net_fail("tcp_connect: " + host + " is not this machine: TCP connects to localhost or 127.x.x.x")
+    ensure false
+    return bytes
+  end
+  let bytes = b
+  ensure list_len(bytes) == 4
+  return bytes
+end
+
+# An address's four bytes as text: [192, 0, 2, 1] gives "192.0.2.1".
+make a function called rt_dotted takes b returns text
+  require (value_class(b) == 9) and (list_len(b) == 4)
+  let text = "" + b[0] + "." + b[1] + "." + b[2] + "." + b[3]
+  ensure value_class(text) == 8
+  return text
+end
+
+# The IPv4 addresses a name has, as text, in the order the system gives them
+# with none twice; [] when it has none. An address gives itself, and
+# localhost 127.0.0.1. IPv6 addresses are not given.
+make a function called dns_resolve takes name returns addrs
+  require value_class(name) == 8
+  rt_require_remote("dns_resolve")
+  let b = rt_host_bytes(name)
+  if list_len(b) == 4 then
+    let addrs = [rt_dotted(b)]
+    ensure value_class(addrs) == 9
+    return addrs
+  end
+  let addrs = rt_unique_texts(os_resolve(name))
+  ensure value_class(addrs) == 9
+  return addrs
+end
+
+make a function called rt_unique_texts takes items returns out
+  require value_class(items) == 9
+  let out = []
+  let i = 0
+  while i < list_len(items) do
+    let seen = false
+    let j = 0
+    while j < list_len(out) do
+      if out[j] == items[i] then
+        let seen = true
+      end
+      let j = j + 1
+    end
+    if not seen then
+      let out = list_push(out, items[i])
+    end
+    let i = i + 1
+  end
+  ensure value_class(out) == 9
+  return out
+end
+
+# Asks the DNS server at server:port (an IPv4 address) for name's A records,
+# over UDP: the addresses, as text, following a CNAME the answer gives; []
+# when the name has none, the server refuses, or no answer comes within
+# wait_ms, twice. A name that is not ASCII labels of 1 to 63 characters gives
+# [] without asking.
+make a function called dns_query takes server, port, name, wait_ms returns addrs
+  require (value_class(server) == 8) and (value_class(port) == 2) and (value_class(name) == 8) and (value_class(wait_ms) == 2) and (wait_ms >= 0)
+  rt_require_remote("dns_query")
+  let sb = rt_host_bytes(server)
+  let q = rt_dns_question(name)
+  if (list_len(sb) != 4) or (list_len(q) == 0) then
+    let addrs = []
+    ensure value_class(addrs) == 9
+    return addrs
+  end
+  let fd = os_udp_open()
+  if fd < 0 then
+    let addrs = []
+    ensure value_class(addrs) == 9
+    return addrs
+  end
+  let addrs = []
+  let tries = 0
+  let asking = true
+  while asking and (tries < 2) do
+    let r = random_bytes(2)
+    let id = r[0] * 256 + r[1]
+    let packet = rt_list_then([word_shr(id, 8), word_and(id, 255), 1, 0, 0, 1, 0, 0, 0, 0, 0, 0], q)
+    os_udp_send(fd, sb, port, packet)
+    let deadline = clock_ms() + wait_ms
+    let waiting = true
+    while waiting do
+      let left = deadline - clock_ms()
+      if left < 0 then
+        let left = 0
+      end
+      let reply = os_udp_recv(fd, left)
+      if list_len(reply) > 0 then
+        let got = rt_dns_answers(reply, id)
+        if got[0] then
+          let addrs = got[1]
+          let waiting = false
+          let asking = false
+        end
+      end
+      if waiting and (clock_ms() >= deadline) then
+        let waiting = false
+      end
+    end
+    let tries = tries + 1
+  end
+  os_udp_close(fd)
+  ensure value_class(addrs) == 9
+  return addrs
+end
+
+# A question for name's A records (type 1, class IN): its labels, each its
+# length then its bytes, a 0, then the type and class; [] for a name that is
+# not ASCII labels of 1 to 63 characters.
+make a function called rt_dns_question takes name returns q
+  require value_class(name) == 8
+  let q = []
+  let n = str_len(name)
+  if (n == 0) or (n > 253) then
+    ensure value_class(q) == 9
+    return q
+  end
+  let label = []
+  let i = 0
+  while i <= n do
+    if (i == n) or (rt_byte_at(name, i) == 46) then
+      if (list_len(label) == 0) or (list_len(label) > 63) then
+        # an empty label: a trailing dot is allowed, nothing else
+        if not ((i == n) and (list_len(label) == 0) and (i > 0)) then
+          let q = []
+          ensure value_class(q) == 9
+          return q
+        end
+      else
+        let q = list_push(q, list_len(label))
+        let q = rt_list_then(q, label)
+      end
+      let label = []
+    else
+      let c = rt_byte_at(name, i)
+      if (c < 33) or (c > 126) then
+        let q = []
+        ensure value_class(q) == 9
+        return q
+      end
+      let label = list_push(label, c)
+    end
+    let i = i + 1
+  end
+  let q = rt_list_then(q, [0, 0, 1, 0, 1])
+  ensure value_class(q) == 9
+  return q
+end
+
+# A list of bytes in an uncounted block, from 16; the caller frees it.
+make a function called rt_bytes_block takes bytes returns block
+  require value_class(bytes) == 9
+  let block = rt_alloc(list_len(bytes) + 8)
+  let i = 0
+  while i < list_len(bytes) do
+    mem_store_byte(block, 16 + i, bytes[i])
+    let i = i + 1
+  end
+  ensure block != 0
+  return block
+end
+
+# The first n bytes of a block from 16, as a list; [] for n of 0 or less.
+make a function called rt_block_bytes takes block, n returns bytes
+  require (block != 0) and (value_class(n) == 2)
+  let out = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(out, mem_load_byte(block, 16 + i))
+    let i = i + 1
+  end
+  let bytes = vec_to_list(out)
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+# a's elements, then b's.
+make a function called rt_list_then takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let out = a
+  let i = 0
+  while i < list_len(b) do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(a) + list_len(b)
+  return out
+end
+
+# Past a name in a DNS message at at: its labels, ending at a 0 or at a
+# pointer (two bytes); -1 when it runs past the end.
+make a function called rt_dns_skip_name takes msg, at returns next
+  require (value_class(msg) == 9) and (value_class(at) == 2)
+  let p = at
+  while p < list_len(msg) do
+    let len = msg[p]
+    if len == 0 then
+      let next = p + 1
+      ensure value_class(next) == 2
+      return next
+    end
+    if word_and(len, 192) == 192 then
+      let next = p + 2
+      if next > list_len(msg) then
+        let next = 0 - 1
+      end
+      ensure value_class(next) == 2
+      return next
+    end
+    let p = p + 1 + len
+  end
+  let next = 0 - 1
+  ensure value_class(next) == 2
+  return next
+end
+
+# A DNS reply's A records: [true, addresses] for a reply to the query id (an
+# answer, or NXDOMAIN's none), [false, []] for anything else (another id, not
+# a reply, or cut short).
+make a function called rt_dns_answers takes msg, id returns got
+  require (value_class(msg) == 9) and (value_class(id) == 2)
+  let n = list_len(msg)
+  if n < 12 then
+    let got = [false, []]
+    ensure list_len(got) == 2
+    return got
+  end
+  if (msg[0] * 256 + msg[1] != id) or (word_and(msg[2], 128) == 0) then
+    let got = [false, []]
+    ensure list_len(got) == 2
+    return got
+  end
+  let rcode = word_and(msg[3], 15)
+  if rcode != 0 then
+    let got = [true, []]
+    ensure list_len(got) == 2
+    return got
+  end
+  let qd = msg[4] * 256 + msg[5]
+  let an = msg[6] * 256 + msg[7]
+  let at = 12
+  let k = 0
+  while (k < qd) and (at >= 0) do
+    let at = rt_dns_skip_name(msg, at)
+    if at >= 0 then
+      let at = at + 4
+    end
+    let k = k + 1
+  end
+  let addrs = []
+  let k = 0
+  while (k < an) and (at >= 0) and (at < n) do
+    let at = rt_dns_skip_name(msg, at)
+    if (at < 0) or (at + 10 > n) then
+      let at = 0 - 1
+    else
+      let rtype = msg[at] * 256 + msg[at + 1]
+      let rclass = msg[at + 2] * 256 + msg[at + 3]
+      let rlen = msg[at + 8] * 256 + msg[at + 9]
+      let data = at + 10
+      if data + rlen > n then
+        let at = 0 - 1
+      else
+        if (rtype == 1) and (rclass == 1) and (rlen == 4) then
+          let addrs = list_push(addrs, rt_dotted([msg[data], msg[data + 1], msg[data + 2], msg[data + 3]]))
+        end
+        let at = data + rlen
+      end
+    end
+    let k = k + 1
+  end
+  let got = [at >= 0, addrs]
+  ensure list_len(got) == 2
+  return got
+end
+
 make a function called tcp_connect takes host, port returns id
   require (value_class(host) == 8) and (value_class(port) == 2)
   let id = tcp_try_connect(host, port)
@@ -215,6 +553,35 @@ make a function called tcp_read_timeout takes conn, ms returns data
   rt_set_recv_timeout(sock, 0)
   ensure value_class(data) == 8
   return data
+end
+
+# What a read within ms found: [text, "data"] for bytes that came, ["",
+# "wait"] when none came in that time, ["", "end"] once the peer has closed,
+# and ["", "error"] when the read failed. tcp_read_timeout gives "" for all
+# but the first; a reader that must know where a stream ends (a response
+# read to its connection's close, a TLS record) asks this.
+make a function called tcp_read_status takes conn, ms returns result
+  require value_live(conn) and (value_class(ms) == 2)
+  let sock = rt_conn_socket(conn)
+  let wait = ms
+  if wait < 1 then
+    let wait = 1
+  end
+  rt_set_recv_timeout(sock, wait)
+  let r = rt_recv(conn)
+  rt_set_recv_timeout(sock, 0)
+  let state = "data"
+  if r[0] == "" then
+    let state = "end"
+    if r[2] then
+      let state = "wait"
+    elif r[1] then
+      let state = "error"
+    end
+  end
+  let result = [r[0], state]
+  ensure (list_len(result) == 2) and (value_class(result[0]) == 8)
+  return result
 end
 
 make a function called tcp_read takes conn returns data

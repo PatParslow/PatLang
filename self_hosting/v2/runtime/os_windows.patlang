@@ -1318,19 +1318,23 @@ make a function called rt_bind_listen takes sock, port returns actual
   return actual
 end
 
-# What one recv gave, "" at the end of the stream; [text, whether it failed].
+# What one recv gave, "" at the end of the stream; [text, whether it failed,
+# whether the failure was the receive timeout running out (WSAETIMEDOUT)].
 make a function called rt_recv takes conn returns result
   require value_live(conn)
   let sock = rt_conn_socket(conn)
   let buf = rt_alloc(65536)
   let n = rt_i32(extern_call("WS2_32.DLL", "recv", sock, buf + 16, 65536, 0))
   let text = ""
+  let timed_out = false
   if n > 0 then
     let text = rt_str_from_bytes(buf + 16, n)
+  elif n < 0 then
+    let timed_out = rt_i32(extern_call("WS2_32.DLL", "WSAGetLastError")) == 10060
   end
   rt_free(buf)
-  let result = [text, n < 0]
-  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1)
+  let result = [text, n < 0, timed_out]
+  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1) and (value_class(result[2]) == 1)
   return result
 end
 
@@ -1386,6 +1390,95 @@ make a function called rt_wait_readable takes sock, ms returns done
   return done
 end
 
+# A name's IPv4 addresses, as text, from the system's resolver (getaddrinfo,
+# AF_INET): [] when it has none.
+make a function called os_resolve takes name returns addrs
+  require value_class(name) == 8
+  rt_wsa_start()
+  let cname = rt_cstr(name)
+  # struct addrinfo hints: ai_flags 0, ai_family AF_INET (2), ai_socktype
+  # SOCK_STREAM (1), the rest 0
+  let hints = rt_alloc(48)
+  let k = 0
+  while k < 6 do
+    mem_store(hints, 16 + 8 * k, 0)
+    let k = k + 1
+  end
+  mem_store(hints, 16, word_shl(2, 32))
+  mem_store(hints, 24, 1)
+  let w = rt_out_word()
+  mem_store(w, 0, 0)
+  let r = rt_i32(extern_call("WS2_32.DLL", "getaddrinfo", cname + 16, 0, hints + 16, w))
+  let res = mem_load(w, 0)
+  rt_free(hints)
+  rt_free(cname)
+  let addrs = []
+  if (r == 0) and (res != 0) then
+    let p = res
+    while p != 0 do
+      # ai_family at 4, ai_addr at 32 (a sockaddr_in, its address at 4), ai_next at 40
+      let addr = mem_load(p, 32)
+      if (word_and(word_shr(mem_load(p, 0), 32), 4294967295) == 2) and (addr != 0) then
+        let addrs = list_push(addrs, rt_dotted([mem_load_byte(addr, 4), mem_load_byte(addr, 5), mem_load_byte(addr, 6), mem_load_byte(addr, 7)]))
+      end
+      let p = mem_load(p, 40)
+    end
+    extern_call("WS2_32.DLL", "freeaddrinfo", res)
+  end
+  ensure value_class(addrs) == 9
+  return addrs
+end
+
+# A UDP socket, or -1.
+make a function called os_udp_open returns fd
+  rt_wsa_start()
+  let fd = extern_call("WS2_32.DLL", "socket", 2, 2, 17)
+  # INVALID_SOCKET, as rt_socket reads it
+  if fd == 0 - 1 then
+    let fd = 0 - 1
+  end
+  ensure value_class(fd) == 2
+  return fd
+end
+
+# Sends packet (a list of bytes) to the address's four bytes and port.
+make a function called os_udp_send takes fd, b, port, packet returns ok
+  require (value_class(fd) == 2) and (value_class(b) == 9) and (list_len(b) == 4) and (value_class(packet) == 9)
+  let addr = rt_sockaddr(b[0], b[1], b[2], b[3], port)
+  let buf = rt_bytes_block(packet)
+  let sent = rt_i32(extern_call("WS2_32.DLL", "sendto", fd, buf + 16, list_len(packet), 0, addr + 16, 16))
+  rt_free(buf)
+  rt_free(addr)
+  let ok = sent == list_len(packet)
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# One datagram, waiting up to ms for it: its bytes, or [] when none came.
+make a function called os_udp_recv takes fd, ms returns bytes
+  require (value_class(fd) == 2) and (value_class(ms) == 2) and (ms >= 0)
+  rt_wait_readable(fd, ms)
+  let buf = rt_alloc(4096)
+  # a socket with nothing waiting would block: FIONBIO on first
+  let arg = rt_alloc(8)
+  mem_store(arg, 16, 1)
+  extern_call("WS2_32.DLL", "ioctlsocket", fd, 2147772030, arg + 16)
+  rt_free(arg)
+  let n = rt_i32(extern_call("WS2_32.DLL", "recvfrom", fd, buf + 16, 4096, 0, 0, 0))
+  let bytes = rt_block_bytes(buf, n)
+  rt_free(buf)
+  ensure value_class(bytes) == 9
+  return bytes
+end
+
+make a function called os_udp_close takes fd returns done
+  require value_class(fd) == 2
+  extern_call("WS2_32.DLL", "closesocket", fd)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
 make a function called rt_wsa_start returns done
   if atomic_add(runtime_state() + 4360, 1) == 0 then
     let data = rt_alloc(512)
@@ -1409,17 +1502,14 @@ end
 # A connection, or -1 when none is made (nothing listens there, or it refused):
 # for a client that has a use for the answer "not now", where tcp_connect
 # stops the program. A host that is not this machine, or not an address, still
-# stops it: TCP is on this machine only (review finding S15).
+# stops it, unless the program has declared tcp_allow_remote(): TCP is on this
+# machine only by default (review finding S15). After the declaration a name
+# with no address gives -1.
 make a function called tcp_try_connect takes host, port returns id
   require (value_class(host) == 8) and (value_class(port) == 2)
-  let b = rt_host_bytes(host)
+  let b = rt_connect_bytes(host)
   if list_len(b) == 0 then
-    let id = rt_net_fail("tcp_connect: " + host + " is not an address: TCP connects to localhost or 127.x.x.x")
-    ensure (id >= 1) or (id == 0 - 1)
-    return id
-  end
-  if b[0] != 127 then
-    let id = rt_net_fail("tcp_connect: " + host + " is not this machine: TCP connects to localhost or 127.x.x.x")
+    let id = 0 - 1
     ensure (id >= 1) or (id == 0 - 1)
     return id
   end
