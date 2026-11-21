@@ -144,7 +144,11 @@ makes.
 `dom_selftest.patlang` (building, querying, escaping, script text, a round trip
 through `html_scan`, and linear cost over 1,000 to 8,000 rows). The five pages
 above are in: each program takes `--page PATH`, and `run_demos.patlang` checks
-the page on every engine against `expected/NAME.html`. Moving the existing
+the page on every engine against `expected/NAME.html`. The parslow.net showcase
+pages show each of the five beside its program: the site build fills an
+`<iframe data-source-page="showcase/expected/NAME.html">` with that file, sandboxed
+with no permissions, so the site shows the page the gates checked (built locally,
+not yet published). Moving the existing
 builders (`lib/html.patlang`'s callers: `tools/build_portfolio.patlang`, the
 GUI examples and the graph tools) onto the tree
 is #270's first open question, still for the owner; the live page in the
