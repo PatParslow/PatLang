@@ -90,6 +90,17 @@ adding a file that breaks it, seeing it fail, and deleting the file.
   time, with `PATLANG_SPEC_OUT` set to a fresh directory, from a checkout with no
   `build` directories. Scratch paths come from `spec_out()`; the package specs
   wrote to `packages/*/build/`, which only a hand run had made.
+- **A check that must act inside a window another process times is a race.**
+  The idle-daemon scenario had to find the daemon before its one idle second ran
+  out. It passed on an idle machine and failed under the gates. Check the result
+  that doesn't depend on winning (the exit code only the idle path gives).
+- **An OS-layer function gets its scenario run on every target.** On Linux
+  `is_alive` collected the child's status and a listener's port stayed taken
+  after its program ended. Both passed on Windows, and each fixture now runs on
+  `part1_linux` too: a new `os_windows`/`os_linux` behaviour gets a part 1
+  fixture, not only a Windows test.
+- **Read the whole transcript, not up to the program's end.** ConPTY sends a
+  program's last output after the program has ended: `pty_close` gives it.
 
 ## 5.5 Measuring a change (an optimisation, or a claim about cost)
 
@@ -129,3 +140,8 @@ adding a file that breaks it, seeing it fail, and deleting the file.
   the counts, and anything not run.
 - Commit only when asked, staged explicitly, with the Co-Authored-By line; push
   only when asked. New issues go on board 5.
+- Write the message from `git diff --cached --stat`, not from memory of the
+  session: a bullet once claimed a change an earlier commit had already made.
+- **Time only on an idle machine.** Before a fine-grained timing, check the load
+  (`Get-CimInstance Win32_Processor` LoadPercentage). At 37% load, splitting a
+  path gave readings where removing code made it slower.
