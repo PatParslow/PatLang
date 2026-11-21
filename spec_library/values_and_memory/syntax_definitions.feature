@@ -18,6 +18,11 @@ Feature: a syntax definition extends the language for the program (spec 1.9)
     When the program runs
     Then the statement runs, and the block runs as its rule says
 
+  Scenario: a token's name is its own, and Symbol("text") is the step that matches the text
+    Given a syntax definition with tokens named Symbol, Symbols and Manyfold, and a rule using them and Symbol("=>")
+    When the program runs
+    Then each bare name matches its token, and Symbol("=>") matches the arrow
+
   Scenario: AST.Name(args) gives a node
     Given rules and ordinary code using AST.Name(args), nested, in a closure, and with a variable named AST
     When the program runs

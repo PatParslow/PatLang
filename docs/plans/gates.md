@@ -227,6 +227,15 @@ finished.
   starts the Linux build, `self_hosting/build/v2_interp_linux` (the unit
   `interpreter_linux`), since a Windows interpreter started through WSL's
   interop listens on a loopback the Linux program cannot reach.
+- **`showcase`, `showcase_linux` and `showcase_compare`** run the showcase
+  programs (docs/plans/showcase-programs.md): `run_demos.patlang --dir showcase`
+  runs each interpreted and compiled (or, with `--linux`, as a Linux build) against
+  `showcase/expected/NAME.txt`, and gives a program with
+  `expected/NAME.constant_time.txt` to `v2.exe --constant-time` as well;
+  `run_showcase_compare.patlang` runs each Python sketch in `showcase/compare/`
+  against the program's expected output, or the sketch's own in
+  `showcase/compare/expected/`. `demos_linux` runs the demos as Linux builds. The two
+  showcase engines share the lane `showcase`, and the demos' the lane `demos`.
 - **Lanes are per feature file.** A suite's lane names a set of resources its
   scenarios hold (a fixed port, a queue topic, a file in the tree); unit
   `SUITE/FEATURE` gets the lane `LANE/FEATURE`. `language_interp`,

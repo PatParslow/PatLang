@@ -1,0 +1,217 @@
+# A spreadsheet that recalculates itself.
+#
+# Paradigms: objects and events.
+#
+# Each cell is an object. Its set method declares that it raises the event
+# changed, so every edit is announced with the cell, the new value and the
+# result, without the method calling anyone. Separate handlers then do
+# separate jobs: one keeps an audit trail of edits, one recalculates the cells
+# that depend on the edited one, in dependency order, and refuses a cycle. The
+# cells know nothing of either job, and a third handler could be added without
+# touching them.
+#
+# Values are exact: a fifth of 10 is 2, and a third of 12.50 is 25/6, not
+# 4.166666666666667.
+
+class Cell {
+  field name = ""
+  field value = 0
+  field inputs = []
+  field formula = 0
+  field old_inputs = []
+  field old_formula = 0
+  make a function called set takes self, v returns value raises changed
+    self.value = v
+    return v
+  end
+  # A new formula over new inputs: announced as a change like any other. The
+  # one it replaces is kept, so a refused change can be undone.
+  make a function called redefine takes self, inputs, f returns value raises changed
+    self.old_inputs = self.inputs
+    self.old_formula = self.formula
+    self.inputs = inputs
+    self.formula = f
+    return self.value
+  end
+  make a function called undo_redefine takes self returns value
+    self.inputs = self.old_inputs
+    self.formula = self.old_formula
+    return self.value
+  end
+}
+
+make a function called has takes items, x returns yes
+  let i = 0
+  while i < list_len(items) do
+    if items[i] == x then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called find takes sheet, name returns c
+  let i = 0
+  while i < vec_len(sheet) do
+    let c = vec_get(sheet, i)
+    if c.name == name then
+      return c
+    end
+    let i = i + 1
+  end
+  # a formula naming a cell the sheet does not have
+  assert false
+  return c
+end
+
+make a function called cell takes sheet, name, value returns c
+  let c = new("Cell")
+  c.name = name
+  c.value = value
+  vec_push(sheet, c)
+  return c
+end
+
+# A cell's value from its formula and its inputs' values, set directly: a
+# recalculation is not an edit, so it raises nothing.
+make a function called recompute takes sheet, c returns v
+  let vals = []
+  let i = 0
+  while i < list_len(c.inputs) do
+    let vals = list_push(vals, find(sheet, c.inputs[i]).value)
+    let i = i + 1
+  end
+  let f = c.formula
+  c.value = f(vals)
+  return c.value
+end
+
+make a function called formula_cell takes sheet, name, inputs, f returns c
+  let c = cell(sheet, name, 0)
+  c.inputs = inputs
+  c.formula = f
+  recompute(sheet, c)
+  return c
+end
+
+# Depth first from name through the cells that read it. Each cell goes into
+# order after everything that depends on it; a cell met again on the current
+# path is a cycle, given back as the path.
+make a function called visit takes sheet, name, done, order, path returns cycle
+  let i = 0
+  while i < vec_len(sheet) do
+    let c = vec_get(sheet, i)
+    if has(c.inputs, name) then
+      if has(path, c.name) then
+        return list_push(path, c.name)
+      end
+      if not has(vec_to_list(done), c.name) then
+        let cycle = visit(sheet, c.name, done, order, list_push(path, c.name))
+        if list_len(cycle) > 0 then
+          return cycle
+        end
+      end
+    end
+    let i = i + 1
+  end
+  vec_push(done, name)
+  vec_push(order, name)
+  return []
+end
+
+# Recalculates name itself, when it has a formula, and everything that
+# depends on it, each cell after its inputs: the names recalculated, or the
+# cycle found. A cycle can come only from a new formula, which is undone, so
+# the sheet is as it was.
+make a function called recalc takes sheet, name returns result
+  let done = vec_new()
+  let order = vec_new()
+  let cycle = visit(sheet, name, done, order, [name])
+  if list_len(cycle) > 0 then
+    find(sheet, name).undo_redefine()
+    emit("cycle", cycle)
+    return cycle
+  end
+  let names = []
+  # order ends with name itself, which is recalculated only if it has a formula
+  let k = vec_len(order) - 1
+  while k >= 0 do
+    let c = find(sheet, vec_get(order, k))
+    if list_len(c.inputs) > 0 then
+      recompute(sheet, c)
+      let names = list_push(names, c.name + "=" + c.value)
+    end
+    let k = k - 1
+  end
+  emit("recalculated", names)
+  return names
+end
+
+make a function called show takes sheet returns text
+  let parts = []
+  let i = 0
+  while i < vec_len(sheet) do
+    let c = vec_get(sheet, i)
+    let parts = list_push(parts, c.name + "=" + c.value)
+    let i = i + 1
+  end
+  return str_join(parts, "  ")
+end
+
+let sheet = vec_new()
+let audit = vec_new()
+
+# ---- the handlers: each one job ----
+
+# event_data is the cell, the method's arguments, then its result: set has
+# one argument, redefine two
+when changed do
+  let c = event_data[0]
+  if list_len(event_data) == 3 then
+    vec_push(audit, c.name + " set to " + event_data[1])
+  else
+    vec_push(audit, c.name + " given a formula over " + str_join(event_data[1], ", "))
+  end
+end
+
+when changed do
+  recalc(sheet, event_data[0].name)
+end
+
+when recalculated do
+  print("  recalculated: " + str_join(event_data, ", "))
+end
+
+when cycle do
+  print("  refused, a cycle: " + str_join(event_data, " -> "))
+end
+
+# ---- the sheet: a net price, its VAT at a fifth, the gross, split three ways ----
+
+let net = cell(sheet, "net", 10)
+let vat = formula_cell(sheet, "vat", ["net"], |v| { return v[0] / 5 })
+let gross = formula_cell(sheet, "gross", ["net", "vat"], |v| { return v[0] + v[1] })
+let share = formula_cell(sheet, "share", ["gross"], |v| { return v[0] / 3 })
+
+print("== the sheet ==")
+print(show(sheet))
+
+print("== net set to 125/12 ==")
+net.set(125 / 12)
+print(show(sheet))
+
+print("== VAT changed to a sixth ==")
+vat.redefine(["net"], |v| { return v[0] / 6 })
+print(show(sheet))
+
+print("== net redefined from share: a cycle ==")
+net.redefine(["share"], |v| { return v[0] * 2 })
+print(show(sheet))
+
+print("== net set to 20: the refused formula is gone, so this recalculates ==")
+net.set(20)
+print(show(sheet))
+
+print("== the audit trail, every edit asked for ==")
+print(str_join(vec_to_list(audit), chr(10)))

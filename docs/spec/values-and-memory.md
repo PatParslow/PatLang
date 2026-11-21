@@ -54,6 +54,14 @@ applies this rule to its result. A sum that leaves the range is a
 two integers that divides evenly is an `int`; otherwise it is a
 `rational`. The rule does not depend on how a value is stored (Part 2).
 
+A `rational` is always in lowest terms, its denominator positive, so two
+equal rationals have the same numerator and denominator. Dividing a
+d-digit integer by an e-digit one costs time growing as (d - e + 1) * e, and
+a gcd of two d-digit numbers as d squared. Adding, subtracting and
+multiplying rationals reduce by the gcds of their parts' factors, never of
+the whole result (Knuth, TAOCP 4.5.1), so adding 1/k to a fraction of many
+digits costs about one division by k.
+
 ### 1.4 Operators are methods, and raise ordinary events
 
 An operator is a method of its left operand's class: `3 + 5` sends `+` to
@@ -220,6 +228,12 @@ running it.
 
 - `syntax NAME { ... }` defines a trigger keyword, tokens and rules. Each block
   `trigger { ... }` is replaced by what its rules give, before the program is parsed.
+- A rule's step `expect NAME` matches the token declared as `NAME`, whatever its name.
+  Four steps are built in: `Symbol("text")` matches the text, `Many(STEP)` repeats a
+  step, and `Identifier` and `Block` match a name and a braced block. `Symbol` and `Many`
+  are those steps only with their parenthesis, so a token may be named `Symbol` or
+  `Symbols`; a token named `Identifier` or `Block` could never be reached, and the
+  definition says so.
 - `AST.Name(args)` gives a node, the list `["Name", args...]`, in a rule or in any other
   code, and nodes nest. A rule can pass one to a function:
   `return handle(AST.Route(verb, path));`. A variable named `AST` keeps its meaning.
@@ -275,7 +289,10 @@ read as signed), and `float_from_bits(n)` the float an int's bits are. A compile
 complex number is its modulus. `to_fixed` rounds the float's exact value, a tie to even.
 `max(a, b)` and `min(a, b)` give the larger and the smaller of two real numbers, keeping its kind.
 `bnot` of an int is its bitwise complement, so `bnot n` is `-1 - n`; of anything else it stops the
-program, as the other bit operators do.
+program, as the other bit operators do. `to_num` reads text as the number it spells: digits with an
+optional sign as an int or bigint, digits, `/` and digits (as a rational prints) as that rational in
+lowest terms, or the int when it divides evenly, and otherwise a float; text that spells no number,
+a zero denominator included, gives 0.0.
 
 ### 1.12 Intervals
 

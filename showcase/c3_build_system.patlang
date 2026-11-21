@@ -1,0 +1,200 @@
+# A build system in a page.
+#
+# Paradigms: logic programming, parallel functional code and a durable queue.
+#
+# Targets and what each depends on are facts; a rule says what a target
+# needs, directly or not. The builder works in waves: every target whose
+# dependencies are built is ready, and the ready ones are built at the same
+# time by parallel_map. Each finished target is recorded in a queue on disk
+# as soon as it is built, so a build that is interrupted resumes where it
+# stopped and rebuilds nothing it already has.
+#
+# "Building" a target here is computing a checksum of its name and its
+# dependencies' checksums, so a change anywhere shows in everything above it.
+
+include "../self_hosting/lib/queue.patlang"
+
+rule depends(app, ui).
+rule depends(app, core).
+rule depends(app, net).
+rule depends(ui, core).
+rule depends(net, core).
+rule depends(core, util).
+rule depends(tests, app).
+rule depends(tests, util).
+rule target(util).
+rule target(core).
+rule target(net).
+rule target(ui).
+rule target(app).
+rule target(tests).
+rule needs(T, D) :- depends(T, D).
+rule needs(T, D) :- depends(T, X), needs(X, D).
+
+make a function called has takes items, x returns yes
+  let i = 0
+  while i < list_len(items) do
+    if items[i] == x then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called direct_deps takes t returns deps
+  let sols = solve("depends", [t, logic_var("D")])
+  let deps = []
+  let i = 0
+  while i < list_len(sols) do
+    let deps = list_push(deps, sols[i][1])
+    let i = i + 1
+  end
+  return deps
+end
+
+# The targets not yet built whose dependencies all are.
+make a function called ready takes built returns out
+  let all = solve("target", [logic_var("T")])
+  let out = []
+  let i = 0
+  while i < list_len(all) do
+    let t = all[i][0]
+    if not has(built, t) then
+      let deps = direct_deps(t)
+      let ok = true
+      let k = 0
+      while k < list_len(deps) do
+        if not has(built, deps[k]) then
+          let ok = false
+        end
+        let k = k + 1
+      end
+      if ok then
+        let out = list_push(out, t)
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# A checksum of a text: the sum of its bytes times their positions, mod 9973.
+make a function called checksum takes text returns c
+  let b = bytes_from_str(text)
+  let c = 0
+  let i = 0
+  while i < bytes_len(b) do
+    let c = (c + b[i] * (i + 1)) % 9973
+    let i = i + 1
+  end
+  return c
+end
+
+# One build job: [target, its dependencies' checksums] -> [target, checksum].
+make a function called build_one takes job returns result
+  return [job[0], checksum(job[0] + ":" + str_join(job[1], ","))]
+end
+
+let topic = "showcase_c3_built"
+queue_remove_topic(topic)
+
+# The build, in waves, starting from the [target, checksum] pairs already
+# built. stop_after_waves < 0 builds everything; otherwise the builder stops
+# after that many waves, as an interrupted build would.
+make a function called build takes topic, sums, stop_after_waves returns built
+  let built = []
+  let i = 0
+  while i < list_len(sums) do
+    let built = list_push(built, sums[i][0])
+    let i = i + 1
+  end
+  let wave = 0
+  while true do
+    let todo = ready(built)
+    if list_len(todo) == 0 then
+      if wave == 0 then
+        print("  nothing to build: every target is up to date")
+      end
+      return built
+    end
+    if wave == stop_after_waves then
+      print("  interrupted before building " + str_join(todo, ", "))
+      return built
+    end
+    let jobs = []
+    let j = 0
+    while j < list_len(todo) do
+      let deps = direct_deps(todo[j])
+      let dep_sums = []
+      let d = 0
+      while d < list_len(deps) do
+        let k = 0
+        while k < list_len(sums) do
+          if sums[k][0] == deps[d] then
+            let dep_sums = list_push(dep_sums, "" + sums[k][1])
+          end
+          let k = k + 1
+        end
+        let d = d + 1
+      end
+      let jobs = list_push(jobs, [todo[j], dep_sums])
+      let j = j + 1
+    end
+    let results = parallel_map(jobs, "build_one")
+    let r = 0
+    while r < list_len(results) do
+      queue_publish(topic, results[r][0] + " " + results[r][1])
+      let sums = list_push(sums, results[r])
+      let built = list_push(built, results[r][0])
+      let r = r + 1
+    end
+    print("  wave " + (wave + 1) + ": built " + str_join(todo, ", "))
+    let wave = wave + 1
+  end
+  return built
+end
+
+# What earlier runs recorded: each message is "target checksum", read back as
+# [target, checksum]. (q_read gives each message as [id, status, payload].)
+make a function called sums_on_disk takes topic returns sums
+  let rows = q_read(topic)
+  let sums = []
+  let i = 0
+  while i < list_len(rows) do
+    let text = rows[i][2]
+    let sp = 0
+    while text[sp] != " " do
+      let sp = sp + 1
+    end
+    let sums = list_push(sums, [substr(text, 0, sp), to_num(substr(text, sp + 1, text.length - sp - 1))])
+    let i = i + 1
+  end
+  return sums
+end
+
+print("== what app needs, directly or not ==")
+let needs = solve("needs", ["app", logic_var("D")])
+let names = []
+let i = 0
+while i < list_len(needs) do
+  if not has(names, needs[i][1]) then
+    let names = list_push(names, needs[i][1])
+  end
+  let i = i + 1
+end
+print("  " + str_join(names, ", "))
+
+print("== a build, interrupted after two waves ==")
+build(topic, sums_on_disk(topic), 2)
+print("  recorded on disk: " + list_len(sums_on_disk(topic)) + " targets")
+
+print("== the build run again: it starts from what is on disk ==")
+build(topic, sums_on_disk(topic), 0 - 1)
+let all = sums_on_disk(topic)
+print("  recorded on disk: " + list_len(all) + " targets")
+print("  checksums: " + all)
+
+print("== and once more, with nothing left to do ==")
+build(topic, sums_on_disk(topic), 0 - 1)
+queue_remove_topic(topic)

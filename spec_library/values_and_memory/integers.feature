@@ -30,3 +30,8 @@ Feature: an integer is an int exactly when it fits in 64 bits (spec 1.3)
     Given 4294967296 * 4294967296
     When it is evaluated
     Then it is bigint with value 18446744073709551616
+
+  Scenario: dividing bigints is exact, and a gcd costs time growing as the square of the digits
+    Given bigint dividends and divisors of many sizes, and consecutive Fibonacci numbers of about 50 and 200 digits
+    When each is divided, and each Fibonacci fraction is reduced
+    Then q * b + r gives back the dividend with the remainder smaller than the divisor, and the larger reduction costs at most 16 times the smaller

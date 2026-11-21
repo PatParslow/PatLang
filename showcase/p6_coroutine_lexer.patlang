@@ -1,0 +1,172 @@
+# A calculator whose lexer is a coroutine.
+#
+# Paradigms: syntax definitions and fibres.
+#
+# The calculator's operators are declared in a small language of their own,
+# defined by a syntax definition: each line names a symbol, its precedence and
+# the function that applies it. The definition expands, before the program
+# runs, into ordinary calls that record each operator as a fact.
+#
+# The lexer is a fibre. It walks the input and yields one token at a time; the
+# parser asks for the next token when it wants one, so neither is written as
+# a state machine or a callback, and the lexer never builds a list of tokens.
+# The parser is precedence climbing over the operator facts, so adding an
+# operator is one line in the operators block.
+
+syntax OperatorTable {
+    trigger: Keyword("operators");
+    tokens {
+        Symbol(sym) = regex("[-+*/%^]", sym);
+        Level(n) = regex("[0-9]+", n);
+        Fn(name) = regex("[a-z_]+", name);
+        Arrow = "=>";
+    }
+    rule OperatorLine {
+        let sym = expect Symbol;
+        let level = expect Level;
+        expect Arrow;
+        let name = expect Fn;
+        return rule_add("operator", [sym, to_num(level), name], []);
+    }
+}
+
+make a function called op_add takes a, b returns r
+  return a + b
+end
+make a function called op_sub takes a, b returns r
+  return a - b
+end
+make a function called op_mul takes a, b returns r
+  return a * b
+end
+make a function called op_div takes a, b returns r
+  require b != 0
+  return a / b
+end
+
+operators {
+    + 1 => op_add
+    - 1 => op_sub
+    * 2 => op_mul
+    / 2 => op_div
+}
+
+# ---- the lexer: a fibre yielding one token at a time ----
+
+make a function called is_digit takes c returns yes
+  return (c >= 48) and (c <= 57)
+end
+
+# Yields ["num", n], ["op", symbol], ["(", ""], [")", ""], and ["end", ""]
+# for ever after the input runs out.
+make a function called lex takes text returns last
+  let bytes = bytes_from_str(text)
+  let i = 0
+  let n = bytes_len(bytes)
+  while i < n do
+    let c = bytes[i]
+    if is_digit(c) then
+      let v = 0
+      while (i < n) and is_digit(bytes[i]) do
+        let v = v * 10 + (bytes[i] - 48)
+        let i = i + 1
+      end
+      fiber_yield(["num", v])
+    elif c == 32 then
+      let i = i + 1
+    elif (c == 40) or (c == 41) then
+      fiber_yield([chr(c), ""])
+      let i = i + 1
+    else
+      fiber_yield(["op", chr(c)])
+      let i = i + 1
+    end
+  end
+  while true do
+    fiber_yield(["end", ""])
+  end
+  return 0
+end
+
+# ---- the parser: pulls tokens, keeping one token of look-ahead ----
+
+class Parser {
+  field lexer = 0
+  field ahead = 0
+  make a function called peek takes self returns tok
+    return self.ahead
+  end
+  make a function called take takes self returns tok
+    let tok = self.ahead
+    self.ahead = fiber_resume(self.lexer, 0)
+    return tok
+  end
+}
+
+# [level, function] for an operator symbol, or [0, ""] for none.
+make a function called operator takes sym returns entry
+  let sols = solve("operator", [sym, logic_var("Level"), logic_var("Fn")])
+  if list_len(sols) == 0 then
+    return [0, ""]
+  end
+  return [sols[0][1], sols[0][2]]
+end
+
+make a function called primary takes p returns v
+  let tok = p.take()
+  if tok[0] == "num" then
+    return tok[1]
+  end
+  if tok[0] == "(" then
+    let v = expression(p, 1)
+    let close = p.take()
+    assert close[0] == ")"
+    return v
+  end
+  if (tok[0] == "op") and (tok[1] == "-") then
+    return 0 - primary(p)
+  end
+  assert false
+  return 0
+end
+
+# Precedence climbing: operators of at least min_level, left associative.
+make a function called expression takes p, min_level returns v
+  let v = primary(p)
+  while true do
+    let tok = p.peek()
+    if tok[0] != "op" then
+      return v
+    end
+    let entry = operator(tok[1])
+    if entry[0] < min_level then
+      return v
+    end
+    p.take()
+    let rhs = expression(p, entry[0] + 1)
+    let v = apply(entry[1], v, rhs)
+  end
+  return v
+end
+
+make a function called calculate takes text returns v
+  let p = new("Parser")
+  p.lexer = fiber_new("lex")
+  # the first resume passes the text in and gives the first token
+  p.ahead = fiber_resume(p.lexer, text)
+  let v = expression(p, 1)
+  let last = p.peek()
+  assert last[0] == "end"
+  return v
+end
+
+print("== the operators, as facts ==")
+print("" + list_len(solve("operator", [logic_var("S"), logic_var("L"), logic_var("F")])) + " operators declared")
+
+print("== calculations ==")
+let inputs = ["1 + 2 * 3", "(1 + 2) * 3", "10 / 4", "2 * (3 + 4) - 5 / 10", "-3 * -(2 + 1)", "1 / 3 + 1 / 6"]
+let i = 0
+while i < list_len(inputs) do
+  print(inputs[i] + " = " + calculate(inputs[i]))
+  let i = i + 1
+end

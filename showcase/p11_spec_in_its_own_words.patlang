@@ -1,0 +1,141 @@
+# A currency converter, its rates in a notation of their own, and its
+# specification run as tests, all in one file.
+#
+# Paradigms: syntax definitions and executable specifications.
+#
+# The exchange rates are written in a small notation, "GBP => EUR 117 per
+# 100", defined by a syntax definition at the top of the file: before the
+# program runs, each line becomes a call that records the rate as a fact.
+# Conversion is exact, so 3 pounds is 351/100 euros, where 3 * 1.17 in
+# floats is 3.5100000000000002.
+#
+# The behaviour is specified in Gherkin, as a feature with scenarios, and the
+# same program runs that feature against the converter: each step's words are
+# matched to a function, with the numbers in it taken as arguments. The
+# notation, the code and the specification are kept together, and the
+# specification is checked every time the program runs.
+
+include "../self_hosting/lib/gherkin.patlang"
+
+syntax RateTable {
+    trigger: Keyword("rates");
+    tokens {
+        Currency(code) = regex("[A-Z][A-Z][A-Z]", code);
+        Amount(n) = regex("[0-9]+", n);
+        Arrow = "=>";
+        Per = "per";
+    }
+    rule RateLine {
+        let from = expect Currency;
+        expect Arrow;
+        let to = expect Currency;
+        let num = expect Amount;
+        expect Per;
+        let den = expect Amount;
+        return rule_add("rate", [from, to, to_num(num) / to_num(den)], []);
+    }
+}
+
+rates {
+    GBP => EUR 117 per 100
+    EUR => USD 108 per 100
+    USD => JPY 15000 per 100
+}
+
+# amount in from, in to: directly, or through one currency between. The rate
+# facts go one way; the other way is the reciprocal.
+make a function called rate_between takes from, to returns r
+  if from == to then
+    return 1
+  end
+  let direct = solve("rate", [from, to, logic_var("R")])
+  if list_len(direct) > 0 then
+    return direct[0][2]
+  end
+  let back = solve("rate", [to, from, logic_var("R")])
+  if list_len(back) > 0 then
+    return 1 / back[0][2]
+  end
+  let via = solve("rate", [from, logic_var("Mid"), logic_var("R")])
+  let i = 0
+  while i < list_len(via) do
+    let onward = rate_between_direct(via[i][1], to)
+    if onward != 0 then
+      return via[i][2] * onward
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+make a function called rate_between_direct takes from, to returns r
+  let direct = solve("rate", [from, to, logic_var("R")])
+  if list_len(direct) > 0 then
+    return direct[0][2]
+  end
+  return 0
+end
+
+make a function called convert takes amount, from, to returns out
+  let r = rate_between(from, to)
+  # no rate between the two
+  assert r != 0
+  return amount * r
+end
+
+# ---- the steps: each sentence, and the function it runs ----
+
+make a function called st_amount takes ctx returns ok
+  ctx_set(ctx, "amount", to_num(step_arg(ctx, "n")))
+  ctx_set(ctx, "from", step_arg(ctx, "cur"))
+  return true
+end
+
+make a function called st_convert takes ctx returns ok
+  ctx_set(ctx, "to", step_arg(ctx, "cur"))
+  ctx_set(ctx, "result", convert(ctx_get(ctx, "amount"), ctx_get(ctx, "from"), step_arg(ctx, "cur")))
+  return true
+end
+
+make a function called st_result takes ctx returns ok
+  return expect(ctx, "the converted amount", "" + ctx_get(ctx, "result"), step_arg(ctx, "want"))
+end
+
+make a function called st_back takes ctx returns ok
+  # from the currency it was converted to, back to the one the step names
+  let back = convert(ctx_get(ctx, "result"), ctx_get(ctx, "to"), step_arg(ctx, "cur"))
+  expect(ctx, "back in the currency it started in", step_arg(ctx, "cur"), ctx_get(ctx, "from"))
+  return expect(ctx, "converted back", back, ctx_get(ctx, "amount"))
+end
+
+let spec = str_join([
+  "Feature: converting between currencies",
+  "",
+  "  Scenario: a direct rate",
+  "    Given an amount of 3 GBP",
+  "    When it is converted to EUR",
+  "    Then the result is 351/100",
+  "",
+  "  Scenario: a rate the other way is the reciprocal",
+  "    Given an amount of 117 EUR",
+  "    When it is converted to GBP",
+  "    Then the result is 100",
+  "",
+  "  Scenario: two hops",
+  "    Given an amount of 100 GBP",
+  "    When it is converted to USD",
+  "    Then the result is 3159/25",
+  "",
+  "  Scenario: there and back loses nothing",
+  "    Given an amount of 7 EUR",
+  "    When it is converted to USD",
+  "    Then converting back to EUR gives the amount again"
+], chr(10))
+
+let ctx = ctx_new()
+step(ctx, "an amount of {n} {cur}", "st_amount")
+step(ctx, "it is converted to {cur}", "st_convert")
+step(ctx, "the result is {want}", "st_result")
+step(ctx, "converting back to {cur} gives the amount again", "st_back")
+run_feature(ctx, spec)
+ctx_report(ctx)

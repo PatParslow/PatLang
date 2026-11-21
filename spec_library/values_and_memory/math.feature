@@ -21,6 +21,11 @@ Feature: powers, trigonometry, rounding, bits and the small file functions
     When a program applies max and min
     Then each gives the larger or the smaller, keeping its kind
 
+  Scenario: to_num reads a rational as it prints
+    Given the texts of fractions, signed and not, in lowest terms and not, and one with a bigint numerator
+    When a program reads each with to_num
+    Then each is the exact rational in lowest terms, or the int when it divides evenly, and a printed sum reads back as itself
+
   Scenario: an operation on two floats costs about what one on two ints does
     Given a loop of 200000 float additions and multiplications, and one of int ones
     When each runs three times

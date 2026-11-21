@@ -1,0 +1,104 @@
+# A long job you can ask about while it works.
+#
+# Paradigms: signals and concurrency (budgeted slices, a monitoring thread).
+#
+# The job counts primes, a slice at a time: each slice runs for at most 20 ms
+# of work (budgeted), and between slices the job answers any signals that
+# have arrived. It announces itself by name, so a monitor that knows only the
+# name "prime_counter" can find its port, ask for its status as it goes, and
+# tell it to stop. Here the monitor is a thread of the same program; it could
+# as well be another program on the same machine, with no change to the job.
+#
+# Output does not depend on timing: the monitor checks that the answers it
+# got show progress, not what the counts were.
+
+include "../self_hosting/lib/signals.patlang"
+include "../self_hosting/lib/signal_discovery.patlang"
+
+class Job {
+  field next_k = 2
+  field primes = 0
+  field running = true
+}
+
+make a function called is_prime takes k returns yes
+  if k < 2 then
+    return false
+  end
+  let d = 2
+  while d * d <= k do
+    if k % d == 0 then
+      return false
+    end
+    let d = d + 1
+  end
+  return true
+end
+
+make a function called starts_with takes text, prefix returns yes
+  return substr(text, 0, prefix.length) == prefix
+end
+
+# N from a reply "checked N, found M".
+make a function called checked_of takes reply returns n
+  let start = "checked ".length
+  let i = start
+  while (i < reply.length) and (reply[i] != ",") do
+    let i = i + 1
+  end
+  return to_num(substr(reply, start, i - start))
+end
+
+let job = new("Job")
+
+when status do
+  signal_reply("checked " + (job.next_k - 2) + ", found " + job.primes)
+end
+
+when quit do
+  job.running = false
+  signal_reply("stopping at " + job.primes + " primes")
+end
+
+let port = signal_claim(0)
+signal_allow(["status", "quit"])
+signal_announce("prime_counter", port, [["status", "how many numbers it has checked, and how many primes it found"], ["quit", "stop after the current slice"]])
+
+# The monitor knows only the job's name.
+let monitor = thread_spawn(|| do
+  let found = signal_discover_one("prime_counter", 60000)
+  let p = to_num(found[0])
+  sleep_ms(200)
+  let first = signal_query(p, "status", "")
+  sleep_ms(200)
+  let second = signal_query(p, "status", "")
+  let last = signal_query(p, "quit", "")
+  return [found[1], first, second, last]
+end)
+
+# The work, 20 ms at a time: when a slice's budget runs out, budgeted gives
+# back a handle, the loop answers whatever signals have come in, and the same
+# computation goes on from where it stopped.
+let handle = false
+while job.running do
+  let out = budgeted(20, handle) {
+    while job.running do
+      if is_prime(job.next_k) then
+        job.primes = job.primes + 1
+      end
+      job.next_k = job.next_k + 1
+    end
+    true
+  }
+  if out[0] != "done" then
+    let handle = out[1]
+  end
+  signal_poll(port, 5)
+end
+
+let heard = thread_result(monitor)
+print("the monitor found the job by name, offering: " + str_join(sd_action_names(heard[0]), ", "))
+print("first status has the form 'checked N, found M': " + starts_with(heard[1], "checked "))
+print("the second shows more work than the first: " + (checked_of(heard[2]) > checked_of(heard[1])))
+print("quit was answered: " + starts_with(heard[3], "stopping at "))
+print("the job counted some primes before it stopped: " + (job.primes > 0))

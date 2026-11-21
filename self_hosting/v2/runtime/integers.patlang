@@ -293,8 +293,44 @@ make a function called rt_mag_mul_small takes a, m returns out
   return out
 end
 
-# [q, r] with a = q * b + r, 0 <= r < b (b not zero): schoolbook long
-# division, one limb of q at a time, each found by binary search.
+# n zero limbs.
+make a function called rt_mag_zeros takes n returns out
+  require n >= 0
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, 0)
+    let i = i + 1
+  end
+  ensure list_len(out) == n
+  return out
+end
+
+# [q, [r]] with a = q * d + r, 0 <= r < d, for a one-limb divisor d.
+make a function called rt_mag_divmod_small takes a, d returns qr
+  require (value_class(a) == 9) and (d > 0) and (d < 1000000000)
+  let q = rt_mag_zeros(list_len(a))
+  let rem = 0
+  let i = list_len(a) - 1
+  while i >= 0 do
+    let cur = rem * 1000000000 + a[i]
+    let q = list_set(q, i, word_div(cur, d))
+    let rem = word_rem(cur, d)
+    let i = i - 1
+  end
+  let qr = [rt_mag_norm(q), [rem]]
+  ensure (list_len(qr) == 2) and (qr[1][0] < d)
+  return qr
+end
+
+# [q, r] with a = q * b + r, 0 <= r < b (b not zero): long division, Knuth's
+# algorithm D (TAOCP 4.3.1, in the form of Hacker's Delight's divmnu). The
+# divisor is first scaled so that its top limb is at least half the base;
+# each quotient limb is then estimated from the top two limbs of what is left
+# over the divisor's top limb, corrected at most twice by the next limb, and
+# once more by an add-back. Each limb of the quotient costs one pass over the
+# divisor, so a division of an n-limb number by an m-limb one costs about
+# (n - m + 1) * m limb operations.
 make a function called rt_mag_divmod takes a, b returns qr
   require (value_class(a) == 9) and (value_class(b) == 9) and (not rt_mag_is_zero(b))
   if rt_mag_cmp(a, b) < 0 then
@@ -302,39 +338,91 @@ make a function called rt_mag_divmod takes a, b returns qr
     ensure (list_len(qr) == 2) and (rt_mag_cmp(qr[1], b) < 0)
     return qr
   end
-  let q = []
-  let i = 0
-  while i < list_len(a) do
-    let q = list_push(q, 0)
-    let i = i + 1
+  let m = list_len(b)
+  if m == 1 then
+    let qr = rt_mag_divmod_small(a, b[0])
+    ensure (list_len(qr) == 2) and (rt_mag_cmp(qr[1], b) < 0)
+    return qr
   end
-  let r = [0]
-  let i = list_len(a) - 1
-  while i >= 0 do
-    # r = r * BASE + a[i]
-    let shifted = [a[i]]
-    let k = 0
-    while k < list_len(r) do
-      let shifted = list_push(shifted, r[k])
-      let k = k + 1
-    end
-    let r = rt_mag_norm(shifted)
-    let lo = 0
-    let hi = 999999999
-    while lo < hi do
-      let mid = lo + word_div(hi - lo + 1, 2)
-      if rt_mag_cmp(rt_mag_mul_small(b, mid), r) <= 0 then
-        let lo = mid
+  let base = 1000000000
+  let n = list_len(a)
+  # scaled so the divisor's top limb is at least base / 2: the scale keeps
+  # the divisor m limbs long, and the dividend gets a limb more
+  let f = word_div(base, b[m - 1] + 1)
+  let v = rt_mag_mul_small(b, f)
+  let u = rt_mag_mul_small(a, f)
+  while list_len(u) < n + 1 do
+    let u = list_push(u, 0)
+  end
+  let vt = v[m - 1]
+  let vs = v[m - 2]
+  let q = rt_mag_zeros(n - m + 1)
+  let j = n - m
+  while j >= 0 do
+    let top = u[j + m] * base + u[j + m - 1]
+    let qhat = word_div(top, vt)
+    let rhat = word_rem(top, vt)
+    let adjusting = true
+    while adjusting do
+      if (qhat >= base) or (qhat * vs > rhat * base + u[j + m - 2]) then
+        let qhat = qhat - 1
+        let rhat = rhat + vt
+        if rhat >= base then
+          let adjusting = false
+        end
       else
-        let hi = mid - 1
+        let adjusting = false
       end
     end
-    let q = list_set(q, i, lo)
-    if lo > 0 then
-      let r = rt_mag_sub(r, rt_mag_mul_small(b, lo))
+    # u[j .. j+m] -= qhat * v
+    let carry = 0
+    let borrow = 0
+    let k = 0
+    while k < m do
+      let p = qhat * v[k] + carry
+      let carry = word_div(p, base)
+      let t = u[j + k] - word_rem(p, base) - borrow
+      if t < 0 then
+        let u = list_set(u, j + k, t + base)
+        let borrow = 1
+      else
+        let u = list_set(u, j + k, t)
+        let borrow = 0
+      end
+      let k = k + 1
     end
-    let i = i - 1
+    let t = u[j + m] - carry - borrow
+    if t < 0 then
+      # qhat was one too many: add the divisor back once
+      let qhat = qhat - 1
+      let c = 0
+      let k = 0
+      while k < m do
+        let s = u[j + k] + v[k] + c
+        if s >= base then
+          let u = list_set(u, j + k, s - base)
+          let c = 1
+        else
+          let u = list_set(u, j + k, s)
+          let c = 0
+        end
+        let k = k + 1
+      end
+      let u = list_set(u, j + m, t + base + c - base)
+    else
+      let u = list_set(u, j + m, t)
+    end
+    let q = list_set(q, j, qhat)
+    let j = j - 1
   end
+  # the remainder is the low m limbs of u, scaled back down
+  let low = []
+  let k = 0
+  while k < m do
+    let low = list_push(low, u[k])
+    let k = k + 1
+  end
+  let r = rt_mag_divmod_small(rt_mag_norm(low), f)[0]
   let qr = [rt_mag_norm(q), r]
   ensure (list_len(qr) == 2) and (rt_mag_cmp(qr[1], b) < 0)
   return qr

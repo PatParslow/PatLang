@@ -51,6 +51,10 @@ Edit nothing it reads. The compiler unit reads `self_hosting/v2/runtime/` and
 - **A suite**: an entry in `gt_suites`: name, program (the interpreter), its
   arguments before the feature file or program, the units it needs, its inputs,
   and a lane ("" for none). The runner must answer `--list` and exit 1 on failure.
+  A lane is per feature file (`LANE/FEATURE`): a suite that runs the same
+  features as another (a new engine for the language scenarios) takes the same
+  lane, `language`, or its scenarios run beside their twins and share their
+  ports and files. Check the plan (`--plan`) lists each of its features.
 - **A build or a tool test**: an entry in `gt_build_units` with `gt_unit(name,
   needs, inputs, cores, lane, ["cmd", program, args], product)`; `edit_tool`
   is the example for a Python test.

@@ -96,6 +96,9 @@ so a runtime edit waits for a running gates run to finish.
   with an open stdin can wait on it, and the call looks hung.
 - **Exit codes:** read a command's status without a pipe after it; `cmd | tail`
   reports tail's.
+- **Git Bash and `.exe`:** a path `NAME` matches `NAME.exe` when only that exists,
+  so `cp X self_hosting/build/v2_interp` overwrote `v2_interp.exe`. Give a Linux
+  build a name with no `.exe` twin (`v2_interp_linux`), or copy with PowerShell.
 - **Before a long gates run:** run the changed code path once by hand on a real
   input. A runner's `--list` does not exercise its run path, and a failure path is
   checked by making something fail.

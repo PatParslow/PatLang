@@ -49,7 +49,41 @@ Feature: send (real user-defined method dispatch)
       ...
       """
 
+  Scenario: A class's own method called set is the one that runs; without one, set sets a field
+    Given the program
+      """
+      class Cell {
+        field v = 0
+        make a function called set takes self, x returns value
+          print("own set " + x)
+          self.v = x
+          return x
+        end
+      }
+      class Plain {
+        field k = 0
+      }
+      let c = new("Cell")
+      c.set(5)
+      print(c.v)
+      send(c, "set", 6)
+      print(c.v)
+      let p = new("Plain")
+      p.set("k", 7)
+      print(p.k)
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      own set 5
+      5
+      own set 6
+      6
+      7
+      """
+
   Note: this is a REAL closure call (the method is resolved by walking the
-  own class then the parent chain and invoked directly), distinct from
-  send(obj, "set", field, val), the one verb send itself understands; any
-  other method name is resolved by the class's own dispatch.
+  own class then the parent chain and invoked directly). send(obj, "set",
+  field, val) sets a field when the object's class, and its parents, have no
+  method called set; a class that defines set gets its own method, like any
+  other name.

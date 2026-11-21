@@ -1,14 +1,20 @@
-# The demo programs (demos/NN_name.patlang), each run interpreted and compiled,
-# and both outputs compared with demos/expected/NN_name.txt.
+# The demo programs (demos/NN_name.patlang), or the showcase programs
+# (showcase/NAME.patlang), each run interpreted and compiled, and both outputs
+# compared with DIR/expected/NAME.txt.
 #
 # Usage, from the repository root:
-#   self_hosting/build/v2_interp.exe self_hosting/tools/run_demos.patlang [--list] [DEMO...]
+#   self_hosting/build/v2_interp.exe self_hosting/tools/run_demos.patlang [--dir DIR] [--linux] [--list] [PROGRAM...]
 #
-# With --list, the demos' paths, one a line, and nothing run. With paths, only
-# those demos run; with none, all of them. Exits with 1 when one failed. The
-# gates run each as a unit of its own (demos/NAME in
-# self_hosting/v2/tools/gates.patlang), and the repository checks fail when a
-# program in demos/ is not listed here.
+# --dir names the directory, demos when it is not given. With --list, the
+# programs' paths, one a line, and nothing run. With paths, only those run;
+# with none, all of them. --linux runs the compiled program as a Linux build
+# under WSL. Exits with 1 when one failed. The gates run each as a unit of its
+# own (demos/NAME, showcase/NAME in self_hosting/v2/tools/gates.patlang).
+#
+# The demos are the list below, which the repository checks keep complete; any
+# other directory's programs are every .patlang file directly in it. A program
+# with DIR/expected/NAME.constant_time.txt is also given to the compiler's
+# --constant-time check, whose report and verdict must be that file's.
 
 include "../lib/includes.patlang"
 include "../lib/gherkin_text.patlang"
@@ -27,7 +33,24 @@ make a function called demo_programs returns paths
   ]
 end
 
-# demos/NN_name.patlang's name without directory or extension.
+# The programs of a directory: the demos' list, or the .patlang files in it.
+make a function called dir_programs takes dir returns paths
+  if dir == "demos" then
+    return demo_programs()
+  end
+  let paths = []
+  let entries = list_dir(dir)
+  let i = 0
+  while i < list_len(entries) do
+    if str_ends_with(entries[i], ".patlang") then
+      let paths = list_push(paths, dir + "/" + entries[i])
+    end
+    let i = i + 1
+  end
+  return paths
+end
+
+# DIR/NAME.patlang's name without directory or extension.
 make a function called demo_name takes path returns name
   let file = path_basename(path)
   return substr(file, 0, file.length - 8)
@@ -56,25 +79,69 @@ make a function called demo_check takes path, engine, result, expected returns o
   return true
 end
 
-make a function called run_demo takes path returns ok
+# The compiler's --constant-time check of the program, against the report
+# DIR/expected/NAME.constant_time.txt holds: a report naming an error is a
+# refusal, and the check must refuse exactly then.
+make a function called constant_time_check takes path, wanted returns ok
+  let expected = demo_lines(read_file(wanted))
+  let r = v2_compile([path, "--constant-time"])
+  let got = demo_lines(r[0])
+  let refused = str_contains(expected, "v2 error")
+  if (got != expected) or (r[1] == refused) then
+    print("  FAIL: " + path + " (constant-time check) reported")
+    print(r[0])
+    print("  expected")
+    print(expected)
+    return false
+  end
+  print("  ok: " + path + " (constant-time check)")
+  return true
+end
+
+make a function called run_demo takes dir, path, linux returns ok
   let name = demo_name(path)
-  let wanted = "demos/expected/" + name + ".txt"
+  let wanted = dir + "/expected/" + name + ".txt"
   if not file_exists(wanted) then
     print("  FAIL: " + path + " has no " + wanted)
     return false
   end
   let expected = demo_lines(read_file(wanted))
   let a = demo_check(path, "interpreted", run_interpreted(path), expected)
-  let b = demo_check(path, "compiled", run_compiled(path, spec_out() + "/demo_" + name + ".exe"), expected)
-  return a and b
+  if linux then
+    let b = demo_check(path, "Linux", run_compiled_linux(path, spec_out() + "/demo_" + name), expected)
+  else
+    let b = demo_check(path, "compiled", run_compiled(path, spec_out() + "/demo_" + name + ".exe"), expected)
+  end
+  let c = true
+  let ct = dir + "/expected/" + name + ".constant_time.txt"
+  if file_exists(ct) == true then
+    let c = constant_time_check(path, ct)
+  end
+  return a and b and c
 end
 
 make a function called demos_main takes args returns ok
-  let all = demo_programs()
-  let chosen = []
+  # the options first: --dir DIR and --linux
+  let dir = "demos"
+  let linux = false
+  let rest = []
   let i = 0
   while i < list_len(args) do
-    if args[i] == "--list" then
+    if (args[i] == "--dir") and (i + 1 < list_len(args)) then
+      let dir = args[i + 1]
+      let i = i + 1
+    elif args[i] == "--linux" then
+      let linux = true
+    else
+      let rest = list_push(rest, args[i])
+    end
+    let i = i + 1
+  end
+  let all = dir_programs(dir)
+  let chosen = []
+  let i = 0
+  while i < list_len(rest) do
+    if rest[i] == "--list" then
       let k = 0
       while k < list_len(all) do
         print(all[k])
@@ -84,15 +151,15 @@ make a function called demos_main takes args returns ok
     end
     let j = 0
     while j < list_len(all) do
-      if all[j] == args[i] then
+      if all[j] == rest[i] then
         let chosen = list_push(chosen, all[j])
       end
       let j = j + 1
     end
     let i = i + 1
   end
-  if (list_len(args) > 0) and (list_len(chosen) == 0) then
-    print("no demo named " + str_join(args, " "))
+  if (list_len(rest) > 0) and (list_len(chosen) == 0) then
+    print("no program named " + str_join(rest, " ") + " in " + dir)
     exit_with(1)
   end
   if list_len(chosen) == 0 then
@@ -102,7 +169,7 @@ make a function called demos_main takes args returns ok
   let fail_count = 0
   let d = 0
   while d < list_len(chosen) do
-    if run_demo(chosen[d]) then
+    if run_demo(dir, chosen[d], linux) then
       let pass_count = pass_count + 1
     else
       let fail_count = fail_count + 1

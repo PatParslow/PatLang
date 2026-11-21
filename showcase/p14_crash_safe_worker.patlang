@@ -1,0 +1,97 @@
+# A worker that loses no job, and that no job can bring down.
+#
+# Paradigms: a durable queue and worlds.
+#
+# Jobs wait in a queue kept on disk. The worker takes the oldest pending job,
+# runs it in a world of its own, and acknowledges it only when it finished;
+# a job that fails stops its world and nothing else, and is marked as failed
+# rather than acknowledged. If the worker itself stops between taking a job
+# and acknowledging it (here it is made to stop dead during its third), the
+# job is still pending on disk, and the next run of the worker picks it up. Nothing
+# here is a separate process or a message broker: the queue is files, and the
+# isolation is the language's.
+
+include "../self_hosting/lib/queue.patlang"
+
+# A job is "kind argument": sum N adds 1..N, divide N divides 100 by N
+# (asserting N is not 0), shout TEXT repeats it with an exclamation mark.
+make a function called run_job takes job returns result
+  let sp = 0
+  while (sp < job.length) and (job[sp] != " ") do
+    let sp = sp + 1
+  end
+  let kind = substr(job, 0, sp)
+  let arg = substr(job, sp + 1, job.length - sp - 1)
+  if kind == "sum" then
+    let n = to_num(arg)
+    return n * (n + 1) / 2
+  elif kind == "divide" then
+    let d = to_num(arg)
+    assert d != 0
+    return 100 / d
+  elif kind == "shout" then
+    return arg + "!"
+  end
+  assert false
+  return 0
+end
+
+# Takes and runs the pending jobs of topic; gives how many it finished. Each
+# job runs in a fresh world. A job whose world stopped has failed: it is
+# recorded as failed, so it is not taken again. With crash_at >= 0 the
+# worker stops dead after taking that many jobs and the next, before running
+# or acknowledging it, as a worker killed mid-job would.
+make a function called work takes topic, crash_at, label returns done_count
+  let done_count = 0
+  while true do
+    let ids = queue_pending(topic)
+    if list_len(ids) == 0 then
+      return done_count
+    end
+    let id = ids[0]
+    let job = queue_consume(topic)
+    if done_count == crash_at then
+      print("  " + label + ": took job " + id + " (" + job + ") and stopped before finishing it")
+      return done_count
+    end
+    let w = world_new()
+    let result = world_call(w, || do
+      return run_job(job)
+    end)
+    world_free(w)
+    # a world's call gives ["done", the job's result] or ["stopped", code]
+    if result[0] == "stopped" then
+      print("  " + label + ": job " + id + " (" + job + ") failed in its world")
+      queue_publish(topic + "_failed", job)
+      queue_ack(topic, id)
+    else
+      print("  " + label + ": job " + id + " (" + job + ") gave " + result[1])
+      queue_ack(topic, id)
+    end
+    let done_count = done_count + 1
+  end
+  return done_count
+end
+
+let topic = "showcase_p14_jobs"
+queue_remove_topic(topic)
+queue_remove_topic(topic + "_failed")
+
+let jobs = ["sum 100", "shout hello", "divide 0", "divide 8", "sum 10"]
+let i = 0
+while i < list_len(jobs) do
+  queue_publish(topic, jobs[i])
+  let i = i + 1
+end
+
+print("== the first worker, which dies during its third job ==")
+work(topic, 2, "first worker")
+print("  still pending on disk: " + list_len(queue_pending(topic)))
+
+print("== the next worker picks up where it stopped ==")
+work(topic, 0 - 1, "next worker")
+print("  still pending: " + list_len(queue_pending(topic)))
+print("  failed, kept for a person to look at: " + list_len(queue_pending(topic + "_failed")))
+
+queue_remove_topic(topic)
+queue_remove_topic(topic + "_failed")
