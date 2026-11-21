@@ -3,8 +3,8 @@
 Python has no planner of its own. The usual choices are a PDDL planner run as
 a separate program (the domain and problem written out as PDDL text, the plan
 read back) or a search written by hand. This is the second: a uniform-cost
-search with heapq over states of facts and numbers, about forty lines before
-the factory itself is described. The PatLang program states the actions and
+search with heapq over states of facts and numbers, written before the
+factory itself is described. The PatLang program states the actions and
 asks; the search is the language's.
 
 Prints each plan's cost and steps. Plans of equal cost can list their steps

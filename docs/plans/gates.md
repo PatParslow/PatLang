@@ -231,7 +231,10 @@ finished.
   programs (docs/plans/showcase-programs.md): `run_demos.patlang --dir showcase`
   runs each interpreted and compiled (or, with `--linux`, as a Linux build) against
   `showcase/expected/NAME.txt`, and gives a program with
-  `expected/NAME.constant_time.txt` to `v2.exe --constant-time` as well;
+  `expected/NAME.constant_time.txt` to `v2.exe --constant-time` as well. A
+  program with `expected/NAME.html` is run with `--page PATH` on each engine, and
+  the page each writes (to a file of its own under `spec_out()`, removed first) is
+  compared with that file;
   `run_showcase_compare.patlang` runs each Python sketch in `showcase/compare/`
   against the program's expected output, or the sketch's own in
   `showcase/compare/expected/`. `demos_linux` runs the demos as Linux builds. The two

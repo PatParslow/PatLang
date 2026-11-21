@@ -904,6 +904,207 @@ make a function called rt_start_process_flags takes program, args, h_in, h_out, 
   return pi
 end
 
+# ---- a pseudo-console: a child's console that this process types into ----
+#
+# A pty is a vec: [console, the input pipe's end to write, the output pipe's
+# end to read, the process, its exit code or -1 until it is known].
+
+# Starts the program with args in a pseudo-console 80 columns by 25 rows: what
+# it reads from its console is what pty_write writes, and what it writes there
+# pty_read gives, as a terminal would show it (text with VT sequences). The
+# pty, or [] where there is no pseudo-console (a browser) or the program could
+# not start.
+make a function called pty_start takes program, args returns pty
+  require value_live(program) and (value_class(args) == 9)
+  # two pipes neither end of which a child inherits, each [read end, write
+  # end], or [] when it could not be made
+  let made = []
+  let p = 0
+  while p < 2 do
+    let pipe = rt_alloc(16)
+    let ends = []
+    if rt_i32(extern_call("KERNEL32.DLL", "CreatePipe", pipe + 16, pipe + 24, 0, 0)) != 0 then
+      let ends = [mem_load(pipe, 16), mem_load(pipe, 24)]
+    end
+    rt_free(pipe)
+    let made = list_push(made, ends)
+    let p = p + 1
+  end
+  let inp = made[0]
+  let outp = made[1]
+  if (list_len(inp) == 0) or (list_len(outp) == 0) then
+    rt_close_ends(inp)
+    rt_close_ends(outp)
+    let pty = []
+    ensure (value_class(pty) == 12) or (value_class(pty) == 9)
+    return pty
+  end
+  let cell = rt_alloc(8)
+  mem_store(cell, 16, 0)
+  # COORD {80, 25}, passed by value: X in the low 16 bits, Y above them
+  let hr = rt_i32(extern_call("KERNEL32.DLL", "CreatePseudoConsole", 80 + 25 * 65536, inp[0], outp[1], 0, cell + 16))
+  let hpc = mem_load(cell, 16)
+  rt_free(cell)
+  # the console keeps its own copies of these two ends
+  extern_call("KERNEL32.DLL", "CloseHandle", inp[0])
+  extern_call("KERNEL32.DLL", "CloseHandle", outp[1])
+  let cmd = 0
+  if hr == 0 then
+    let cmd = rt_command_line(program, args)
+  end
+  let pi = 0
+  if cmd != 0 then
+    # STARTUPINFOEXA, 112 bytes, its attribute list at 104 holding the
+    # console (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, whose value is the
+    # console itself). STARTF_USESTDHANDLES with no handles: without it, a
+    # child of a process whose standard handles are pipes takes those pipes
+    # (seen: the probe printed to this process's output, not the console's)
+    let si = rt_alloc(112)
+    let k = 0
+    while k < 14 do
+      mem_store(si, 16 + 8 * k, 0)
+      let k = k + 1
+    end
+    mem_store(si, 16, 112)
+    mem_store(si, 76, 256)
+    let size = rt_alloc(8)
+    mem_store(size, 16, 0)
+    extern_call("KERNEL32.DLL", "InitializeProcThreadAttributeList", 0, 1, 0, size + 16)
+    let attrs = rt_alloc(mem_load(size, 16))
+    let listed = extern_call("KERNEL32.DLL", "InitializeProcThreadAttributeList", attrs + 16, 1, 0, size + 16) != 0
+    let ready = listed
+    if ready then
+      let ready = extern_call("KERNEL32.DLL", "UpdateProcThreadAttribute", attrs + 16, 0, 131094, hpc, 8, 0, 0) != 0
+    end
+    mem_store(si, 120, attrs + 16)
+    let pi = rt_alloc(24)
+    let ok = 0
+    if ready then
+      # The child starts with Ctrl+C on, as a program a terminal starts does:
+      # whether a process ignores it is inherited, and a process started from
+      # one that ignores it (Git Bash's children do) ignores it too, with no
+      # call to ask which. So this process turns it on for itself first, and
+      # the child inherits that.
+      extern_call("KERNEL32.DLL", "SetConsoleCtrlHandler", 0, 0)
+      # no handles inherited; EXTENDED_STARTUPINFO_PRESENT
+      let ok = extern_call("KERNEL32.DLL", "CreateProcessA", 0, cmd + 16, 0, 0, 0, 524288, 0, 0, si + 16, pi + 16)
+    end
+    if listed then
+      extern_call("KERNEL32.DLL", "DeleteProcThreadAttributeList", attrs + 16)
+    end
+    rt_free(attrs)
+    rt_free(size)
+    rt_free(si)
+    rt_free(cmd)
+    if ok == 0 then
+      rt_free(pi)
+      let pi = 0
+    end
+  end
+  if pi == 0 then
+    if hr == 0 then
+      extern_call("KERNEL32.DLL", "ClosePseudoConsole", hpc)
+    end
+    extern_call("KERNEL32.DLL", "CloseHandle", inp[1])
+    extern_call("KERNEL32.DLL", "CloseHandle", outp[0])
+    let pty = []
+    ensure (value_class(pty) == 12) or (value_class(pty) == 9)
+    return pty
+  end
+  extern_call("KERNEL32.DLL", "CloseHandle", mem_load(pi, 24))
+  let pty = vec_new()
+  vec_push(pty, hpc)
+  vec_push(pty, inp[1])
+  vec_push(pty, outp[0])
+  vec_push(pty, mem_load(pi, 16))
+  vec_push(pty, 0 - 1)
+  rt_free(pi)
+  ensure (value_class(pty) == 12) or (value_class(pty) == 9)
+  return pty
+end
+
+# Types text into the pty's console, as if at its keyboard: whether all of it
+# was written.
+make a function called pty_write takes pty, text returns ok
+  require (value_class(pty) == 12) and value_live(text)
+  let s = to_s(text)
+  let fed = 0
+  let ok = true
+  while ok and (fed < str_len(s)) do
+    let w = rt_out_word()
+    mem_store(w, 0, 0)
+    let ok = rt_i32(extern_call("KERNEL32.DLL", "WriteFile", vec_get(pty, 1), rt_str_bytes(s) + fed, str_len(s) - fed, w, 0)) != 0
+    let fed = fed + word_and(mem_load(w, 0), 4294967295)
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# What the pty's console has shown since the last read, without waiting.
+make a function called pty_read takes pty returns text
+  require value_class(pty) == 12
+  let b = sb_new()
+  rt_drain_pipe(vec_get(pty, 2), b)
+  let text = sb_str(b)
+  ensure value_class(text) == 8
+  return text
+end
+
+# Waits up to ms for the pty's program to end: its exit code, or -1 while it
+# runs. Its output is not read meanwhile, so a caller waiting long reads
+# between waits.
+make a function called pty_wait takes pty, ms returns code
+  require (value_class(pty) == 12) and (value_class(ms) == 2) and (ms >= 0)
+  if vec_get(pty, 4) == 0 - 1 then
+    # WAIT_OBJECT_0 is 0: it has ended
+    if rt_i32(extern_call("KERNEL32.DLL", "WaitForSingleObject", vec_get(pty, 3), ms)) == 0 then
+      vec_set(pty, 4, rt_exit_code(vec_get(pty, 3)))
+    end
+  end
+  let code = vec_get(pty, 4)
+  ensure value_class(code) == 2
+  return code
+end
+
+# Ends the pty: its program, if it still runs, then the console and its pipes;
+# what the console showed that was not yet read. The console draws what its
+# program wrote a moment after, so a program that has ended can have output
+# still to come: closing the console sends its last frame and then closes the
+# output pipe, read here to that end. ClosePseudoConsole returns at once from
+# Windows 11 24H2 (build 26100); earlier versions wait for the console to
+# exit, which can wait on a full output pipe, so what is there is read first.
+make a function called pty_close takes pty returns rest
+  require value_class(pty) == 12
+  if pty_wait(pty, 0) == 0 - 1 then
+    extern_call("KERNEL32.DLL", "TerminateProcess", vec_get(pty, 3), 1)
+    pty_wait(pty, 4294967295)
+  end
+  extern_call("KERNEL32.DLL", "CloseHandle", vec_get(pty, 1))
+  let b = sb_new()
+  rt_drain_pipe(vec_get(pty, 2), b)
+  extern_call("KERNEL32.DLL", "ClosePseudoConsole", vec_get(pty, 0))
+  # the output pipe, waiting, until the console has closed its end
+  let buf = rt_alloc(4096)
+  let reading = true
+  while reading do
+    let w = rt_out_word()
+    mem_store(w, 0, 0)
+    let ok = rt_i32(extern_call("KERNEL32.DLL", "ReadFile", vec_get(pty, 2), buf + 16, 4096, w, 0)) != 0
+    let n = word_and(mem_load(w, 0), 4294967295)
+    if ok and (n > 0) then
+      sb_push(b, rt_str_from_bytes(buf + 16, n))
+    else
+      let reading = false
+    end
+  end
+  rt_free(buf)
+  extern_call("KERNEL32.DLL", "CloseHandle", vec_get(pty, 2))
+  extern_call("KERNEL32.DLL", "CloseHandle", vec_get(pty, 3))
+  let rest = sb_str(b)
+  ensure value_class(rest) == 8
+  return rest
+end
+
 make a function called sleep_ms takes ms returns done
   require (value_class(ms) == 2)
   extern_call("KERNEL32.DLL", "Sleep", ms)

@@ -1,0 +1,325 @@
+# Selftest for self_hosting/lib/image_load.patlang and its decoders
+# (image_bmp.patlang, image_png.patlang) on v2 (GitHub #274).
+#
+# Given image files this test writes itself (BMPs at 32, 24 and 1 bit per
+# pixel, bottom-up and top-down, and PNGs in RGB and RGBA whose rows use each
+# of the five PNG filters), when img_load_file reads each, then every pixel is
+# the one written; a file that is not an image, or is cut short, gives [].
+# The files are read as bytes, so the zero bytes and bytes above 127 every
+# header holds come through as themselves.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/v2_engines.patlang"
+include "lib/image_load.patlang"
+include "../packages/deflate/deflate.patlang"
+
+# ---- writing the fixtures ----
+
+make a function called le16 takes out, v returns ok
+  bytes_push(out, v band 255)
+  bytes_push(out, (v shr 8) band 255)
+  return true
+end
+
+make a function called le32 takes out, v returns ok
+  let u = v
+  if u < 0 then
+    let u = u + 4294967296
+  end
+  bytes_push(out, u band 255)
+  bytes_push(out, (u shr 8) band 255)
+  bytes_push(out, (u shr 16) band 255)
+  bytes_push(out, (u shr 24) band 255)
+  return true
+end
+
+make a function called be32 takes out, v returns ok
+  bytes_push(out, (v shr 24) band 255)
+  bytes_push(out, (v shr 16) band 255)
+  bytes_push(out, (v shr 8) band 255)
+  bytes_push(out, v band 255)
+  return true
+end
+
+# The fixture's colour at x, y: distinct in every pixel of a small image.
+make a function called colour_at takes x, y returns rgb
+  return [(x * 60 + 10) % 256, (y * 70 + 20) % 256, (x * 13 + y * 29 + 200) % 256]
+end
+
+# A BMP of the fixture's colours: bpp 24 or 32, rows bottom-up unless
+# top_down (a negative height).
+make a function called bmp_file takes w, h, bpp, top_down returns out
+  let bpx = bpp / 8
+  let row = w * bpx
+  let pad = (4 - row % 4) % 4
+  let data = (row + pad) * h
+  let out = bytes_new(0)
+  bytes_push(out, 66)
+  bytes_push(out, 77)
+  le32(out, 54 + data)
+  le32(out, 0)
+  le32(out, 54)
+  le32(out, 40)
+  le32(out, w)
+  if top_down then
+    le32(out, 0 - h)
+  else
+    le32(out, h)
+  end
+  le16(out, 1)
+  le16(out, bpp)
+  le32(out, 0)
+  le32(out, data)
+  le32(out, 2835)
+  le32(out, 2835)
+  le32(out, 0)
+  le32(out, 0)
+  let r = 0
+  while r < h do
+    let y = h - 1 - r
+    if top_down then
+      let y = r
+    end
+    let x = 0
+    while x < w do
+      let c = colour_at(x, y)
+      bytes_push(out, c[2])
+      bytes_push(out, c[1])
+      bytes_push(out, c[0])
+      if bpp == 32 then
+        bytes_push(out, 255)
+      end
+      let x = x + 1
+    end
+    let p = 0
+    while p < pad do
+      bytes_push(out, 0)
+      let p = p + 1
+    end
+    let r = r + 1
+  end
+  return out
+end
+
+# A 1-bit BMP, black and white in a checkerboard, palette black then white.
+make a function called bmp_1bit_file takes w, h returns out
+  let row = (w + 7 - (w + 7) % 8) / 8
+  let padded = row + (4 - row % 4) % 4
+  let out = bytes_new(0)
+  bytes_push(out, 66)
+  bytes_push(out, 77)
+  le32(out, 62 + padded * h)
+  le32(out, 0)
+  le32(out, 62)
+  le32(out, 40)
+  le32(out, w)
+  le32(out, h)
+  le16(out, 1)
+  le16(out, 1)
+  le32(out, 0)
+  le32(out, padded * h)
+  le32(out, 2835)
+  le32(out, 2835)
+  le32(out, 2)
+  le32(out, 0)
+  le32(out, 0)
+  le32(out, 16777215)
+  let r = 0
+  while r < h do
+    let y = h - 1 - r
+    let k = 0
+    while k < padded do
+      let byte = 0
+      let bit = 0
+      while bit < 8 do
+        let x = k * 8 + bit
+        if (x < w) and ((x + y) % 2 == 1) then
+          let byte = byte bor (1 shl (7 - bit))
+        end
+        let bit = bit + 1
+      end
+      bytes_push(out, byte)
+      let k = k + 1
+    end
+    let r = r + 1
+  end
+  return out
+end
+
+make a function called paeth takes a, b, c returns p
+  let p = a + b - c
+  let pa = abs(p - a)
+  let pb = abs(p - b)
+  let pc = abs(p - c)
+  if (pa <= pb) and (pa <= pc) then
+    return a
+  end
+  if pb <= pc then
+    return b
+  end
+  return c
+end
+
+# A PNG of the fixture's colours, channels 3 (RGB) or 4 (RGBA, alpha a),
+# row y filtered with filter type y % 5, so every filter is used.
+make a function called png_file takes w, h, channels, a returns out
+  let raw = []
+  let y = 0
+  while y < h do
+    let x = 0
+    while x < w do
+      let c = colour_at(x, y)
+      let raw = list_push(raw, c[0])
+      let raw = list_push(raw, c[1])
+      let raw = list_push(raw, c[2])
+      if channels == 4 then
+        let raw = list_push(raw, a)
+      end
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  let stride = w * channels
+  let filtered = bytes_new(0)
+  let y = 0
+  while y < h do
+    let f = y % 5
+    bytes_push(filtered, f)
+    let i = 0
+    while i < stride do
+      let v = raw[y * stride + i]
+      let left = 0
+      if i >= channels then
+        let left = raw[y * stride + i - channels]
+      end
+      let up = 0
+      if y > 0 then
+        let up = raw[(y - 1) * stride + i]
+      end
+      let ul = 0
+      if (y > 0) and (i >= channels) then
+        let ul = raw[(y - 1) * stride + i - channels]
+      end
+      let pred = 0
+      if f == 1 then
+        let pred = left
+      elif f == 2 then
+        let pred = up
+      elif f == 3 then
+        let pred = (left + up - (left + up) % 2) / 2
+      elif f == 4 then
+        let pred = paeth(left, up, ul)
+      end
+      bytes_push(filtered, (v - pred + 256) % 256)
+      let i = i + 1
+    end
+    let y = y + 1
+  end
+  let out = bytes_new(0)
+  let sig = [137, 80, 78, 71, 13, 10, 26, 10]
+  let s = 0
+  while s < 8 do
+    bytes_push(out, sig[s])
+    let s = s + 1
+  end
+  let ihdr = bytes_new(0)
+  be32(ihdr, w)
+  be32(ihdr, h)
+  bytes_push(ihdr, 8)
+  if channels == 4 then
+    bytes_push(ihdr, 6)
+  else
+    bytes_push(ihdr, 2)
+  end
+  bytes_push(ihdr, 0)
+  bytes_push(ihdr, 0)
+  bytes_push(ihdr, 0)
+  png_chunk(out, "IHDR", ihdr)
+  png_chunk(out, "IDAT", zlib_compress(filtered, "dynamic"))
+  png_chunk(out, "IEND", bytes_new(0))
+  return out
+end
+
+make a function called png_chunk takes out, kind, data returns ok
+  be32(out, list_len(data))
+  let typed = bytes_from_str(kind)
+  bytes_extend(typed, data)
+  bytes_extend(out, typed)
+  be32(out, crc32_bytes(typed))
+  return true
+end
+
+# Whether every pixel of img is the fixture's colour, each channel scaled by
+# a/255 and floored (PNG alpha is composited onto black).
+make a function called all_pixels_are takes img, w, h, a returns yes
+  if list_len(img) == 0 then return false end
+  if (img_width(img) != w) or (img_height(img) != h) then return false end
+  let y = 0
+  while y < h do
+    let x = 0
+    while x < w do
+      let want = colour_at(x, y)
+      let got = img_get_pixel(img, x, y)
+      let k = 0
+      while k < 3 do
+        if got[k] != floor(want[k] * a / 255) then
+          return false
+        end
+        let k = k + 1
+      end
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return true
+end
+
+make a function called checker_right takes img, w, h returns yes
+  if list_len(img) == 0 then return false end
+  let y = 0
+  while y < h do
+    let x = 0
+    while x < w do
+      let v = 0
+      if (x + y) % 2 == 1 then
+        let v = 255
+      end
+      if img_get_pixel(img, x, y) != [v, v, v] then
+        return false
+      end
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return true
+end
+
+let ctx = ctx_new()
+# write_file_bytes makes the directory
+let dir = spec_out() + "/image_selftest"
+
+write_file_bytes(dir + "/rgb32.bmp", bmp_file(5, 3, 32, false))
+expect(ctx, "a 32-bit bottom-up BMP decodes to the pixels written", all_pixels_are(img_load_file(ctx, dir + "/rgb32.bmp"), 5, 3, 255), true)
+write_file_bytes(dir + "/rgb24.bmp", bmp_file(5, 3, 24, false))
+expect(ctx, "a 24-bit BMP, its rows padded to four bytes, decodes to the pixels written", all_pixels_are(img_load_file(ctx, dir + "/rgb24.bmp"), 5, 3, 255), true)
+write_file_bytes(dir + "/topdown.BMP", bmp_file(4, 4, 24, true))
+expect(ctx, "a top-down BMP, named in capitals, decodes the right way up", all_pixels_are(img_load_file(ctx, dir + "/topdown.BMP"), 4, 4, 255), true)
+write_file_bytes(dir + "/mono.bmp", bmp_1bit_file(10, 3))
+expect(ctx, "a 1-bit palette BMP decodes to its black and white", checker_right(img_load_file(ctx, dir + "/mono.bmp"), 10, 3), true)
+
+write_file_bytes(dir + "/rgb.png", png_file(6, 5, 3, 255))
+expect(ctx, "an RGB PNG using all five row filters decodes to the pixels written", all_pixels_are(img_load_file(ctx, dir + "/rgb.png"), 6, 5, 255), true)
+write_file_bytes(dir + "/rgba.png", png_file(6, 5, 4, 128))
+expect(ctx, "an RGBA PNG decodes composited onto black", all_pixels_are(img_load_file(ctx, dir + "/rgba.png"), 6, 5, 128), true)
+
+write_file(dir + "/text.bmp", "this is not a bitmap at all, though it is long enough to be one")
+expect(ctx, "a file that is not a BMP gives []", img_load_file(ctx, dir + "/text.bmp"), [])
+write_file_bytes(dir + "/short.bmp", bytes_slice(bmp_file(5, 3, 24, false), 0, 80))
+expect(ctx, "a BMP whose rows are cut short gives []", img_load_file(ctx, dir + "/short.bmp"), [])
+write_file_bytes(dir + "/short.png",bytes_slice(png_file(6, 5, 3, 255), 0, 40))
+expect(ctx, "a PNG cut short gives []", img_load_file(ctx, dir + "/short.png"), [])
+expect(ctx, "a file that is not there gives []", img_load_file(ctx, dir + "/nowhere.bmp"), [])
+expect(ctx, "an extension no decoder takes gives []", img_load_file(ctx, dir + "/rgb24.gif"), [])
+
+ctx_report(ctx)

@@ -8,6 +8,10 @@
 #   self_hosting/build/v2_interp.exe self_hosting/examples/build_daemon_demo.patlang rebuild
 #   self_hosting/build/v2_interp.exe self_hosting/examples/build_daemon_demo.patlang quit
 #
+# Started with --idle-ms N, the primary also stops by itself, with exit code
+# 3, once no signal has reached it for N ms; a quit gives exit code 0. A test
+# starts it so, and a quit that is lost cannot leave it holding the port.
+#
 # Once it holds its port it announces itself as "build_daemon"
 # (self_hosting/lib/signal_discovery.patlang), so another program can find
 # the port and its actions without being told them.
@@ -70,7 +74,19 @@ when quit do
   ctx_set(ctx, "bd_should_stop", "1")
 end
 
+# --idle-ms N first, if given; what follows is the client's signal name
 let cli_args = argv()
+let idle_ms = 0
+if (cli_args.length >= 2) and (cli_args[0] == "--idle-ms") then
+  let idle_ms = to_num(cli_args[1])
+  let rest = []
+  let ai = 2
+  while ai < cli_args.length do
+    let rest = list_push(rest, cli_args[ai])
+    let ai = ai + 1
+  end
+  let cli_args = rest
+end
 
 let port_id = signal_claim(BD_PORT)
 signal_allow(["status", "rebuild", "quit"])
@@ -81,12 +97,25 @@ if port_id >= 0 then
   print("DAEMON: initial cycle done, watching for signals (status / rebuild / quit)")
   ctx_set(ctx, "bd_should_stop", "0")
   ctx_set(ctx, "bd_rebuild_requested", "0")
-  while ctx_get(ctx, "bd_should_stop") == "0" do
-    signal_poll(port_id, 200)
+  let last_signal = now_ms()
+  let idled = false
+  while (ctx_get(ctx, "bd_should_stop") == "0") and (not idled) do
+    let got = signal_poll(port_id, 200)
+    if got != "" then
+      let last_signal = now_ms()
+    end
     if ctx_get(ctx, "bd_rebuild_requested") == "1" then
       ctx_set(ctx, "bd_rebuild_requested", "0")
       bd_run_cycle(ctx)
+      let last_signal = now_ms()
     end
+    if (idle_ms > 0) and (now_ms() - last_signal > idle_ms) then
+      let idled = true
+    end
+  end
+  if idled then
+    print("DAEMON: no signal for " + idle_ms + " ms, exiting")
+    exit_with(3)
   end
   print("DAEMON: exiting")
 else

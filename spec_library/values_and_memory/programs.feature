@@ -66,6 +66,16 @@ Feature: what functions, commands and includes give (spec 1.13)
     When another program captures its output
     Then the capture ends in well under the child's six seconds, and the port can be listened on again while the child still runs
 
+  Scenario: is_alive changes nothing, so a wait after it gives the exit code
+    Given a program that spawns a child exiting with code 3, and asks is_alive until it says false
+    When it then asks is_alive again and waits for the child
+    Then is_alive says false again, and the wait gives 3
+
+  Scenario: a port is free once the program that listened on it has ended
+    Given a program that listens on a port, takes a connection, closes its end first and ends
+    When another program listens on that port straight after, and a third tries a port its own listener holds
+    Then the second gets the port, and the third is refused
+
   Scenario: a program named with no directory is found through PATH alone
     Given a directory holding a cmd.exe that prints planted, and a program run from it that captures cmd /c echo from the system
     When the program runs

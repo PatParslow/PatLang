@@ -1,0 +1,192 @@
+# Selftest for the pseudo-console (pty_start, pty_write, pty_read, pty_wait,
+# pty_close: os_windows.patlang by ConPTY, os_linux.patlang by /dev/ptmx), and
+# through it the console a key at a time (console_raw_enable and the rest,
+# GitHub #271), checked in a real console with no person at it (#275).
+#
+# Given a probe program in a pseudo-console that turns raw mode on and
+# reports each byte it reads, when this test types at it, then each key
+# arrives on its own, before any Enter, with no echo; Backspace, Tab and
+# Enter arrive as the console gives them; UTF-8 input arrives as its bytes;
+# once raw mode is turned off the console echoes a line again; and Ctrl+C
+# stops the program. On Linux the same is checked by a driver program built
+# for Linux and run under WSL, with the probe built for Linux too, where the
+# terminal gives Enter as 10 (its ICRNL) and Backspace as 127.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/v2_engines.patlang"
+include "lib/program_run.patlang"
+
+make a function called probe_source returns text
+  return str_join([
+    "let m = console_raw_enable()",
+    "console_set_utf8()",
+    "print(\"raw \" + (m != 0 - 1))",
+    "let seen = []",
+    "let going = true",
+    "while going do",
+    "  let c = console_read_raw_byte()",
+    "  if (c == 0 - 1) or (c == 113) then",
+    "    let going = false",
+    "  else",
+    "    let seen = list_push(seen, c)",
+    "    print(\"got \" + c)",
+    "  end",
+    "end",
+    "console_raw_disable(m)",
+    "print(\"cooked\")",
+    "let line = []",
+    "let c = console_read_raw_byte()",
+    "while (c != 0 - 1) and (c != 10) and (c != 13) do",
+    "  let line = list_push(line, c)",
+    "  let c = console_read_raw_byte()",
+    "end",
+    "print(\"line \" + line)",
+    "print(\"done\")",
+    ""
+  ], chr(10))
+end
+
+# Reads the pty until its transcript holds want, or its program ends, or
+# limit_ms passes (only so a failure ends; the expect says what was missing):
+# the transcript so far.
+make a function called read_until takes pty, transcript, want, limit_ms returns text
+  let b = sb_new()
+  sb_push(b, transcript)
+  let deadline = now_ms() + limit_ms
+  let looking = true
+  while looking do
+    sb_push(b, pty_read(pty))
+    let so_far = sb_str(b)
+    if str_contains(so_far, want) then
+      let looking = false
+    elif (pty_wait(pty, 20) != 0 - 1) or (now_ms() >= deadline) then
+      sb_push(b, pty_read(pty))
+      let looking = false
+    end
+  end
+  return sb_str(b)
+end
+
+# The first line of the transcript holding start, or "" when none does: a
+# failed check shows what came.
+make a function called line_from takes transcript, start returns line
+  let lines = split_lines(transcript)
+  let i = 0
+  while i < list_len(lines) do
+    if str_contains(lines[i], start) then
+      return lines[i]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+let ctx = ctx_new()
+let probe = spec_out() + "/pty_probe.patlang"
+write_file(probe, probe_source())
+
+# ---- Windows: the probe in a pseudo-console ----
+
+let pty = pty_start(v2_interpreter(), [path_absolute(probe)])
+expect(ctx, "a pseudo-console starts the probe", value_class(pty) == 12, true)
+if value_class(pty) == 12 then
+  let t = read_until(pty, "", "raw true", 30000)
+  expect(ctx, "the probe's input is a console, so raw mode takes", str_contains(t, "raw true"), true)
+  pty_write(pty, "x")
+  let t = read_until(pty, t, "got 120", 30000)
+  expect(ctx, "a key arrives on its own, with no Enter after it", str_contains(t, "got 120"), true)
+  pty_write(pty, "yz")
+  let t = read_until(pty, t, "got 122", 30000)
+  expect(ctx, "typed keys are not echoed", str_contains(t, "xyz") or str_contains(t, "yz"), false)
+  pty_write(pty, chr(127))
+  let t = read_until(pty, t, "got 8" + chr(13), 30000)
+  expect(ctx, "Backspace arrives as 8", str_contains(t, "got 8" + chr(13)), true)
+  pty_write(pty, chr(9))
+  let t = read_until(pty, t, "got 9", 30000)
+  expect(ctx, "Tab arrives as 9", str_contains(t, "got 9"), true)
+  pty_write(pty, chr(13))
+  let t = read_until(pty, t, "got 13", 30000)
+  expect(ctx, "Enter arrives as 13", str_contains(t, "got 13"), true)
+  pty_write(pty, chr(233))
+  let t = read_until(pty, t, "got 169", 30000)
+  expect(ctx, "UTF-8 input arrives as its bytes (e acute: 195, 169)", str_contains(t, "got 195") and str_contains(t, "got 169"), true)
+  pty_write(pty, "q")
+  let t = read_until(pty, t, "cooked", 30000)
+  pty_write(pty, "hello" + chr(13))
+  let t = read_until(pty, t, "done", 30000)
+  expect(ctx, "the probe ends, exit code 0", pty_wait(pty, 30000), 0)
+  # the console's last frame can come after the program has ended
+  let t = t + pty_close(pty)
+  expect(ctx, "raw mode off, the console echoes a line again", str_contains(t, "hello"), true)
+  let got_line = line_from(t, "line [")
+  expect(ctx, "and gives the line only at its Enter (it gave: " + got_line + ")", str_contains(got_line, "line [104, 101, 108, 108, 111]"), true)
+  expect(ctx, "the transcript runs to the probe's last line", str_contains(t, "done"), true)
+end
+
+let pty2 = pty_start(v2_interpreter(), [path_absolute(probe)])
+if value_class(pty2) == 12 then
+  let t2 = read_until(pty2, "", "raw true", 30000)
+  pty_write(pty2, chr(3))
+  let code = pty_wait(pty2, 30000)
+  let t2 = t2 + pty_read(pty2) + pty_close(pty2)
+  expect(ctx, "Ctrl+C stops the program", [code != 0 - 1, code != 0, str_contains(t2, "done")], [true, true, false])
+end
+
+# ---- Linux: a driver built for Linux, the probe in a pseudo-terminal ----
+
+make a function called driver_source takes probe_path returns text
+  return str_join([
+    "make a function called until takes pty, t, want returns text",
+    "  let b = sb_new()",
+    "  sb_push(b, t)",
+    "  let deadline = now_ms() + 30000",
+    "  while (not str_contains(sb_str(b), want)) and (pty_wait(pty, 20) == 0 - 1) and (now_ms() < deadline) do",
+    "    sb_push(b, pty_read(pty))",
+    "  end",
+    "  sb_push(b, pty_read(pty))",
+    "  return sb_str(b)",
+    "end",
+    "let pty = pty_start(argv()[0], [])",
+    "print(value_class(pty) == 12)",
+    "let t = until(pty, \"\", \"raw true\")",
+    "print(str_contains(t, \"raw true\"))",
+    "pty_write(pty, \"x\")",
+    "let t = until(pty, t, \"got 120\")",
+    "print(str_contains(t, \"got 120\"))",
+    "pty_write(pty, \"yz\")",
+    "let t = until(pty, t, \"got 122\")",
+    "print(str_contains(t, \"yz\"))",
+    "pty_write(pty, chr(127) + chr(9) + chr(13))",
+    "let t = until(pty, t, \"got 10\")",
+    "print([str_contains(t, \"got 127\"), str_contains(t, \"got 9\"), str_contains(t, \"got 10\")])",
+    "pty_write(pty, \"q\")",
+    "let t = until(pty, t, \"cooked\")",
+    "pty_write(pty, \"hello\" + chr(13))",
+    "let t = until(pty, t, \"done\")",
+    "print(pty_wait(pty, 30000))",
+    "let t = t + pty_close(pty)",
+    "print([str_contains(t, \"hello\"), str_contains(t, \"line [104, 101, 108, 108, 111]\"), str_contains(t, \"done\")])",
+    "let p2 = pty_start(argv()[0], [])",
+    "let t2 = until(p2, \"\", \"raw true\")",
+    "pty_write(p2, chr(3))",
+    "let code = pty_wait(p2, 30000)",
+    "let t2 = t2 + pty_read(p2) + pty_close(p2)",
+    "print([code != 0 - 1, code != 0, str_contains(t2, \"done\")])",
+    ""
+  ], chr(10))
+end
+
+expect(ctx, "wsl is on the PATH, for the Linux half", has_program("wsl"), true)
+if has_program("wsl") then
+  let driver = spec_out() + "/pty_driver.patlang"
+  write_file(driver, driver_source(probe))
+  let built = exec_measured("self_hosting/build/v2.exe", [driver, spec_out() + "/pty_driver", "--linux", "--workers", "4"])
+  let built_probe = exec_measured("self_hosting/build/v2.exe", [probe, spec_out() + "/pty_probe", "--linux", "--workers", "4"])
+  expect(ctx, "the driver and the probe build for Linux", [built[2], built_probe[2]], [true, true])
+  let r = exec_measured("wsl", ["-d", "Ubuntu-24.04", "-e", v2_wsl_path(path_absolute(spec_out() + "/pty_driver")), v2_wsl_path(path_absolute(spec_out() + "/pty_probe"))])
+  let want = str_join(["true", "true", "true", "false", "[true, true, true]", "0", "[true, true, true]", "[true, true, false]", ""], chr(10))
+  expect(ctx, "on Linux: started, raw, a key at a time, no echo, Backspace 127, Tab 9, Enter 10, a line echoed after, exit 0, Ctrl+C stops it", r[0], want)
+end
+
+ctx_report(ctx)

@@ -1,0 +1,147 @@
+# Selftest for self_hosting/lib/dom.patlang (GitHub #270): a page built as a
+# tree of element and text nodes, queried like a browser's DOM, and written
+# out as HTML by one writer that escapes as it writes.
+#
+# Given a tree built with the create, append and attribute operations,
+# when it is queried by tag, id and class, then the nodes come back in
+# document order; when it is written out, then every text node and attribute
+# value is escaped, so a hostile value stays text; and the written HTML,
+# read back by lib/html_scan.patlang into a tree, writes out the same again.
+
+include "lib/includes.patlang"
+include "lib/gherkin.patlang"
+include "lib/dom.patlang"
+
+make a function called dom_text_content_all takes nodes returns texts
+  let texts = []
+  let i = 0
+  while i < list_len(nodes) do
+    let texts = list_push(texts, dom_text_content(nodes[i]))
+    let i = i + 1
+  end
+  return texts
+end
+
+let ctx = ctx_new()
+
+# ---- building and writing ----
+
+let ul = dom_element("ul")
+dom_set_attr(ul, "id", "todo")
+dom_set_attr(ul, "class", "list open")
+let li1 = dom_append(ul, dom_element("li"))
+dom_append(li1, dom_text("milk"))
+let li2 = dom_append(ul, dom_element("li"))
+dom_set_attr(li2, "class", "done")
+dom_append(li2, dom_text("bread"))
+expect(ctx, "a small list writes as HTML", dom_to_html(ul), "<ul id=\"todo\" class=\"list open\"><li>milk</li><li class=\"done\">bread</li></ul>")
+expect(ctx, "an attribute reads back", dom_get_attr(ul, "id"), "todo")
+expect(ctx, "an absent attribute reads as empty", dom_get_attr(li1, "class"), "")
+expect(ctx, "has_attr tells absent from empty", [dom_has_attr(li1, "class"), dom_has_attr(li2, "class")], [false, true])
+dom_set_attr(ul, "id", "shopping")
+expect(ctx, "setting an attribute again replaces it in place", dom_to_html(ul), "<ul id=\"shopping\" class=\"list open\"><li>milk</li><li class=\"done\">bread</li></ul>")
+expect(ctx, "an element's children, in order", to_num(list_len(dom_children(ul))), 2)
+expect(ctx, "text content joins the text below a node", dom_text_content(ul), "milkbread")
+
+let cellnode = dom_element("td")
+dom_append(cellnode, dom_text("old"))
+dom_append(cellnode, dom_element("b"))
+dom_set_text(cellnode, "1 < 2")
+expect(ctx, "set_text replaces an element's children with one text node", dom_to_html(cellnode), "<td>1 &lt; 2</td>")
+
+let br = dom_element("br")
+dom_append(li1, br)
+expect(ctx, "a void element has no closing tag", dom_to_html(li1), "<li>milk<br></li>")
+expect(ctx, "a void element takes no children", world_call(world_new(), || do
+  dom_append(dom_element("img"), dom_text("x"))
+  return "appended"
+end)[0], "stopped")
+
+# ---- querying, in document order ----
+
+let page = dom_page("Groceries")
+let body = dom_body(page)
+let h = dom_append(body, dom_element("h1"))
+dom_append(h, dom_text("Shopping"))
+dom_append(body, ul)
+let p = dom_append(body, dom_element("p"))
+dom_set_attr(p, "class", "note done")
+dom_append(p, dom_text("Two items."))
+expect(ctx, "by tag, in document order", dom_text_content_all(dom_by_tag(page, "li")), ["milk", "bread"])
+expect(ctx, "by id", dom_text_content(dom_by_id(page, "shopping")), "milkbread")
+expect(ctx, "an id not there gives false", dom_by_id(page, "nowhere"), false)
+expect(ctx, "by class, matching one class among several", dom_text_content_all(dom_by_class(page, "done")), ["bread", "Two items."])
+expect(ctx, "a class matches whole names only", to_num(list_len(dom_by_class(page, "don"))), 0)
+expect(ctx, "has_class", [dom_has_class(ul, "open"), dom_has_class(ul, "list"), dom_has_class(ul, "lis")], [true, true, false])
+expect(ctx, "a page is a document with a title", str_starts_with(dom_document_html(page), "<!doctype html><html><head><meta charset=\"utf-8\"><title>Groceries</title></head><body><h1>Shopping</h1>"), true)
+
+# ---- escaping, once, in the writer ----
+
+let evil = dom_element("p")
+dom_set_attr(evil, "title", "\" onmouseover=\"alert(1)")
+dom_append(evil, dom_text("<script>alert(1)</script> & more"))
+let written = dom_to_html(evil)
+expect(ctx, "a hostile text node and attribute come out escaped", written, "<p title=\"&quot; onmouseover=&quot;alert(1)\">&lt;script&gt;alert(1)&lt;/script&gt; &amp; more</p>")
+let tokens = html_tokenize(written)
+expect(ctx, "read back, the hostile text holds no script tag", list_len(html_find_all(tokens, ["script"])), 0)
+expect(ctx, "read back, the element has the one attribute it was given", to_num(list_len(tokens[0][2])), 1)
+expect(ctx, "an element name that is not a name is refused", world_call(world_new(), || do
+  dom_element("p onclick=x")
+  return "made"
+end)[0], "stopped")
+expect(ctx, "an attribute name that is not a name is refused", world_call(world_new(), || do
+  dom_set_attr(dom_element("p"), "a=\"b\" c", "d")
+  return "set"
+end)[0], "stopped")
+
+# script and style hold raw text, written as it is; text that would end the
+# element early is refused, since escaping would change what the script says
+let sc = dom_element("script")
+dom_append(sc, dom_text("if (a < b && c > d) { go() }"))
+expect(ctx, "script text is written raw", dom_to_html(sc), "<script>if (a < b && c > d) { go() }</script>")
+expect(ctx, "script text that would close the element is refused", world_call(world_new(), || do
+  let s2 = dom_element("script")
+  dom_append(s2, dom_text("x = 1 </SCRIPT><img src=x>"))
+  return dom_to_html(s2)
+end)[0], "stopped")
+
+# ---- a round trip through html_scan ----
+
+let html1 = dom_document_html(page)
+let back = dom_from_html(html1)
+expect(ctx, "a page read back by html_scan writes out the same", dom_document_html(back), html1)
+let html2 = dom_to_html(evil)
+expect(ctx, "the hostile paragraph read back writes out the same", dom_to_html(dom_from_html(html2)), html2)
+expect(ctx, "read back, the text is the text that was put in", dom_text_content(dom_from_html(html2)), "<script>alert(1)</script> & more")
+expect(ctx, "read back, the attribute is the value that was put in", dom_get_attr(dom_from_html(html2), "title"), "\" onmouseover=\"alert(1)")
+
+# ---- scale: writing and querying are linear in the tree's size ----
+
+make a function called build_rows takes n returns table
+  let table = dom_element("table")
+  let i = 0
+  while i < n do
+    let tr = dom_append(table, dom_element("tr"))
+    dom_set_attr(tr, "class", "row")
+    let td = dom_append(tr, dom_element("td"))
+    dom_append(td, dom_text("cell " + i))
+    let i = i + 1
+  end
+  return table
+end
+
+make a function called write_cost takes n returns cycles
+  let t = build_rows(n)
+  let c0 = cpu_cycles()
+  let html = dom_to_html(t)
+  let found = dom_by_class(t, "row")
+  let c1 = cpu_cycles()
+  assert list_len(found) == n
+  return c1 - c0
+end
+
+let small = write_cost(1000)
+let large = write_cost(4000)
+expect(ctx, "four times the rows costs no more than about four times as much to write and query", large <= 8 * small + 20000000, true)
+
+ctx_report(ctx)

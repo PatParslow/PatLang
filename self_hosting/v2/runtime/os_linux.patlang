@@ -1284,10 +1284,11 @@ end
 # Starts the program with args, the descriptors in, out and err as its 0, 1
 # and 2 (-1 keeps this process's own); apart is 0 to stay in this process's
 # group, 1 for a process group of its own (a tree to end together), 2 for a
-# session of its own (spawn's: it outlives this one): its pid, or -1 when it
-# could not start.
+# session of its own (spawn's: it outlives this one), 3 for a session of its
+# own whose controlling terminal is its descriptor 0 (pty_start's): its pid,
+# or -1 when it could not start.
 make a function called rt_lx_spawn takes program, args, fd_in, fd_out, fd_err, apart returns pid
-  require value_live(program) and (value_class(args) == 9) and (apart >= 0) and (apart <= 2)
+  require value_live(program) and (value_class(args) == 9) and (apart >= 0) and (apart <= 3)
   let path = rt_lx_program_path(program)
   if path == "" then
     let pid = 0 - 1
@@ -1328,6 +1329,125 @@ make a function called rt_lx_concat takes a, b returns out
   end
   ensure list_len(out) == list_len(a) + list_len(b)
   return out
+end
+
+# ---- a pseudo-terminal: a child's terminal that this process types into ----
+#
+# A pty is a vec, as on Windows: [the master's descriptor, the same to write,
+# the same to read, the child's pid, its exit code or -1 until it is known].
+
+# Starts the program with args on a new pseudo-terminal 80 columns by 25
+# rows, as its controlling terminal and its 0, 1 and 2: the pty, or [] when
+# no terminal could be made or the program could not start.
+make a function called pty_start takes program, args returns pty
+  require value_live(program) and (value_class(args) == 9)
+  # O_RDWR | O_NOCTTY | O_CLOEXEC
+  let master = rt_lx_open("/dev/ptmx", 2 + 256 + 524288, 0)
+  if master < 0 then
+    let pty = []
+    ensure (value_class(pty) == 12) or (value_class(pty) == 9)
+    return pty
+  end
+  let cell = rt_alloc(8)
+  mem_store(cell, 16, 0)
+  # TIOCSPTLCK with 0 unlocks it; TIOCGPTN gives its number
+  extern_call("LINUX", "syscall", 16, master, 1074025521, cell + 16)
+  let got = extern_call("LINUX", "syscall", 16, master, 2147767344, cell + 16)
+  let n = word_and(mem_load(cell, 16), 4294967295)
+  rt_free(cell)
+  let slave = 0 - 1
+  if not rt_lx_failed(got) then
+    let slave = rt_lx_open("/dev/pts/" + n, 2 + 256 + 524288, 0)
+  end
+  let pid = 0 - 1
+  if slave >= 0 then
+    # TIOCSWINSZ: rows 25, columns 80
+    let ws = rt_alloc(8)
+    mem_store(ws, 16, 25 + 80 * 65536)
+    extern_call("LINUX", "syscall", 16, slave, 21524, ws + 16)
+    rt_free(ws)
+    let pid = rt_lx_spawn(program, args, slave, slave, slave, 3)
+    rt_lx_close(slave)
+  end
+  if pid < 0 then
+    rt_lx_close(master)
+    let pty = []
+    ensure (value_class(pty) == 12) or (value_class(pty) == 9)
+    return pty
+  end
+  rt_lx_nonblocking(master)
+  let pty = vec_new()
+  vec_push(pty, master)
+  vec_push(pty, master)
+  vec_push(pty, master)
+  vec_push(pty, pid)
+  vec_push(pty, 0 - 1)
+  ensure (value_class(pty) == 12) or (value_class(pty) == 9)
+  return pty
+end
+
+make a function called pty_write takes pty, text returns ok
+  require (value_class(pty) == 12) and value_live(text)
+  let s = to_s(text)
+  let fed = 0
+  let ok = true
+  while ok and (fed < str_len(s)) do
+    let r = extern_call("LINUX", "syscall", 1, vec_get(pty, 1), rt_str_bytes(s) + fed, str_len(s) - fed)
+    if r > 0 then
+      let fed = fed + r
+    elif r != 0 - 11 then
+      # anything but EAGAIN (the terminal's input full for now) ends it
+      let ok = false
+    end
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called pty_read takes pty returns text
+  require value_class(pty) == 12
+  let b = sb_new()
+  rt_lx_drain(vec_get(pty, 2), b)
+  let text = sb_str(b)
+  ensure value_class(text) == 8
+  return text
+end
+
+make a function called pty_wait takes pty, ms returns code
+  require (value_class(pty) == 12) and (value_class(ms) == 2) and (ms >= 0)
+  let deadline = clock_ms() + ms
+  let looking = vec_get(pty, 4) == 0 - 1
+  while looking do
+    let w = rt_lx_wait(vec_get(pty, 3), false)
+    if w[0] then
+      vec_set(pty, 4, w[1])
+      let looking = false
+    elif clock_ms() >= deadline then
+      let looking = false
+    else
+      sleep_ms(5)
+    end
+  end
+  let code = vec_get(pty, 4)
+  ensure value_class(code) == 2
+  return code
+end
+
+# Ends the pty: its program, if it still runs, then the terminal; what the
+# terminal held that was not yet read (the kernel keeps what an ended program
+# wrote, so it is all there to read).
+make a function called pty_close takes pty returns rest
+  require value_class(pty) == 12
+  if pty_wait(pty, 0) == 0 - 1 then
+    extern_call("LINUX", "syscall", 62, vec_get(pty, 3), 9)
+    vec_set(pty, 4, rt_lx_wait(vec_get(pty, 3), true)[1])
+  end
+  let b = sb_new()
+  rt_lx_drain(vec_get(pty, 0), b)
+  rt_lx_close(vec_get(pty, 0))
+  let rest = sb_str(b)
+  ensure value_class(rest) == 8
+  return rest
 end
 
 # A pipe, both ends close-on-exec: [read end, write end], or [].
@@ -1591,10 +1711,31 @@ make a function called wait takes pid returns code
   return code
 end
 
-# 259 while the process runs, else its exit code (is_alive, hosts.patlang).
+# 259 while the process runs, else its exit code (is_alive, hosts.patlang),
+# or -1 for no child of this process. waitid with WNOWAIT leaves an ended
+# child to be waited for, as GetExitCodeProcess does on Windows: wait4 here
+# would collect its status, and a wait after is_alive would find no child.
 make a function called rt_exit_code takes h returns code
   require value_class(h) == 2
-  let code = rt_lx_wait(h, false)[1]
+  let buf = rt_alloc(160)
+  # siginfo's si_pid, which stays 0 while no child has ended (WNOHANG)
+  mem_store(buf, 32, 0)
+  # P_PID 1; WEXITED 4, WNOHANG 1, WNOWAIT 16777216
+  let r = extern_call("LINUX", "syscall", 247, 1, h, buf + 16, 16777221, 0)
+  let code = 0 - 1
+  if not rt_lx_failed(r) then
+    if word_and(mem_load(buf, 32), 4294967295) == 0 then
+      let code = 259
+    else
+      # si_code: CLD_EXITED 1 gives si_status as the exit code, else the signal
+      let status = word_and(mem_load(buf, 40), 4294967295)
+      let code = 128 + status
+      if word_and(mem_load(buf, 24), 4294967295) == 1 then
+        let code = status
+      end
+    end
+  end
+  rt_free(buf)
   ensure value_class(code) == 2
   return code
 end
@@ -1702,6 +1843,13 @@ end
 
 make a function called rt_bind_listen takes sock, port returns actual
   require (value_class(sock) == 2) and (value_class(port) == 2)
+  # SOL_SOCKET, SO_REUSEADDR: a port whose listener has ended is free, as on
+  # Windows, though a connection it closed first waits a minute in TIME_WAIT;
+  # a port another socket listens on is still refused (EADDRINUSE)
+  let one = rt_alloc(8)
+  mem_store(one, 16, 1)
+  extern_call("LINUX", "syscall", 54, sock, 1, 2, one + 16, 4)
+  rt_free(one)
   let addr = rt_sockaddr(127, 0, 0, 1, port)
   let bound = extern_call("LINUX", "syscall", 49, sock, addr + 16, 16)
   if rt_lx_failed(bound) then

@@ -140,6 +140,16 @@ text, and has an escape function, a page template and an HTTP response.
 The parslow.net pages (§8) can then show each program beside the page it
 makes.
 
+**Status (2026-11-21):** `self_hosting/lib/dom.patlang` is in, with
+`dom_selftest.patlang` (building, querying, escaping, script text, a round trip
+through `html_scan`, and linear cost over 1,000 to 8,000 rows). The five pages
+above are in: each program takes `--page PATH`, and `run_demos.patlang` checks
+the page on every engine against `expected/NAME.html`. Moving the existing
+builders (`lib/html.patlang`'s callers: `tools/build_portfolio.patlang`, the
+GUI examples and the graph tools) onto the tree
+is #270's first open question, still for the owner; the live page in the
+browser is its third.
+
 ## 6. Where they live and how they are checked
 
 - **Directory:** `showcase/NAME.patlang`, with `showcase/expected/NAME.txt` and

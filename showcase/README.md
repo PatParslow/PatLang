@@ -54,11 +54,33 @@ The Python sketches are run too, and their output must match the program's, or
 | [c4_proven_calculator](c4_proven_calculator.patlang) | S N O C | an interval class; the notation read with `re` |
 | [c5_specified_bank](c5_specified_bank.patlang) | B C N O | a state-space explorer for the schema; a Gherkin step matcher |
 
-`p10_ct_exchange` (9 lines) and `p10_ct_leaky` (11 lines) are what the constant-time
+`p10_ct_exchange` and `p10_ct_leaky` are what the constant-time
 check is run on: `v2.exe showcase/p10_ct_exchange.patlang --constant-time` reports no
 value-dependent branch or access, and the same check refuses `p10_ct_leaky`, naming
 the branch in `pin_matches`. The expected reports are in
 `expected/*.constant_time.txt`, and the showcase suite checks them.
+
+## Pages
+
+Five of the programs also write a web page when given `--page PATH`, built as a
+tree of element and text nodes with `self_hosting/lib/dom.patlang` and written out
+by its one writer, which escapes every text node and attribute value as it writes.
+Their text output is the same with or without it.
+
+| Program | Its page |
+|---|---|
+| [p4_spreadsheet](p4_spreadsheet.patlang) | the sheet as a table, kept up to date by one more handler on `recalculated`; the cells know nothing of it |
+| [p2_access_rules](p2_access_rules.patlang) | people against documents and actions, each cell holding its reason, one query per column |
+| [p3_factory_plan](p3_factory_plan.patlang) | each plan as a row of steps, coloured by kind, with its cost |
+| [p5_guaranteed_bounds](p5_guaranteed_bounds.patlang) | the bisection as an SVG drawing, each interval a bar titled with its exact bounds |
+| [c3_build_system](c3_build_system.patlang) | the dependency graph in SVG, a column per wave, drawn from the builder's own facts |
+
+The gates compare each page with `expected/NAME.html` on every engine. The
+expected pages of P5 and C3 were computed from the drawings' rules by separate
+Python scripts, `pages/p5_guaranteed_bounds_page.py` and
+`pages/c3_build_system_page.py` (`py -3 -I pages/NAME_page.py >
+expected/NAME.html`), so the programs' coordinates are checked against an
+independent calculation.
 
 ## What the comparison shows
 

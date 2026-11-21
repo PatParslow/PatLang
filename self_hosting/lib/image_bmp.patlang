@@ -10,29 +10,30 @@
 # BMP would be -- confirmed by reading that exact file's own header
 # fields directly rather than guessing).
 #
-# Confirmed before writing this: read_file (x64_runtime.patlang's
-# rt_read_file) reads exactly the real file size into a proper
-# length-prefixed buffer (mem_poke_qword(buf, 0, size) then a raw byte
-# copy) -- NOT null-terminated, NOT text-interpreted -- so arbitrary
-# binary bytes (including embedded zero bytes, which every one of
-# these formats' file headers genuinely contains) round-trip correctly
-# through char_code/substr the same way ASCII text does elsewhere in
-# this codebase.
+# The file is a bytes value (read_file_raw, in image_load.patlang): read as
+# text, its zero bytes and bytes above 127 would not come through as
+# themselves.
 
 include "includes.patlang"
 include "image.patlang"
 
+# The byte at offset. Each decode path first checks that the file holds
+# every row (and palette entry) it reads.
+make a function called bmp_byte takes bytes, offset returns v
+  return bytes[offset]
+end
+
 make a function called bmp_u16 takes bytes, offset returns v
-  let b0 = char_code(bytes, offset)
-  let b1 = char_code(bytes, offset + 1)
+  let b0 = bmp_byte(bytes,offset)
+  let b1 = bmp_byte(bytes,offset + 1)
   return b0 + (b1 * 256)
 end
 
 make a function called bmp_u32 takes bytes, offset returns v
-  let b0 = char_code(bytes, offset)
-  let b1 = char_code(bytes, offset + 1)
-  let b2 = char_code(bytes, offset + 2)
-  let b3 = char_code(bytes, offset + 3)
+  let b0 = bmp_byte(bytes,offset)
+  let b1 = bmp_byte(bytes,offset + 1)
+  let b2 = bmp_byte(bytes,offset + 2)
+  let b3 = bmp_byte(bytes,offset + 3)
   return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
 end
 
@@ -50,18 +51,18 @@ end
 # spec's own bit order, same as PBM/PGM-family formats).
 make a function called bmp_indexed_pixel takes bytes, row_offset, x, bpp returns idx
   if bpp == 8 then
-    return char_code(bytes, row_offset + x)
+    return bmp_byte(bytes,row_offset + x)
   end
   if bpp == 4 then
     let byte_offset = row_offset + floor(x / 2)
-    let byte_val = char_code(bytes, byte_offset)
+    let byte_val = bmp_byte(bytes,byte_offset)
     if (x band 1) == 0 then
       return (byte_val shr 4) band 15
     end
     return byte_val band 15
   end
   let byte_offset = row_offset + floor(x / 8)
-  let byte_val = char_code(bytes, byte_offset)
+  let byte_val = bmp_byte(bytes,byte_offset)
   let bit_index = 7 - (x band 7)
   return (byte_val shr bit_index) band 1
 end
@@ -82,6 +83,9 @@ make a function called bmp_decode_indexed takes bytes, data_offset, header_size,
   let bits_per_row = width * bpp
   let row_size = floor((bits_per_row + 7) / 8)
   let padded_row_size = floor((row_size + 3) / 4) * 4
+  if (data_offset + padded_row_size * height > list_len(bytes)) or (palette_offset + palette_count * 4 > list_len(bytes)) then
+    return []
+  end
   let out = img_new(width, height)
   let y = 0
   while y < height do
@@ -97,9 +101,9 @@ make a function called bmp_decode_indexed takes bytes, data_offset, header_size,
         let idx = palette_count - 1
       end
       let pal_offset = palette_offset + (idx * 4)
-      let b = char_code(bytes, pal_offset)
-      let g = char_code(bytes, pal_offset + 1)
-      let r = char_code(bytes, pal_offset + 2)
+      let b = bmp_byte(bytes,pal_offset)
+      let g = bmp_byte(bytes,pal_offset + 1)
+      let r = bmp_byte(bytes,pal_offset + 2)
       img_set_pixel(out, x, y, r, g, b)
       let x = x + 1
     end
@@ -116,6 +120,9 @@ make a function called bmp_decode_direct takes bytes, data_offset, width, height
   let bytes_per_pixel = floor(bpp / 8)
   let row_size = width * bytes_per_pixel
   let padded_row_size = floor((row_size + 3) / 4) * 4
+  if data_offset + padded_row_size * height > list_len(bytes) then
+    return []
+  end
   let out = img_new(width, height)
   let y = 0
   while y < height do
@@ -127,9 +134,9 @@ make a function called bmp_decode_direct takes bytes, data_offset, width, height
     let x = 0
     while x < width do
       let px_offset = row_offset + (x * bytes_per_pixel)
-      let b = char_code(bytes, px_offset)
-      let g = char_code(bytes, px_offset + 1)
-      let r = char_code(bytes, px_offset + 2)
+      let b = bmp_byte(bytes,px_offset)
+      let g = bmp_byte(bytes,px_offset + 1)
+      let r = bmp_byte(bytes,px_offset + 2)
       img_set_pixel(out, x, y, r, g, b)
       let x = x + 1
     end
@@ -139,15 +146,12 @@ make a function called bmp_decode_direct takes bytes, data_offset, width, height
 end
 
 # bmp_decode(bytes) -> an image.patlang "image" value, or [] on any
-# unsupported/malformed input. [] as the failure signal matches this
-# backend's own established convention elsewhere (rt_read_file returns
-# an empty string on a missing file, for the same reason: no exception
-# mechanism exists in this backend at all) -- callers check for it.
+# unsupported/malformed input; callers check for it.
 make a function called bmp_decode takes bytes returns image
-  if bytes.length < 54 then
+  if list_len(bytes) < 54 then
     return []
   end
-  if (substr(bytes, 0, 1) != "B") or (substr(bytes, 1, 1) != "M") then
+  if (bytes[0] != 66) or (bytes[1] != 77) then
     return []
   end
   let data_offset = bmp_u32(bytes, 10)

@@ -1,0 +1,361 @@
+# A page as a tree of nodes, with the structure of a browser's DOM
+# (GitHub #270): elements with attributes and children, and text nodes.
+# A program builds the tree with the familiar operations (create, append, set
+# and read attributes, query by tag, id and class) and writes it out as HTML.
+#
+# Escaping happens once, in the writer: every text node and attribute value
+# is escaped as it is written, so a value put in a text node is text in the
+# page, whatever characters it holds. Element and attribute names are checked
+# when they are given. The text of script and style is written as it is, since
+# escaping would change what the script says, and text that would end the
+# element early is refused.
+#
+# dom_from_html reads HTML back into a tree through lib/html_scan.patlang,
+# for markup of the kind this writer produces (spec: dom_selftest.patlang).
+
+include "html_scan.patlang"
+
+class DomNode {
+  field kind = ""
+  field tag = ""
+  field text = ""
+  field attrs = 0
+  field children = 0
+}
+
+# ---- names ----
+
+# A name an element or attribute may have: a letter, then letters, digits,
+# "-", "_", ":" or ".". Anything else (a space, a quote, "=", ">") could turn
+# the name into markup, so it is refused.
+make a function called dom_is_name takes name returns yes
+  if name == "" then return false end
+  let n = byte_length(name)
+  let i = 0
+  while i < n do
+    let c = char_code(name, i)
+    let letter = ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122))
+    let other = ((c >= 48) and (c <= 57)) or (c == 45) or (c == 95) or (c == 58) or (c == 46)
+    if not letter then
+      if (i == 0) or (not other) then return false end
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- making nodes ----
+
+make a function called dom_element takes tag returns node
+  require dom_is_name(tag)
+  let node = new("DomNode")
+  node.kind = "element"
+  node.tag = html_lower(tag)
+  node.attrs = vec_new()
+  node.children = vec_new()
+  return node
+end
+
+make a function called dom_text takes s returns node
+  let node = new("DomNode")
+  node.kind = "text"
+  node.text = "" + s
+  node.children = vec_new()
+  return node
+end
+
+make a function called dom_is_element takes node returns yes
+  return node.kind == "element"
+end
+
+make a function called dom_is_void takes node returns yes
+  return dom_is_element(node) and html_name_in_list(html_void_tags(), node.tag)
+end
+
+make a function called dom_is_raw_text takes node returns yes
+  return dom_is_element(node) and ((node.tag == "script") or (node.tag == "style"))
+end
+
+# Appends child as parent's last child, and gives back the child, so a
+# program can write let li = dom_append(ul, dom_element("li")).
+make a function called dom_append takes parent, child returns child
+  require dom_is_element(parent) and (not dom_is_void(parent))
+  vec_push(parent.children, child)
+  return child
+end
+
+# Replaces an element's children with one text node holding s, as setting a
+# browser's textContent does.
+make a function called dom_set_text takes node, s returns node
+  require dom_is_element(node) and (not dom_is_void(node))
+  node.children = vec_new()
+  vec_push(node.children, dom_text(s))
+  return node
+end
+
+make a function called dom_children takes node returns nodes
+  return vec_to_list(node.children)
+end
+
+make a function called dom_tag takes node returns tag
+  return node.tag
+end
+
+# ---- attributes, in the order they were first set ----
+
+make a function called dom_set_attr takes node, name, value returns node
+  require dom_is_element(node) and dom_is_name(name)
+  let key = html_lower(name)
+  let i = 0
+  while i < vec_len(node.attrs) do
+    if vec_get(node.attrs, i)[0] == key then
+      vec_set(node.attrs, i, [key, "" + value])
+      return node
+    end
+    let i = i + 1
+  end
+  vec_push(node.attrs, [key, "" + value])
+  return node
+end
+
+make a function called dom_get_attr takes node, name returns value
+  if not dom_is_element(node) then return "" end
+  let key = html_lower(name)
+  let i = 0
+  while i < vec_len(node.attrs) do
+    if vec_get(node.attrs, i)[0] == key then
+      return vec_get(node.attrs, i)[1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called dom_has_attr takes node, name returns yes
+  if not dom_is_element(node) then return false end
+  let key = html_lower(name)
+  let i = 0
+  while i < vec_len(node.attrs) do
+    if vec_get(node.attrs, i)[0] == key then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# Whether one of the space-separated names in the class attribute is c.
+make a function called dom_has_class takes node, c returns yes
+  let classes = dom_get_attr(node, "class")
+  let n = byte_length(classes)
+  let start = 0
+  let i = 0
+  while i <= n do
+    let at_end = i == n
+    let space = false
+    if not at_end then
+      let space = char_code(classes, i) == 32
+    end
+    if at_end or space then
+      if (i > start) and (substr(classes, start, i - start) == c) then
+        return true
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- text ----
+
+# The text below a node, joined in document order, as a browser's
+# textContent gives it.
+make a function called dom_text_content takes node returns text
+  let b = sb_new()
+  dom_collect_text(node, b)
+  return sb_str(b)
+end
+
+make a function called dom_collect_text takes node, b returns ok
+  if node.kind == "text" then
+    sb_push(b, node.text)
+    return true
+  end
+  let i = 0
+  while i < vec_len(node.children) do
+    dom_collect_text(vec_get(node.children, i), b)
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- queries, each in document order ----
+
+# Every element at or below root, in document order.
+make a function called dom_elements takes root returns nodes
+  let found = vec_new()
+  dom_walk(root, found)
+  return vec_to_list(found)
+end
+
+make a function called dom_walk takes node, found returns ok
+  if not dom_is_element(node) then return true end
+  vec_push(found, node)
+  let i = 0
+  while i < vec_len(node.children) do
+    dom_walk(vec_get(node.children, i), found)
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called dom_by_tag takes root, tag returns nodes
+  let want = html_lower(tag)
+  let all = dom_elements(root)
+  let found = vec_new()
+  let i = 0
+  while i < list_len(all) do
+    if all[i].tag == want then vec_push(found, all[i]) end
+    let i = i + 1
+  end
+  return vec_to_list(found)
+end
+
+make a function called dom_by_class takes root, c returns nodes
+  let all = dom_elements(root)
+  let found = vec_new()
+  let i = 0
+  while i < list_len(all) do
+    if dom_has_class(all[i], c) then vec_push(found, all[i]) end
+    let i = i + 1
+  end
+  return vec_to_list(found)
+end
+
+# The first element whose id is id, or false when there is none.
+make a function called dom_by_id takes root, id returns node
+  let all = dom_elements(root)
+  let i = 0
+  while i < list_len(all) do
+    if dom_get_attr(all[i], "id") == id then return all[i] end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- a page ----
+
+# An html element holding a head (charset and title) and an empty body.
+make a function called dom_page takes title returns page
+  let page = dom_element("html")
+  let head = dom_append(page, dom_element("head"))
+  dom_set_attr(dom_append(head, dom_element("meta")), "charset", "utf-8")
+  dom_append(dom_append(head, dom_element("title")), dom_text(title))
+  dom_append(page, dom_element("body"))
+  return page
+end
+
+make a function called dom_body takes page returns body
+  let bodies = dom_by_tag(page, "body")
+  require list_len(bodies) > 0
+  return bodies[0]
+end
+
+# ---- writing ----
+
+make a function called dom_to_html takes node returns html
+  let b = sb_new()
+  dom_write(node, b, false)
+  return sb_str(b)
+end
+
+# A whole document: the doctype, then the tree.
+make a function called dom_document_html takes root returns html
+  return "<!doctype html>" + dom_to_html(root)
+end
+
+# raw is true inside script and style, whose text is written as it is.
+make a function called dom_write takes node, b, raw returns ok
+  if node.kind == "text" then
+    if raw then
+      sb_push(b, node.text)
+    else
+      sb_push(b, html_escape(node.text))
+    end
+    return true
+  end
+  sb_push(b, "<")
+  sb_push(b, node.tag)
+  sb_push(b, html_attrs_to_string(vec_to_list(node.attrs)))
+  sb_push(b, ">")
+  if dom_is_void(node) then return true end
+  let inner_raw = dom_is_raw_text(node)
+  if inner_raw then
+    require not str_contains(html_lower(dom_text_content(node)), "</" + node.tag)
+  end
+  let i = 0
+  while i < vec_len(node.children) do
+    dom_write(vec_get(node.children, i), b, inner_raw)
+    let i = i + 1
+  end
+  sb_push(b, "</")
+  sb_push(b, node.tag)
+  sb_push(b, ">")
+  return true
+end
+
+# ---- reading back ----
+
+# The first element of html as a tree, read with html_scan's tokenizer. Text
+# is unescaped, except inside script and style. A doctype or comment is
+# skipped, and a close tag with no open element to match is ignored.
+make a function called dom_from_html takes html returns root
+  let tokens = html_tokenize(html)
+  let holder = dom_element("div")
+  # the open elements, outermost first; depth says how many of the vec's
+  # entries are in use
+  let stack = vec_new()
+  vec_push(stack, holder)
+  let depth = 1
+  let i = 0
+  while i < list_len(tokens) do
+    let t = tokens[i]
+    let top = vec_get(stack, depth - 1)
+    if t[0] == "text" then
+      if dom_is_raw_text(top) then
+        dom_append(top, dom_text(t[1]))
+      else
+        dom_append(top, dom_text(html_unescape(t[1])))
+      end
+    elif (t[0] == "open") or (t[0] == "void") then
+      if dom_is_name(t[1]) then
+        let el = dom_element(t[1])
+        let a = 0
+        while a < list_len(t[2]) do
+          dom_set_attr(el, t[2][a][0], t[2][a][1])
+          let a = a + 1
+        end
+        dom_append(top, el)
+        if (t[0] == "open") and (not dom_is_void(el)) then
+          if depth < vec_len(stack) then
+            vec_set(stack, depth, el)
+          else
+            vec_push(stack, el)
+          end
+          let depth = depth + 1
+        end
+      end
+    elif t[0] == "close" then
+      if (depth > 1) and (top.tag == t[1]) then
+        let depth = depth - 1
+      end
+    end
+    let i = i + 1
+  end
+  let kids = dom_children(holder)
+  let k = 0
+  while k < list_len(kids) do
+    if dom_is_element(kids[k]) then return kids[k] end
+    let k = k + 1
+  end
+  return holder
+end

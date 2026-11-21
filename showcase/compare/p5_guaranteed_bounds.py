@@ -1,8 +1,7 @@
 """The guaranteed bounds of showcase/p5_guaranteed_bounds.patlang, in Python.
 
 Python's standard library has no interval type, so the sketch writes the
-small one it needs over fractions.Fraction: about twenty lines for + - * and
-printing. (mpmath has interval arithmetic, outside the standard library, with
+small one it needs over fractions.Fraction, with + - * and printing. (mpmath has interval arithmetic, outside the standard library, with
 float bounds rounded outwards; exact bounds are what this program wants.)
 PatLang has intervals built in, with exact bounds when the numbers are exact.
 The contracts become asserts, which python -O removes.

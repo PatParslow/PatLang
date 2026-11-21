@@ -202,7 +202,10 @@ running it.
   stop: give each worker its own and merge afterwards. The language has no lock.
 - TCP is on this machine only. A listener binds 127.0.0.1 itself, not every address, and while
   it holds the port Windows refuses another socket binding 127.0.0.1 on it, from this process
-  or another, even one that sets `SO_REUSEADDR` (checked 2026-11-17). `tcp_connect` takes
+  or another, even one that sets `SO_REUSEADDR` (checked 2026-11-17). Once the listener's
+  program has ended the port is free, even when it closed a connection's end first: on Linux
+  that end waits in TIME_WAIT for a minute, and the runtime sets `SO_REUSEADDR` so that a bind
+  is not refused for it, while one on a port another socket listens on still is. `tcp_connect` takes
   `localhost` or a `127.x.x.x` address; another address stops the program saying it is not this
   machine, and text that is not four numbers of 0 to 255 stops it saying it is not an address.
   A connection nothing accepts stops it too; `tcp_try_connect` gives `-1` there instead, and
@@ -407,7 +410,9 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - A child process inherits its own standard handles and nothing else this process holds: not
   the pipes another thread made for its own child, and not a socket. A program that spawns a
   long-running child and ends is seen to end at once by whoever captured its output, and its
-  listening ports are free once it has ended.
+  listening ports are free once it has ended. `is_alive(pid)` asks whether a process runs and
+  changes nothing, so `wait(pid)` after it has said `false` still gives the exit code (on
+  Linux it asks with `waitid` and `WNOWAIT`, which leaves the ended child to be waited for).
 - A program named with no directory (`"cmd"`, `"git"`) is looked for in the directories in
   `PATH` alone, `.exe` added when the name has no extension: never first in the current
   directory or the running program's own, where Windows would look. A name that no directory
@@ -450,6 +455,22 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   output with no line end after them. `console_set_utf8()` makes a Windows console read and
   write UTF-8 (a Linux terminal does already), and `console_enable_colors()` gives whether
   standard output takes ANSI colour sequences, turning them on in a Windows console.
+- A pseudo-console, a program's console that this program types into (for testing the
+  above with no person at the keyboard): `pty_start(program, args)` starts the program on a
+  console 80 columns by 25 rows of its own (Windows' ConPTY; on Linux a pseudo-terminal from
+  `/dev/ptmx`, its controlling terminal and its 0, 1 and 2), and gives the pty, or `[]` where
+  there is none (a browser) or the program could not start. `pty_write(pty, text)` types
+  text at it, giving whether all was written; `pty_read(pty)` gives what the console has
+  shown since the last read, with its VT sequences, without waiting; `pty_wait(pty, ms)`
+  waits up to `ms` for the program to end and gives its exit code, or -1 while it runs (its
+  output is not read meanwhile); `pty_close(pty)` ends the program if it still runs, closes
+  the console and gives what it showed that was not yet read. A program's last output can
+  come after it has ended, since ConPTY draws what was written a moment later, so a
+  transcript's end is what `pty_close` gives. The program starts with Ctrl+C on, as one a terminal starts does: on
+  Windows, where whether a process ignores Ctrl+C is inherited with no call to ask it,
+  `pty_start` turns it on in the calling process first. What a key gives differs as the
+  systems' terminals do: Enter is 13 on Windows and 10 on Linux (the terminal's CR to NL),
+  Backspace 8 and 127 (spec: `self_hosting/pty_selftest.patlang`).
 - `dir_files(path)` gives a directory's files, each `[name, bytes, written]`, sorted by name:
   `written` is when the file was last written, in 100-nanosecond steps since 1601 (Windows'
   FILETIME), so the larger is the later. Subdirectories are left out, and a path with no
