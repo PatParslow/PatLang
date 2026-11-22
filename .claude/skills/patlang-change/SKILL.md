@@ -40,12 +40,23 @@ report which steps ran and which did not.
 
 **A new or changed runtime function** (`self_hosting/v2/runtime/`):
 - a contract that is true for every input, including `..` paths, empty strings
-  and non-ASCII text;
+  and non-ASCII text: both a `require` and an `ensure` when it takes arguments
+  (`require value_live(v)` at least), since `part2/contracts` counts them;
 - a line in `docs/spec/values-and-memory.md` in the section it belongs to;
-- a fixture and scenario, and the fixture's name in `st_engines_agree`'s list;
+- a fixture and scenario, and the fixture's name in `st_engines_agree`'s list.
+  Before naming a new fixture, list `self_hosting/v2/spec/fixtures/` for the
+  stem: a near-identical name (`vi_modint_words`, `vi_modint_word_form`) is
+  read as the wrong file later;
 - if it calls `extern_call`, the same entry point in the WASM host
   (`self_hosting/v2/wasm/executor.mjs`), answering as the browser can;
 - the interpreter rebuilt.
+
+**A changed primitive** (`xv_prim` in `x64.patlang`, `wv_prim` in `wasm.patlang`):
+- the same change in its Python twins, `bootstrap/ir_reader.py` and
+  `bootstrap/ir_wasm.py`. The gates' `wasm` unit catches a stale `ir_wasm.py`;
+  nothing catches a stale `ir_reader.py` unless the compiler itself meets the
+  case. Check both by hand: `v2.exe F OUT.ir --ir --check-runtime`, then each
+  Python tool on that IR, run, and `cmp` with the fixture's `.expected`.
 
 **A new selftest** (`*_selftest.patlang`):
 - its path in `self_hosting/tools/run_selftests.patlang`'s list, or in the
