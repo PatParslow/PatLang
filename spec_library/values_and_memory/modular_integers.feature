@@ -11,6 +11,11 @@ Feature: integers modulo n (spec 1.14)
     When a program prints their band, bor, bxor, bnot, shl, shr, rotl and rotr
     Then each prints what the rules of spec 1.14 give for words
 
+  Scenario: a modint modulo 2^k shows the same whatever the runtime holds it as
+    Given modints modulo 2^1, 2^8, 2^32, 2^63 and 2^64
+    When a program prints every operator on them, alone and with integers, their values, moduli, classes, equality, lists of them, mod_make across moduli, quotients and powers, then mixes two moduli
+    Then each engine prints what they printed before such modints were held as words, ending at the mix
+
   Scenario: SHA-256 written on words modulo 2^32 gives the FIPS 180-4 digests
     Given a SHA-256 written in PatLang on modints modulo 2^32
     When a program prints the digests of "abc", the empty message, and the 448-bit and 896-bit messages

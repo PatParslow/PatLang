@@ -596,6 +596,21 @@ end
 # depend on it.
 make a function called rt_mod_same_modulus takes a, b returns same
   require (value_class(a) == 15) and (value_class(b) == 15)
+  let wa = rt_mod_is_word(a)
+  let wb = rt_mod_is_word(b)
+  if wa or wb then
+    # a word's modulus is 2^k: a word of the same k, or a block made from
+    # one (rt_mod_box)
+    if wa and wb then
+      let same = value_type_word(a) == value_type_word(b)
+    elif wa then
+      let same = (rt_mod_kind(b) == 0) and (rt_mod_word(b, 48) == rt_modw_bits(a))
+    else
+      let same = (rt_mod_kind(a) == 0) and (rt_mod_word(a, 48) == rt_modw_bits(b))
+    end
+    ensure value_class(same) == 1
+    return same
+  end
   if (rt_mod_word(a, 16) == rt_mod_word(b, 16)) and (rt_mod_word(a, 24) == rt_mod_word(b, 24)) then
     let same = true
   elif (rt_mod_word(a, 32) != rt_mod_word(b, 32)) or (rt_mod_word(a, 40) != rt_mod_word(b, 40)) or (rt_mod_word(a, 48) != rt_mod_word(b, 48)) then
@@ -638,6 +653,11 @@ end
 
 make a function called mod_modulus takes m returns n
   require value_class(m) == 15
+  if rt_mod_is_word(m) then
+    let n = rt_modw_modulus(rt_modw_bits(m))
+    ensure rt_is_integer(n) and (n >= 2)
+    return n
+  end
   let n = mem_load_value(value_data(m), 16)
   ct_public(n)
   ensure rt_is_integer(n) and (n >= 2)
@@ -696,15 +716,425 @@ make a function called rt_mod_like takes m returns block
   return block
 end
 
+# A modint whose block says its modulus is 2^k, k up to 64, is given as the
+# word it holds (spec 2.1); any other as its block. Every modint result is
+# made here, so the two forms never meet for one modulus.
 make a function called rt_mod_wrap takes block returns m
   require block != 0
+  if (rt_mod_header(block, 40) == 0) and (rt_mod_header(block, 48) <= 64) then
+    let k = rt_mod_header(block, 48)
+    let w = mem_load(block, 64)
+    if rt_mod_header(block, 32) > 1 then
+      let w = word_or(w, word_shl(mem_load(block, 72), 32))
+    end
+    rt_release_value_at(block, 16)
+    rt_lb_free(block)
+    let m = value_make(rt_modw_type(k), word_and(w, rt_modw_mask(k)))
+    ensure value_class(m) == 15
+    return m
+  end
   let m = value_make(rt_modint_heap_type(), block)
   ensure value_class(m) == 15
   return m
 end
 
+# A block as a modint the runtime goes on working on as a block, for a modulus
+# no word holds: what rt_mod_wrap gives for it, said so where the
+# constant-time check cannot read it from the header.
+make a function called rt_mod_held takes block returns m
+  require (block != 0) and ((rt_mod_header(block, 40) != 0) or (rt_mod_header(block, 48) > 64))
+  let m = value_make(rt_modint_heap_type(), block)
+  ensure (value_class(m) == 15) and (not rt_mod_is_word(m))
+  return m
+end
+
+# ---- modints modulo 2^k held as words (spec 2.1) ----
+#
+# A modint modulo 2^k, for k from 1 to 64, is held in its value's two words,
+# as a float is: the type word is class 15 with no heap bit and k in bits 40
+# to 46, and the data word is the residue. This is the runtime's affair only:
+# a program sees a modint as it always has (vi_modint_word_form). The word is
+# secret, as a block's residue is: one made from a public integer goes
+# through memory marked ct_secret, and one computed from another word is
+# secret already. Operations on words are word arithmetic and a mask, so
+# their time depends on k alone. What has no word path here (/, pow, a
+# modulus compared with a block's) works on rt_mod_box's block, and its
+# result comes back a word at rt_mod_wrap.
+
+# Whether m is a modint held as a word: one whose type word is not a block's.
+# Asked so, the constant-time check can answer it from the type word's class
+# and follows each kind of modint on its own path (v2/ct.patlang).
+make a function called rt_mod_is_word takes m returns yes
+  require value_live(m)
+  let yes = (value_class(m) == 15) and (value_type_word(m) != rt_modint_heap_type())
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# k, for a modint held as a word.
+make a function called rt_modw_bits takes m returns k
+  require rt_mod_is_word(m)
+  let k = word_and(word_shr(value_type_word(m), 40), 127)
+  ensure (k >= 1) and (k <= 64)
+  return k
+end
+
+# The k low bits set.
+make a function called rt_modw_mask takes k returns mask
+  require (k >= 1) and (k <= 64)
+  if k == 64 then
+    let mask = word_sub(0, 1)
+  else
+    let mask = word_sub(word_shl(1, k), 1)
+  end
+  ensure value_class(mask) == 2
+  return mask
+end
+
+# A modint like m, a word, holding w's low k bits: m's type word kept.
+make a function called rt_modw_like takes m, w returns r
+  require rt_mod_is_word(m) and (value_class(w) == 2)
+  let r = value_make(value_type_word(m), word_and(w, rt_modw_mask(rt_modw_bits(m))))
+  ensure rt_mod_is_word(r)
+  return r
+end
+
+# The word x as a secret: through memory the check is told holds one.
+make a function called rt_modw_secret takes x returns w
+  require value_class(x) == 2
+  let cell = rt_alloc(8)
+  ct_secret(cell)
+  mem_store(cell, 16, x)
+  let w = mem_load(cell, 16)
+  rt_lb_free(cell)
+  ensure value_class(w) == 2
+  return w
+end
+
+# 2^k, an int or for k from 63 a bigint, as mod_modulus gives it.
+make a function called rt_modw_modulus takes k returns n
+  require (k >= 1) and (k <= 64)
+  if k <= 62 then
+    let n = word_shl(1, k)
+  else
+    let n = 4611686018427387904 * word_shl(1, k - 62)
+  end
+  ct_public(n)
+  ensure rt_is_integer(n) and (n >= 2)
+  return n
+end
+
+# The modint modulo 2^k holding the int x's low k bits, which is x reduced
+# modulo 2^k for a negative x too (two's complement).
+make a function called rt_modw_of_int takes k, x returns m
+  require (k >= 1) and (k <= 64) and (value_class(x) == 2)
+  let m = value_make(rt_modw_type(k), word_and(rt_modw_secret(x), rt_modw_mask(k)))
+  ensure rt_mod_is_word(m)
+  return m
+end
+
+# m as a block, in the layout every modint had before words (above): m itself
+# when it is one, else a new block from the word, for an operation with no
+# word path. Its result returns to a word at rt_mod_wrap.
+make a function called rt_mod_box takes m returns b
+  require value_class(m) == 15
+  if not rt_mod_is_word(m) then
+    let b = m
+    ensure value_class(b) == 15
+    return b
+  end
+  let k = rt_modw_bits(m)
+  let count = word_shr(k + 31, 5)
+  let block = rt_alloc(48 + 24 * count)
+  mem_init_value(block, 16, rt_modw_modulus(k))
+  mem_store(block, 32, count)
+  mem_store(block, 40, 0)
+  mem_store(block, 48, k)
+  mem_store(block, 56, 0)
+  rt_lb_zero(block, 64, 3 * count)
+  ct_secret(block)
+  let w = value_data(m)
+  mem_store(block, 64, word_and(w, rt_mask32()))
+  if count > 1 then
+    mem_store(block, 72, word_shr(w, 32))
+  end
+  let b = value_make(rt_modint_heap_type(), block)
+  ensure (value_class(b) == 15) and (not rt_mod_is_word(b))
+  return b
+end
+
+# Whether a and b take the word path: a modint held as a word with a word of
+# the same k, or with an int, which counts as the word it reduces to (spec
+# 1.14: its low k bits, two's complement for a negative). Anything else (a
+# word with a modint of another modulus, a bigint, another class) takes the
+# block path, which refuses what spec 1.14 refuses.
+make a function called rt_modw_fits takes a, b returns yes
+  require value_live(a) and value_live(b)
+  let wa = rt_mod_is_word(a)
+  let wb = rt_mod_is_word(b)
+  if wa and wb then
+    let yes = value_type_word(a) == value_type_word(b)
+  elif wa then
+    let yes = value_class(b) == 2
+  elif wb then
+    let yes = value_class(a) == 2
+  else
+    let yes = false
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# k when the int n is 2^k (a modulus held as a word), else 0. n is public.
+make a function called rt_modw_pow2_bits takes n returns k
+  require value_class(n) == 2
+  let k = 0
+  if (n >= 2) and (word_and(n, n - 1) == 0) then
+    let p = 1
+    while p != n do
+      let p = word_shl(p, 1)
+      let k = k + 1
+    end
+  end
+  ensure (k >= 0) and (k <= 62)
+  return k
+end
+
+# k, for a shift or rotation of the word m by s: an int from 0 to k, else the
+# program stops naming the modint class (spec 1.14).
+make a function called rt_modw_count takes m, s returns k
+  require rt_mod_is_word(m) and value_live(s)
+  let k = rt_modw_bits(m)
+  if (value_class(s) != 2) or (s < 0) or (s > k) then
+    rt_fail_class(15)
+  end
+  ensure (k >= 1) and (k <= 64)
+  return k
+end
+
+# m to the integer power e, for a word: the ladder of rt_modint_pow on words,
+# the same steps for every exponent of one size (spec 1.14).
+make a function called rt_modw_pow takes m, e returns r
+  require rt_mod_is_word(m) and value_live(e)
+  if not rt_is_integer(e) then
+    rt_fail_class(15)
+  end
+  let base = m
+  if e < 0 then
+    let base = rt_mod_inverse(m)
+  end
+  let mask = rt_modw_mask(rt_modw_bits(m))
+  let eb = rt_exponent_bits(e)
+  let ecount = rt_exponent_limbs(e)
+  let r0 = 1
+  let r1 = value_data(base)
+  let i = 32 * ecount - 1
+  while i >= 0 do
+    let bit = word_and(word_shr(mem_load(eb, 16 + 8 * word_shr(i, 5)), word_and(i, 31)), 1)
+    let sel = word_sub(0, bit)
+    # the ladder step on the pair, exchanged when the bit is 1, by masks
+    let d = word_and(word_xor(r0, r1), sel)
+    let x0 = word_xor(r0, d)
+    let x1 = word_xor(r1, d)
+    let n1 = word_and(word_mul(x0, x1), mask)
+    let n0 = word_and(word_mul(x0, x0), mask)
+    let d2 = word_and(word_xor(n0, n1), sel)
+    let r0 = word_xor(n0, d2)
+    let r1 = word_xor(n1, d2)
+    let i = i - 1
+  end
+  rt_lb_free(eb)
+  let r = rt_modw_like(m, r0)
+  ensure rt_mod_is_word(r)
+  return r
+end
+
+# Whichever of a and b is held as a word (a when both are).
+make a function called rt_modw_template takes a, b returns t
+  require rt_mod_is_word(a) or rt_mod_is_word(b)
+  if rt_mod_is_word(a) then
+    let t = a
+  else
+    let t = b
+  end
+  ensure rt_mod_is_word(t)
+  return t
+end
+
+# The word of an operand on the word path: a modint's word, or an int's bits.
+# Combined with the other operand's secret word, what it gives is secret.
+make a function called rt_modw_w takes v returns w
+  require (value_class(v) == 15) or (value_class(v) == 2)
+  if value_class(v) == 2 then
+    let w = v
+  else
+    let w = value_data(v)
+  end
+  ensure value_class(w) == 2
+  return w
+end
+
+# The type word of a modint modulo 2^k held as a word: class 15, k in bits
+# 40 to 46, one literal for each k, so the constant-time check knows it names
+# a modint.
+make a function called rt_modw_type takes k returns t
+  require (k >= 1) and (k <= 64)
+  if k == 1 then
+    let t = 1099511627791
+  elif k == 2 then
+    let t = 2199023255567
+  elif k == 3 then
+    let t = 3298534883343
+  elif k == 4 then
+    let t = 4398046511119
+  elif k == 5 then
+    let t = 5497558138895
+  elif k == 6 then
+    let t = 6597069766671
+  elif k == 7 then
+    let t = 7696581394447
+  elif k == 8 then
+    let t = 8796093022223
+  elif k == 9 then
+    let t = 9895604649999
+  elif k == 10 then
+    let t = 10995116277775
+  elif k == 11 then
+    let t = 12094627905551
+  elif k == 12 then
+    let t = 13194139533327
+  elif k == 13 then
+    let t = 14293651161103
+  elif k == 14 then
+    let t = 15393162788879
+  elif k == 15 then
+    let t = 16492674416655
+  elif k == 16 then
+    let t = 17592186044431
+  elif k == 17 then
+    let t = 18691697672207
+  elif k == 18 then
+    let t = 19791209299983
+  elif k == 19 then
+    let t = 20890720927759
+  elif k == 20 then
+    let t = 21990232555535
+  elif k == 21 then
+    let t = 23089744183311
+  elif k == 22 then
+    let t = 24189255811087
+  elif k == 23 then
+    let t = 25288767438863
+  elif k == 24 then
+    let t = 26388279066639
+  elif k == 25 then
+    let t = 27487790694415
+  elif k == 26 then
+    let t = 28587302322191
+  elif k == 27 then
+    let t = 29686813949967
+  elif k == 28 then
+    let t = 30786325577743
+  elif k == 29 then
+    let t = 31885837205519
+  elif k == 30 then
+    let t = 32985348833295
+  elif k == 31 then
+    let t = 34084860461071
+  elif k == 32 then
+    let t = 35184372088847
+  elif k == 33 then
+    let t = 36283883716623
+  elif k == 34 then
+    let t = 37383395344399
+  elif k == 35 then
+    let t = 38482906972175
+  elif k == 36 then
+    let t = 39582418599951
+  elif k == 37 then
+    let t = 40681930227727
+  elif k == 38 then
+    let t = 41781441855503
+  elif k == 39 then
+    let t = 42880953483279
+  elif k == 40 then
+    let t = 43980465111055
+  elif k == 41 then
+    let t = 45079976738831
+  elif k == 42 then
+    let t = 46179488366607
+  elif k == 43 then
+    let t = 47278999994383
+  elif k == 44 then
+    let t = 48378511622159
+  elif k == 45 then
+    let t = 49478023249935
+  elif k == 46 then
+    let t = 50577534877711
+  elif k == 47 then
+    let t = 51677046505487
+  elif k == 48 then
+    let t = 52776558133263
+  elif k == 49 then
+    let t = 53876069761039
+  elif k == 50 then
+    let t = 54975581388815
+  elif k == 51 then
+    let t = 56075093016591
+  elif k == 52 then
+    let t = 57174604644367
+  elif k == 53 then
+    let t = 58274116272143
+  elif k == 54 then
+    let t = 59373627899919
+  elif k == 55 then
+    let t = 60473139527695
+  elif k == 56 then
+    let t = 61572651155471
+  elif k == 57 then
+    let t = 62672162783247
+  elif k == 58 then
+    let t = 63771674411023
+  elif k == 59 then
+    let t = 64871186038799
+  elif k == 60 then
+    let t = 65970697666575
+  elif k == 61 then
+    let t = 67070209294351
+  elif k == 62 then
+    let t = 68169720922127
+  elif k == 63 then
+    let t = 69269232549903
+  else
+    # k is 64, as the require leaves it
+    let t = 70368744177679
+  end
+  ensure word_and(t, 4294967295) == 15
+  return t
+end
+
 make a function called mod_make takes x, n returns m
   require (rt_is_integer(x) or (value_class(x) == 15)) and ((value_class(n) == 15) or (rt_is_integer(n) and (n >= 2)))
+  # to a modulus 2^k, k up to 64: a word (spec 2.1). A word's residue reduced
+  # modulo 2^k is its low k bits whichever modulus it had, and so is an int's.
+  let k = 0
+  if rt_mod_is_word(n) then
+    let k = rt_modw_bits(n)
+  elif value_class(n) == 2 then
+    let k = rt_modw_pow2_bits(n)
+  end
+  if k > 0 then
+    if rt_mod_is_word(x) then
+      let m = value_make(rt_modw_type(k), word_and(value_data(x), rt_modw_mask(k)))
+      ensure rt_mod_is_word(m)
+      return m
+    end
+    if value_class(x) == 2 then
+      let m = rt_modw_of_int(k, x)
+      ensure rt_mod_is_word(m)
+      return m
+    end
+  end
   if value_class(n) == 15 then
     # n's modulus, its header already worked out
     if value_class(x) == 15 then
@@ -832,7 +1262,12 @@ end
 # The modint like m holding the public integer x.
 make a function called rt_mod_int_like takes m, x returns r
   require (value_class(m) == 15) and rt_is_integer(x)
-  let block = rt_mod_like(m)
+  if rt_mod_is_word(m) and (value_class(x) == 2) then
+    let r = rt_modw_like(m, rt_modw_secret(x))
+    ensure rt_mod_is_word(r)
+    return r
+  end
+  let block = rt_mod_like(rt_mod_box(m))
   rt_mod_set_int(block, x)
   let r = rt_mod_wrap(block)
   ensure (value_class(r) == 15) and (rt_mod_same_modulus(r, m))
@@ -841,8 +1276,10 @@ end
 
 # x's residue reduced modulo shape's modulus n, in steps fixed by x's modulus
 # and n: the low k bits for n = 2^k, else a reduction over all of x's limbs.
-make a function called rt_mod_convert takes x, shape returns m
-  require (value_class(x) == 15) and (value_class(shape) == 15)
+make a function called rt_mod_convert takes x0, shape0 returns m
+  require (value_class(x0) == 15) and (value_class(shape0) == 15)
+  let x = rt_mod_box(x0)
+  let shape = rt_mod_box(shape0)
   let count = rt_mod_limbs(shape)
   let sc = rt_mod_limbs(x)
   let plain = rt_mod_plain(x)
@@ -902,6 +1339,18 @@ end
 # The residue, from 0 to n - 1: here it leaves the class.
 make a function called mod_value takes m returns v
   require value_class(m) == 15
+  if rt_mod_is_word(m) then
+    let w = value_data(m)
+    ct_reveal(w)
+    # only a 64-bit word can have its top bit set: that residue is a bigint
+    if word_shr(w, 63) == 1 then
+      let v = word_shr(w, 32) * 4294967296 + word_and(w, rt_mask32())
+    else
+      let v = w
+    end
+    ensure rt_is_integer(v) and (v >= 0)
+    return v
+  end
   let count = rt_mod_limbs(m)
   let plain = rt_mod_plain(m)
   ct_reveal(plain)
@@ -945,14 +1394,15 @@ make a function called rt_mod_operand takes v, t returns m
     if not rt_mod_same_modulus(v, t) then
       rt_fail_class(15)
     end
-    let m = v
+    # as a block: what takes an operand from here reads its block
+    let m = rt_mod_box(v)
     ensure value_class(m) == 15
     return m
   end
   if not rt_is_integer(v) then
     rt_fail_class(15)
   end
-  let m = rt_mod_int_like(t, v)
+  let m = rt_mod_box(rt_mod_int_like(t, v))
   ensure value_class(m) == 15
   return m
 end
@@ -983,10 +1433,24 @@ end
 
 make a function called rt_modint_arith takes op, a, b returns r
   require (op >= 0) and (op <= 3) and ((value_class(a) == 15) or (value_class(b) == 15))
+  if (op <= 2) and rt_modw_fits(a, b) then
+    let wa = rt_modw_w(a)
+    let wb = rt_modw_w(b)
+    if op == 0 then
+      let w = word_add(wa, wb)
+    elif op == 1 then
+      let w = word_sub(wa, wb)
+    else
+      let w = word_mul(wa, wb)
+    end
+    let r = rt_modw_like(rt_modw_template(a, b), w)
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let x = rt_mod_operand(a, rt_mod_template(a, b))
   let y = rt_mod_operand(b, rt_mod_template(a, b))
   if op == 3 then
-    let y = rt_mod_inverse(y)
+    let y = rt_mod_box(rt_mod_inverse(y))
   end
   let count = rt_mod_limbs(x)
   let px = value_data(x)
@@ -1016,6 +1480,11 @@ end
 
 make a function called rt_modint_neg takes a returns r
   require value_class(a) == 15
+  if rt_mod_is_word(a) then
+    let r = rt_modw_like(a, word_sub(0, value_data(a)))
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let count = rt_mod_limbs(a)
   let pa = value_data(a)
   let block = rt_mod_like(a)
@@ -1151,8 +1620,9 @@ end
 # The inverse of m: for an odd n by rt_lb_invert_odd; for 2^k by Newton's
 # iteration; for 2^s times an odd part q above 1, the two combined by the
 # Chinese remainder theorem. No inverse stops the program.
-make a function called rt_mod_inverse takes m returns r
-  require value_class(m) == 15
+make a function called rt_mod_inverse takes m0 returns r
+  require value_class(m0) == 15
+  let m = rt_mod_box(m0)
   let count = rt_mod_limbs(m)
   let kind = rt_mod_kind(m)
   let k = rt_mod_word(m, 48)
@@ -1300,14 +1770,22 @@ make a function called rt_modint_pow takes m, e returns r
   if not rt_is_integer(e) then
     rt_fail_class(15)
   end
+  if rt_mod_is_word(m) then
+    let r = rt_modw_pow(m, e)
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let base = m
   if e < 0 then
     let base = rt_mod_inverse(m)
   end
   let eb = rt_exponent_bits(e)
   let ecount = rt_exponent_limbs(e)
-  let r0 = rt_mod_int_like(m, 1)
-  let r1 = base
+  # m is a block (a word took the path above), so its modulus is not one a
+  # word holds, and the ladder works on blocks throughout: rt_mod_box gives
+  # a block back as it is, and the steps' results are rt_mod_held
+  let r0 = rt_mod_box(rt_mod_int_like(m, 1))
+  let r1 = rt_mod_box(base)
   let i = 32 * ecount - 1
   while i >= 0 do
     let bit = word_and(word_shr(mem_load(eb, 16 + 8 * word_shr(i, 5)), word_and(i, 31)), 1)
@@ -1320,15 +1798,15 @@ make a function called rt_modint_pow takes m, e returns r
     rt_lb_copy(a0, 64, p0, 64, count)
     rt_lb_copy(a1, 64, p1, 64, count)
     rt_lb_cswap(a0, 64, a1, 64, count, bit)
-    let x0 = rt_mod_wrap(a0)
-    let x1 = rt_mod_wrap(a1)
+    let x0 = rt_mod_held(a0)
+    let x1 = rt_mod_held(a1)
     let n1 = rt_mod_like(m)
     let n0 = rt_mod_like(m)
     rt_mod_mul_into(n1, x0, x1)
     rt_mod_mul_into(n0, x0, x0)
     rt_lb_cswap(n0, 64, n1, 64, count, bit)
-    let r0 = rt_mod_wrap(n0)
-    let r1 = rt_mod_wrap(n1)
+    let r0 = rt_mod_held(n0)
+    let r1 = rt_mod_held(n1)
     let i = i - 1
   end
   rt_lb_free(eb)
@@ -1398,6 +1876,20 @@ end
 # band, bor and bxor (op 0, 1, 2) of two k-bit words.
 make a function called rt_modint_bitwise takes op, a, b returns r
   require (op >= 0) and (op <= 2) and ((value_class(a) == 15) or (value_class(b) == 15))
+  if rt_modw_fits(a, b) then
+    let wa = rt_modw_w(a)
+    let wb = rt_modw_w(b)
+    if op == 0 then
+      let w = word_and(wa, wb)
+    elif op == 1 then
+      let w = word_or(wa, wb)
+    else
+      let w = word_xor(wa, wb)
+    end
+    let r = rt_modw_like(rt_modw_template(a, b), w)
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let x = rt_mod_operand(a, rt_mod_template(a, b))
   let y = rt_mod_operand(b, rt_mod_template(a, b))
   rt_mod_bits(x)
@@ -1417,6 +1909,11 @@ end
 
 make a function called rt_modint_bnot takes a returns r
   require value_class(a) == 15
+  if rt_mod_is_word(a) then
+    let r = rt_modw_like(a, word_xor(value_data(a), word_sub(0, 1)))
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let k = rt_mod_bits(a)
   let r = rt_mod_of_word(a, word_xor(rt_mod_word_of(a), rt_word_shr_full(word_sub(0, 1), 64 - k)))
   ensure (value_class(r) == 15) and (rt_mod_same_modulus(r, a))
@@ -1440,6 +1937,16 @@ make a function called rt_modint_shift takes op, m, s returns r
   if value_class(m) != 15 then
     rt_fail_class(15)
   end
+  if rt_mod_is_word(m) then
+    let k = rt_modw_count(m, s)
+    if op == 0 then
+      let r = rt_modw_like(m, rt_word_shl_full(value_data(m), s))
+    else
+      let r = rt_modw_like(m, rt_word_shr_full(value_data(m), s))
+    end
+    ensure rt_mod_is_word(r)
+    return r
+  end
   rt_mod_count(m, s)
   if op == 0 then
     let r = rt_mod_of_word(m, rt_word_shl_full(rt_mod_word_of(m), s))
@@ -1452,6 +1959,27 @@ end
 
 make a function called rotl takes m, s returns r
   require (value_class(m) == 15) and value_live(s)
+  # a word: everything here, with no call, for a cipher's inner loop. Its type
+  # word is not a block's (rt_modint_heap_type), asked as rt_mod_is_word asks
+  let t = value_type_word(m)
+  if t != 4294967311 then
+    let k = word_and(word_shr(t, 40), 127)
+    if (value_class(s) != 2) or (s < 0) or (s > k) then
+      rt_fail_class(15)
+    end
+    let w = value_data(m)
+    # w shl s and w shr (k - s), each in two machine shifts (a machine shift
+    # takes its count modulo 64, and either count may be 64)
+    let hl = word_shr(s, 1)
+    let hr = word_shr(k - s, 1)
+    let x = word_or(word_shl(word_shl(w, hl), s - hl), word_shr(word_shr(w, hr), k - s - hr))
+    if k < 64 then
+      let x = word_and(x, word_sub(word_shl(1, k), 1))
+    end
+    let r = value_make(t, x)
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let k = rt_mod_count(m, s)
   let w = rt_mod_word_of(m)
   let r = rt_mod_of_word(m, word_or(rt_word_shl_full(w, s), rt_word_shr_full(w, k - s)))
@@ -1461,6 +1989,12 @@ end
 
 make a function called rotr takes m, s returns r
   require (value_class(m) == 15) and value_live(s)
+  if rt_mod_is_word(m) then
+    let k = rt_modw_count(m, s)
+    let r = rotl(m, k - s)
+    ensure rt_mod_is_word(r)
+    return r
+  end
   let k = rt_mod_count(m, s)
   let r = rotl(m, k - s)
   ensure (value_class(r) == 15) and (rt_mod_same_modulus(r, m))
@@ -1977,6 +2511,12 @@ make a function called op_eq takes a, b returns r
     end
   end
   if ((ca == 15) and ((cb == 15) or rt_is_integer(b))) or ((cb == 15) and rt_is_integer(a)) then
+    if rt_modw_fits(a, b) then
+      # two words of one k, or a word and an int: equal when their low k bits are
+      let r = word_and(word_xor(rt_modw_w(a), rt_modw_w(b)), rt_modw_mask(rt_modw_bits(rt_modw_template(a, b)))) == 0
+      ensure value_class(r) == 1
+      return r
+    end
     if (ca == 15) and (cb == 15) and (not rt_mod_same_modulus(a, b)) then
       let r = false
       ensure value_class(r) == 1

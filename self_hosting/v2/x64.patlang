@@ -264,8 +264,81 @@ make a function called xv_op takes b, op, d, a, c, n, plus_events returns done
     xv_float_op(b, op, d, a, c, n, plus_events, slow, done)
   end
   sb_push(b, slow + ":" + xv_nl())
+  let mw = (op == "+") or (op == "q+") or (op == "a+") or (op == "-") or (op == "*") or (op == "band") or (op == "bor") or (op == "bxor") or (op == "==") or (op == "!=")
+  if mw then
+    xv_modint_word_op(b, op, d, a, c, n, done)
+  end
   xv_call(b, xv_op_fn(op), [a, c], d)
   sb_push(b, done + ":" + xv_nl())
+  return true
+end
+
+# a op b for two modints modulo one 2^k held as words (runtime numbers.patlang,
+# spec 2.1): class 15, k in bits 40 to 46 of the type word, the residue the
+# data word. The machine operation, then the k low bits kept; == and != on the
+# masked xor. Equal type words mean one modulus. Anything else falls through
+# to the runtime's function, which handles an int operand, other moduli, and
+# what spec 1.14 refuses. The time depends on k alone.
+make a function called xv_modint_word_op takes b, op, d, a, c, n, done returns ok
+  let call = ".op_mwcall_" + n
+  let masked = ".op_mwmask_" + n
+  xv_line(b, "mov rax, " + xv_t(a))
+  xv_line(b, "mov rdx, " + xv_t(c))
+  xv_line(b, "cmp rax, rdx")
+  xv_line(b, "jne " + call)
+  # k's bits set: no other kind of value has bits above 33
+  xv_line(b, "mov rcx, rax")
+  xv_line(b, "shr rcx, 40")
+  xv_line(b, "test rcx, rcx")
+  xv_line(b, "je " + call)
+  xv_line(b, "mov rdx, 4294967295")
+  xv_line(b, "and rdx, rax")
+  xv_line(b, "cmp rdx, 15")
+  xv_line(b, "jne " + call)
+  xv_line(b, "mov rax, " + xv_d(a))
+  xv_line(b, "mov rdx, " + xv_d(c))
+  if (op == "+") or (op == "q+") or (op == "a+") then
+    xv_line(b, "add rax, rdx")
+  elif op == "-" then
+    xv_line(b, "sub rax, rdx")
+  elif op == "*" then
+    xv_line(b, "imul rax, rdx")
+  elif op == "band" then
+    xv_line(b, "and rax, rdx")
+  elif op == "bor" then
+    xv_line(b, "or rax, rdx")
+  else
+    # bxor, and == and != on the xor
+    xv_line(b, "xor rax, rdx")
+  end
+  # the k low bits: all of them for k = 64
+  xv_line(b, "cmp rcx, 64")
+  xv_line(b, "jae " + masked)
+  xv_line(b, "mov rdx, 1")
+  xv_line(b, "shl rdx, cl")
+  xv_line(b, "sub rdx, 1")
+  xv_line(b, "and rax, rdx")
+  sb_push(b, masked + ":" + xv_nl())
+  if (op == "==") or (op == "!=") then
+    xv_line(b, "test rax, rax")
+    xv_line(b, "mov rax, 1")
+    if op == "==" then
+      xv_line(b, "je " + masked + "_t")
+    else
+      xv_line(b, "jne " + masked + "_t")
+    end
+    xv_line(b, "mov rax, 0")
+    sb_push(b, masked + "_t:" + xv_nl())
+    xv_line(b, "mov rcx, 1")
+    xv_line(b, "mov " + xv_t(d) + ", rcx")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+  else
+    xv_line(b, "mov rdx, " + xv_t(a))
+    xv_line(b, "mov " + xv_t(d) + ", rdx")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+  end
+  xv_line(b, "jmp " + done)
+  sb_push(b, call + ":" + xv_nl())
   return true
 end
 
@@ -397,16 +470,19 @@ make a function called xv_prim takes b, name, d, args, n, inline returns done
   end
   if name == "value_live" then
     # the invariant every value meets: only the type word's defined bits, a
-    # class that exists, and a heap value's block still counted
+    # class that exists, and a heap value's block still counted. A modint
+    # modulo 2^k held as a word (spec 2.1) is class 15 with no heap bit and k,
+    # from 1 to 64, in bits 40 to 46, and nothing else.
     let bad = ".live_bad_" + n
     let known = ".live_known_" + n
     let good = ".live_good_" + n
     let store = ".live_store_" + n
+    let word = ".live_word_" + n
     xv_line(b, "mov rax, " + xv_t(args[0]))
     xv_line(b, "mov rcx, rax")
     xv_line(b, "shr rcx, 34")
     xv_line(b, "test rcx, rcx")
-    xv_line(b, "jne " + bad)
+    xv_line(b, "jne " + word)
     xv_line(b, "mov rcx, 4294967295")
     xv_line(b, "and rcx, rax")
     xv_line(b, "cmp rcx, " + ir_last_builtin_class())
@@ -424,6 +500,19 @@ make a function called xv_prim takes b, name, d, args, n, inline returns done
     sb_push(b, good + ":" + xv_nl())
     xv_line(b, "mov rax, 1")
     xv_line(b, "jmp " + store)
+    sb_push(b, word + ":" + xv_nl())
+    # the type word with k's bits cleared must be 15 alone, and k 1 to 64
+    xv_line(b, "mov rcx, 139637976727552")
+    xv_line(b, "not rcx")
+    xv_line(b, "and rcx, rax")
+    xv_line(b, "cmp rcx, 15")
+    xv_line(b, "jne " + bad)
+    xv_line(b, "mov rcx, rax")
+    xv_line(b, "shr rcx, 40")
+    xv_line(b, "test rcx, rcx")
+    xv_line(b, "je " + bad)
+    xv_line(b, "cmp rcx, 64")
+    xv_line(b, "jbe " + good)
     sb_push(b, bad + ":" + xv_nl())
     xv_line(b, "mov rax, 0")
     sb_push(b, store + ":" + xv_nl())

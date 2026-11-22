@@ -227,6 +227,7 @@ class Code:
 
 
 JL, JGE, JE, JNE, JLE, JG, JO, JZ, JP = 0xC, 0xD, 0x4, 0x5, 0xE, 0xF, 0x0, 0x4, 0xA
+JBE = 0x6
 CMP_JUMP = {"<": JL, ">": JG, "<=": JLE, ">=": JGE, "==": JE, "!=": JNE}
 # The highest built-in class value_live accepts: ir_last_builtin_class in
 # self_hosting/v2/ir.patlang, 18 being bytes.
@@ -408,12 +409,13 @@ class FnGen:
             return self.store_unit(d)
         if name == "value_live":
             bad, known, good, store = c.new_label(), c.new_label(), c.new_label(), c.new_label()
+            word = c.new_label()
             self.load_t(RAX, args[0])
             c.op_rr((0x89,), RAX, RCX)        # mov rcx, rax
             c.rex(True, 0, RCX)
             c.emit(0xC1, 0xE9, 34)            # shr rcx, 34
             c.alu("test", RCX, RCX)
-            c.jcc(JNE, bad)
+            c.jcc(JNE, word)
             c.mov_imm(RCX, 0xFFFFFFFF)
             c.alu("and", RCX, RAX)
             c.alu_imm("cmp", RCX, LAST_BUILTIN_CLASS)
@@ -431,6 +433,20 @@ class FnGen:
             c.place(good)
             c.mov_imm(RAX, 1)
             c.jmp(store)
+            # a modint modulo 2^k held as a word (spec 2.1): the type word
+            # with k's bits (40 to 46) cleared is 15 alone, and k is 1 to 64
+            c.place(word)
+            c.mov_imm(RCX, ~(127 << 40))
+            c.alu("and", RCX, RAX)
+            c.alu_imm("cmp", RCX, 15)
+            c.jcc(JNE, bad)
+            c.op_rr((0x89,), RAX, RCX)        # mov rcx, rax
+            c.rex(True, 0, RCX)
+            c.emit(0xC1, 0xE9, 40)            # shr rcx, 40
+            c.alu("test", RCX, RCX)
+            c.jcc(JE, bad)
+            c.alu_imm("cmp", RCX, 64)
+            c.jcc(JBE, good)
             c.place(bad)
             c.mov_imm(RAX, 0)
             c.place(store)

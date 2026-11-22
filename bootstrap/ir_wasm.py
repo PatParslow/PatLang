@@ -338,6 +338,7 @@ class Body:
 
 # opcodes
 I64_EQZ, I64_EQ, I64_NE, I64_LT_S, I64_GT_S, I64_LE_S, I64_GE_S = 0x50, 0x51, 0x52, 0x53, 0x55, 0x57, 0x59
+I64_LT_U = 0x54
 I32_EQZ, I32_AND, I32_OR, I32_WRAP, I64_EXTEND_U = 0x45, 0x71, 0x72, 0xA7, 0xAD
 I64_ADD, I64_SUB, I64_MUL, I64_DIV_S, I64_REM_S = 0x7C, 0x7D, 0x7E, 0x7F, 0x81
 I64_AND, I64_OR, I64_XOR, I64_SHL, I64_SHR_S, I64_SHR_U = 0x83, 0x84, 0x85, 0x86, 0x87, 0x88
@@ -772,6 +773,20 @@ class Module:
             b.get(self.T(a))
             b.i64(34)
             b.op(I64_SHR_U, I64_EQZ)
+            # or a modint modulo 2^k held as a word (spec 2.1): the type word
+            # with k's bits (40 to 46) cleared is 15, and k - 1 is below 64
+            b.get(self.T(a))
+            b.i64(~(127 << 40))
+            b.op(I64_AND)
+            b.i64(15)
+            b.op(I64_EQ)
+            b.get(self.T(a))
+            b.i64(40)
+            b.op(I64_SHR_U)
+            b.i64(1)
+            b.op(I64_SUB)
+            b.i64(64)
+            b.op(I64_LT_U, I32_AND, I32_OR)
             b.get(self.T(a))
             b.i64(0xFFFFFFFF)
             b.op(I64_AND)

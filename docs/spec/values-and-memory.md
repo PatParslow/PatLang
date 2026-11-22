@@ -638,7 +638,9 @@ byte into a field or a field element's low byte out of it.
   integer operand is reduced as `mod_make` reduces it. Whether the program stops (no inverse,
   a count out of range) depends on the values. `mod_make` of an integer, `mod_value` and
   printing convert between modints and other values, and their time may depend on the values
-  converted. The constant-time check (2.7) is how this is tested.
+  converted. The constant-time check (2.7) is how this is tested. A modint modulo 2^k for k
+  up to 64 costs about what an int does, being held as a word (2.1); nothing else about it
+  differs from any other modint.
 
 ### 1.15 Worlds
 
@@ -703,6 +705,20 @@ loops and calls.
 - One flag of the type word is reserved for per-value metadata; nothing
   uses it yet.
 - A list slot, an argument and a result are each a two-word value.
+- A modint whose modulus is 2^k, for k from 1 to 64, is held in the two
+  words as a float is: its type word is class 15 with no heap bit and k in
+  bits 40 to 46, and its data word is the residue. Every other modint is a
+  heap block (`runtime/numbers.patlang`). This is the runtime's affair
+  alone. Such a modint is the same modint to a program: its class, printing,
+  `mod_value`, `mod_modulus`, equality, which operations stop the program,
+  the time each takes (1.14) and its residue's secrecy to the constant-time
+  check (2.7) are as they were. `vi_modint_word_form` holds what each engine
+  printed before the change. The compiler does `+`, `-`, `*`, `band`, `bor`,
+  `bxor`, `==` and `!=` on two of one modulus inline, a machine operation
+  and a mask, and `rotl` and `rotr` are one runtime call. An add, an xor and
+  a rotate on 32-bit modints cost about 19,000 cycles held as blocks and
+  about 250 held as words, against about 60 on ints masked to 32 bits
+  (`modint_cost_selftest`).
 - Each class has a flag word saying whether any handler is registered for
   an event its methods raise. An operator whose class has no handler
   costs that one test, and nothing where the compiler can see that no
@@ -859,19 +875,30 @@ reach, the runtime's included, as the IR is before the ownership stage, and repo
 where the time taken can depend on a modint's residue (1.14):
 
 - **What is secret.** A modint's residue. A word read from a modint's block, or from any block
-  a secret was stored in, is secret, and so is a value computed from a secret. The modulus, and
-  what the runtime computes from the modulus alone, is not. A call is followed with its
+  a secret was stored in, is secret, and so is a value computed from a secret. A modint held as
+  a word (2.1) is a secret word itself: the runtime makes one from a public integer through
+  memory marked secret, and its type word, one literal for each k, tells the check it is
+  that kind of modint. The check keeps the two kinds apart: a modint in a block has the one
+  type word 4294967311, so a test of which kind a modint is (`rt_mod_is_word`) is decided for
+  each, and neither's data word is taken for the other's. A secret raw word and a residue
+  held in a value are two kinds of secrecy, and memory holding either is followed as such:
+  a value read whole from a list keeps its residue as a residue. A raw word read where
+  values hold residues may be one, so it is secret, except a block's header. The modulus,
+  and what the runtime computes from the modulus alone, is not. A call is followed with its
   arguments' secrecy, so a function is reported only where a secret reaches it.
 - **What is followed.** The check knows, for each value, the classes it may have and, for a
   bool or a small int, the values it may hold, and follows only the instructions those allow:
   a test of a modint's class does not lead it into the string or list code beside it. A
-  modint's block always holds a secret, so a value that points to none is not a modint. The
+  modint is a secret word or points to a block holding a secret, so a value that is neither is
+  not a modint. The
   runtime marks what the IR cannot show itself: where a modint's block is made, what is
-  computed from the modulus, a residue leaving the class, and memory being freed, which reads
-  only the block's size. A list's length, count and room, and an element's type word, are
+  computed from the modulus, a residue leaving the class, and memory being freed or released,
+  which reads only blocks' counts and headers and the type words of what they hold. A list's
+  length, count and room, and an element's type word, are
   public too: they depend on how the list was used and on its elements' classes, never on
   what a residue is. A call whose argument may be of several classes is followed once for
-  each kind (an int, a modint, a value that holds values, anything else), each with the
+  each kind (an int, a modint in a block, a modint held as a word, a value that holds values,
+  anything else), each with the
   secrecy that kind can carry, so a callee's `require` rules out the kinds it does not take.
 - **What is not known.** An element read from a list, a vec or another cell is known only as
   some value, of any class. Arithmetic on it may be string or list arithmetic as far as the
@@ -887,6 +914,9 @@ where the time taken can depend on a modint's residue (1.14):
   `mod_value` or printing of a modint, where the residue leaves the class.
 - Each place is one line naming the function and what it does with the secret. With none it
   prints `v2: no value-dependent branch or access` and exits 0; with any it exits 1. While it
-  runs, `self_hosting/build/v2_constant_time.progress` says how far it has got.
+  runs, `self_hosting/build/v2_constant_time.NAME.progress`, for the source file NAME, says
+  how far it has got. When it ends, `v2_constant_time.NAME.why` beside it gives, for each
+  place, the chain of calls that brought the secret there, then every function followed,
+  with its arguments' secrecy and classes and what it returns.
 - The interpreter runs the same runtime routines, so the check of a program's modint
   operations covers both engines.

@@ -25,3 +25,8 @@ Feature: the constant-time check (spec 1.14 and 2.7)
     Given a program that agrees an X25519 secret, makes an Ed25519 key and signs a message, all written in PatLang on modints
     When the constant-time check reads it
     Then it reports nothing in them and exits 0
+
+  Scenario: a stream cipher's round on 32-bit modints has no value-dependent step, and a branch on one of their bits is reported
+    Given ChaCha20's quarter round on modints modulo 2^32, and a program with an if on such a modint's low bit
+    When the constant-time check reads each
+    Then it reports nothing in the round and exits 0, and reports the branch and exits 1

@@ -5,14 +5,27 @@
 # It reads the IR before the ownership stage, and follows only the
 # instructions a function can reach, given what is known of its slots. Each
 # slot has a state, one int of four fields, each a set that only grows:
-#   bits 0 to 5, its secrecy. Bit 0: it may be a secret word. Bit k, for k
-#     from 1 to 5: it may point to memory holding what bit k - 1 describes;
-#     bit 5 also stands for anything deeper.
-#   bits 8 to 25, the classes it may have: 0 to 15 the runtime's own, 16 a
-#     class a program declares.
-#   bits 26 to 43, the values it may hold when it is a unit, a bool or an
+#   bits 0 to 8, its secrecy, in two chains:
+#     bits 0 to 5, raw words. Bit 0: it may be a secret raw word (a modint's
+#       limb, or what arithmetic on one gives). Bit k, for k from 1 to 5: it
+#       may point to memory holding what bit k - 1 describes; bit 5 also
+#       stands for anything deeper.
+#     bits 6 to 8, residues held as words (a modint modulo 2^k, spec 2.1).
+#       Bit 6: it may be such a modint, whose data word is its residue, so
+#       only the state's class 15 part is secret. Bit 7: it may point to
+#       memory holding such values; bit 8, memory holding pointers to that,
+#       or anything deeper.
+#     A value read whole (mem_load_value) keeps both chains; a raw word read
+#     from memory holding residues may be one, so it becomes a secret raw
+#     word, except a block's header (an offset known to be below 16).
+#   bits 9 to 26, the classes it may have: 0 to 15 the runtime's own, 16 a
+#     class a program declares, and 17 a modint held as a word, which
+#     value_class calls 15 too. So 15 here is a modint in a block, whose data
+#     word points to memory holding its secret, and 17 one whose data word is
+#     its residue: followed apart (ct_split), neither is taken for the other.
+#   bits 27 to 44, the values it may hold when it is a unit, a bool or an
 #     int: 0 to 15 themselves, 16 any int above 15, 17 any int below 0.
-#   bits 44 to 61, for an int used as a type word, the classes it may name.
+#   bits 45 to 62, for an int used as a type word, the classes it may name.
 # The runtime marks what the IR cannot show with three primitives that do
 # nothing when run: ct_secret(p), the memory at p holds a secret (a modint's
 # residue); ct_public(x), x is computed from the modulus alone; ct_reveal(x), a
@@ -30,18 +43,22 @@ end
 
 make a function called ct_secrecy takes s returns t
   require value_class(s) == 2
-  let t = word_and(s, 63)
-  ensure (t >= 0) and (t < 64)
+  let t = word_and(s, 511)
+  ensure (t >= 0) and (t < 512)
   return t
 end
 
-# A modint's block always holds a secret (ct_secret), so a value that does
-# not point to one is not a modint.
+# A modint in a block points to memory holding a secret (bit 1, ct_secret),
+# and one held as a word holds its residue (bit 6), so a value that does not
+# is not that kind of modint.
 make a function called ct_classes takes s returns c
   require value_class(s) == 2
-  let c = word_and(word_shr(s, 8), ct_all())
+  let c = word_and(word_shr(s, 9), ct_all())
   if word_and(s, 2) == 0 then
     let c = word_and(c, word_xor(ct_all(), ct_bit(15)))
+  end
+  if word_and(s, 64) == 0 then
+    let c = word_and(c, word_xor(ct_all(), ct_bit(17)))
   end
   ensure (c >= 0) and (c <= ct_all())
   return c
@@ -49,22 +66,22 @@ end
 
 make a function called ct_known takes s returns k
   require value_class(s) == 2
-  let k = word_and(word_shr(s, 26), ct_all())
+  let k = word_and(word_shr(s, 27), ct_all())
   ensure (k >= 0) and (k <= ct_all())
   return k
 end
 
 make a function called ct_tclasses takes s returns c
   require value_class(s) == 2
-  let c = word_and(word_shr(s, 44), ct_all())
+  let c = word_and(word_shr(s, 45), ct_all())
   ensure (c >= 0) and (c <= ct_all())
   return c
 end
 
 make a function called ct_state_of takes secrecy, classes, known, tclasses returns s
-  require (secrecy >= 0) and (secrecy < 64) and (classes >= 0) and (known >= 0) and (tclasses >= 0)
-  let s = word_or(word_or(secrecy, word_shl(classes, 8)), word_or(word_shl(known, 26), word_shl(tclasses, 44)))
-  ensure (ct_secrecy(s) == secrecy) and (word_and(word_shr(s, 8), ct_all()) == classes)
+  require (secrecy >= 0) and (secrecy < 512) and (classes >= 0) and (known >= 0) and (tclasses >= 0)
+  let s = word_or(word_or(secrecy, word_shl(classes, 9)), word_or(word_shl(known, 27), word_shl(tclasses, 45)))
+  ensure (ct_secrecy(s) == secrecy) and (word_and(word_shr(s, 9), ct_all()) == classes)
   return s
 end
 
@@ -103,20 +120,82 @@ make a function called ct_value_set takes v returns k
   return k
 end
 
-# The classes a type word may name: a small one names itself, and one with the
-# heap bit names its low 32 bits.
+# The classes a type word may name: a small one names itself, one with the
+# heap bit names its low 32 bits, and a modint's held as a word (class 15 with
+# k, from 1 to 64, in bits 40 to 46: runtime rt_modw_type) names 17, as 15
+# does.
 make a function called ct_type_set takes v returns c
   require value_live(v)
   let c = ct_all()
   if ct_is_integer(v) then
-    if (v >= 0) and (v < 16) then
+    if v == 15 then
+      # class 15 with no heap bit is a modint held as a word's, so 15 names
+      # 17 here, and only 4294967311 names 15: a block's type word is exact
+      let c = ct_bit(17)
+    elif (v >= 0) and (v < 16) then
       let c = ct_bit(v)
     elif (v >= 4294967296) and (v < 4294967312) then
       let c = ct_bit(v - 4294967296)
+    elif (v > 0) and (word_and(v, word_xor(word_sub(0, 1), 139637976727552)) == 15) and (word_shr(v, 40) >= 1) and (word_shr(v, 40) <= 64) then
+      let c = ct_bit(17)
     end
   end
   ensure c > 0
   return c
+end
+
+# Whether a state may be a secret raw word.
+make a function called ct_raw_word takes s returns yes
+  require value_class(s) == 2
+  let yes = word_and(s, 1) != 0
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Whether a state's secret may be seen by what it is used as: a raw word
+# always, a residue held as a word only where the state may be a modint held
+# as a word.
+make a function called ct_secret_here takes s returns yes
+  require value_class(s) == 2
+  let yes = ct_raw_word(s) or ((word_and(s, 64) != 0) and (word_and(ct_classes(s), ct_bit(17)) != 0))
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The secrecy of a raw word taken from something of secrecy t: a residue
+# held as a word (bit 6) becomes a secret raw word (bit 0).
+make a function called ct_as_raw takes t returns r
+  require (t >= 0) and (t < 512)
+  let r = t
+  if word_and(t, 64) != 0 then
+    let r = word_or(word_xor(t, 64), 1)
+  end
+  ensure (r >= 0) and (r < 512)
+  return r
+end
+
+# The secrecy of a value made from a raw word of secrecy t with a type word
+# naming class 15 alone: its secret raw word is its residue (bit 6).
+make a function called ct_as_residue takes t returns r
+  require (t >= 0) and (t < 512)
+  let r = t
+  if word_and(t, 1) != 0 then
+    let r = word_or(word_xor(t, 1), 64)
+  end
+  ensure (r >= 0) and (r < 512)
+  return r
+end
+
+# What a secrecy is secret as when anything may be done with it: a residue
+# counts as a secret raw word too.
+make a function called ct_any_secret takes t returns r
+  require (t >= 0) and (t < 512)
+  let r = word_and(t, 1)
+  if word_and(t, 64) != 0 then
+    let r = 1
+  end
+  ensure (r == 0) or (r == 1)
+  return r
 end
 
 # The state of value_class(x): an int, its value one of x's classes.
@@ -126,29 +205,48 @@ make a function called ct_class_values takes classes returns k
   if word_and(classes, ct_bit(16)) != 0 then
     let k = word_or(k, ct_bit(16))
   end
+  if word_and(classes, ct_bit(17)) != 0 then
+    let k = word_or(k, ct_bit(15))
+  end
   ensure k >= 0
   return k
 end
 
-# The secrecy of a pointer to memory holding something of secrecy t.
+# The secrecy of a pointer to memory holding something of secrecy t, each
+# chain one deeper.
 make a function called ct_up takes t returns u
-  require (value_class(t) == 2) and (t >= 0) and (t < 64)
-  let u = word_and(word_shl(t, 1), 63)
-  if word_and(t, 32) != 0 then
+  require (value_class(t) == 2) and (t >= 0) and (t < 512)
+  let r = word_and(t, 63)
+  let u = word_and(word_shl(r, 1), 63)
+  if word_and(r, 32) != 0 then
     let u = word_or(u, 32)
   end
-  ensure (u >= 0) and (u < 64)
+  let m = word_shr(t, 6)
+  let mu = word_and(word_shl(m, 1), 7)
+  if word_and(m, 4) != 0 then
+    let mu = word_or(mu, 4)
+  end
+  let u = word_or(u, word_shl(mu, 6))
+  ensure (u >= 0) and (u < 512)
   return u
 end
 
-# The secrecy of a word read through a pointer of secrecy t.
+# The secrecy of what is read through a pointer of secrecy t, each chain one
+# less deep.
 make a function called ct_down takes t returns d
-  require (value_class(t) == 2) and (t >= 0) and (t < 64)
-  let d = word_shr(word_and(t, 62), 1)
-  if word_and(t, 32) != 0 then
+  require (value_class(t) == 2) and (t >= 0) and (t < 512)
+  let r = word_and(t, 63)
+  let d = word_shr(word_and(r, 62), 1)
+  if word_and(r, 32) != 0 then
     let d = word_or(d, 32)
   end
-  ensure (d >= 0) and (d < 64)
+  let m = word_shr(t, 6)
+  let md = word_shr(word_and(m, 6), 1)
+  if word_and(m, 4) != 0 then
+    let md = word_or(md, 4)
+  end
+  let d = word_or(d, word_shl(md, 6))
+  ensure (d >= 0) and (d < 512)
   return d
 end
 
@@ -599,7 +697,7 @@ end
 # Something of secrecy t stored through the address in slot: that slot and
 # the slots it was computed from now point to it, and so does a parameter.
 make a function called ct_store takes fr, slot, t returns changed
-  require (list_len(fr) == 7) and (slot >= 0) and (t >= 0) and (t < 64)
+  require (list_len(fr) == 7) and (slot >= 0) and (t >= 0) and (t < 512)
   let changed = false
   if t == 0 then
     ensure value_class(changed) == 1
@@ -644,7 +742,7 @@ make a function called ct_join takes fr, slots returns t
     let t = word_or(t, ct_secrecy(vec_get(fr[0], slots[i])))
     let i = i + 1
   end
-  ensure (t >= 0) and (t < 64)
+  ensure (t >= 0) and (t < 512)
   return t
 end
 
@@ -670,30 +768,37 @@ end
 
 # The states a value's state divides into, each followed on its own, by the
 # secrecy each class can carry. Only a modint's block and the raw blocks the
-# runtime keeps limbs in hold secret words (ct_secret), so: a modint points to
-# memory holding a secret word and to nothing deeper (its modulus is public);
-# a list, closure, cell or object holds values, so it never points to secret
-# words directly; a number other than an int, a string, a unit or a bool
-# points to no secret at all; an int may be a raw block, so it keeps all of
-# its secrecy. Each may still be a secret word itself (bit 0).
+# runtime keeps limbs in hold secret raw words (ct_secret), so: a modint
+# points to memory holding a secret word and to nothing deeper (its modulus is
+# public), or holds its residue as a word; a list, closure, cell or object
+# holds values, so it never points to secret raw words directly, though the
+# values it holds may hold residues; a number other than an int, a string, a
+# unit or a bool points to no secret at all; an int may be a raw block, so it
+# keeps all of its raw chain. Each may still be a secret raw word itself (bit
+# 0), and only a modint holds a residue as a word (bit 6).
 make a function called ct_split takes s returns parts
   require value_class(s) == 2
   let c = ct_classes(s)
   let t = ct_secrecy(s)
-  if word_and(t, 62) == 0 then
+  if word_and(t, 510) == 0 then
     let parts = [s]
     ensure list_len(parts) == 1
     return parts
   end
   let ints = ct_bit(2)
-  let modint = ct_bit(15)
+  let block = ct_bit(15)
+  let word = ct_bit(17)
   let holders = word_or(word_or(ct_bit(9), ct_bit(10)), word_or(word_or(ct_bit(11), ct_bit(12)), word_or(ct_bit(13), ct_bit(14))))
-  let holders = word_or(holders, word_or(ct_bit(16), ct_bit(17)))
-  let plain = word_xor(ct_all(), word_or(word_or(ints, modint), holders))
-  let groups = [[ints, 63], [modint, 3], [holders, 61], [plain, 1]]
+  let holders = word_or(holders, ct_bit(16))
+  let plain = word_xor(ct_all(), word_or(word_or(ints, word_or(block, word)), holders))
+  # each group's raw chain as before; of the residue chain, only a modint held
+  # as a word holds a residue (bit 6), and points to nothing; a modint in a
+  # block points to a secret raw word; an int (a raw pointer) or a holder may
+  # point to values holding residues (bits 7 and 8); nothing else does either
+  let groups = [[ints, 63 + 384], [block, 3], [word, 1 + 64], [holders, 61 + 384], [plain, 1]]
   let parts = []
   let g = 0
-  while g < 4 do
+  while g < 5 do
     let cg = word_and(c, groups[g][0])
     if cg != 0 then
       let parts = list_push(parts, ct_state_of(word_and(t, groups[g][1]), cg, ct_known(s), ct_tclasses(s)))
@@ -703,7 +808,7 @@ make a function called ct_split takes s returns parts
   if list_len(parts) == 0 then
     let parts = [s]
   end
-  ensure (list_len(parts) >= 1) and (list_len(parts) <= 4)
+  ensure (list_len(parts) >= 1) and (list_len(parts) <= 5)
   return parts
 end
 
@@ -755,7 +860,8 @@ make a function called ct_call takes st, fr, d, name, args returns changed
   while s < list_len(sigs) do
     let idx = ct_summary(st, name, sigs[s], fr[6])
     if idx < 0 then
-      let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, args), ct_all(), ct_all(), ct_all()))
+      let t = ct_join(fr, args)
+      let changed = ct_raise(fr, d, ct_state_of(word_or(t, ct_any_secret(t)), ct_all(), ct_all(), ct_all()))
       ensure value_class(changed) == 1
       return changed
     end
@@ -874,7 +980,7 @@ make a function called ct_step takes st, fr, fname, ins, labels, instrs, reports
     if t != 0 then
       let found = "a secret is passed to a closure call, which the check cannot follow"
     end
-    let changed = ct_raise(fr, ins[1], ct_state_of(t, all, all, all))
+    let changed = ct_raise(fr, ins[1], ct_state_of(word_or(t, ct_any_secret(t)), all, all, all))
   elif (op == "extern") or (op == "externf") then
     if (ins[3] != "ExitProcess") and (ct_join(fr, ins[4]) != 0) then
       let found = "a secret is passed to " + ins[2] + "!" + ins[3] + ", which the check cannot follow"
@@ -895,7 +1001,7 @@ make a function called ct_step takes st, fr, fname, ins, labels, instrs, reports
   elif op == "branch" then
     let s = vec_get(fr[0], ins[1])
     let ways = ct_ways(s)
-    if (word_and(ct_secrecy(s), 1) != 0) and ways[0] and ways[1] and (reports != false) then
+    if ct_secret_here(s) and ways[0] and ways[1] and (reports != false) then
       let t_at = vec_get(labels, ins[2])
       let f_at = vec_get(labels, ins[3])
       if (not ct_path_stops(st, instrs, labels, t_at)) and (not ct_path_stops(st, instrs, labels, f_at)) then
@@ -940,7 +1046,13 @@ make a function called ct_op takes st, fr, ins returns r
   end
   let sa = vec_get(fr[0], ins[3])
   let sb = vec_get(fr[0], ins[4])
-  let t = word_or(ct_secrecy(sa), ct_secrecy(sb))
+  # the inline int path sees a secret raw word; a residue held as a word is
+  # a modint's, which goes to the operator's runtime function, by the call
+  # below
+  let t = 0
+  if ct_raw_word(sa) or ct_raw_word(sb) then
+    let t = 1
+  end
   let ints = ct_bit(2)
   let both_ints = (word_and(ct_classes(sa), ints) != 0) and (word_and(ct_classes(sb), ints) != 0)
   let other = (word_and(ct_classes(sa), word_xor(all, ints)) != 0) or (word_and(ct_classes(sb), word_xor(all, ints)) != 0)
@@ -949,7 +1061,25 @@ make a function called ct_op takes st, fr, ins returns r
       let found = "arithmetic on a secret integer, whose time depends on whether it stays an int"
     end
     if ct_is_compare(o) then
-      let s = ct_state_of(word_and(t, 1), ct_bit(1), ct_compare(o, ct_known(sa), ct_known(sb)), all)
+      let k = ct_compare(o, ct_known(sa), ct_known(sb))
+      # ints naming no class in common as type words are not equal, and two
+      # naming a modint in a block alone are both its type word, 4294967311
+      if (o == "==") or (o == "!=") then
+        let ta = ct_tclasses(sa)
+        let tb = ct_tclasses(sb)
+        if word_and(ta, tb) == 0 then
+          let k = ct_bit(0)
+          if o == "!=" then
+            let k = ct_bit(1)
+          end
+        elif (ta == ct_bit(15)) and (tb == ct_bit(15)) then
+          let k = ct_bit(1)
+          if o == "!=" then
+            let k = ct_bit(0)
+          end
+        end
+      end
+      let s = ct_state_of(word_and(t, 1), ct_bit(1), k, all)
     elif ct_is_arith(o) then
       let s = ct_state_of(word_and(t, 1), word_or(ints, ct_bit(4)), all, all)
     else
@@ -982,7 +1112,11 @@ make a function called ct_un takes st, fr, ins returns r
     return r
   end
   let sa = vec_get(fr[0], ins[3])
-  let t = word_and(ct_secrecy(sa), 1)
+  # as in ct_op: a modint's secret word goes to the runtime function
+  let t = 0
+  if ct_raw_word(sa) then
+    let t = 1
+  end
   let c = ct_classes(sa)
   let fast = ct_bit(2)
   if o == "not" then
@@ -1063,20 +1197,46 @@ make a function called ct_prim takes st, fr, ins returns r
     end
     let changed = ct_raise(fr, d, ct_state_of(0, ct_bit(0), ct_bit(0), all))
   elif name == "value_data" then
-    let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, a), ct_bit(2), all, all))
+    # a modint's residue held as a word is its data word: a secret raw word;
+    # nothing else holds a residue as a word
+    let t = ct_join(fr, a)
+    if word_and(ct_classes(vec_get(fr[0], a[0])), ct_bit(17)) != 0 then
+      let t = ct_as_raw(t)
+    else
+      let t = word_and(t, word_xor(511, 64))
+    end
+    let changed = ct_raise(fr, d, ct_state_of(t, ct_bit(2), all, all))
   elif name == "value_make" then
-    let changed = ct_raise(fr, d, ct_state_of(ct_join(fr, [a[1]]), ct_tclasses(vec_get(fr[0], a[0])), all, all))
+    # a value made with a type word that may name a modint held as a word may
+    # be one, and a secret data word then its residue (spec 1.14); what else
+    # the type word may name keeps the data word's secrecy
+    let tc = ct_tclasses(vec_get(fr[0], a[0]))
+    let t = ct_join(fr, [a[1]])
+    if tc == ct_bit(17) then
+      let t = word_or(ct_as_residue(t), 64)
+    elif (word_and(tc, ct_bit(17)) != 0) and ct_raw_word(t) then
+      let t = word_or(t, 64)
+    end
+    let changed = ct_raise(fr, d, ct_state_of(t, tc, all, all))
   elif (name == "mem_load") or (name == "mem_load_byte") or (name == "mem_load_value") or (name == "mem_take_value") or (name == "atomic_add") then
-    if word_and(ct_join(fr, [a[0], a[1]]), 1) != 0 then
+    if ct_any_secret(ct_join(fr, [a[0], a[1]])) != 0 then
       let found = address
     end
+    let t = ct_down(ct_join(fr, [a[0]]))
     let c = ct_bit(2)
     if (name == "mem_load_value") or (name == "mem_take_value") then
       let c = all
+    elif (name == "atomic_add") or (word_and(ct_known(vec_get(fr[0], a[1])), word_xor(all, 65535)) == 0) then
+      # a block's header (offsets 0 and 8, below 16; atomic_add's count at
+      # 0): never a residue
+      let t = word_and(t, word_xor(511, 64))
+    else
+      # a raw word read where values hold residues may be one
+      let t = ct_as_raw(t)
     end
-    let changed = ct_raise(fr, d, ct_state_of(ct_down(ct_join(fr, [a[0]])), c, all, all))
+    let changed = ct_raise(fr, d, ct_state_of(t, c, all, all))
   elif (name == "mem_store") or (name == "mem_store_byte") or (name == "mem_store_value") or (name == "mem_init_value") then
-    if word_and(ct_join(fr, [a[0], a[1]]), 1) != 0 then
+    if ct_any_secret(ct_join(fr, [a[0], a[1]])) != 0 then
       let found = address
     end
     let changed = ct_store(fr, a[0], ct_up(ct_join(fr, [a[2]])))
@@ -1084,14 +1244,16 @@ make a function called ct_prim takes st, fr, ins returns r
       let changed = true
     end
   else
-    if ((name == "word_div") or (name == "word_rem")) and (word_and(ct_join(fr, a), 1) != 0) then
+    # a word primitive works on its operands' data words, a residue's too
+    let t = ct_any_secret(ct_join(fr, a))
+    if ((name == "word_div") or (name == "word_rem")) and (t != 0) then
       let found = "the machine's division on a secret"
     end
     let c = ct_bit(2)
     if (name == "float_lt") or (name == "float_eq") then
       let c = ct_bit(2)
     end
-    let changed = ct_raise(fr, d, ct_state_of(word_and(ct_join(fr, a), 1), c, all, all))
+    let changed = ct_raise(fr, d, ct_state_of(t, c, all, all))
   end
   let r = [changed, found]
   ensure list_len(r) == 2
@@ -1147,17 +1309,19 @@ make a function called ct_follow takes st, idx returns done
   return done
 end
 
-# Where the check writes how far it has got.
-make a function called ct_progress_path returns path
-  let path = "self_hosting/build/v2_constant_time.progress"
+# Where the check of the program named name writes how far it has got: a
+# file of its own, so checks run side by side do not share one.
+make a function called ct_progress_path takes name returns path
+  require str_len(name) > 0
+  let path = "self_hosting/build/v2_constant_time." + name + ".progress"
   ensure str_len(path) > 0
   return path
 end
 
 # Every place the program's time can depend on a modint's residue, as lines
 # naming the function; empty when there is none.
-make a function called ct_check takes fns returns lines
-  require value_class(fns) == 9
+make a function called ct_check takes fns, name returns lines
+  require (value_class(fns) == 9) and (str_len(name) > 0)
   let st = ct_state(fns)
   ct_summary(st, "__main", [], 0 - 1)
   ct_summary(st, "__register", [], 0 - 1)
@@ -1169,7 +1333,7 @@ make a function called ct_check takes fns returns lines
     ct_follow(st, idx)
     if at % 500 == 0 then
       # progress, where a long check can be watched from outside
-      write_file(ct_progress_path(), at + " functions followed, " + vec_len(st[3]) + " argument lists, " + (vec_len(st[9]) - at) + " queued; last " + ir_fn_name(st[0][vec_get(st[3], idx)]) + chr(10))
+      write_file(ct_progress_path(name), at + " functions followed, " + vec_len(st[3]) + " argument lists, " + (vec_len(st[9]) - at) + " queued; last " + ir_fn_name(st[0][vec_get(st[3], idx)]) + chr(10))
     end
   end
   let out = vec_new()
@@ -1185,7 +1349,78 @@ make a function called ct_check takes fns returns lines
     end
     let i = i + 1
   end
+  write_file(ct_why_path(name), ct_why(st))
   let lines = vec_to_list(out)
   ensure value_class(lines) == 9
   return lines
+end
+
+# Where the check of the program named name writes how it reached each place
+# it reports, and every summary it made.
+make a function called ct_why_path takes name returns path
+  require str_len(name) > 0
+  let path = "self_hosting/build/v2_constant_time." + name + ".why"
+  ensure str_len(path) > 0
+  return path
+end
+
+# One summary as text: its function and each argument's secrecy and classes.
+make a function called ct_summary_text takes st, idx returns text
+  require (list_len(st) == 13) and (idx >= 0)
+  let b = sb_new()
+  sb_push(b, ir_fn_name(st[0][vec_get(st[3], idx)]) + "(")
+  let sig = vec_get(st[4], idx)
+  let i = 0
+  while i < list_len(sig) do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, "s" + ct_secrecy(sig[i]) + " c" + ct_classes(sig[i]))
+    let i = i + 1
+  end
+  sb_push(b, ")")
+  let text = sb_str(b)
+  ensure str_len(text) > 0
+  return text
+end
+
+# For each summary that reports a place: what it reports, then the chain of
+# its first callers back to the program's start, so a report can be traced to
+# the call that brought the secret.
+make a function called ct_why takes st returns text
+  require list_len(st) == 13
+  let b = sb_new()
+  let i = 0
+  while i < vec_len(st[7]) do
+    let found = vec_get(st[7], i)
+    if list_len(found) > 0 then
+      sb_push(b, found[0] + chr(10))
+      let at = i
+      let seen = []
+      let depth = 0
+      while (at >= 0) and (depth < 40) and (not v2_contains(seen, at)) do
+        let seen = list_push(seen, at)
+        sb_push(b, "  " + ct_summary_text(st, at) + chr(10))
+        let callers = vec_get(st[8], at)
+        if list_len(callers) == 0 then
+          let at = 0 - 1
+        else
+          let at = callers[0]
+        end
+        let depth = depth + 1
+      end
+    end
+    let i = i + 1
+  end
+  # then every summary and the state it returns, to find where a state began
+  sb_push(b, "-- summaries" + chr(10))
+  let i = 0
+  while i < vec_len(st[5]) do
+    let ret = vec_get(st[5], i)
+    sb_push(b, ct_summary_text(st, i) + " -> s" + ct_secrecy(ret) + " c" + ct_classes(ret) + " t" + ct_tclasses(ret) + chr(10))
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  ensure value_class(text) == 8
+  return text
 end
