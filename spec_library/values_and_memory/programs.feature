@@ -181,6 +181,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When v2 builds each
     Then the first build warns naming line 7 and s, the second warns of nothing, and both programs run as written
 
+  Scenario: the compiler warns of an index that is certainly not an int or a modint
+    Given a program indexing with a float, a sqrt and a string, and passing floor of a float to a function that indexes with it through another, and a program whose indexes are ints, modints, parameters, elements and a name that is not always a float
+    When v2 builds each
+    Then the first build warns of each, naming its line and the call, the second warns of nothing, and the first runs until its first float index
+
   Scenario: a program declares whether a string stands for the object of that name
     Given an object named w1, in a program that declares nothing and in one that declares object_names_explicit()
     When each reads it through object_named, reads w1.color or w1.length from the string, and deletes the object given the string

@@ -16,6 +16,16 @@ Feature: powers, trigonometry, rounding, bits and the small file functions
     When a program applies bnot to it
     Then the program stops, reporting the float's class
 
+  Scenario: to_int gives the int a whole number is
+    Given an int, whole floats of either sign and zero, and floats of 2^62, 2^63, -2^63 and 1e20
+    When a program applies to_int to each
+    Then each is the int it is, a bigint from 2^63 up, and floor's float made an int indexes a list
+
+  Scenario: to_int of a number that is not whole stops the program
+    Given 2.5, an infinite float and a string
+    When a program applies to_int to each
+    Then each stops, saying to_int takes a whole number and naming what it was given
+
   Scenario: max and min of two numbers
     Given ints, floats, rationals and a bigint
     When a program applies max and min

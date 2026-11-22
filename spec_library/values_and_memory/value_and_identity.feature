@@ -36,6 +36,16 @@ Feature: values and objects with identity (spec 1.5)
     When each is read where nothing is
     Then a list, a vec, a non-list or an object gives unit, a string gives "", getenv and read_file give "", file_exists gives false, vfs_exists gives false and query gives 0
 
+  Scenario: a modint is an index, by its residue
+    Given a list, a vec, a bytes, a bool array and a string
+    When each is read and set at modints of several moduli
+    Then each reads and sets where the residue says, v[i] reads a vec as vec_get does, and a residue past the end reads as an int past the end does
+
+  Scenario: an index that is neither an int nor a modint stops the program
+    Given a whole float, a string and a float
+    When a program indexes a list with the first, reads a vec with the second and sets a list with the third
+    Then each stops, saying an index is an int or a modint and naming what it was given
+
   Scenario: two objects with the same contents are not equal
     Given two objects of class Point, each with x = 1 and y = 2
     When they are compared with ==

@@ -118,6 +118,16 @@ any event is (`emit`, `when`), with nothing specific to operators.
   missing file from an empty one. `vfs_exists` gives `true` or `false`, and
   `vfs_read` of a missing path stops the program. (`vfs_exists` gave the text `"1"` or
   `"0"`, both true as a condition, so `if vfs_exists(p)` always took its first branch.) `query` gives the number of matches, 0 for none.
+- **What an index is:** an int, or a modint, which names the position its residue
+  does (a residue of 2^63 or more is past any end). This holds wherever a position is
+  taken: `v[i]`, `list_get`, `list_set`, `vec_get`, `vec_set`, `bytes_get`,
+  `bytes_set`, `bool_array_get` and `bool_array_set`; `v[i]` reads a vec as `vec_get`
+  does (it gave `unit` for every `i`). Any other index stops the
+  program, saying `an index is an int or a modint, not a float` (or whatever it was).
+  A whole float is not an index: `floor` gives a float, so `v[floor(x)]` stops, where
+  it gave `unit` without a word; `to_int` gives a whole float's int (1.11). The compiler
+  warns of an index that is certainly not an int or a modint (1.13). (The string cursor's functions and `char_code` take
+  an int, by contract.)
 
 - **bytes** (class 18) is a buffer of bytes, one byte of memory each, where a list of
   ints holds a 16-byte value for each. `bytes_new(n)` is `n` zero bytes; `bytes_len`,
@@ -298,7 +308,11 @@ it. When nothing else holds it, the time an append takes does not depend on the 
 are the runtime's own (`runtime/libm.patlang`, fdlibm's algorithms by way of musl), not the
 system's, so every target gives the same bits: each of the functions above is within one unit
 in the last place of the exact result, and `sqrt`, `floor`, `ceil`, `trunc`, `round` and `%` on
-floats are exact. `float_bits(x)` gives a number's IEEE 754 double bits as an int (the 64 bits
+floats are exact. `floor`, `ceil`, `trunc` and `round` of a float give a float; `to_int(x)`
+gives the int a whole number is: an int or a bigint as it is, a whole float as its int (a
+bigint from 2^63 up), and it stops the program for a float that is not whole, NaN or infinite,
+a rational, or anything that is not a number (`to_int takes a whole number, not 2.5`). An
+index is an int (1.5), so `v[to_int(floor(x))]`. `float_bits(x)` gives a number's IEEE 754 double bits as an int (the 64 bits
 read as signed), and `float_from_bits(n)` the float an int's bits are. A compiled `+`, `-`,
 `*`, `/` or comparison of two floats is one machine operation, about the cost of one on two ints
 (a float add took about 940 cycles through the runtime's operator function, and takes about 10). `abs` of a
@@ -421,6 +435,14 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   line N: this loop's body sets NAME, ...`), naming the loop's line; the build still succeeds and
   the program runs as written. An inner loop that moves the shared index on (it reads the name it
   sets) is not warned of.
+- An index that is certainly not an int or a modint (1.5) is warned of too (`v2 warning: FILE:
+  line N: in F, the index x is a float: ...`). Certainly means wherever it is set: a literal,
+  an operator on evident kinds, `sqrt` and the trigonometric functions, `floor` and the other
+  rounding functions of a float, a function of the program's that returns one kind on every
+  path, or a parameter a function indexes with, which makes the argument passed to it an index
+  (`in smooth, x0, argument 2 of pixel, is a float, and pixel indexes with it (through
+  sample)`). A parameter, an element, a field, or a name set to a float on one path and an int
+  on another is not warned of, so a correct program never is; the build still succeeds.
 - `exec_capture` gives what the command wrote to standard output and to standard error.
 - A child process inherits its own standard handles and nothing else this process holds: not
   the pipes another thread made for its own child, and not a socket. A program that spawns a

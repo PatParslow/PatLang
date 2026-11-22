@@ -1,0 +1,573 @@
+# The compiler's warning of an index that is certainly not an int or a modint
+# (spec 1.5 and 1.13). Such an index stops the program when it is reached.
+#
+# A value's kind is evident only from literals, from operators on evident
+# kinds, and from functions whose result is evident (sqrt and the like, floor
+# of a float, or a function of the program's own that returns one kind on
+# every path). A parameter, a list's element, a field and anything else are of
+# any kind, so a correct program is never warned of: the warning is for an
+# index that is a float, a string, a bool, a list or unit wherever it is set.
+#
+# A parameter that a function uses as an index, through + - * / % and the
+# rounding functions, makes an argument passed to it an index too, so the
+# warning names the call: `x0 = floor(1.5)` passed to pixel_at, which indexes
+# with (y * w + x) * 3, is warned of at the call.
+#
+# Kinds: "" (not set yet), "int", "float", "string", "bool", "list", "unit",
+# "any". Within a function the analysis does not follow the order of
+# statements: a local's kind is the join of every let that sets it.
+
+make a function called ik_join takes a, b returns k
+  if a == "" then
+    return b
+  end
+  if (b == "") or (a == b) then
+    return a
+  end
+  return "any"
+end
+
+make a function called ik_bad takes k returns yes
+  return (k == "float") or (k == "string") or (k == "bool") or (k == "list") or (k == "unit")
+end
+
+make a function called ik_words takes k returns words
+  if k == "unit" then
+    return "unit"
+  end
+  return "a " + k
+end
+
+# ---- a table from names to values: n buckets of [name, value] ----
+
+make a function called ik_table takes n returns t
+  require (type_of(n) == "int") and (n > 0)
+  let t = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(t, [])
+    let i = i + 1
+  end
+  ensure vec_len(t) == n
+  return t
+end
+
+make a function called ik_get takes t, name returns v
+  let bucket = vec_get(t, str_hash(name) % vec_len(t))
+  let i = 0
+  while i < list_len(bucket) do
+    if bucket[i][0] == name then
+      return bucket[i][1]
+    end
+    let i = i + 1
+  end
+  return unit
+end
+
+make a function called ik_put takes t, name, v returns done
+  let h = str_hash(name) % vec_len(t)
+  let bucket = vec_get(t, h)
+  let i = 0
+  while i < list_len(bucket) do
+    if bucket[i][0] == name then
+      vec_set(t, h, list_set(bucket, i, [name, v]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(t, h, list_push(bucket, [name, v]))
+  return true
+end
+
+# ---- what a function holds ----
+
+# A node whose body is another scope: nothing in it is this function's.
+make a function called ik_other_scope takes node returns yes
+  let h = node[0]
+  return (h == "Func") or (h == "Closure") or (h == "ClassDecl") or (h == "When") or (h == "RuleDecl") or (h == "GoalDecl")
+end
+
+# The rounding functions keep a float a float and an int an int.
+make a function called ik_rounding takes name returns yes
+  return (name == "floor") or (name == "ceil") or (name == "trunc") or (name == "round") or (name == "abs")
+end
+
+make a function called ik_float_function takes name returns yes
+  return (name == "sin") or (name == "cos") or (name == "tan") or (name == "asin") or (name == "acos") or (name == "atan") or (name == "atan2") or (name == "exp") or (name == "log") or (name == "float_from_bits")
+end
+
+make a function called ik_int_function takes name returns yes
+  return (name == "to_int") or (name == "list_len") or (name == "vec_len") or (name == "str_len") or (name == "len") or (name == "bytes_len") or (name == "char_code")
+end
+
+# The runtime functions that take an index as their second argument.
+make a function called ik_index_function takes name returns yes
+  return (name == "list_get") or (name == "list_set") or (name == "vec_get") or (name == "vec_set") or (name == "bytes_get") or (name == "bytes_set") or (name == "bool_array_get") or (name == "bool_array_set")
+end
+
+# What a function's body holds, gathered once, onto the vecs given:
+# - lets: [name, expr] for each let;
+# - others: each name bound otherwise (a pattern's);
+# - returns: each returned expression;
+# - sites: [expr, line, callee, position] for each place an index may be:
+#   callee "" for v[i] and the runtime's index functions, or the program's
+#   function the expression is passed to, at that argument position.
+# by_name: the program's functions, so a call of one is told from the runtime's.
+make a function called ik_gather takes node, line, by_name, acc returns done
+  if type_of(node) != "list" then
+    return false
+  end
+  if list_len(node) == 0 then
+    return false
+  end
+  let at = line
+  if type_of(node[0]) == "string" then
+    if ik_other_scope(node) then
+      return false
+    end
+    let h = node[0]
+    let last = node[list_len(node) - 1]
+    if ((h == "Let") or (h == "Expr") or (h == "Return") or (h == "If") or (h == "While")) and (type_of(last) == "int") then
+      let at = last
+    end
+    if (h == "Let") and (list_len(node) >= 3) and (type_of(node[1]) == "string") then
+      vec_push(acc[0], [node[1], node[2]])
+    end
+    if (h == "PBind") and (list_len(node) >= 2) and (type_of(node[1]) == "string") then
+      vec_push(acc[1], node[1])
+    end
+    if (h == "Return") and (list_len(node) >= 2) then
+      vec_push(acc[2], node[1])
+    end
+    if (h == "Index") and (list_len(node) >= 3) then
+      vec_push(acc[3], [node[2], at, "", 1])
+    end
+    if (h == "Call") and (list_len(node) >= 3) and (type_of(node[2]) == "list") then
+      let args = node[2]
+      let own = ik_get(by_name, node[1]) != unit
+      if own then
+        let a = 0
+        while a < list_len(args) do
+          vec_push(acc[3], [args[a], at, node[1], a])
+          let a = a + 1
+        end
+      elif ik_index_function(node[1]) and (list_len(args) >= 2) then
+        vec_push(acc[3], [args[1], at, "", 1])
+      end
+    end
+  end
+  let i = 0
+  while i < list_len(node) do
+    ik_gather(node[i], at, by_name, acc)
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- kinds ----
+
+# The kind of expression e, given a function's local kinds (a table) and st,
+# the analysis state (ik_warnings).
+make a function called ik_kind takes e, env, st returns k
+  if type_of(e) != "list" then
+    return "any"
+  end
+  if list_len(e) == 0 then
+    return "any"
+  end
+  let h = e[0]
+  if h == "Num" then
+    if lw_num_kind(e[1]) == "float" then
+      return "float"
+    end
+    return "int"
+  end
+  if h == "Str" then
+    return "string"
+  end
+  if h == "Bool" then
+    return "bool"
+  end
+  if h == "List" then
+    return "list"
+  end
+  if h == "Unit" then
+    return "unit"
+  end
+  if h == "Var" then
+    let k = ik_get(env, e[1])
+    if (k == unit) or (k == "") then
+      return "any"
+    end
+    return k
+  end
+  if h == "Bin" then
+    let op = e[1]
+    if (op == "==") or (op == "!=") or (op == "<") or (op == "<=") or (op == ">") or (op == ">=") then
+      return "bool"
+    end
+    if (op == "+") or (op == "-") or (op == "*") or (op == "/") or (op == "%") then
+      let a = ik_kind(e[2], env, st)
+      let b = ik_kind(e[3], env, st)
+      if (op == "+") and ((a == "string") or (b == "string")) then
+        return "string"
+      end
+      if ((a == "int") or (a == "float")) and ((b == "int") or (b == "float")) then
+        if (a == "float") or (b == "float") then
+          return "float"
+        end
+        if op == "/" then
+          # an int, or a rational
+          return "any"
+        end
+        return "int"
+      end
+      return "any"
+    end
+    return "any"
+  end
+  if h == "Un" then
+    if e[1] == "not" then
+      return "bool"
+    end
+    if e[1] == "-" then
+      let a = ik_kind(e[2], env, st)
+      if (a == "int") or (a == "float") then
+        return a
+      end
+    end
+    return "any"
+  end
+  if h == "Call" then
+    let name = e[1]
+    let r = ik_get(st[1], name)
+    if r != unit then
+      if r == "" then
+        return "any"
+      end
+      return r
+    end
+    if (ik_rounding(name) or (name == "sqrt")) and (list_len(e[2]) == 1) then
+      let a = ik_kind(e[2][0], env, st)
+      if a == "float" then
+        return "float"
+      end
+      if (a == "int") and (name != "sqrt") then
+        return "int"
+      end
+      return "any"
+    end
+    if ik_float_function(name) then
+      return "float"
+    end
+    if ik_int_function(name) then
+      return "int"
+    end
+    return "any"
+  end
+  return "any"
+end
+
+# The positions of the parameters that e is a float whenever they are: e is
+# one of them, or + - * / % or a rounding function of one. carry: what each
+# local carries (a table).
+make a function called ik_carry takes e, carry returns ps
+  if type_of(e) != "list" then
+    return []
+  end
+  if list_len(e) == 0 then
+    return []
+  end
+  let h = e[0]
+  if h == "Var" then
+    let c = ik_get(carry, e[1])
+    if type_of(c) != "list" then
+      return []
+    end
+    return c
+  end
+  if (h == "Bin") and ((e[1] == "+") or (e[1] == "-") or (e[1] == "*") or (e[1] == "/") or (e[1] == "%")) then
+    return ik_union(ik_carry(e[2], carry), ik_carry(e[3], carry))
+  end
+  if (h == "Un") and (e[1] == "-") then
+    return ik_carry(e[2], carry)
+  end
+  if (h == "Call") and ik_rounding(e[1]) and (list_len(e[2]) == 1) then
+    return ik_carry(e[2][0], carry)
+  end
+  return []
+end
+
+make a function called ik_has takes l, x returns yes
+  let i = 0
+  while i < list_len(l) do
+    if l[i] == x then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called ik_union takes a, b returns u
+  if list_len(b) == 0 then
+    return a
+  end
+  let u = a
+  let i = 0
+  while i < list_len(b) do
+    if not ik_has(u, b[i]) then
+      let u = list_push(u, b[i])
+    end
+    let i = i + 1
+  end
+  return u
+end
+
+make a function called ik_meet takes a, b returns m
+  let m = []
+  let i = 0
+  while i < list_len(a) do
+    if ik_has(b, a[i]) then
+      let m = list_push(m, a[i])
+    end
+    let i = i + 1
+  end
+  return m
+end
+
+# A function's locals: [kinds, carries], each a table. A parameter starts as
+# any kind and carrying itself; a pattern's name is any kind and carries
+# nothing; a let joins its value's kind in and meets its carry. fx is a
+# function's record (ik_warnings).
+make a function called ik_env takes fx, st returns env
+  let params = fx[1]
+  let lets = fx[4]
+  let others = fx[5]
+  let size = 2 * (list_len(params) + list_len(lets) + list_len(others)) + 1
+  let kinds = ik_table(size)
+  let carry = ik_table(size)
+  let all = []
+  let p = 0
+  while p < list_len(params) do
+    ik_put(kinds, params[p], "any")
+    ik_put(carry, params[p], [p])
+    let all = list_push(all, p)
+    let p = p + 1
+  end
+  let o = 0
+  while o < list_len(others) do
+    ik_put(kinds, others[o], "any")
+    ik_put(carry, others[o], [])
+    let o = o + 1
+  end
+  # carries start from every parameter, and only fall
+  let l0 = 0
+  while l0 < list_len(lets) do
+    let name = lets[l0][0]
+    if ik_get(kinds, name) == unit then
+      ik_put(kinds, name, "")
+      ik_put(carry, name, all)
+    end
+    let l0 = l0 + 1
+  end
+  let changed = true
+  while changed do
+    let changed = false
+    let l1 = 0
+    while l1 < list_len(lets) do
+      let lt = lets[l1]
+      let old_k = ik_get(kinds, lt[0])
+      let new_k = ik_join(old_k, ik_kind(lt[1], kinds, st))
+      if new_k != old_k then
+        ik_put(kinds, lt[0], new_k)
+        let changed = true
+      end
+      let old_c = ik_get(carry, lt[0])
+      if list_len(old_c) > 0 then
+        let new_c = ik_meet(old_c, ik_carry(lt[1], carry))
+        if list_len(new_c) != list_len(old_c) then
+          ik_put(carry, lt[0], new_c)
+          let changed = true
+        end
+      end
+      let l1 = l1 + 1
+    end
+  end
+  return [kinds, carry]
+end
+
+# Whether a site is an index: a direct one, or an argument at a position the
+# callee indexes with.
+make a function called ik_site_live takes site, bounds returns yes
+  if site[2] == "" then
+    return true
+  end
+  return ik_get(bounds, site[2])[site[3]] != ""
+end
+
+# The warnings for a program's files, each [path, statements]: one line for
+# each index that is certainly not an int or a modint.
+make a function called ik_warnings takes files returns warnings
+  require type_of(files) == "list"
+  # the program's functions, and each file's top level as one more
+  let found = vec_new()
+  let by_name = ik_table(4096)
+  let i = 0
+  while i < list_len(files) do
+    let stmts = files[i][1]
+    let top = []
+    let s = 0
+    while s < list_len(stmts) do
+      let node = stmts[s]
+      if (type_of(node) == "list") and (list_len(node) >= 4) and (node[0] == "Func") and (type_of(node[1]) == "string") then
+        vec_push(found, [node[1], node[2], node[3], files[i][0]])
+        ik_put(by_name, node[1], true)
+      else
+        let top = list_push(top, node)
+      end
+      let s = s + 1
+    end
+    vec_push(found, ["", [], top, files[i][0]])
+    let i = i + 1
+  end
+  # each function's record: [name, params, body, path, lets, others,
+  # returns, sites]
+  let fns = vec_new()
+  let rets = ik_table(4096)
+  let bounds = ik_table(4096)
+  let f0 = 0
+  while f0 < vec_len(found) do
+    let fx = vec_get(found, f0)
+    let acc = [vec_new(), vec_new(), vec_new(), vec_new()]
+    ik_gather(fx[2], 0, by_name, acc)
+    vec_push(fns, [fx[0], fx[1], fx[2], fx[3], vec_to_list(acc[0]), vec_to_list(acc[1]), vec_to_list(acc[2]), vec_to_list(acc[3])])
+    if fx[0] != "" then
+      ik_put(rets, fx[0], "")
+      let none = []
+      let p = 0
+      while p < list_len(fx[1]) do
+        let none = list_push(none, "")
+        let p = p + 1
+      end
+      ik_put(bounds, fx[0], none)
+    end
+    let f0 = f0 + 1
+  end
+  # st: [the program's functions, what each returns, for each parameter of
+  # each the callee it is an index for ("" if none, "-" if the function itself)]
+  let st = [by_name, rets, bounds]
+  let envs = vec_new()
+  let changed = true
+  while changed do
+    let changed = false
+    let envs = vec_new()
+    let f1 = 0
+    while f1 < vec_len(fns) do
+      let fx = vec_get(fns, f1)
+      let env = ik_env(fx, st)
+      vec_push(envs, env)
+      if fx[0] != "" then
+        let r = ""
+        if list_len(fx[6]) == 0 then
+          let r = "any"
+        end
+        let a = 0
+        while a < list_len(fx[6]) do
+          let r = ik_join(r, ik_kind(fx[6][a], env[0], st))
+          let a = a + 1
+        end
+        if r != ik_get(rets, fx[0]) then
+          ik_put(rets, fx[0], r)
+          let changed = true
+        end
+        # the parameters this function indexes with
+        let bound = ik_get(bounds, fx[0])
+        let b0 = bound
+        let sites = fx[7]
+        let k = 0
+        while k < list_len(sites) do
+          let site = sites[k]
+          if ik_site_live(site, bounds) then
+            let ps = ik_carry(site[0], env[1])
+            let q = 0
+            while q < list_len(ps) do
+              if bound[ps[q]] == "" then
+                let via = "-"
+                if site[2] != "" then
+                  let via = site[2]
+                end
+                let bound = list_set(bound, ps[q], via)
+              end
+              let q = q + 1
+            end
+          end
+          let k = k + 1
+        end
+        if bound != b0 then
+          ik_put(bounds, fx[0], bound)
+          let changed = true
+        end
+      end
+      let f1 = f1 + 1
+    end
+  end
+  # the warnings
+  let out = vec_new()
+  let f2 = 0
+  while f2 < vec_len(fns) do
+    let fx = vec_get(fns, f2)
+    let env = vec_get(envs, f2)
+    let sites = fx[7]
+    let k2 = 0
+    while k2 < list_len(sites) do
+      let site = sites[k2]
+      if ik_site_live(site, bounds) then
+        let kind = ik_kind(site[0], env[0], st)
+        if ik_bad(kind) then
+          vec_push(out, ik_message(fx, site, kind, st))
+        end
+      end
+      let k2 = k2 + 1
+    end
+    let f2 = f2 + 1
+  end
+  let warnings = vec_to_list(out)
+  ensure type_of(warnings) == "list"
+  return warnings
+end
+
+make a function called ik_message takes fx, site, kind, st returns text
+  let where = "the top level"
+  if fx[0] != "" then
+    let where = fx[0]
+  end
+  let named = (type_of(site[0]) == "list") and (site[0][0] == "Var")
+  let head = fx[3] + ": line " + site[1] + ": in " + where + ", "
+  let tail = ": an index is an int or a modint, and a list, a vec, a string or a bytes indexed with it stops the program"
+  if kind == "float" then
+    let tail = tail + " (to_int gives the int a whole float is)"
+  end
+  if site[2] == "" then
+    let what = "this index"
+    if named then
+      let what = "the index " + site[0][1]
+    end
+    let text = head + what + " is " + ik_words(kind) + tail
+    ensure value_class(text) == 8
+    return text
+  end
+  let g = site[2]
+  let via = ik_get(st[2], g)[site[3]]
+  let through = ""
+  if via != "-" then
+    let through = " (through " + via + ")"
+  end
+  let arg = "argument " + (site[3] + 1) + " of " + g
+  if named then
+    let arg = site[0][1] + ", argument " + (site[3] + 1) + " of " + g + ","
+  end
+  let text = head + arg + " is " + ik_words(kind) + ", and " + g + " indexes with it" + through + tail
+  ensure value_class(text) == 8
+  return text
+end
