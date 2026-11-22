@@ -764,7 +764,7 @@ class Module:
             b.get(self.D(args[0]))
             b.get(self.D(args[1]))
             return self.set_result(d)
-        if pname in ("ct_secret", "ct_public", "ct_reveal"):
+        if pname in ("ct_secret", "ct_public", "ct_reveal", "ct_declassify"):
             # marks for the constant-time check, doing nothing
             return self.set_unit(d)
         if pname == "value_live":

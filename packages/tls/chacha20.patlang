@@ -1,0 +1,118 @@
+# ChaCha20 (RFC 8439 sections 2.3 and 2.4) on 32-bit words, each a modint
+# modulo 2^32 (spec 1.14). Keys, nonces, data and keystream are lists of bytes;
+# a byte given as an int is taken as public, and every byte made here is a
+# modint modulo 256, so the constant-time check (spec 2.7) follows the key
+# and the data as secret. Only the data's length decides how many steps run.
+#
+#   chacha20_block(key, counter, nonce) -> the 64 keystream bytes of a block
+#   chacha20_xor(key, counter, nonce, data) -> data xor the keystream from
+#                                              block counter on
+
+make a function called cc_word takes x returns w
+  require (type_of(x) == "int") or (type_of(x) == "modint")
+  let w = mod_make(x, 4294967296)
+  ensure mod_modulus(w) == 4294967296
+  return w
+end
+
+make a function called cc_byte takes x returns b
+  require (type_of(x) == "int") or (type_of(x) == "modint")
+  let b = mod_make(x, 256)
+  ensure mod_modulus(b) == 256
+  return b
+end
+
+# The little-endian word of the four bytes at i.
+make a function called cc_le32 takes bytes, i returns w
+  require (i >= 0) and (i + 4 <= list_len(bytes))
+  let w = cc_word(bytes[i]) bor (cc_word(bytes[i + 1]) shl 8) bor (cc_word(bytes[i + 2]) shl 16) bor (cc_word(bytes[i + 3]) shl 24)
+  ensure mod_modulus(w) == 4294967296
+  return w
+end
+
+# RFC 8439 2.1: the quarter round on words a, b, c and d of x.
+make a function called cc_quarter takes x, a, b, c, d returns out
+  require list_len(x) == 16
+  let wa = cc_word(x[a])
+  let wb = cc_word(x[b])
+  let wc = cc_word(x[c])
+  let wd = cc_word(x[d])
+  let wa = wa + wb
+  let wd = rotl(wd bxor wa, 16)
+  let wc = wc + wd
+  let wb = rotl(wb bxor wc, 12)
+  let wa = wa + wb
+  let wd = rotl(wd bxor wa, 8)
+  let wc = wc + wd
+  let wb = rotl(wb bxor wc, 7)
+  let out = list_set(list_set(list_set(list_set(x, a, wa), b, wb), c, wc), d, wd)
+  ensure list_len(out) == 16
+  return out
+end
+
+# RFC 8439 2.3: the block for a 32-byte key, a block counter (a public int)
+# and a 12-byte nonce, as 64 bytes.
+make a function called chacha20_block takes key, counter, nonce returns bytes
+  require (list_len(key) == 32) and (list_len(nonce) == 12)
+  require (type_of(counter) == "int") and (counter >= 0) and (counter < 4294967296)
+  let s = [cc_word(1634760805), cc_word(857760878), cc_word(2036477234), cc_word(1797285236)]
+  let i = 0
+  while i < 8 do
+    let s = list_push(s, cc_le32(key, 4 * i))
+    let i = i + 1
+  end
+  let s = list_push(s, cc_word(counter))
+  let i = 0
+  while i < 3 do
+    let s = list_push(s, cc_le32(nonce, 4 * i))
+    let i = i + 1
+  end
+  let x = s
+  let round = 0
+  while round < 10 do
+    let x = cc_quarter(x, 0, 4, 8, 12)
+    let x = cc_quarter(x, 1, 5, 9, 13)
+    let x = cc_quarter(x, 2, 6, 10, 14)
+    let x = cc_quarter(x, 3, 7, 11, 15)
+    let x = cc_quarter(x, 0, 5, 10, 15)
+    let x = cc_quarter(x, 1, 6, 11, 12)
+    let x = cc_quarter(x, 2, 7, 8, 13)
+    let x = cc_quarter(x, 3, 4, 9, 14)
+    let round = round + 1
+  end
+  let bytes = []
+  let i = 0
+  while i < 16 do
+    let w = cc_word(x[i]) + cc_word(s[i])
+    let bytes = list_push(bytes, cc_byte(w))
+    let bytes = list_push(bytes, cc_byte(w shr 8))
+    let bytes = list_push(bytes, cc_byte(w shr 16))
+    let bytes = list_push(bytes, cc_byte(w shr 24))
+    let i = i + 1
+  end
+  ensure list_len(bytes) == 64
+  return bytes
+end
+
+# RFC 8439 2.4: data xor the keystream of the blocks counter, counter + 1, ...
+make a function called chacha20_xor takes key, counter, nonce, data returns out
+  require (list_len(key) == 32) and (list_len(nonce) == 12) and (type_of(data) == "list")
+  require (type_of(counter) == "int") and (counter >= 0)
+  require counter + (list_len(data) + 63) / 64 <= 4294967296
+  let out = []
+  let n = list_len(data)
+  let at = 0
+  let block = counter
+  while at < n do
+    let ks = chacha20_block(key, block, nonce)
+    let j = 0
+    while (j < 64) and (at + j < n) do
+      let out = list_push(out, cc_byte(data[at + j]) bxor ks[j])
+      let j = j + 1
+    end
+    let at = at + 64
+    let block = block + 1
+  end
+  ensure list_len(out) == n
+  return out
+end

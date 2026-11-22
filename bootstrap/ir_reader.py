@@ -404,7 +404,7 @@ class FnGen:
 
     def prim(self, name, d, args):
         c = self.c
-        if name in ("ct_secret", "ct_public", "ct_reveal"):
+        if name in ("ct_secret", "ct_public", "ct_reveal", "ct_declassify"):
             # marks for the constant-time check, doing nothing
             return self.store_unit(d)
         if name == "value_live":

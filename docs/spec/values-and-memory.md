@@ -610,7 +610,10 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 
 `mod_make(x, n)` gives a `modint`: the integer `x` reduced modulo the integer `n`, with `n` at
 least 2; any other call stops the program at its `require`. `mod_value(m)` gives the residue,
-from 0 to n - 1, and `mod_modulus(m)` gives n, each an `int` or a `bigint` (1.3). A modint
+from 0 to n - 1, and `mod_modulus(m)` gives n, each an `int` or a `bigint` (1.3).
+`mod_reveal(m)` gives what `mod_value(m)` gives, and says the residue is meant to be public
+(an AEAD's tag check, a signature's verdict): the constant-time check lists it rather than
+reporting it (2.7). A modint
 prints as `3 mod 7`, and `type_of` and `numeric_kind` give `modint`. A modint's modulus is
 fixed when it is made, and no operation changes it. `mod_make(m, n)` of a modint `m` gives
 m's residue reduced modulo n: the way a value moves from one modulus to another, such as a
@@ -904,7 +907,7 @@ where the time taken can depend on a modint's residue (1.14):
   some value, of any class. Arithmetic on it may be string or list arithmetic as far as the
   check can tell, and a secret reaching that code is reported. A program settles an
   element's class by reading it through `mod_make(x, shape)`, whose `require` admits only
-  integers and modints, as `self_hosting/v2/lib/sha512.patlang` and `curve25519.patlang`
+  integers and modints, as the `sha512` and `curve25519` packages (`packages/`)
   do.
 - **What is reported.** A branch (`if`, `while`, `and`, `or`, `match`) deciding on a secret,
   except one whose one side stops the program; an address computed from a secret, as a list,
@@ -912,6 +915,11 @@ where the time taken can depend on a modint's residue (1.14):
   depends on whether the result leaves the `int` class; the machine's division on a secret; a
   secret passed to a closure call or an external function, which the check cannot follow; and
   `mod_value` or printing of a modint, where the residue leaves the class.
+- **What is declared.** `mod_reveal(m)` (1.14) is a reveal the program says it means. It is
+  listed, one line for each function that calls it with a secret
+  (`declared: tag_matches reveals a residue through mod_reveal`), and is not counted: a
+  program whose only places are declared ones passes, and the check ends
+  `no value-dependent branch or access, and N declared reveals`. Its result is public.
 - Each place is one line naming the function and what it does with the secret. With none it
   prints `v2: no value-dependent branch or access` and exits 0; with any it exits 1. While it
   runs, `self_hosting/build/v2_constant_time.NAME.progress`, for the source file NAME, says

@@ -1,7 +1,7 @@
 # v2 examples: integers modulo n and the cryptography built on them
 
 Programs that use modints (spec 1.14), the constant-time check (spec 2.7), and SHA-512, X25519 and
-Ed25519, which `self_hosting/v2/lib/` writes in PatLang (#251). Build and run any of them with v2:
+Ed25519, which the `sha512` and `curve25519` packages (`packages/`) write in PatLang (#251). Build and run any of them with v2:
 
 ```
 ./self_hosting/build/v2.exe self_hosting/v2/examples/<name>.patlang <name>.exe

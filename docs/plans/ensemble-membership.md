@@ -9,7 +9,7 @@ on 2026-11-08 for PatLang without Rust and for its use in package trust
 (`docs/plans/package-trust.md`). "Revisions" at the end lists what changed from draft 0.1. The
 ensemble itself is not built. Two of the parts it rests on are: the record, view and transition
 checks shared with package trust (`packages/trust/`, T1 of `package-trust.md`), and X25519 and
-Ed25519 written in PatLang (`self_hosting/v2/lib/`), whose use in a signed handshake
+Ed25519 written in PatLang (`packages/curve25519/`), whose use in a signed handshake
 `self_hosting/v2/examples/handshake_attacks.patlang` tests against a man in the middle, replay,
 reflection, keys of small order and an outsider without the group secret.
 

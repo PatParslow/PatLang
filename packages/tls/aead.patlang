@@ -1,0 +1,134 @@
+# AEAD_CHACHA20_POLY1305 (RFC 8439 section 2.8). The tag is checked by
+# comparing every byte whatever they are; only the verdict leaves the modint
+# class, through mod_reveal, which the constant-time check lists as declared
+# (spec 2.7).
+#
+#   chacha20_poly1305_seal(key, nonce, aad, plaintext) -> ciphertext, then the
+#                                                         16-byte tag
+#   chacha20_poly1305_check(key, nonce, aad, sealed)   -> whether the tag is
+#                                                         right: a public bool
+#   chacha20_poly1305_open(key, nonce, aad, sealed)    -> the plaintext, or
+#                                                         false when the tag is
+#                                                         wrong
+#
+# open gives a list or a bool, never a list holding both: the constant-time
+# check knows an element read from a list only as some value carrying the
+# secrecy of all the list holds, so ["ok", plaintext][0] would look secret.
+# type_of(r) == "list" tells the two apart, since a value's type word is public.
+
+include "poly1305.patlang"
+
+# The little-endian 8 bytes of a public length.
+make a function called aead_le64 takes n returns bytes
+  require (type_of(n) == "int") and (n >= 0)
+  let bytes = []
+  let v = n
+  let i = 0
+  while i < 8 do
+    let bytes = list_push(bytes, v % 256)
+    let v = (v - v % 256) / 256
+    let i = i + 1
+  end
+  ensure list_len(bytes) == 8
+  return bytes
+end
+
+# What Poly1305 reads: aad, zeros to a multiple of 16, the ciphertext, zeros
+# again, and the two lengths.
+make a function called aead_mac_data takes aad, ct returns data
+  require (type_of(aad) == "list") and (type_of(ct) == "list")
+  let data = vec_new()
+  let parts = [aad, ct]
+  let p = 0
+  while p < 2 do
+    let part = parts[p]
+    let i = 0
+    while i < list_len(part) do
+      vec_push(data, part[i])
+      let i = i + 1
+    end
+    while vec_len(data) % 16 != 0 do
+      vec_push(data, 0)
+    end
+    let p = p + 1
+  end
+  let lens = aead_le64(list_len(aad)) + aead_le64(list_len(ct))
+  let i = 0
+  while i < 16 do
+    vec_push(data, lens[i])
+    let i = i + 1
+  end
+  let data = vec_to_list(data)
+  ensure list_len(data) % 16 == 0
+  return data
+end
+
+# The tag for aad and ciphertext ct: Poly1305 keyed by block 0's first 32 bytes.
+make a function called aead_tag takes key, nonce, aad, ct returns tag
+  require (list_len(key) == 32) and (list_len(nonce) == 12)
+  let block = chacha20_block(key, 0, nonce)
+  let otk = []
+  let i = 0
+  while i < 32 do
+    let otk = list_push(otk, block[i])
+    let i = i + 1
+  end
+  let tag = poly1305_mac(otk, aead_mac_data(aad, ct))
+  ensure list_len(tag) == 16
+  return tag
+end
+
+make a function called chacha20_poly1305_seal takes key, nonce, aad, plaintext returns sealed
+  require (list_len(key) == 32) and (list_len(nonce) == 12) and (type_of(aad) == "list") and (type_of(plaintext) == "list")
+  let ct = chacha20_xor(key, 1, nonce, plaintext)
+  let sealed = ct + aead_tag(key, nonce, aad, ct)
+  ensure list_len(sealed) == list_len(plaintext) + 16
+  return sealed
+end
+
+# The sealed text's first n bytes, n its length less the tag's 16.
+make a function called aead_body takes sealed returns ct
+  require list_len(sealed) >= 16
+  let ct = []
+  let i = 0
+  while i < list_len(sealed) - 16 do
+    let ct = list_push(ct, sealed[i])
+    let i = i + 1
+  end
+  ensure list_len(ct) == list_len(sealed) - 16
+  return ct
+end
+
+make a function called chacha20_poly1305_check takes key, nonce, aad, sealed returns ok
+  require (list_len(key) == 32) and (list_len(nonce) == 12) and (type_of(aad) == "list") and (type_of(sealed) == "list")
+  if list_len(sealed) < 16 then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let ct = aead_body(sealed)
+  let n = list_len(ct)
+  let want = aead_tag(key, nonce, aad, ct)
+  let diff = cc_byte(0)
+  let i = 0
+  while i < 16 do
+    let diff = diff bor (cc_byte(sealed[n + i]) bxor want[i])
+    let i = i + 1
+  end
+  # the verdict, and only it, is public
+  let ok = mod_reveal(diff) == 0
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called chacha20_poly1305_open takes key, nonce, aad, sealed returns r
+  require (list_len(key) == 32) and (list_len(nonce) == 12) and (type_of(aad) == "list") and (type_of(sealed) == "list")
+  if not chacha20_poly1305_check(key, nonce, aad, sealed) then
+    let r = false
+    ensure r == false
+    return r
+  end
+  let r = chacha20_xor(key, 1, nonce, aead_body(sealed))
+  ensure list_len(r) == list_len(sealed) - 16
+  return r
+end

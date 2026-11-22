@@ -28,7 +28,7 @@ Feature: the repository keeps its own rules
   Scenario: every package's specs run in the gates, from a fresh checkout
     Given every package's spec runner, packages/NAME/spec/run_spec.patlang
     When it and the gates' suites are read
-    Then each takes its scratch paths from spec_out() and is a gates suite (pkg_NAME)
+    Then each that writes files takes their paths from spec_out(), and each is a gates suite (pkg_NAME)
 
   Scenario: every package's files match its manifest
     Given every directory under packages/ that holds a manifest.pkg

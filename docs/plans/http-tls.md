@@ -14,14 +14,26 @@ program connects beyond 127.0.0.1 only after it declares so.
 Already there to reuse:
 - `packages/sha256` (`sha256_bytes`, incremental `sha256_new/update/finish`,
   `hmac_sha256`, `bytes_to_hex`, `hex_to_bytes`, `digest_equal`).
-- `self_hosting/v2/lib/sha512.patlang` (on modints, constant-time; SHA-384 is
-  SHA-512 with another IV, cut to 48 bytes).
-- `self_hosting/v2/lib/curve25519.patlang` (X25519, RFC 7748 vectors, passes
-  `--constant-time`: showcase P10).
+- `packages/sha512` (on modints, constant-time; SHA-384 is SHA-512 with another
+  IV, cut to 48 bytes).
+- `packages/curve25519` (X25519 and Ed25519, RFC 7748 and 8032 vectors, passes
+  `--constant-time`: showcase P10), depending on `sha512`.
 - bigints and modints (`mod_make`, spec 1.14) for RSA and the NIST curves.
 - `lib/ollama.patlang`'s HTTP/1.1 over loopback, for what an HTTP reader looks like.
 - The opt-in pattern: `object_names_explicit()` (runtime/objects.patlang) sets a
   flag in the world's state (worlds.patlang).
+
+## Status (2026-11-22)
+- Done before Stage 2: modints modulo 2^k held as words (e43d710e); SHA-512
+  and X25519/Ed25519 moved into the `sha512` and `curve25519` packages, so
+  `tls` can depend on them; and `mod_reveal` (spec 1.14, 2.7), by the owner's
+  decision: a reveal the program declares, listed by the constant-time check
+  and not counted. An AEAD's tag verdict is one.
+- Stage 2, in `packages/tls`: ChaCha20, Poly1305 and AEAD_CHACHA20_POLY1305
+  pass RFC 8439's vectors and agree with Python's cryptography at the block
+  edges. Still to do: HKDF and SHA-384 (on modints, so the check follows the
+  key schedule: SHA-256 on modints beside `packages/sha256`), AES-128-GCM, the
+  signature checks, and P-256.
 
 ## Status (2026-11-21)
 - Stage 1 is written: `tcp_allow_remote()`, `dns_resolve`, `dns_query`,

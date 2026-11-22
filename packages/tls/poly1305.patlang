@@ -1,0 +1,102 @@
+# Poly1305 (RFC 8439 section 2.5) on modints (spec 1.14). The accumulator is
+# a modint modulo p = 2^130 - 5; the tag, (acc + s) mod 2^128, is taken in the
+# odd modulus 2^136 + 1, wide enough that acc + s does not wrap, and its 16
+# low bytes are taken off one at a time by exact division by 256, which is
+# invertible there. Nothing decides on the key or the message: only the
+# message's length decides how many steps run.
+#
+#   poly1305_mac(key, msg) -> the 16-byte tag of msg under the 32-byte key
+
+include "chacha20.patlang"
+
+make a function called p1305_p returns p
+  let p = 1361129467683753853853498429727072845819
+  return p
+end
+
+# 2^136 + 1, and 1/256 modulo it: 256 * -2^128 = -2^136, which is 1 there.
+make a function called p1305_wide returns w
+  let w = 87112285931760246646623899502532662132737
+  return w
+end
+
+make a function called p1305_wide_inv256 returns inv
+  let inv = 86772003564839308183160524895100893921281
+  ensure (inv * 256) % p1305_wide() == 1
+  return inv
+end
+
+# The little-endian number of bytes lo..hi-1, modulo the modulus of shape.
+make a function called p1305_number takes bytes, lo, hi, shape returns e
+  require (lo >= 0) and (lo <= hi) and (hi <= list_len(bytes)) and (type_of(shape) == "modint")
+  let e = mod_make(0, shape)
+  let weight = mod_make(1, shape)
+  let step = mod_make(256, shape)
+  let i = lo
+  while i < hi do
+    let e = e + mod_make(cc_byte(bytes[i]), shape) * weight
+    let weight = weight * step
+    let i = i + 1
+  end
+  ensure mod_modulus(e) == mod_modulus(shape)
+  return e
+end
+
+# r, the key's first half clamped (RFC 8439 2.5): bytes 3, 7, 11 and 15 keep
+# their low four bits, and bytes 4, 8 and 12 lose their low two.
+make a function called p1305_r takes key returns r
+  require list_len(key) == 32
+  let clamped = []
+  let i = 0
+  while i < 16 do
+    let b = cc_byte(key[i])
+    if (i == 3) or (i == 7) or (i == 11) or (i == 15) then
+      let b = b band 15
+    elif (i == 4) or (i == 8) or (i == 12) then
+      let b = b band 252
+    end
+    let clamped = list_push(clamped, b)
+    let i = i + 1
+  end
+  let r = p1305_number(clamped, 0, 16, mod_make(0, p1305_p()))
+  ensure mod_modulus(r) == p1305_p()
+  return r
+end
+
+make a function called poly1305_mac takes key, msg returns tag
+  require (list_len(key) == 32) and (type_of(msg) == "list")
+  let r = p1305_r(key)
+  let shape = mod_make(0, p1305_p())
+  let acc = shape
+  # each 16-byte block, or the last shorter one, with a 1 byte after it
+  let one = mod_make(1, shape)
+  let n = list_len(msg)
+  let at = 0
+  while at < n do
+    let upto = at + 16
+    if upto > n then
+      let upto = n
+    end
+    let top = one
+    let k = 0
+    while k < upto - at do
+      let top = top * mod_make(256, shape)
+      let k = k + 1
+    end
+    let acc = (acc + p1305_number(msg, at, upto, shape) + top) * r
+    let at = upto
+  end
+  let wide = mod_make(0, p1305_wide())
+  let t = mod_make(acc, wide) + p1305_number(key, 16, 32, wide)
+  let inv = mod_make(p1305_wide_inv256(), wide)
+  let tag = []
+  let i = 0
+  while i < 16 do
+    let b = cc_byte(t)
+    let tag = list_push(tag, b)
+    let t = (t - mod_make(b, wide)) * inv
+    let i = i + 1
+  end
+  ensure list_len(tag) == 16
+  return tag
+end

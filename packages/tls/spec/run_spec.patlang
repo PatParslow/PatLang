@@ -1,0 +1,153 @@
+# Runs packages/tls/spec/tls.feature, from the repository root:
+#
+#   ./self_hosting/build/v2_interp.exe packages/tls/spec/run_spec.patlang [feature file]
+#
+# The known answers are RFC 8439's; Python's cryptography (spec/oracle.py, run
+# as `py -3 -I`) is the reference for random inputs. The exit code is 0 when
+# every check passes, 1 otherwise.
+include "../../../self_hosting/lib/includes.patlang"
+include "../../../self_hosting/lib/gherkin.patlang"
+include "../tls.patlang"
+
+# One line from the oracle, trimmed.
+make a function called tl_py takes a returns out
+  require list_len(a) >= 3
+  let o = "packages/tls/spec/oracle.py"
+  let n = list_len(a)
+  let raw = ""
+  if n == 3 then
+    let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2])
+  elif n == 4 then
+    let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2], a[3])
+  else
+    let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2], a[3], a[4])
+  end
+  let out = str_trim(raw)
+  ensure value_class(out) == 8
+  return out
+end
+
+make a function called st_tl_key takes ctx returns ok
+  ctx_set(ctx, "key", tls_hex_bytes(step_arg(ctx, "hex")))
+  return true
+end
+
+make a function called st_tl_nonce takes ctx returns ok
+  ctx_set(ctx, "nonce", tls_hex_bytes(step_arg(ctx, "hex")))
+  return true
+end
+
+make a function called st_tl_aad takes ctx returns ok
+  ctx_set(ctx, "aad", tls_hex_bytes(step_arg(ctx, "hex")))
+  return true
+end
+
+make a function called st_tl_text takes ctx returns ok
+  ctx_set(ctx, "text", tls_text_bytes(step_arg(ctx, "text")))
+  return true
+end
+
+make a function called st_tl_chacha takes ctx returns ok
+  let got = tls_hex(chacha20_xor(ctx_get(ctx, "key"), 1, ctx_get(ctx, "nonce"), ctx_get(ctx, "text")))
+  return expect(ctx, "ChaCha20", got, step_arg(ctx, "hex"))
+end
+
+make a function called st_tl_poly takes ctx returns ok
+  return expect(ctx, "Poly1305", tls_hex(poly1305_mac(ctx_get(ctx, "key"), ctx_get(ctx, "text"))), step_arg(ctx, "hex"))
+end
+
+make a function called st_tl_seal takes ctx returns ok
+  let sealed = chacha20_poly1305_seal(ctx_get(ctx, "key"), ctx_get(ctx, "nonce"), ctx_get(ctx, "aad"), ctx_get(ctx, "text"))
+  ctx_set(ctx, "sealed", sealed)
+  return expect(ctx, "the sealed text", tls_hex(sealed), step_arg(ctx, "hex"))
+end
+
+make a function called st_tl_open takes ctx returns ok
+  let r = chacha20_poly1305_open(ctx_get(ctx, "key"), ctx_get(ctx, "nonce"), ctx_get(ctx, "aad"), ctx_get(ctx, "sealed"))
+  let text = "refused"
+  if type_of(r) == "list" then
+    let text = tls_hex(r)
+  end
+  return expect(ctx, "opening the sealed text", text, tls_hex(ctx_get(ctx, "text")))
+end
+
+# Each byte of the sealed text changed in turn, ciphertext and tag alike, and
+# the additional data changed too: each is refused.
+make a function called st_tl_tamper takes ctx returns ok
+  let key = ctx_get(ctx, "key")
+  let nonce = ctx_get(ctx, "nonce")
+  let aad = ctx_get(ctx, "aad")
+  let sealed = ctx_get(ctx, "sealed")
+  let refused = 0
+  let i = 0
+  while i < list_len(sealed) do
+    let bad = list_set(sealed, i, sealed[i] bxor 1)
+    if chacha20_poly1305_open(key, nonce, aad, bad) == false then
+      let refused = refused + 1
+    end
+    let i = i + 1
+  end
+  let bad_aad = chacha20_poly1305_open(key, nonce, list_push(aad, 0), sealed)
+  let a = expect(ctx, "each of the " + list_len(sealed) + " bytes changed is refused", refused, list_len(sealed))
+  let b = expect(ctx, "other additional data is refused", bad_aad, false)
+  let c = expect(ctx, "the right tag checks", chacha20_poly1305_check(key, nonce, aad, sealed), true)
+  let d = expect(ctx, "a text shorter than a tag is refused", chacha20_poly1305_open(key, nonce, aad, [1, 2, 3]), false)
+  return a and b and c and d
+end
+
+make a function called st_tl_random_setup takes ctx returns ok
+  ctx_set(ctx, "key", random_bytes(32))
+  ctx_set(ctx, "nonce", random_bytes(12))
+  ctx_set(ctx, "aad", random_bytes(13))
+  return true
+end
+
+make a function called st_tl_random takes ctx returns ok
+  let key = ctx_get(ctx, "key")
+  let nonce = ctx_get(ctx, "nonce")
+  let aad = ctx_get(ctx, "aad")
+  let all = true
+  let lengths = [0, 1, 15, 16, 17, 63, 64, 65, 200]
+  let i = 0
+  while i < list_len(lengths) do
+    let n = lengths[i]
+    let text = random_bytes(n)
+    let kh = tls_hex(key)
+    let nh = tls_hex(nonce)
+    let th = tls_hex(text)
+    let ah = tls_hex(aad)
+    let sealed = chacha20_poly1305_seal(key, nonce, aad, text)
+    let opened = chacha20_poly1305_open(key, nonce, aad, sealed)
+    let back = "refused"
+    if type_of(opened) == "list" then
+      let back = tls_hex(opened)
+    end
+    let got = [tls_hex(chacha20_xor(key, 7, nonce, text)), tls_hex(poly1305_mac(key, text)), tls_hex(sealed), back]
+    let want = [tl_py(["chacha20", kh, "7", nh, th]), tl_py(["poly1305", kh, th]), tl_py(["seal", kh, nh, ah, th]), th]
+    if not expect(ctx, "length " + n, got, want) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called register_tls_steps takes ctx returns ok
+  step(ctx, "the key \"{hex}\"", "st_tl_key")
+  step(ctx, "the nonce \"{hex}\"", "st_tl_nonce")
+  step(ctx, "the additional data \"{hex}\"", "st_tl_aad")
+  step(ctx, "the text \"{text}\"", "st_tl_text")
+  step(ctx, "ChaCha20 from block 1 gives \"{hex}\"", "st_tl_chacha")
+  step(ctx, "its Poly1305 tag is \"{hex}\"", "st_tl_poly")
+  step(ctx, "sealing it gives \"{hex}\"", "st_tl_seal")
+  step(ctx, "opening that gives the text back", "st_tl_open")
+  step(ctx, "opening it with any one byte changed is refused", "st_tl_tamper")
+  step(ctx, "a random key, nonce and additional data", "st_tl_random_setup")
+  step(ctx, "for random texts of lengths 0, 1, 15, 16, 17, 63, 64, 65 and 200, ChaCha20, Poly1305 and sealing agree with Python's cryptography, and opening gives each text back", "st_tl_random")
+  return true
+end
+
+let ctx = ctx_new()
+register_tls_steps(ctx)
+# --list names the feature files (the gates run each); a failure exits 1
+run_suite(ctx, ["packages/tls/spec/tls.feature"], argv())

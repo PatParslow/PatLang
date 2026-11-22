@@ -37,6 +37,9 @@ Current packages:
 | deflate | 0.2.0   | DEFLATE (RFC 1951) inflate and deflate, the zlib wrapper (RFC 1950), Adler-32, CRC-32 |
 | zip     | 0.2.0   | zip archive reader and writer (stored and deflate entries, CRC-checked) |
 | sha256  | 0.1.1   | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104) over bytes, strings and files |
+| sha512  | 0.1.0   | SHA-512 (FIPS 180-4) on modint words, secret to the constant-time check (spec 2.7) |
+| curve25519 | 0.1.0 | X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints; depends on sha512 |
+| tls     | 0.1.0   | a TLS 1.3 client's cryptography on modints, so far ChaCha20, Poly1305 and AEAD_CHACHA20_POLY1305 (RFC 8439) (`docs/plans/http-tls.md`, stage 2) |
 | resolve | 0.1.0   | manifest reader, version constraints, and dependency resolution through `rule_add`/`solve` (`docs/plans/package-manager.md`, P1) |
 | trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in (`docs/plans/package-trust.md`, T1) |
 
