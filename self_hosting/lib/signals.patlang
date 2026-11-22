@@ -48,8 +48,10 @@
 #     file under the user's own profile, which signal_send and signal_query
 #     read. A process that cannot read that file cannot send a signal.
 # A peer that connects and sends nothing, or half a message, costs one
-# signal_poll at most signal_read_ms() beyond its timeout, and one that
-# leaves before the reply is written costs nothing.
+# signal_poll at most signal_read_ms() beyond its timeout and is parked, not
+# dropped, so a slow peer is answered once its message is whole; at most
+# signal_parked_max() peers are parked at once. One that leaves before the
+# reply is written costs nothing.
 #
 # Wire format: "token\nname\nN\n" then N bytes of payload. The reply is
 # everything the primary writes before it closes the connection.
@@ -130,9 +132,57 @@ make a function called signal_new_token returns token
   return sb_str(b)
 end
 
-# How long signal_poll waits for a connected peer's message, in ms.
+# How long one signal_poll waits on a connected peer's message, in ms. A
+# message not complete by then is not dropped: the connection is parked, and
+# later polls go on reading it, so a peer slowed by a loaded machine is still
+# answered while the program is held no longer.
 make a function called signal_read_ms returns ms
   return 250
+end
+
+# How many peers may be parked part way through a message at once. Parking
+# one more closes the one parked longest, so peers that connect and send
+# nothing hold at most this many connections.
+make a function called signal_parked_max returns n
+  return 16
+end
+
+# Parked peers are kept in the run's vfs as
+# /signal_state/parked/PORT_ID/SEQ/CONN, holding the text read so far; SEQ
+# is twelve digits, so the sorted listing puts the oldest first.
+make a function called signal_parked_prefix takes port_id returns prefix
+  return "/signal_state/parked/" + port_id + "/"
+end
+
+make a function called signal_park takes port_id, conn, text returns done
+  let prefix = signal_parked_prefix(port_id)
+  let parked = vfs_list(prefix)
+  if list_len(parked) >= signal_parked_max() then
+    tcp_close(signal_parked_conn(prefix, parked[0]))
+    vfs_delete(parked[0])
+  end
+  let seq_key = "/signal_state/parked_seq/" + port_id
+  let seq = 0
+  if vfs_exists(seq_key) then
+    let seq = to_num(vfs_read(seq_key)) + 1
+  end
+  vfs_write(seq_key, "" + seq)
+  let digits = "" + seq
+  let b = sb_new()
+  let pad = 12 - str_len(digits)
+  while pad > 0 do
+    sb_push(b, "0")
+    let pad = pad - 1
+  end
+  sb_push(b, digits)
+  vfs_write(prefix + sb_str(b) + "/" + conn, text)
+  return true
+end
+
+# The connection a parked peer's key names.
+make a function called signal_parked_conn takes prefix, key returns conn
+  let start = str_len(prefix) + 13
+  return to_num(substr(key, start, str_len(key) - start))
 end
 
 # A message's header, read from the first bytes of text: [token, name, the
@@ -173,32 +223,40 @@ end
 
 # The message a connected peer sends, within signal_read_ms(): [token, name,
 # payload], or [] when it did not send a whole one in that time.
-make a function called signal_read_message takes conn returns msg
-  let deadline = clock_ms() + signal_read_ms()
+# Reads a peer's message on from the text read so far, for up to ms:
+# ["done", [token, name, payload]] once it is whole, ["more", text so far]
+# when the time ran out first, and ["drop", ""] when the peer closed, the
+# read failed, or the first 400 bytes hold no header.
+make a function called signal_read_message takes conn, so_far, ms returns result
+  let deadline = clock_ms() + ms
   let b = sb_new()
-  let header = []
+  sb_push(b, so_far)
+  let header = signal_header(so_far)
   while true do
+    if (list_len(header) > 0) and (sb_len(b) >= header[3] + header[2]) then
+      let text = sb_str(b)
+      return ["done", [header[0], header[1], substr(text, header[3], text.length - header[3])]]
+    end
+    if (list_len(header) == 0) and (sb_len(b) > 400) then
+      return ["drop", ""]
+    end
     let left = deadline - clock_ms()
     if left <= 0 then
-      return []
+      return ["more", sb_str(b)]
     end
-    let chunk = tcp_read_timeout(conn, left)
-    if chunk == "" then
-      return []
+    let r = tcp_read_status(conn, left)
+    if r[1] == "wait" then
+      return ["more", sb_str(b)]
     end
-    sb_push(b, chunk)
+    if r[1] != "data" then
+      return ["drop", ""]
+    end
+    sb_push(b, r[0])
     if list_len(header) == 0 then
       let header = signal_header(sb_str(b))
     end
-    if (list_len(header) > 0) and (sb_len(b) >= header[3] + header[2]) then
-      let text = sb_str(b)
-      return [header[0], header[1], substr(text, header[3], text.length - header[3])]
-    end
-    if (list_len(header) == 0) and (sb_len(b) > 400) then
-      return []
-    end
   end
-  return []
+  return ["drop", ""]
 end
 
 # signal_poll(port_id, timeout_ms) -> the signal name received this call,
@@ -218,21 +276,51 @@ end
 # plain signal_send, which never reads a reply) never notices either way.
 make a function called signal_poll takes port_id, timeout_ms returns name
   if signal_driver() == "vfs" then return sigv_poll(port_id) end
+  # Nothing a peer does here stops the program. A peer whose message is not
+  # whole after signal_read_ms() is parked, and each poll reads on from what
+  # it sent (signal_park); one that closes, or sends no header, is dropped;
+  # one without the run's token, or naming a signal the program did not
+  # allow, is dropped unanswered; and the reply is written with
+  # tcp_try_write, since the peer may have gone (a status query once ended a
+  # 20-minute simulation one tick before it finished, when its sender
+  # dropped the connection).
+  let prefix = signal_parked_prefix(port_id)
+  let parked = vfs_list(prefix)
+  let p = 0
+  while p < list_len(parked) do
+    let key = parked[p]
+    let pconn = signal_parked_conn(prefix, key)
+    let pr = signal_read_message(pconn, vfs_read(key), 1)
+    if pr[0] == "more" then
+      vfs_write(key, pr[1])
+    else
+      vfs_delete(key)
+      if pr[0] == "done" then
+        return signal_answer(port_id, pconn, pr[1])
+      end
+      tcp_close(pconn)
+    end
+    let p = p + 1
+  end
   let conn = tcp_accept_timeout(port_id, timeout_ms)
   if conn < 0 then
     return ""
   end
-  # Nothing a peer does here stops the program. A peer that sends nothing, or
-  # part of a message, is dropped after signal_read_ms(); one without the
-  # run's token, or naming a signal the program did not allow, is dropped
-  # unanswered; and the reply is written with tcp_try_write, since the peer
-  # may have gone (a status query once ended a 20-minute simulation one tick
-  # before it finished, when its sender dropped the connection).
-  let msg = signal_read_message(conn)
-  if list_len(msg) == 0 then
+  let r = signal_read_message(conn, "", signal_read_ms())
+  if r[0] == "more" then
+    signal_park(port_id, conn, r[1])
+    return ""
+  end
+  if r[0] == "drop" then
     tcp_close(conn)
     return ""
   end
+  return signal_answer(port_id, conn, r[1])
+end
+
+# A whole message from a peer: dispatched to its handler when it carries the
+# run's token and names an allowed signal, and the handler's reply written.
+make a function called signal_answer takes port_id, conn, msg returns name
   if (msg[0] != vfs_read(signal_token_key(port_id))) or (not signal_allowed(msg[1])) then
     tcp_close(conn)
     return ""

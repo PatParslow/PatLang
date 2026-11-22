@@ -44,3 +44,57 @@ Feature: signals full round trip (signal_send/signal_query/signal_reply, two rea
 
   The primary stops by itself after 200 polls of 100 ms, so the wait for it
   to exit ends either way; its log says which way it went.
+
+  Scenario: A peer whose message comes late, as on a loaded machine, still gets its reply
+    Given the program
+      """
+      include "{lib}/v2_engines.patlang"
+      include "{lib}/signals.patlang"
+      let log_path = "self_hosting/tools/spec_fixtures/signal_primary.log"
+      write_file(log_path, "")
+      let pid = spawn(v2_interpreter(), "self_hosting/tools/spec_fixtures/signal_primary.patlang")
+      let port = 0 - 1
+      let looking = true
+      while looking do
+        let text = read_file(log_path)
+        let n = text.length
+        if (n > 6) and (substr(text, 0, 5) == "port ") and (char_code(text, n - 1) == 10) then
+          let port = to_num(substr(text, 5, n - 6))
+          let looking = false
+        elif not is_alive(pid) then
+          let looking = false
+        else
+          sleep_ms(20)
+        end
+      end
+      let conn = tcp_connect("127.0.0.1", port)
+      sleep_ms(600)
+      tcp_write(conn, read_file(signal_token_path(port)) + chr(10) + "status" + chr(10) + "0" + chr(10))
+      let b = sb_new()
+      let going = true
+      while going do
+        let chunk = tcp_read_or_empty(conn)
+        if chunk == "" then
+          let going = false
+        else
+          sb_push(b, chunk)
+        end
+      end
+      tcp_close(conn)
+      print("late peer: " + sb_str(b))
+      signal_send(port, "quit", "")
+      while is_alive(pid) do
+        sleep_ms(50)
+      end
+      print(read_file(log_path))
+      """
+    When it runs interpreted and compiled
+    Then both print
+      """
+      late peer: uptime: 42
+      exited via quit path
+      """
+
+  The peer connects, then waits 600 ms before it writes, longer than one
+  signal_poll waits on a connected peer (signal_read_ms, 250 ms). The primary
+  keeps the connection between polls and reads the message when it comes.
