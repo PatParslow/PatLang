@@ -35,6 +35,13 @@ Feature: file_marshal edits: a change given by its context, and the shift it mak
     When the bytes between 1 2 3 and 7 8 9 are changed with no position
     Then the edit is refused, saying its context is found 2 times, at 100 and 3000
 
+  Scenario: an edit that knows its place takes the candidate nearest it, in text that repeats
+    Given the text "x. x. x. x."
+    When the part "x" between ". " and "." near 5, within 20, nearest it, becomes "y"
+    Then the text is "x. x. y. x."
+    When the part "x" between ". " and "." near 4, within 20, nearest it, becomes "z"
+    Then the edit is refused, saying its context is found 2 times, at 1 and 7
+
   Scenario: a position is carried past an edit, or reported as inside it
     Given the shifts [10, 6, 5] and then [2, 0, 4]
     Then position 3 becomes 7, position 20 becomes 23, and position 0 stays 0

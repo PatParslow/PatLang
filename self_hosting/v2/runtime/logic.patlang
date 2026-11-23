@@ -954,13 +954,13 @@ make a function called rt_prove takes frame, subst, out, limit returns done
   let goal = f[1][f[2]]
   let depth = f[3]
   let next = rt_frame(stores, f[1], f[2] + 1, depth, f[4])
-  if goal[0] == "neq" then
-    if logic_walk(goal[1][0], subst) != logic_walk(goal[1][1], subst) then
-      rt_prove(next, subst, out, limit)
-    end
-    let done = true
-    ensure value_class(done) == 1
-    return done
+  # The goals the solver answers itself (neq, the comparisons, not) are
+  # proved in a function of their own. This frame is on the stack once for
+  # every level of a search, and every expression here adds to it: a search
+  # 2000 deep runs close to the limit of Linux's stack, and the comparisons
+  # written here overflowed it before the depth limit could stop the program.
+  if rt_is_builtin_goal(goal[0]) then
+    return rt_prove_builtin(goal, f, next, subst, out, limit)
   end
   let goal_stores = stores
   if list_len(goal) > 2 then
@@ -1001,6 +1001,142 @@ end
 
 # The query's arguments under each of the first limit ways (-1: every way)
 # of proving it from a list of stores, in the order the search finds them.
+make a function called rt_is_builtin_goal takes name returns yes
+  require value_live(name)
+  let yes = (name == "neq") or (name == "lt") or (name == "le") or (name == "gt") or (name == "ge") or (name == "not")
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A comparison or a not, the goal of frame f, proved, the proof going on to
+# next when it holds.
+make a function called rt_prove_builtin takes goal, f, next, subst, out, limit returns done
+  require (value_class(goal) == 9) and (value_class(f) == 9) and (value_class(subst) == 9) and (value_class(out) == 12)
+  if goal[0] == "neq" then
+    if logic_walk(goal[1][0], subst) != logic_walk(goal[1][1], subst) then
+      rt_prove(next, subst, out, limit)
+    end
+    let done = true
+    ensure value_class(done) == 1
+    return done
+  end
+  if goal[0] != "not" then
+    if rt_compare_holds(goal[0], logic_walk(goal[1][0], subst), logic_walk(goal[1][1], subst)) then
+      rt_prove(next, subst, out, limit)
+    end
+    let done = true
+    ensure value_class(done) == 1
+    return done
+  end
+  # negation as failure: the goal under the bindings so far has no proof
+  # from the same stores, for any values of the variables still unbound in
+  # it ("S has no paragraph P" for any P). One of those the body's later
+  # goals use would make the answer hang on the goals' order: refused.
+  # The goal is ["not", [pred, arg, ...]], its arguments at the top, where
+  # a rule's renaming reaches them.
+  let inner_args = []
+  let a = 1
+  while a < list_len(goal[1]) do
+    let inner_args = list_push(inner_args, goal[1][a])
+    let a = a + 1
+  end
+  let inner = [goal[1][0], apply_subst(inner_args, subst)]
+  if not rt_is_ground(inner[1]) then
+    if rt_shares_unbound(inner[1], f[1], f[2] + 1) then
+      print("not(" + inner[0] + ") has a variable unbound that a later goal uses: bind it before the not (spec 1.13)")
+      rt_stop(70)
+    end
+  end
+  let found = vec_new()
+  rt_prove(rt_frame(f[0], [inner], 0, f[3] + 1, 0), [], found, 1)
+  if vec_len(found) == 0 then
+    rt_prove(next, subst, out, limit)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# whether a variable in terms is in a goal of body from the goal at from on
+make a function called rt_shares_unbound takes terms, body, from returns yes
+  require (value_class(terms) == 9) and (value_class(body) == 9)
+  let vars = rt_vars_of(terms, [])
+  let g = from
+  while g < list_len(body) do
+    let later = rt_vars_of(body[g][1], [])
+    let k = 0
+    while k < list_len(vars) do
+      let j = 0
+      while j < list_len(later) do
+        if vars[k] == later[j] then
+          let yes = true
+          ensure value_class(yes) == 1
+          return yes
+        end
+        let j = j + 1
+      end
+      let k = k + 1
+    end
+    let g = g + 1
+  end
+  let yes = false
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# the logic variables in a term or a list of terms, added to found
+make a function called rt_vars_of takes t, found returns vars
+  require value_live(t) and (value_class(found) == 9)
+  if is_logic_var(t) then
+    let vars = list_push(found, t)
+    ensure value_class(vars) == 9
+    return vars
+  end
+  if value_class(t) == 9 then
+    let vars = found
+    let k = 0
+    while k < list_len(t) do
+      let vars = rt_vars_of(t[k], vars)
+      let k = k + 1
+    end
+    ensure value_class(vars) == 9
+    return vars
+  end
+  let vars = found
+  ensure value_class(vars) == 9
+  return vars
+end
+
+# lt, le, gt or ge of two values, which must be numbers: a variable still
+# unbound stops the program, since "no" would be a wrong answer, as does a
+# value that is not a number.
+make a function called rt_compare_holds takes op, a, b returns yes
+  require (value_class(op) == 8) and value_live(a) and value_live(b)
+  if is_logic_var(a) or is_logic_var(b) then
+    print(op + " of a variable unbound: a comparison needs both its numbers (spec 1.13)")
+    let yes = rt_stop(70)
+    ensure value_class(yes) == 1
+    return yes
+  end
+  if (not rt_is_number(a)) or (not rt_is_number(b)) then
+    print(op + " compares numbers, not " + type_of(a) + " and " + type_of(b))
+    let yes = rt_stop(70)
+    ensure value_class(yes) == 1
+    return yes
+  end
+  if op == "lt" then
+    let yes = a < b
+  elif op == "le" then
+    let yes = a <= b
+  elif op == "gt" then
+    let yes = a > b
+  else
+    let yes = a >= b
+  end
+  ensure value_class(yes) == 1
+  return yes
+end
+
 make a function called rt_solve_limited takes stores, pred, query_args, limit returns solutions
   require (value_class(stores) == 9) and value_live(pred) and (value_class(query_args) == 9) and (value_class(limit) == 2)
   let out = vec_new()
@@ -1075,6 +1211,87 @@ make a function called fact_in takes store, pred, a, b returns done
   let done = true
   ensure value_class(done) == 1
   return done
+end
+
+# Takes the ground fact pred(args) out of a store: whether it was there. The
+# rules after it keep their order, and pred's first-argument index is made
+# again over them, so the time grows with pred's rules and the store's.
+make a function called fact_remove_in takes store, pred, args returns removed
+  require (value_class(store) == 14) and (value_class(pred) == 8) and (value_class(args) == 9)
+  if not rt_is_ground(args) then
+    print("fact_remove_in takes a fact with no variable in it: " + pred)
+    let removed = rt_stop(70)
+    ensure value_class(removed) == 1
+    return removed
+  end
+  let block = value_data(store)
+  let e = rt_cell_write(block + 80)
+  let f = [pred, args]
+  # out of the set of facts held
+  let buckets = mem_load_value(block, 48)
+  let at = rt_fact_bucket(f, vec_len(buckets))
+  let bucket = vec_get(buckets, at)
+  let kept = []
+  let found = false
+  let k = 0
+  while k < list_len(bucket) do
+    if (not found) and (bucket[k] == f) then
+      let found = true
+    else
+      let kept = list_push(kept, bucket[k])
+    end
+    let k = k + 1
+  end
+  if not found then
+    rt_cell_write_end(block + 80, e)
+    let removed = false
+    ensure value_class(removed) == 1
+    return removed
+  end
+  vec_set(buckets, at, kept)
+  mem_store(block, 64, mem_load(block, 64) - 1)
+  let rule = [pred, args, []]
+  # out of the store's rules, in order
+  let all = mem_load_value(block, 16)
+  let rest = vec_new()
+  let gone = false
+  let k = 0
+  while k < vec_len(all) do
+    let r = vec_get(all, k)
+    if (not gone) and (r == rule) then
+      let gone = true
+    else
+      vec_push(rest, r)
+    end
+    let k = k + 1
+  end
+  mem_store_value(block, 16, rest)
+  # out of pred's rules, and its index made again over those left
+  let i = rt_store_pred_index(block, pred)
+  let preds = mem_load_value(block, 32)
+  let entry = preds[i]
+  let mine = entry[1]
+  let left = vec_new()
+  let idx = rt_index_new(8)
+  let gone = false
+  let k = 0
+  while k < vec_len(mine) do
+    let r = vec_get(mine, k)
+    if (not gone) and (r == rule) then
+      let gone = true
+    else
+      vec_push(left, r)
+      if list_len(r[1]) > 0 then
+        let idx = rt_index_add(idx, rt_first_key(r[1][0]), vec_len(left) - 1)
+      end
+    end
+    let k = k + 1
+  end
+  mem_store_value(block, 32, list_set(preds, i, [pred, left, idx]))
+  rt_cell_write_end(block + 80, e)
+  let removed = true
+  ensure value_class(removed) == 1
+  return removed
 end
 
 make a function called query_in takes stores, pred, a, ignored returns count

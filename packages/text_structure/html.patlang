@@ -1,0 +1,261 @@
+# text_structure HTML: units read through the PatLang DOM (lib/dom.patlang),
+# each linked to its DomNode, with the node's range in the file's bytes.
+#
+#   let got = ts_html(ts_structurer(), bytes)     [tree, root DomNode]
+#   ts_node_of(unit)                               its DomNode, or false
+#   ts_unit_of(tree, node)                         the unit of a node, or false
+#
+# h1 to h6 start sections (by ts_nest, as Markdown's headings do); p is a
+# paragraph, ul and ol a list of item (li), blockquote a quote holding its
+# blocks, pre code, table a table, hr a break. div, body, section, article,
+# main, header, footer, nav, aside, figure and form hold blocks and are not
+# units of their own; text straight inside one of them is a paragraph. head,
+# script, style and template are left out. Sentences are found in a block's
+# text across its inline elements (em, a, code, ...), which run straight on,
+# with br as a space; nested lists' items are items of the outer list, with
+# their depth in "depth".
+#
+# An entity is read as written (its "&amp;" counts as five characters for the
+# sentence rules, which it changes only in odd cases); the DOM's text has it
+# decoded. The HTML read is html_scan's: well-formed markup of the kind the
+# site's pages are, not the HTML5 parsing algorithm.
+include "structure.patlang"
+include "../../self_hosting/lib/dom.patlang"
+
+make a function called th_in takes tag, names returns yes
+  let k = 0
+  while k < list_len(names) do
+    if names[k] == tag then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+make a function called th_containers returns names
+  return ["html", "body", "div", "section", "article", "main", "header", "footer", "nav", "aside", "figure", "form"]
+end
+
+make a function called th_skipped returns names
+  return ["head", "script", "style", "template"]
+end
+
+make a function called th_blocks returns names
+  return ["p", "ul", "ol", "blockquote", "pre", "table", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "dl"]
+end
+
+# A source range in characters as bytes, through the code points' offsets.
+make a function called th_bytes takes offs, a, b returns r
+  let n = list_len(offs) - 1
+  let x = a
+  let y = b
+  if x > n then
+    let x = n
+  end
+  if y > n then
+    let y = n
+  end
+  return [offs[x], offs[y]]
+end
+
+# The text view of a node's inline content: each text node's byte range, run
+# straight on, with br as a break between ranges; nested lists left out.
+make a function called th_view_into takes node, offs, view, first returns got
+  if node.kind == "text" then
+    if node.start >= 0 then
+      let r = th_bytes(offs, node.start, node.end)
+      if first then
+        return [list_push(view, r), false]
+      end
+      return [list_push(view, [r[0], r[1], true]), false]
+    end
+    return [view, first]
+  end
+  if th_in(node.tag, th_skipped()) or (node.tag == "ul") or (node.tag == "ol") then
+    return [view, first]
+  end
+  if node.tag == "br" then
+    # the next range is not run on: a space comes between
+    return [view, true]
+  end
+  let v = view
+  let f = first
+  let kids = dom_children(node)
+  let k = 0
+  while k < list_len(kids) do
+    let got = th_view_into(kids[k], offs, v, f)
+    let v = got[0]
+    let f = got[1]
+    let k = k + 1
+  end
+  return [v, f]
+end
+
+make a function called th_view takes node, offs returns view
+  return th_view_into(node, offs, [], true)[0]
+end
+
+make a function called th_unit takes kind, node, offs, attrs, kids returns u
+  let r = th_bytes(offs, node.start, node.end)
+  return ts_unit(kind, r[0], r[1], list_push(attrs, ["node", node]), kids)
+end
+
+# a view with something in it besides spaces
+make a function called th_has_text takes text, view returns yes
+  let k = 0
+  while k < list_len(view) do
+    let i = view[k][0]
+    while i < view[k][1] do
+      let c = bytes_get(text, i)
+      if not ((c == 32) or (c == 9) or (c == 10) or (c == 13)) then
+        return true
+      end
+      let i = i + 1
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# a list's items, nested lists' items among them with their depth
+make a function called th_items_into takes st, text, offs, list, depth, out returns items
+  let items = out
+  let kids = dom_children(list)
+  let k = 0
+  while k < list_len(kids) do
+    let li = kids[k]
+    if (li.kind == "element") and (li.tag == "li") then
+      let view = th_view(li, offs)
+      let items = list_push(items, th_unit("item", li, offs, [["depth", depth]], ts_sentences(st, text, view)))
+      let inner = dom_children(li)
+      let j = 0
+      while j < list_len(inner) do
+        if (inner[j].kind == "element") and ((inner[j].tag == "ul") or (inner[j].tag == "ol")) then
+          let items = th_items_into(st, text, offs, inner[j], depth + 1, items)
+        end
+        let j = j + 1
+      end
+    end
+    let k = k + 1
+  end
+  return items
+end
+
+# The blocks of a node's children, in order, appended to out.
+make a function called th_blocks_of takes st, text, offs, node, out returns blocks
+  let blocks = out
+  # inline content straight inside a container, gathered until a block
+  let run = []
+  let kids = dom_children(node)
+  let k = 0
+  while k <= list_len(kids) do
+    let c = false
+    let is_block = false
+    if k < list_len(kids) then
+      let c = kids[k]
+      let is_block = (c.kind == "element") and (th_in(c.tag, th_blocks()) or th_in(c.tag, th_containers()) or th_in(c.tag, th_skipped()))
+    end
+    if (k == list_len(kids)) or is_block then
+      if list_len(run) > 0 then
+        let view = []
+        let first = true
+        let j = 0
+        while j < list_len(run) do
+          let got = th_view_into(run[j], offs, view, first)
+          let view = got[0]
+          let first = got[1]
+          let j = j + 1
+        end
+        if th_has_text(text, view) then
+          let a = view[0][0]
+          let b = view[list_len(view) - 1][1]
+          let blocks = list_push(blocks, ts_unit("paragraph", a, b, [], ts_sentences(st, text, view)))
+        end
+        let run = []
+      end
+      if is_block then
+        let blocks = th_block(st, text, offs, c, blocks)
+      end
+    else
+      let run = list_push(run, c)
+    end
+    let k = k + 1
+  end
+  return blocks
+end
+
+make a function called th_block takes st, text, offs, c, out returns blocks
+  let blocks = out
+  let tag = c.tag
+  if th_in(tag, th_skipped()) then
+    return blocks
+  end
+  if th_in(tag, th_containers()) then
+    return th_blocks_of(st, text, offs, c, blocks)
+  end
+  if (tag == "h1") or (tag == "h2") or (tag == "h3") or (tag == "h4") or (tag == "h5") or (tag == "h6") then
+    let level = to_num(substr(tag, 1, 1))
+    let title = ts_html_trim(dom_text_content(c))
+    return list_push(blocks, th_unit("heading", c, offs, [["title", title], ["level", level]], []))
+  end
+  if tag == "p" then
+    return list_push(blocks, th_unit("paragraph", c, offs, [], ts_sentences(st, text, th_view(c, offs))))
+  end
+  if (tag == "ul") or (tag == "ol") or (tag == "dl") then
+    return list_push(blocks, th_unit("list", c, offs, [], th_items_into(st, text, offs, c, 0, [])))
+  end
+  if tag == "blockquote" then
+    return list_push(blocks, th_unit("quote", c, offs, [], th_blocks_of(st, text, offs, c, [])))
+  end
+  if tag == "pre" then
+    return list_push(blocks, th_unit("code", c, offs, [["lang", ""]], []))
+  end
+  if tag == "table" then
+    return list_push(blocks, th_unit("table", c, offs, [], []))
+  end
+  return list_push(blocks, th_unit("break", c, offs, [], []))
+end
+
+# a text without the spaces and line breaks at either end
+make a function called ts_html_trim takes s returns out
+  let b = bytes_from_str(s)
+  let t = ts_trim_line(b, [0, bytes_len(b)])
+  let a = t[0]
+  let e = t[1]
+  while (a < e) and ((bytes_get(b, a) == 10) or (bytes_get(b, a) == 13)) do
+    let a = a + 1
+  end
+  while (e > a) and ((bytes_get(b, e - 1) == 10) or (bytes_get(b, e - 1) == 13)) do
+    let e = e - 1
+  end
+  return bytes_to_str(bytes_slice(b, a, e - a))
+end
+
+# [tree, root]: the document's units and the DOM it was read as
+make a function called ts_html takes st, text returns got
+  let source = bytes_to_str(text)
+  let root = dom_from_html_spans(source)
+  let offs = ts_decode(text)[1]
+  let blocks = th_block(st, text, offs, root, [])
+  let nested = ts_nest(blocks, 0, 0, bytes_len(text))
+  return [ts_unit("document", 0, bytes_len(text), [["format", "html"], ["node", root]], nested[0]), root]
+end
+
+make a function called ts_node_of takes u returns node
+  return ts_attr(u, "node")
+end
+
+# the unit whose node is node (the same object), or false
+make a function called ts_unit_of takes tree, node returns u
+  let all = ts_all(tree, "*")
+  let k = 0
+  while k < list_len(all) do
+    let n = ts_attr(all[k], "node")
+    if (n != false) and (n == node) then
+      return all[k]
+    end
+    let k = k + 1
+  end
+  return false
+end

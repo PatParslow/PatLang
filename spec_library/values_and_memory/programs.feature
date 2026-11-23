@@ -303,6 +303,12 @@ Feature: what functions, commands and includes give (spec 1.13)
     When the program runs
     Then a capitalised constant matches only itself, a variable matches any constant, and a logic variable is a value of its own type, equal to another of the same name and to no string
 
+  Scenario: a rule's body may compare numbers, ask that a goal have no proof, and a fact may be taken out
+    Given a store of word counts and sections, rules using gt, le, ge, lt and not, and rule declarations with numbers in them
+    When they are solved, and facts are taken out with fact_remove_in
+    Then the comparisons and the not answer as they say, a number in a declaration is an int, and a fact taken out is gone from every rule that read it, the store's index still finding the rest
+    And a comparison of a variable still unbound, and a not whose unbound variable a later goal uses, each stop the program, saying so, and nothing after runs
+
   Scenario: a let that rebinds a variable to a call taking it is a call like any other
     Given a let rebinding a variable to a call that takes it, of a closure held in a parameter, of a function ending in rest with further arguments, and of the program's own max
     When the program runs

@@ -610,7 +610,20 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
   as data matches only itself. (Before, a string starting with a capital was a variable, so a
   fact about `"Bob"` matched every query.)
 - A store holds each ground fact (a rule with no body and no variables) once: adding a fact
-  the store holds changes nothing.
+  the store holds changes nothing. `fact_remove_in(store, pred, args)` takes a ground fact
+  out, giving whether it was there; the rules after it keep their order, and the predicate's
+  index is made again, in time growing with its rules.
+- A rule's body may hold, beside goals of predicates, the goals the solver answers itself:
+  `neq(a, b)` (the two differ), `lt`, `le`, `gt` and `ge` (of two numbers; a variable
+  still unbound, or a value that is not a number, stops the program, as "no" would be a
+  wrong answer), and `not(pred(args))`, written `["not", [pred, arg, ...]]` to
+  `rule_add_to`: negation as failure, holding when the goal under the bindings so far has
+  no proof from the same stores, for any values of the variables that only it has
+  (`not(has_paragraph(S, P))`: S has no paragraph). A variable unbound in it that a later
+  goal of the body uses stops the program, since the answer would hang on the goals'
+  order. In a `rule` declaration a number is the number it is (`12`, which was the string
+  `"12"` until 2026-11-23), a bare name in lower case its name as a string, and a quoted
+  string itself.
 - `solve_in(stores, pred, args)` solves against a store or a list of stores: a goal sees the
   rules of every store listed, store by store in the order listed and, within a store, in the
   order they were added. A rule's body goals are solved against the same stores, except a goal

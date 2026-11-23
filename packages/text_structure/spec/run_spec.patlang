@@ -7,7 +7,7 @@
 include "../../../self_hosting/lib/includes.patlang"
 include "../../../self_hosting/lib/gherkin.patlang"
 include "../plain.patlang"
-include "../markdown.patlang"
+include "../update.patlang"
 
 make a function called tt_lines takes b returns lines
   let out = []
@@ -191,6 +191,10 @@ make a function called tt_restructure takes ctx returns done
   let text = ctx_get(ctx, "text")
   if ctx_get(ctx, "format") == "plain" then
     ctx_set(ctx, "tree", ts_plain(tt_st(ctx), text))
+  elif ctx_get(ctx, "format") == "html" then
+    let got = ts_html(tt_st(ctx), text)
+    ctx_set(ctx, "tree", got[0])
+    ctx_set(ctx, "dom", got[1])
   else
     ctx_set(ctx, "tree", ts_markdown(tt_st(ctx), text))
   end
@@ -390,7 +394,212 @@ make a function called st_tt_order takes ctx returns ok
   return expect(ctx, "the paragraphs", tt_texts(ctx, ps), [step_arg(ctx, "a"), step_arg(ctx, "b")])
 end
 
+# ---- HTML ----
+
+make a function called st_th_html takes ctx returns ok
+  return tt_set_text(ctx, step_doc(ctx), "html")
+end
+
+make a function called st_th_first_sentences takes ctx returns ok
+  let p = ts_all(ctx_get(ctx, "tree"), "paragraph")[0]
+  let q = chr(34)
+  return expect(ctx, "the first paragraph's sentences", tt_texts(ctx, ts_children(p)), ["The <em>first</em> one.", "And a <a href=" + q + "x" + q + ">second</a> one."])
+end
+
+make a function called st_th_edit_intro takes ctx returns ok
+  let before = ctx_get(ctx, "text")
+  let node = dom_by_id(ctx_get(ctx, "dom"), "intro")
+  let u = ts_unit_of(ctx_get(ctx, "tree"), node)
+  let a = expect(ctx, "the node has a unit", u != false, true)
+  if u == false then
+    return false
+  end
+  ctx_set(ctx, "found_node", node)
+  ctx_set(ctx, "found_unit", u)
+  ctx_set(ctx, "before", before)
+  let q = chr(34)
+  return a and tt_apply(ctx, [ts_edit_for(before, u, "<p id=" + q + "intro" + q + ">New words.</p>")])
+end
+
+make a function called st_th_same_but takes ctx returns ok
+  let u = ctx_get(ctx, "found_unit")
+  let a = expect(ctx, "the unit's node", ts_node_of(u) == ctx_get(ctx, "found_node"), true)
+  let before = ctx_get(ctx, "before")
+  let q = chr(34)
+  let new = bytes_from_str("<p id=" + q + "intro" + q + ">New words.</p>")
+  let want = bytes_slice(before, 0, ts_start(u))
+  bytes_extend(want, new)
+  bytes_extend(want, bytes_slice(before, ts_end(u), bytes_len(before) - ts_end(u)))
+  let b = expect(ctx, "the text, byte for byte", bytes_eq(ctx_get(ctx, "text"), want), true)
+  return a and b
+end
+
+make a function called st_th_odd_kept takes ctx returns ok
+  return expect(ctx, "the second paragraph as written", str_contains(bytes_to_str(ctx_get(ctx, "text")), "<p  class='note'>Spacing   and 'quotes' as written.</p>"), true)
+end
+
+# ---- updates ----
+
+make a function called tu_sample_md returns text
+  let nl = chr(10)
+  let f = chr(96) + chr(96) + chr(96)
+  return "# Title" + nl + nl + "First paragraph. It has two sentences." + nl + "And a wrapped line." + nl + nl + "## Part" + nl + nl + "- one item. More." + nl + "- two" + nl + "  continued" + nl + nl + "> quoted. Text." + nl + "> more" + nl + nl + f + "sh" + nl + "code. here" + nl + f + nl + nl + "| a | b |" + nl + "|---|---|" + nl + nl + "Setext" + nl + "------" + nl + nl + "Last paragraph here. End." + nl
+end
+
+make a function called tu_sample_plain returns text
+  let nl = chr(10)
+  return "Notes" + nl + "=====" + nl + nl + "Intro text. Two." + nl + nl + "Details" + nl + "-------" + nl + nl + "More text. And more." + nl + "Wrapped on." + nl + nl + "Tail." + nl
+end
+
+make a function called st_tu_md takes ctx returns ok
+  return tt_set_text(ctx, tu_sample_md(), "markdown")
+end
+
+make a function called st_tu_plain takes ctx returns ok
+  return tt_set_text(ctx, tu_sample_plain(), "plain")
+end
+
+# a small generator of its own, so a run can be repeated from its seed
+make a function called tu_next takes s returns s2
+  return (s * 1103515245 + 12345) % 2147483648
+end
+
+make a function called tu_pieces returns ps
+  let f = chr(96) + chr(96) + chr(96)
+  return [chr(10), chr(10) + chr(10), "a", "B", ".", " ", "# ", "- ", f, "> ", "|", "===", "1. ", "    ", "word"]
+end
+
+# n random edits, each applied, the tree updated and compared with a full read:
+# [edits whose trees differed, the first such edit's description]
+make a function called tu_random takes ctx, n, seed returns got
+  let st = tt_st(ctx)
+  let ps = tu_pieces()
+  let s = seed
+  let bad = 0
+  let first = ""
+  let k = 0
+  while k < n do
+    let text = ctx_get(ctx, "text")
+    let len = bytes_len(text)
+    let s = tu_next(s)
+    let p = s % (len + 1)
+    let s = tu_next(s)
+    let del = s % 4
+    if p + del > len then
+      let del = len - p
+    end
+    let ins = bytes_new(0)
+    let s = tu_next(s)
+    let count = s % 4
+    let j = 0
+    while j < count do
+      let s = tu_next(s)
+      bytes_extend(ins, bytes_from_str(ps[s % list_len(ps)]))
+      let j = j + 1
+    end
+    let after = bytes_slice(text, 0, p)
+    bytes_extend(after, ins)
+    bytes_extend(after, bytes_slice(text, p + del, len - p - del))
+    let shift = [p, del, bytes_len(ins)]
+    let updated = ts_update(st, ctx_get(ctx, "tree"), after, [shift])[0]
+    ctx_set(ctx, "text", after)
+    tt_restructure(ctx)
+    if updated != ctx_get(ctx, "tree") then
+      if bad == 0 then
+        let first = "edit " + (k + 1) + ": " + shift
+      end
+      let bad = bad + 1
+    end
+    let k = k + 1
+  end
+  return [bad, first]
+end
+
+make a function called st_tu_random_md takes ctx returns ok
+  ctx_set(ctx, "random", tu_random(ctx, 200, 7))
+  return true
+end
+
+make a function called st_tu_random_plain takes ctx returns ok
+  ctx_set(ctx, "random", tu_random(ctx, 100, 11))
+  return true
+end
+
+make a function called st_tu_every takes ctx returns ok
+  let r = ctx_get(ctx, "random")
+  return expect(ctx, "edits whose updated tree differed from the full read (" + r[1] + ")", r[0], 0)
+end
+
+make a function called st_tu_batch takes ctx returns ok
+  let text = ctx_get(ctx, "text")
+  let edits = [fm_with_old(fm_edit("First ", " It", "Opening."), "paragraph."), fm_with_old(fm_edit("Last ", " here", "words"), "paragraph")]
+  let r = fm_apply_batch(text, edits)
+  let a = expect(ctx, "the batch applies", r[0], "ok")
+  let updated = ts_update(tt_st(ctx), ctx_get(ctx, "tree"), r[1], r[2])[0]
+  ctx_set(ctx, "text", r[1])
+  tt_restructure(ctx)
+  ctx_set(ctx, "updated", updated)
+  return a
+end
+
+make a function called st_tu_equal takes ctx returns ok
+  return expect(ctx, "the updated tree is the full read's", ctx_get(ctx, "updated") == ctx_get(ctx, "tree"), true)
+end
+
+make a function called st_tu_large takes ctx returns ok
+  let b = sb_new()
+  let i = 0
+  while i < 1300 do
+    sb_push(b, tu_sample_md())
+    sb_push(b, chr(10))
+    let i = i + 1
+  end
+  tt_set_text(ctx, sb_str(b), "markdown")
+  return expect(ctx, "the document is about 280 KB", bytes_len(ctx_get(ctx, "text")) > 250000, true)
+end
+
+make a function called st_tu_large_edit takes ctx returns ok
+  let text = ctx_get(ctx, "text")
+  let tree = ctx_get(ctx, "tree")
+  let sentences = ts_all(tree, "sentence")
+  let u = sentences[word_shr(list_len(sentences), 1)]
+  let r = fm_apply_batch(text, [ts_edit_for(text, u, "A new sentence here.")])
+  let t0 = clock_ms()
+  let got = ts_update(tt_st(ctx), tree, r[1], r[2])
+  let update_ms = clock_ms() - t0
+  ctx_set(ctx, "text", r[1])
+  let t0 = clock_ms()
+  tt_restructure(ctx)
+  let full_ms = clock_ms() - t0
+  ctx_set(ctx, "large", [got, update_ms, full_ms])
+  return true
+end
+
+make a function called st_tu_large_cost takes ctx returns ok
+  let l = ctx_get(ctx, "large")
+  let region = l[0][1]
+  let a = expect(ctx, "the region read again: " + region, region[1] - region[0] < 1024, true)
+  let b = expect(ctx, "the updated tree is the full read's", l[0][0] == ctx_get(ctx, "tree"), true)
+  let c = expect(ctx, "the update " + l[1] + " ms, the full read " + l[2] + " ms", l[1] * 10 <= l[2] + 10, true)
+  return a and b and c
+end
+
 let ctx = ctx_new()
+step(ctx, "a Markdown text of headings, paragraphs, a list, a quote, code and a table", "st_tu_md")
+step(ctx, "a plain text of titles and paragraphs", "st_tu_plain")
+step(ctx, "200 random edits are made one at a time, each deleting up to 3 bytes and inserting up to 3 pieces of line breaks, letters, full stops, \"#\", \"- \", \"```\", \"> \", \"|\", \"===\" and spaces, from seed 7", "st_tu_random_md")
+step(ctx, "100 random edits are made one at a time in the same way, from seed 11", "st_tu_random_plain")
+step(ctx, "after every edit the updated tree equals a full read of the new text", "st_tu_every")
+step(ctx, "a batch changes a word in the first paragraph and one in the last, and the tree is updated from the batch's shifts", "st_tu_batch")
+step(ctx, "the updated tree equals a full read of the new text", "st_tu_equal")
+step(ctx, "a Markdown document of about 280 KB", "st_tu_large")
+step(ctx, "one sentence in its middle is changed", "st_tu_large_edit")
+step(ctx, "the region read again is under 1 KB, the updated tree equals a full read, and the update takes at most a tenth of the full read's time", "st_tu_large_cost")
+step(ctx, "the HTML", "st_th_html")
+step(ctx, "the first paragraph's sentences are \"The <em>first</em> one.\" and \"And a <a href=\\\"x\\\">second</a> one.\"", "st_th_first_sentences")
+step(ctx, "the node with id \"intro\" is found with dom_by_id, and its unit is made into \"<p id=\\\"intro\\\">New words.</p>\"", "st_th_edit_intro")
+step(ctx, "the unit's node is that node, and the text is the same but for that paragraph", "st_th_same_but")
+step(ctx, "the second paragraph's odd spacing and quotes are as they were", "st_th_odd_kept")
 step(ctx, "the plain text", "st_tt_plain")
 step(ctx, "the Markdown", "st_tt_markdown")
 step(ctx, "it has 2 paragraphs, the first with the sentences \"{a}\" and \"{b}\"", "st_tt_two_paras")
@@ -415,4 +624,4 @@ step(ctx, "the lines of SentenceBreakTest.txt", "st_tt_lines")
 step(ctx, "each gives exactly the breaks it marks, all 512 of them", "st_tt_conform")
 step(ctx, "the bytes of \"é—a\" and the bytes 255, 65 and 226, 130", "st_tt_bytes")
 step(ctx, "they read as 233, 8212, 97 at 0, 2, 5, and as 65533, 65, 65533, 65533", "st_tt_decoded")
-run_suite(ctx, ["packages/text_structure/spec/sentences.feature", "packages/text_structure/spec/structure.feature"], argv())
+run_suite(ctx, ["packages/text_structure/spec/sentences.feature", "packages/text_structure/spec/structure.feature", "packages/text_structure/spec/html.feature", "packages/text_structure/spec/update.feature"], argv())

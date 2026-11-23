@@ -1,0 +1,299 @@
+# text_structure updates: a tree carried past edits, re-reading only what they
+# touched.
+#
+#   let got = ts_update(st, tree, new_text, shifts)    [new tree, [r0, r1]]
+#
+# shifts are the edits' [o, a, b] in the order applied (fm_apply_batch, or the
+# files service's reply). A Markdown or plain text tree is a flat list of
+# blocks under its sections; each block an edit does not touch is carried past
+# it (moved by b - a when after it), the blocks it touches are read again from
+# the new text, with the block either side of them (a new underline makes the
+# paragraph above it a heading, a new line can join a list), on whole lines,
+# and the sections are made again over the blocks, which costs little. A
+# region holding a code fence runs to the text's end, since a fence opened or
+# closed changes everything after it. [r0, r1] is the region read again, in
+# the new text's bytes: a program keeping facts about the units (spec: the
+# plan's step 7) re-derives those in it and moves the rest.
+#
+# The test of this is that the tree it gives equals a full read of the new
+# text, after any edits. HTML is read again whole.
+include "plain.patlang"
+include "markdown.patlang"
+include "html.patlang"
+
+# the units a document's sections hold that are not sections: its blocks, in order
+make a function called ts_flat_blocks takes tree returns blocks
+  let out = vec_new()
+  ts_flat_into(tree, out)
+  return vec_to_list(out)
+end
+
+make a function called ts_flat_into takes u, out returns done
+  let kids = u[4]
+  let k = 0
+  while k < list_len(kids) do
+    if kids[k][0] == "section" then
+      ts_flat_into(kids[k], out)
+    else
+      vec_push(out, kids[k])
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+# a unit and every unit inside it moved by d bytes
+make a function called ts_shift_unit takes u, d returns u2
+  let kids = []
+  let k = 0
+  while k < list_len(u[4]) do
+    let kids = list_push(kids, ts_shift_unit(u[4][k], d))
+    let k = k + 1
+  end
+  return [u[0], u[1] + d, u[2] + d, u[3], kids]
+end
+
+# a range [s, e] carried past one shift; a range touching the change takes it in
+make a function called tu_carry takes r, sh returns r2
+  let o = sh[0]
+  let a = sh[1]
+  let b = sh[2]
+  let s = r[0]
+  let e = r[1]
+  if e < o then
+    return r
+  end
+  if s > o + a then
+    return [s + b - a, e + b - a]
+  end
+  let s2 = s
+  if s2 > o then
+    let s2 = o
+  end
+  let e2 = o + b
+  if e >= o + a then
+    let e2 = e + b - a
+  end
+  return [s2, e2]
+end
+
+# the start of the line holding offset p, and the end (before its line break)
+# of the line holding offset q
+make a function called tu_line_start takes text, p returns s
+  let s = p
+  if s > bytes_len(text) then
+    let s = bytes_len(text)
+  end
+  while (s > 0) and (bytes_get(text, s - 1) != 10) do
+    let s = s - 1
+  end
+  return s
+end
+
+make a function called tu_line_end takes text, q returns e
+  let e = q
+  let n = bytes_len(text)
+  if e < 0 then
+    let e = 0
+  end
+  while (e < n) and (bytes_get(text, e) != 10) do
+    let e = e + 1
+  end
+  return e
+end
+
+# the lines from r0 to r1 (whole lines), as ts_lines gives them
+make a function called tu_lines takes text, r0, r1 returns lines
+  let out = vec_new()
+  let n = bytes_len(text)
+  let start = r0
+  let k = r0
+  let stop = r1
+  if stop > n then
+    let stop = n
+  end
+  while k < stop do
+    if bytes_get(text, k) == 10 then
+      let e = k
+      if (e > start) and (bytes_get(text, e - 1) == 13) then
+        let e = e - 1
+      end
+      vec_push(out, [start, e])
+      let start = k + 1
+    end
+    let k = k + 1
+  end
+  if start < stop then
+    let e = stop
+    if (e > start) and (bytes_get(text, e - 1) == 13) then
+      let e = e - 1
+    end
+    vec_push(out, [start, e])
+  end
+  return vec_to_list(out)
+end
+
+# whether a line in the lines is a code fence
+make a function called tu_has_fence takes text, lines returns yes
+  let k = 0
+  while k < list_len(lines) do
+    if md_fence(text, lines[k])[0] != 0 then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+make a function called ts_update takes st, tree, text, shifts returns got
+  let format = ts_attr(tree, "format")
+  if format == "html" then
+    return [ts_html(st, text)[0], [0, bytes_len(text)]]
+  end
+  if list_len(shifts) == 0 then
+    return [tree, [0, 0]]
+  end
+  # the blocks, each [unit, range now, touched], carried past each shift
+  let old = ts_flat_blocks(tree)
+  let blocks = []
+  let k = 0
+  while k < list_len(old) do
+    let blocks = list_push(blocks, [old[k], [old[k][1], old[k][2]], false])
+    let k = k + 1
+  end
+  let changed = []
+  let s = 0
+  while s < list_len(shifts) do
+    let sh = shifts[s]
+    let next = []
+    let k = 0
+    while k < list_len(blocks) do
+      let bl = blocks[k]
+      let r = bl[1]
+      let touched = bl[2]
+      if (r[1] >= sh[0]) and (r[0] <= sh[0] + sh[1]) then
+        let touched = true
+      end
+      let next = list_push(next, [bl[0], tu_carry(r, sh), touched])
+      let k = k + 1
+    end
+    let blocks = next
+    let moved = []
+    let k = 0
+    while k < list_len(changed) do
+      let moved = list_push(moved, tu_carry(changed[k], sh))
+      let k = k + 1
+    end
+    let changed = list_push(moved, [sh[0], sh[0] + sh[2]])
+    let s = s + 1
+  end
+  # the region: every change and touched block, then a block either side, on
+  # whole lines, taking in any block it overlaps
+  let r0 = bytes_len(text)
+  let r1 = 0
+  let k = 0
+  while k < list_len(changed) do
+    if changed[k][0] < r0 then
+      let r0 = changed[k][0]
+    end
+    if changed[k][1] > r1 then
+      let r1 = changed[k][1]
+    end
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(blocks) do
+    if blocks[k][2] then
+      if blocks[k][1][0] < r0 then
+        let r0 = blocks[k][1][0]
+      end
+      if blocks[k][1][1] > r1 then
+        let r1 = blocks[k][1][1]
+      end
+    end
+    let k = k + 1
+  end
+  let before = 0 - 1
+  let after = 0 - 1
+  let k = 0
+  while k < list_len(blocks) do
+    let r = blocks[k][1]
+    if r[1] < r0 then
+      let before = k
+    end
+    if (r[0] > r1) and (after < 0) then
+      let after = k
+    end
+    let k = k + 1
+  end
+  if before >= 0 then
+    let r0 = blocks[before][1][0]
+  end
+  if after >= 0 then
+    let r1 = blocks[after][1][1]
+  end
+  let r0 = tu_line_start(text, r0)
+  let r1 = tu_line_end(text, r1)
+  let lines = tu_lines(text, r0, r1)
+  if (format == "markdown") and tu_has_fence(text, lines) then
+    let r1 = bytes_len(text)
+    let lines = tu_lines(text, r0, r1)
+  end
+  let more = true
+  while more do
+    let more = false
+    let k = 0
+    while k < list_len(blocks) do
+      let r = blocks[k][1]
+      if (r[1] >= r0) and (r[0] <= r1) then
+        if r[0] < r0 then
+          let r0 = tu_line_start(text, r[0])
+          let more = true
+        end
+        if r[1] > r1 then
+          let r1 = tu_line_end(text, r[1])
+          let more = true
+        end
+      end
+      let k = k + 1
+    end
+  end
+  let lines = tu_lines(text, r0, r1)
+  let read = []
+  if format == "markdown" then
+    let read = md_blocks(st, text, lines)
+  else
+    let read = plain_blocks(st, text, lines)
+  end
+  # the blocks before the region and after it, carried; the region's read again
+  let out = []
+  let k = 0
+  let placed = false
+  while k < list_len(blocks) do
+    let bl = blocks[k]
+    let r = bl[1]
+    if r[1] < r0 then
+      let out = list_push(out, ts_shift_unit(bl[0], r[0] - bl[0][1]))
+    elif r[0] > r1 then
+      if not placed then
+        let j = 0
+        while j < list_len(read) do
+          let out = list_push(out, read[j])
+          let j = j + 1
+        end
+        let placed = true
+      end
+      let out = list_push(out, ts_shift_unit(bl[0], r[0] - bl[0][1]))
+    end
+    let k = k + 1
+  end
+  if not placed then
+    let j = 0
+    while j < list_len(read) do
+      let out = list_push(out, read[j])
+      let j = j + 1
+    end
+  end
+  let nested = ts_nest(out, 0, 0, bytes_len(text))
+  return [ts_unit("document", 0, bytes_len(text), [["format", format]], nested[0]), [r0, r1]]
+end

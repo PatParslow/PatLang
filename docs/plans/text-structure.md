@@ -92,8 +92,13 @@ where a token or a node was in the source, so:
 - The HTML structurer makes units from the tree: `h1` to `h6` start sections
   (and `section`, `article` and `main` are sections of their own), `p`, `li`,
   `blockquote`, `pre`, `table` and the rest as their kinds, and sentences in a
-  block's text across its inline elements (`em`, `a`, `code`), with an entity
-  counted as the one character it stands for and its range its source's.
+  block's text across its inline elements (`em`, `a`, `code`), which run
+  straight on (a text view range marked to join with no space), with `br` as
+  a space. An entity is read as written for the sentence rules ("&amp;" is
+  five characters to them), which changes a boundary only in odd cases; the
+  DOM's own text has it decoded. HTML's sectioning elements (`section`,
+  `article`, `main`) hold blocks and are not sections of their own yet:
+  headings make the sections.
 - Each HTML unit's attrs name its node, and `ts_node_of(unit)` and
   `ts_unit_of(tree, node)` go each way, so a program can find a node with the
   DOM's queries (`dom_by_id`, `dom_by_class`) and edit its range in the file by
@@ -133,6 +138,20 @@ so the logic store and the planner can use both:
   replanning the goal-oriented programs already do.
 - These sit on top of the core and cost nothing to a program that does not use
   them; they come after the formats.
+- **Keeping the facts current** (from step 4): `ts_update` re-reads only a
+  region and carries every other block, so facts can follow it at the
+  region's cost if they do not hold positions. Each unit gets an id when it is
+  read, kept in its attrs and carried by `ts_update` with the block; the facts
+  are the relations (`unit`, `child`, `attr`, `words`), which do not change
+  for a carried block, and a unit's range is read from the tree when a rule
+  needs it (`ts_span_of(tree, id)`), never stored as a fact. After an update,
+  the facts of the ids that left (the region's old blocks) are taken out, and
+  those of the region's new blocks added; the sections, made again over the
+  blocks, change only their `child` facts. The cost of keeping a document's
+  facts is then that of the edit, not of the document.
+- A plan's batch goes to the files service, whose reply carries the shifts;
+  `ts_update` with those shifts gives the tree, and the fact update above the
+  facts, so the next goal is planned from the new state without a full read.
 
 ## With the files service
 
@@ -145,6 +164,17 @@ the service, giving the tree for a format, can come later if clients that do
 not want to parse ask for it.
 
 ## Order
+
+Done 2026-11-23: steps 1 to 5 (`sentences.patlang`, `structure.patlang`,
+`plain.patlang`, `markdown.patlang`, `html.patlang`, `update.patlang`; spans in
+`lib/html_scan` and `lib/dom`, checked in `dom_selftest`), 45 checks
+interpreted and compiled. Step 4's test is a property: after each of 200
+random edits to Markdown and 100 to plain text, the updated tree equals a full
+read; on 290 KB, one sentence changed re-reads 80 bytes, in 328 ms against a
+full read's 10 s (before the ASCII class table, which made a full read about
+ten times faster). An edit by address takes, where its context repeats within
+1 KB of its place, the candidate nearest its place (`fm_nearest`): a document
+can repeat its own text so that no context near a unit is unique.
 
 1. The sentence table from the data file, the UAX #29 rules, and the
    conformance test (all 512 lines), interpreted and compiled.
