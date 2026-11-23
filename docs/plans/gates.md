@@ -186,7 +186,8 @@ finished.
 2026-11-19:
 
 - **The packages' specs are suites,** `pkg_deflate`, `pkg_zip`, `pkg_sha256`,
-  `pkg_resolve` and `pkg_trust`: each package's `spec/run_spec.patlang` on the
+  `pkg_resolve` and `pkg_trust` (and since then `pkg_sha512`, `pkg_curve25519`,
+  `pkg_tls` and `pkg_port_marshal`): each package's `spec/run_spec.patlang` on the
   interpreter, which lists its feature files with `--list` (`run_suite`) and
   exits 1 on a failure. They read `packages/` and `self_hosting/lib`, and call
   Python's oracle (`spec/oracle.py`) as their steps say. Until now they ran only

@@ -41,6 +41,7 @@ Current packages:
 | curve25519 | 0.1.0 | X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints; depends on sha512 |
 | tls     | 0.1.0   | a TLS 1.3 client's cryptography on modints, so far ChaCha20, Poly1305 and AEAD_CHACHA20_POLY1305 (RFC 8439) (`docs/plans/http-tls.md`, stage 2) |
 | resolve | 0.1.0   | manifest reader, version constraints, and dependency resolution through `rule_add`/`solve` (`docs/plans/package-manager.md`, P1) |
+| port_marshal | 0.1.0 | one well-known port (9400) for local services: a service on any free port registers a name, and a client asks for the name and is piped through (`docs/plans/port-marshal.md`) |
 | trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in (`docs/plans/package-trust.md`, T1) |
 
 deflate and zip take their data as a `bytes` or a list of ints from 0 to 255,

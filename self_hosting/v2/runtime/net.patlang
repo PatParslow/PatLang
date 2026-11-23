@@ -471,58 +471,138 @@ make a function called tcp_connect takes host, port returns id
   return id
 end
 
-make a function called rt_listener_socket takes port, what returns sock
-  require (value_class(port) == 2) and (value_class(what) == 8)
+# This program's listener socket on the port, or -1 when it has none there.
+make a function called rt_listener_find takes port returns sock
+  require (value_class(port) == 2)
   let listeners = rt_engine_get(4320)
   let i = rt_pairs_index(listeners, port)
   if i < 0 then
-    let sock = rt_net_fail(what + ": no listener on port " + port)
+    let sock = 0 - 1
     ensure (value_class(sock) == 2)
     return sock
   end
   let sock = listeners[i][1]
+  ensure (value_class(sock) == 2) and (sock >= 0)
+  return sock
+end
+
+make a function called rt_listener_socket takes port, what returns sock
+  require (value_class(port) == 2) and (value_class(what) == 8)
+  let sock = rt_listener_find(port)
+  if sock < 0 then
+    let sock = rt_net_fail(what + ": no listener on port " + port)
+    ensure (value_class(sock) == 2)
+    return sock
+  end
   ensure (value_class(sock) == 2)
   return sock
 end
 
+# The accepts wait in turns of at most 100 ms and look the listener up again at
+# each, so one that tcp_unlisten closes is never waited on again: the socket's
+# number may by then belong to another. rt_accept_waiting gives -2 for a
+# listener closed between the look and the accept.
 make a function called tcp_accept takes port returns id
   require (value_class(port) == 2)
-  let sock = rt_listener_socket(port, "tcp_accept")
+  rt_listener_socket(port, "tcp_accept")
   while true do
-    let id = rt_accept_waiting(sock, port, "tcp_accept")
+    let sock = rt_listener_find(port)
+    let id = 0 - 2
+    if sock >= 0 then
+      let id = rt_accept_waiting(sock, port, "tcp_accept")
+    end
     if id >= 1 then
       ensure id >= 1
       return id
     end
-    rt_wait_readable(sock, 0 - 1)
+    if id == 0 - 2 then
+      let id = rt_net_fail("tcp_accept: the listener on port " + port + " was closed")
+      ensure id >= 1
+      return id
+    end
+    rt_wait_readable(sock, 100)
   end
   let id = rt_net_fail("tcp_accept: port " + port + ": accept failed")
   ensure id >= 1
   return id
 end
 
-# A connection accepted within ms, else -1.
+# A connection accepted within ms, else -1; -1 too once the listener is closed.
 make a function called tcp_accept_timeout takes port, ms returns id
   require (value_class(port) == 2) and (value_class(ms) == 2)
-  let sock = rt_listener_socket(port, "tcp_accept_timeout")
+  rt_listener_socket(port, "tcp_accept_timeout")
   let deadline = clock_ms() + ms
   while true do
-    let id = rt_accept_waiting(sock, port, "tcp_accept_timeout")
+    let sock = rt_listener_find(port)
+    let id = 0 - 2
+    if sock >= 0 then
+      let id = rt_accept_waiting(sock, port, "tcp_accept_timeout")
+    end
     if id >= 1 then
       ensure id >= 0 - 1
       return id
     end
     let left = deadline - clock_ms()
-    if left <= 0 then
+    if (left <= 0) or (id == 0 - 2) then
       let id = 0 - 1
       ensure id >= 0 - 1
       return id
+    end
+    if left > 100 then
+      let left = 100
     end
     rt_wait_readable(sock, left)
   end
   let id = 0 - 1
   ensure id >= 0 - 1
   return id
+end
+
+# Waits up to ms (-1: no limit) for any of the connections to have something to
+# read or to have ended, or any of the listeners to have a client waiting:
+# [ready connections, ready ports], each in the order given, [[], []] when the
+# time is up. Each connection and port is checked first, so an unknown one
+# stops the program before any wait.
+make a function called tcp_wait_any takes conns, ports, ms returns ready
+  require (value_class(conns) == 9) and (value_class(ports) == 9) and (value_class(ms) == 2) and (ms >= 0 - 1)
+  let socks = []
+  let k = 0
+  while k < list_len(conns) do
+    let socks = list_push(socks, rt_conn_socket(conns[k]))
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(ports) do
+    let socks = list_push(socks, rt_listener_socket(ports[k], "tcp_wait_any"))
+    let k = k + 1
+  end
+  if list_len(socks) == 0 then
+    if ms < 0 then
+      let ready = rt_net_fail("tcp_wait_any: nothing to wait for, and no time limit")
+      ensure value_class(ready) == 9
+      return ready
+    end
+    sleep_ms(ms)
+    let ready = [[], []]
+    ensure value_class(ready) == 9
+    return ready
+  end
+  let hit = rt_poll_readable(socks, ms)
+  let rc = []
+  let rp = []
+  let k = 0
+  while k < list_len(hit) do
+    let at = hit[k]
+    if at < list_len(conns) then
+      let rc = list_push(rc, conns[at])
+    else
+      let rp = list_push(rp, ports[at - list_len(conns)])
+    end
+    let k = k + 1
+  end
+  let ready = [rc, rp]
+  ensure (value_class(ready) == 9) and (list_len(ready) == 2)
+  return ready
 end
 
 # What arrives on the connection within ms: "" when nothing does in that time,

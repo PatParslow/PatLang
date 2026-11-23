@@ -212,7 +212,11 @@ running it.
   stop: give each worker its own and merge afterwards. The language has no lock.
 - TCP is on this machine only. A listener binds 127.0.0.1 itself, not every address, and while
   it holds the port Windows refuses another socket binding 127.0.0.1 on it, from this process
-  or another, even one that sets `SO_REUSEADDR` (checked 2026-11-17). Once the listener's
+  or another, even one that sets `SO_REUSEADDR` (checked 2026-11-17). `tcp_unlisten(port)`
+  closes the program's listener on a port, and the port is free at once; a port the program
+  is not listening on stops it, saying so. A thread waiting on that listener finds it gone
+  within 100 ms: `tcp_accept_timeout` gives -1, and `tcp_accept` stops, saying the listener
+  was closed. Once the listener's
   program has ended the port is free, even when it closed a connection's end first: on Linux
   that end waits in TIME_WAIT for a minute, and the runtime sets `SO_REUSEADDR` so that a bind
   is not refused for it, while one on a port another socket listens on still is. `tcp_connect` takes
@@ -239,6 +243,12 @@ running it.
   listener waiting as before: a later `tcp_accept` waits for its client. Threads may wait on
   one listener at once, with either call: each connection goes to one of them, and each timed
   wait still gives -1 when its time is up.
+  `tcp_wait_any(conns, ports, ms)` waits up to `ms` (-1 for no limit) for any of the
+  connections to have something to read or a peer that has ended, or any of the listeners on
+  `ports` to have a client waiting, and gives `[ready connections, ready ports]`, each in the
+  order given, or `[[], []]` when the time is up (`WSAPoll` on Windows, `poll` on Linux). A
+  connection or port the program does not hold stops it before any wait, and so does a wait
+  with nothing to wait on and no limit.
   `tcp_read_timeout(conn, ms)` gives what arrives within `ms`, and `""` when nothing does,
   when the peer has closed, or when the read fails; `tcp_read_status(conn, ms)` tells those
   apart, giving `[text, "data"]`, `["", "wait"]`, `["", "end"]` or `["", "error"]`. Text

@@ -1,0 +1,426 @@
+# Runs packages/port_marshal/spec/port_marshal.feature, from the repository root:
+#
+#   ./self_hosting/build/v2_interp.exe packages/port_marshal/spec/run_spec.patlang [feature file]
+#
+# Each scenario has a marshaller of its own, on a port the system chose, with
+# an echo service registered; the next scenario's Background stops them. The
+# exit code is 0 when every check passes, 1 otherwise.
+include "../../../self_hosting/lib/includes.patlang"
+include "../../../self_hosting/lib/gherkin.patlang"
+include "../port_marshal.patlang"
+
+# ---- the echo service ----
+# It accepts until BASE/stop exists, each client on a thread of its own that
+# sends back what comes, until either end closes; "please close" makes it close
+# its own end. Each connection that ends leaves BASE/ended/N. BASE is
+# /pm_test/SERIAL, one for each echo service: the system may give a later one
+# the port an earlier one had.
+
+make a function called es_conn takes c, key returns n
+  let n = 0
+  let open = true
+  while open do
+    let st = tcp_read_status(c, 200)
+    if st[1] == "data" then
+      if st[0] == "please close" then
+        let open = false
+      else
+        if not tcp_try_write(c, st[0]) then
+          let open = false
+        end
+        let n = n + str_len(st[0])
+      end
+    elif st[1] != "wait" then
+      let open = false
+    end
+  end
+  tcp_close(c)
+  vfs_write(key, "ended")
+  return n
+end
+
+make a function called es_serve takes p, base returns served
+  let n = 0
+  while not vfs_exists(base + "/stop") do
+    let c = tcp_accept_timeout(p, 100)
+    if c >= 1 then
+      let n = n + 1
+      thread_spawn(|cc, key| do
+        return es_conn(cc, key)
+      end, c, base + "/ended/" + n)
+    end
+  end
+  tcp_unlisten(p)
+  return n
+end
+
+make a function called es_ended takes base returns n
+  let n = 0
+  let k = 1
+  while k <= 64 do
+    if vfs_exists(base + "/ended/" + k) then
+      let n = n + 1
+    end
+    let k = k + 1
+  end
+  return n
+end
+
+# Waits up to ms for es_ended(base) to pass n.
+make a function called es_ended_past takes base, n, ms returns yes
+  let deadline = clock_ms() + ms
+  while clock_ms() < deadline do
+    if es_ended(base) > n then
+      return true
+    end
+    sleep_ms(20)
+  end
+  return false
+end
+
+# ---- bytes ----
+
+make a function called pt_bytes_0_255 returns text
+  let all = []
+  let i = 0
+  while i < 256 do
+    let all = list_push(all, i)
+    let i = i + 1
+  end
+  return bytes_to_str(bytes_from_list(all))
+end
+
+# n bytes of a pattern of its own for seed, every value 0 to 255 among them
+make a function called pt_block takes seed, n returns text
+  let b = bytes_new(n)
+  let i = 0
+  while i < n do
+    bytes_set(b, i, (i * 7919 + seed * 131 + word_shr(i, 8)) % 256)
+    let i = i + 1
+  end
+  return bytes_to_str(b)
+end
+
+# What arrives on conn until it has n bytes, or nothing more comes within ms.
+make a function called pt_read_n takes conn, n, ms returns text
+  let b = sb_new()
+  let have = 0
+  let deadline = clock_ms() + ms
+  while (have < n) and (clock_ms() < deadline) do
+    let st = tcp_read_status(conn, deadline - clock_ms())
+    if st[1] == "data" then
+      sb_push(b, st[0])
+      let have = have + str_len(st[0])
+    elif st[1] != "wait" then
+      let deadline = 0
+    end
+  end
+  return sb_str(b)
+end
+
+make a function called pt_same takes a, b returns yes
+  return bytes_eq(bytes_from_str(a), bytes_from_str(b))
+end
+
+# ---- the Background ----
+
+# The previous scenario's marshaller and echo service, stopped.
+make a function called pt_stop_previous takes ctx returns done
+  if (ctx_get(ctx, "pm_port") != false) and (not ctx_get(ctx, "pm_quit")) then
+    pm_quit_at(ctx_get(ctx, "pm_port"))
+    thread_result(ctx_get(ctx, "pm_daemon"))
+  end
+  if (ctx_get(ctx, "es_port") != false) and (not ctx_get(ctx, "es_stopped")) then
+    vfs_write(ctx_get(ctx, "es_base") + "/stop", "1")
+    thread_result(ctx_get(ctx, "es_thread"))
+  end
+  return true
+end
+
+make a function called st_pm_marshaller takes ctx returns ok
+  pt_stop_previous(ctx)
+  let port = tcp_listen(0)
+  let m = pm_start(port)
+  let d = thread_spawn(|mm| do
+    return pm_status_line(pm_loop(mm, 3000))
+  end, m)
+  ctx_set(ctx, "pm_port", port)
+  ctx_set(ctx, "pm_daemon", d)
+  ctx_set(ctx, "pm_quit", false)
+  return expect(ctx, "the marshaller listens on a port the system chose", port > 0, true)
+end
+
+make a function called st_pm_echo takes ctx returns ok
+  let p = tcp_listen(0)
+  let serial = ctx_get(ctx, "es_serial")
+  if serial == false then
+    let serial = 0
+  end
+  let serial = serial + 1
+  ctx_set(ctx, "es_serial", serial)
+  let base = "/pm_test/" + serial
+  let t = thread_spawn(|pp, bb| do
+    return es_serve(pp, bb)
+  end, p, base)
+  ctx_set(ctx, "es_base", base)
+  ctx_set(ctx, "es_port", p)
+  ctx_set(ctx, "es_thread", t)
+  ctx_set(ctx, "es_stopped", false)
+  return expect(ctx, "the echo service is registered", pm_register_at(ctx_get(ctx, "pm_port"), step_arg(ctx, "name"), p), "OK")
+end
+
+# ---- the steps ----
+
+make a function called st_pm_connect takes ctx returns ok
+  ctx_set(ctx, "got", pm_connect_at(ctx_get(ctx, "pm_port"), step_arg(ctx, "name")))
+  return true
+end
+
+make a function called st_pm_ok takes ctx returns ok
+  return expect(ctx, "the marshaller answers OK, and the client holds a connection", ctx_get(ctx, "got")[0] > 0, true)
+end
+
+make a function called st_pm_refused takes ctx returns ok
+  let got = ctx_get(ctx, "got")
+  let a = expect(ctx, "no connection is given", got[0], 0 - 1)
+  let b = expect(ctx, "the answer", got[1], step_arg(ctx, "text"))
+  return a and b
+end
+
+make a function called st_pm_bytes_255 takes ctx returns ok
+  let conn = ctx_get(ctx, "got")[0]
+  let sent = pt_bytes_0_255()
+  tcp_write(conn, sent)
+  let back = pt_read_n(conn, 256, 10000)
+  return expect(ctx, "bytes 0 to 255 come back the same", pt_same(back, sent), true)
+end
+
+# The block is written on a thread of its own while this one reads, so neither
+# side waits for the other to read.
+make a function called st_pm_block takes ctx returns ok
+  let conn = ctx_get(ctx, "got")[0]
+  let block = pt_block(1, 1048576)
+  let w = thread_spawn(|c, text| do
+    tcp_write(c, text)
+    return true
+  end, conn, block)
+  let back = pt_read_n(conn, 1048576, 60000)
+  thread_result(w)
+  tcp_close(conn)
+  let a = expect(ctx, "1 MB comes back: " + str_len(back) + " bytes", str_len(back), 1048576)
+  let b = expect(ctx, "and the same bytes", pt_same(back, block), true)
+  return a and b
+end
+
+make a function called pt_client_turns takes port, seed returns same
+  let got = pm_connect_at(port, "echo")
+  if got[0] < 0 then
+    return false
+  end
+  let conn = got[0]
+  let all = pt_block(seed, 65536)
+  let b = bytes_from_str(all)
+  let same = true
+  let at = 0
+  while at < 65536 do
+    let turn = bytes_to_str(bytes_slice(b, at, 4096))
+    tcp_write(conn, turn)
+    if not pt_same(pt_read_n(conn, 4096, 10000), turn) then
+      let same = false
+    end
+    let at = at + 4096
+  end
+  tcp_close(conn)
+  return same
+end
+
+make a function called st_pm_two_clients takes ctx returns ok
+  let port = ctx_get(ctx, "pm_port")
+  let a = thread_spawn(|p| do
+    return pt_client_turns(p, 2)
+  end, port)
+  let b = thread_spawn(|p| do
+    return pt_client_turns(p, 3)
+  end, port)
+  ctx_set(ctx, "two", [thread_result(a), thread_result(b)])
+  return true
+end
+
+make a function called st_pm_each_own takes ctx returns ok
+  return expect(ctx, "each client got back its own 64 KB", ctx_get(ctx, "two"), [true, true])
+end
+
+make a function called st_pm_client_closes takes ctx returns ok
+  ctx_set(ctx, "ended_before", es_ended(ctx_get(ctx, "es_base")))
+  let got = pm_connect_at(ctx_get(ctx, "pm_port"), "echo")
+  let a = expect(ctx, "the client is connected", got[0] > 0, true)
+  tcp_close(got[0])
+  return a
+end
+
+make a function called st_pm_service_sees_end takes ctx returns ok
+  return expect(ctx, "the echo service's connection ends within 5 s", es_ended_past(ctx_get(ctx, "es_base"), ctx_get(ctx, "ended_before"), 5000), true)
+end
+
+make a function called st_pm_service_closes takes ctx returns ok
+  let got = pm_connect_at(ctx_get(ctx, "pm_port"), "echo")
+  ctx_set(ctx, "got", got)
+  tcp_write(got[0], "please close")
+  return expect(ctx, "the client is connected", got[0] > 0, true)
+end
+
+make a function called st_pm_client_sees_end takes ctx returns ok
+  let conn = ctx_get(ctx, "got")[0]
+  let st = tcp_read_status(conn, 5000)
+  tcp_close(conn)
+  return expect(ctx, "the client's read says the connection has ended", st[1], "end")
+end
+
+make a function called st_pm_wrong_token takes ctx returns ok
+  let p = tcp_listen(0)
+  let answer = pm_ask(ctx_get(ctx, "pm_port"), "REGISTER other " + p + " 0123456789abcdef0123456789abcdef")
+  tcp_unlisten(p)
+  return expect(ctx, "REGISTER with a wrong token", answer, "ERR wrong token")
+end
+
+make a function called st_pm_name_taken takes ctx returns ok
+  let p = tcp_listen(0)
+  let answer = pm_register_at(ctx_get(ctx, "pm_port"), "echo", p)
+  tcp_unlisten(p)
+  return expect(ctx, "REGISTER of a name a live service holds", answer, "ERR echo is registered")
+end
+
+make a function called st_pm_echo_stops takes ctx returns ok
+  vfs_write(ctx_get(ctx, "es_base") + "/stop", "1")
+  thread_result(ctx_get(ctx, "es_thread"))
+  ctx_set(ctx, "es_stopped", true)
+  return true
+end
+
+make a function called st_pm_list_without takes ctx returns ok
+  let names = []
+  let services = pm_list_at(ctx_get(ctx, "pm_port"))
+  let k = 0
+  while k < list_len(services) do
+    let names = list_push(names, services[k][0])
+    let k = k + 1
+  end
+  return expect(ctx, "LIST names", names, [])
+end
+
+make a function called st_pm_silent takes ctx returns ok
+  ctx_set(ctx, "silent", tcp_connect("127.0.0.1", ctx_get(ctx, "pm_port")))
+  sleep_ms(100)
+  return true
+end
+
+make a function called st_pm_second_client takes ctx returns ok
+  let t0 = clock_ms()
+  let got = pm_connect_at(ctx_get(ctx, "pm_port"), "echo")
+  let back = "" + got[1]
+  if got[0] > 0 then
+    tcp_write(got[0], "second")
+    let back = pt_read_n(got[0], 6, 5000)
+    tcp_close(got[0])
+  end
+  ctx_set(ctx, "second", [back, clock_ms() - t0])
+  return true
+end
+
+make a function called st_pm_within_second takes ctx returns ok
+  let r = ctx_get(ctx, "second")
+  tcp_close(ctx_get(ctx, "silent"))
+  let a = expect(ctx, "the second client's bytes come back", r[0], "second")
+  let b = expect(ctx, "within a second (" + r[1] + " ms)", r[1] < 1000, true)
+  return a and b
+end
+
+make a function called st_pm_keeps_sending takes ctx returns ok
+  let got = pm_connect_at(ctx_get(ctx, "pm_port"), "echo")
+  ctx_set(ctx, "got", got)
+  let block = pt_block(4, 8192)
+  tcp_write(got[0], block)
+  let back = pt_read_n(got[0], 8192, 10000)
+  return expect(ctx, "8 KB went through and came back", pt_same(back, block), true)
+end
+
+# the value after "name=" in a status line, or ""
+make a function called pt_field takes line, name returns v
+  let words = pm_words(line)
+  let k = 0
+  while k < list_len(words) do
+    let parts = pm_split_eq(words[k])
+    if parts[0] == name then
+      return parts[1]
+    end
+    let k = k + 1
+  end
+  return ""
+end
+
+make a function called pm_split_eq takes word returns parts
+  let b = bytes_from_str(word)
+  let n = bytes_len(b)
+  let at = 0
+  while (at < n) and (bytes_get(b, at) != 61) do
+    let at = at + 1
+  end
+  if at == n then
+    return [word, ""]
+  end
+  return [bytes_to_str(bytes_slice(b, 0, at)), bytes_to_str(bytes_slice(b, at + 1, n - at - 1))]
+end
+
+make a function called st_pm_status takes ctx returns ok
+  let line = pm_status_at(ctx_get(ctx, "pm_port"))
+  let a = expect(ctx, "status names the service: " + line, pt_field(line, "names"), "echo")
+  let b = expect(ctx, "one pair is open", pt_field(line, "open"), "1")
+  let c = expect(ctx, "8 KB has gone each way", [to_num(pt_field(line, "up")) >= 8192, to_num(pt_field(line, "down")) >= 8192], [true, true])
+  return a and b and c
+end
+
+make a function called st_pm_quit takes ctx returns ok
+  let answer = pm_quit_at(ctx_get(ctx, "pm_port"))
+  # the open pair ends when its client does, so the marshaller need not wait out its drain
+  tcp_close(ctx_get(ctx, "got")[0])
+  return expect(ctx, "QUIT with the token", answer, "OK")
+end
+
+make a function called st_pm_ended takes ctx returns ok
+  let port = ctx_get(ctx, "pm_port")
+  let last = thread_result(ctx_get(ctx, "pm_daemon"))
+  ctx_set(ctx, "pm_quit", true)
+  let a = expect(ctx, "the marshaller ended, every pair done: " + last, pt_field(last, "open"), "0")
+  let b = expect(ctx, "its port can be listened on again", tcp_try_listen(port), port)
+  tcp_unlisten(port)
+  let c = expect(ctx, "its token file is gone", file_exists(signal_token_path(port)), false)
+  return a and b and c
+end
+
+let ctx = ctx_new()
+step(ctx, "a marshaller on a free port", "st_pm_marshaller")
+step(ctx, "an echo service registered as \"{name}\"", "st_pm_echo")
+step(ctx, "a client connects to \"echo\" and closes", "st_pm_client_closes")
+step(ctx, "the echo service sees its connection end", "st_pm_service_sees_end")
+step(ctx, "a client connects to \"echo\" and the service closes its end", "st_pm_service_closes")
+step(ctx, "the client sees its connection end", "st_pm_client_sees_end")
+step(ctx, "a client connects to \"echo\" and keeps sending", "st_pm_keeps_sending")
+step(ctx, "a client connects to the marshaller and sends nothing", "st_pm_silent")
+step(ctx, "another client connects to \"echo\"", "st_pm_second_client")
+step(ctx, "the second client's bytes come back within a second", "st_pm_within_second")
+step(ctx, "a client connects to \"{name}\"", "st_pm_connect")
+step(ctx, "the marshaller answers OK", "st_pm_ok")
+step(ctx, "the marshaller answers \"{text}\" and closes", "st_pm_refused")
+step(ctx, "bytes 0 to 255 sent through it come back the same", "st_pm_bytes_255")
+step(ctx, "a block of 1 MB sent through it comes back the same", "st_pm_block")
+step(ctx, "two clients connect to \"echo\" and each sends 64 KB of its own bytes, in turns of 4 KB", "st_pm_two_clients")
+step(ctx, "each gets back exactly what it sent", "st_pm_each_own")
+step(ctx, "REGISTER with a wrong token is refused", "st_pm_wrong_token")
+step(ctx, "REGISTER of \"echo\" by another service is refused while the first is listening", "st_pm_name_taken")
+step(ctx, "the echo service stops listening", "st_pm_echo_stops")
+step(ctx, "LIST no longer names \"echo\"", "st_pm_list_without")
+step(ctx, "a status query names \"echo\", 1 pair open, and bytes moved each way", "st_pm_status")
+step(ctx, "the marshaller is sent quit", "st_pm_quit")
+step(ctx, "it ends, and its port can be listened on again", "st_pm_ended")
+# --list names the feature files (the gates run each); a failure exits 1
+run_suite(ctx, ["packages/port_marshal/spec/port_marshal.feature"], argv())

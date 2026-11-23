@@ -1841,6 +1841,45 @@ make a function called rt_wait_readable takes sock, ms returns done
   return done
 end
 
+# The positions in socks of those with something to read, a peer that has
+# ended, or a client waiting, after waiting up to ms (-1: no limit) for one:
+# poll, with POLLIN asked and any answer counted (POLLHUP, POLLERR). A signal
+# that ends the wait early (EINTR) waits again for the time left. A struct
+# pollfd is the descriptor (4 bytes), events (2) and revents (2).
+make a function called rt_poll_readable takes socks, ms returns hit
+  require (value_class(socks) == 9) and (list_len(socks) > 0) and (value_class(ms) == 2) and (ms >= 0 - 1)
+  let n = list_len(socks)
+  let fds = rt_alloc(8 * n)
+  let k = 0
+  while k < n do
+    mem_store(fds, 16 + 8 * k, word_or(word_and(socks[k], 4294967295), word_shl(1, 32)))
+    let k = k + 1
+  end
+  let deadline = clock_ms() + ms
+  let wait = ms
+  let got = extern_call("LINUX", "syscall", 7, fds + 16, n, wait)
+  while (0 - got) == 4 do
+    if ms >= 0 then
+      let wait = deadline - clock_ms()
+      if wait < 0 then
+        let wait = 0
+      end
+    end
+    let got = extern_call("LINUX", "syscall", 7, fds + 16, n, wait)
+  end
+  let hit = []
+  let k = 0
+  while k < n do
+    if (mem_load_byte(fds, 22 + 8 * k) != 0) or (mem_load_byte(fds, 23 + 8 * k) != 0) then
+      let hit = list_push(hit, k)
+    end
+    let k = k + 1
+  end
+  rt_free(fds)
+  ensure (value_class(hit) == 9) and (list_len(hit) <= n)
+  return hit
+end
+
 make a function called rt_bind_listen takes sock, port returns actual
   require (value_class(sock) == 2) and (value_class(port) == 2)
   # SOL_SOCKET, SO_REUSEADDR: a port whose listener has ended is free, as on
@@ -1885,6 +1924,12 @@ make a function called rt_accept_waiting takes sock, port, what returns id
   let got = extern_call("LINUX", "syscall", 288, sock, 0, 0, 524288)
   if rt_lx_failed(got) then
     if (0 - got) != 11 then
+      # closed by tcp_unlisten since the caller looked it up
+      if rt_listener_find(port) != sock then
+        let id = 0 - 2
+        ensure id >= 0 - 2
+        return id
+      end
       let id = rt_net_fail(what + ": port " + port + ": accept failed")
       ensure id >= 0 - 1
       return id
@@ -2158,4 +2203,22 @@ make a function called tcp_try_listen takes port returns actual
   rt_engine_push(4320, [actual, sock])
   ensure (actual >= 0 - 1) and (actual < 65536)
   return actual
+end
+
+# Closes this program's listener on the port, which is then free. It leaves the
+# table first, so a thread waiting on it (tcp_accept, tcp_accept_timeout) finds
+# it gone at its next look.
+make a function called tcp_unlisten takes port returns done
+  require (value_class(port) == 2)
+  let sock = rt_listener_find(port)
+  if sock < 0 then
+    let done = rt_net_fail("tcp_unlisten: no listener on port " + port)
+    ensure value_class(done) == 1
+    return done
+  end
+  rt_engine_drop(4320, port)
+  rt_lx_close(sock)
+  let done = true
+  ensure value_class(done) == 1
+  return done
 end

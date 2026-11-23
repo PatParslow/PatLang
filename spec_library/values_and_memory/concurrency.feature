@@ -82,6 +82,16 @@ Feature: fibers, budgeted blocks and threads (spec 1.8)
     When a client then connects while the program waits in tcp_accept
     Then every timed wait gives -1, and tcp_accept gets the client and what it sent
 
+  Scenario: a listener can be closed, and its port is free at once
+    Given a listener, closed with tcp_unlisten, then listened on again with a thread waiting on it with tcp_accept_timeout for 10 s, and closed again
+    Then the port is free at once, the waiting thread gets -1 within 5 s, and the port can be listened on and accepted on again
+    And tcp_unlisten of a port the program is not listening on stops it, saying so, and nothing after it runs
+
+  Scenario: one wait on several connections and listeners
+    Given two connections each way, data written to some of them, and one closed
+    Then tcp_wait_any gives the ready connections and listeners in the order given, [[], []] when its time is up, and a closed peer counts as ready
+    And tcp_wait_any given a connection the program does not hold stops it, saying so, and nothing after it runs
+
   Scenario: a fiber that is running cannot be resumed
     Given a fiber whose function resumes the fiber it is running in
     When it runs

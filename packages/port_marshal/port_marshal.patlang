@@ -1,0 +1,612 @@
+# port_marshal: one well-known port, services found by name.
+#
+# A marshaller listens on one port (9400 by default). A service listens on any
+# free port, registers a name with the marshaller, and a client that asks for
+# the name is piped through to the service, both ways, until either side ends.
+# Only the marshaller's port is fixed, so programs that each want a port of
+# their own no longer collide.
+#
+# The protocol, from a client to the marshaller's port; each line ends with LF:
+#   CONNECT name                  OK, then the piped bytes; or ERR no service name
+#   REGISTER name port token      OK, or ERR ...
+#   UNREGISTER name token         OK, or ERR ...
+#   LIST                          a line "name port" for each service, then an empty line
+#   STATUS                        one line: services=N open=N done=N up=N down=N
+#   QUIT token                    OK; the marshaller stops taking clients, lets the
+#                                 open pairs finish, and ends
+# The token is the marshaller's run token, in the file signal_token_path(port)
+# (lib/signals.patlang), which only the same user can read. CONNECT, LIST and
+# STATUS need none: a service on this machine can be reached on its own port
+# anyway. The marshaller's own port is its status and quit channel, so it claims
+# no second port for signals.
+#
+# The daemon: one control thread owns the route table, and nothing else writes
+# it. It waits with tcp_wait_any on the listener and on the connections whose
+# first line has not yet arrived, so a client that sends nothing holds up no
+# one (and one that sends no full line within pm_line_ms() is closed). Each
+# CONNECT that succeeds gets a pump thread, handed its two connections and
+# nothing else: a slow reader holds up only its own pair.
+include "../../self_hosting/lib/signals.patlang"
+
+make a function called pm_default_port returns port
+  return 9400
+end
+
+# how long a client may take over its first line
+make a function called pm_line_ms returns ms
+  return 10000
+end
+
+make a function called pm_max_line returns n
+  return 4096
+end
+
+# ---- text, by its bytes ----
+# Piped text is any bytes, so it is split as bytes: indexing a text with a byte
+# of 128 or more in it walks from its start (spec 1.10).
+
+# [the text before the first LF, the text after it], or [false, text] with no LF.
+make a function called pm_split_line takes text returns parts
+  let b = bytes_from_str(text)
+  let n = bytes_len(b)
+  let at = 0
+  while (at < n) and (bytes_get(b, at) != 10) do
+    let at = at + 1
+  end
+  if at == n then
+    return [false, text]
+  end
+  return [bytes_to_str(bytes_slice(b, 0, at)), bytes_to_str(bytes_slice(b, at + 1, n - at - 1))]
+end
+
+# a text without the spaces, tabs, CRs and LFs at either end
+make a function called pm_trim takes text returns out
+  let b = bytes_from_str(text)
+  let n = bytes_len(b)
+  let s = 0
+  while (s < n) and pm_blank(bytes_get(b, s)) do
+    let s = s + 1
+  end
+  let e = n
+  while (e > s) and pm_blank(bytes_get(b, e - 1)) do
+    let e = e - 1
+  end
+  return bytes_to_str(bytes_slice(b, s, e - s))
+end
+
+make a function called pm_blank takes c returns yes
+  return (c == 32) or (c == 9) or (c == 13) or (c == 10)
+end
+
+# the lines of a text, without their LFs; a last line with no LF is kept
+make a function called pm_lines takes text returns lines
+  let out = []
+  let left = text
+  let more = str_len(left) > 0
+  while more do
+    let parts = pm_split_line(left)
+    if parts[0] == false then
+      let out = list_push(out, left)
+      let more = false
+    else
+      let out = list_push(out, parts[0])
+      let left = parts[1]
+      let more = str_len(left) > 0
+    end
+  end
+  return out
+end
+
+# the words of a line, split at spaces, none empty
+make a function called pm_words takes line returns words
+  let b = bytes_from_str(pm_trim(line))
+  let n = bytes_len(b)
+  let out = []
+  let start = 0
+  let i = 0
+  while i <= n do
+    if (i == n) or (bytes_get(b, i) == 32) then
+      if i > start then
+        let out = list_push(out, bytes_to_str(bytes_slice(b, start, i - start)))
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called pm_has takes items, x returns yes
+  let k = 0
+  while k < list_len(items) do
+    if items[k] == x then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# ---- the client side ----
+
+# The first line of what arrives on conn, and the rest after it: [line, rest],
+# or [false, ""] when the peer ends first or nothing comes within ms.
+make a function called pm_read_line takes conn, ms returns got
+  let b = sb_new()
+  let deadline = clock_ms() + ms
+  while true do
+    let left = deadline - clock_ms()
+    if left <= 0 then
+      return [false, ""]
+    end
+    let st = tcp_read_status(conn, left)
+    if st[1] == "data" then
+      sb_push(b, st[0])
+      let parts = pm_split_line(sb_str(b))
+      if parts[0] != false then
+        return parts
+      end
+    elif st[1] != "wait" then
+      return [false, ""]
+    end
+  end
+  return [false, ""]
+end
+
+# One request with a one-line answer: the answer, or "ERR no marshaller" when
+# none is listening on the port.
+make a function called pm_ask takes port, request returns answer
+  let conn = tcp_try_connect("127.0.0.1", port)
+  if conn < 0 then
+    return "ERR no marshaller"
+  end
+  tcp_write(conn, request + chr(10))
+  let got = pm_read_line(conn, 10000)
+  tcp_close(conn)
+  if got[0] == false then
+    return "ERR no answer"
+  end
+  return got[0]
+end
+
+make a function called pm_token takes port returns token
+  let path = signal_token_path(port)
+  if not file_exists(path) then
+    return ""
+  end
+  return pm_trim(read_file(path))
+end
+
+make a function called pm_register_at takes port, name, service_port returns answer
+  return pm_ask(port, "REGISTER " + name + " " + service_port + " " + pm_token(port))
+end
+
+make a function called pm_unregister_at takes port, name returns answer
+  return pm_ask(port, "UNREGISTER " + name + " " + pm_token(port))
+end
+
+make a function called pm_quit_at takes port returns answer
+  return pm_ask(port, "QUIT " + pm_token(port))
+end
+
+make a function called pm_status_at takes port returns answer
+  return pm_ask(port, "STATUS")
+end
+
+# [[name, port], ...] of the services registered, or [] with no marshaller.
+make a function called pm_list_at takes port returns services
+  let conn = tcp_try_connect("127.0.0.1", port)
+  if conn < 0 then
+    return []
+  end
+  tcp_write(conn, "LIST" + chr(10))
+  let b = sb_new()
+  let more = true
+  while more do
+    let chunk = tcp_read_or_empty(conn)
+    if chunk == "" then
+      let more = false
+    else
+      sb_push(b, chunk)
+    end
+  end
+  tcp_close(conn)
+  let out = []
+  let lines = pm_lines(sb_str(b))
+  let k = 0
+  while k < list_len(lines) do
+    let parts = pm_words(lines[k])
+    if list_len(parts) == 2 then
+      let out = list_push(out, [parts[0], to_num(parts[1])])
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+# A connection piped to the service registered as name: [conn, rest], where rest
+# is any of the service's bytes that came in with OK; [-1, reason] when there is
+# no such service, or no marshaller.
+make a function called pm_connect_at takes port, name returns got
+  let conn = tcp_try_connect("127.0.0.1", port)
+  if conn < 0 then
+    return [0 - 1, "ERR no marshaller"]
+  end
+  tcp_write(conn, "CONNECT " + name + chr(10))
+  let line = pm_read_line(conn, 10000)
+  if line[0] != "OK" then
+    tcp_close(conn)
+    if line[0] == false then
+      return [0 - 1, "ERR no answer"]
+    end
+    return [0 - 1, line[0]]
+  end
+  return [conn, line[1]]
+end
+
+# Listens on a free port and registers it as name: the port, or -1 when the
+# marshaller refuses (the listener is then closed again).
+make a function called pm_serve_on_at takes port, name returns service_port
+  let p = tcp_listen(0)
+  if pm_register_at(port, name, p) != "OK" then
+    tcp_unlisten(p)
+    return 0 - 1
+  end
+  return p
+end
+
+make a function called pm_register takes name, service_port returns answer
+  return pm_register_at(pm_default_port(), name, service_port)
+end
+
+make a function called pm_unregister takes name returns answer
+  return pm_unregister_at(pm_default_port(), name)
+end
+
+make a function called pm_list returns services
+  return pm_list_at(pm_default_port())
+end
+
+make a function called pm_connect takes name returns got
+  return pm_connect_at(pm_default_port(), name)
+end
+
+make a function called pm_serve_on takes name returns service_port
+  return pm_serve_on_at(pm_default_port(), name)
+end
+
+# ---- the daemon ----
+
+# Where a pump keeps its counts while it runs, "up down", for status: a virtual
+# file of its own, which threads may write together (spec 1.8).
+make a function called pm_count_key takes port, serial returns key
+  return "/port_marshal/" + port + "/pump/" + serial
+end
+
+# Moves bytes both ways between a and b until either ends, then closes both:
+# [bytes a to b, bytes b to a]. first is what a sent before the pipe began.
+# Its counts are kept at key as they change.
+make a function called pm_pump takes a, b, first, key returns moved
+  let up = 0
+  let down = 0
+  if str_len(first) > 0 then
+    tcp_try_write(b, first)
+    let up = str_len(first)
+  end
+  vfs_write(key, up + " " + down)
+  let open = true
+  while open do
+    let ready = tcp_wait_any([a, b], [], 1000)[0]
+    let k = 0
+    while (k < list_len(ready)) and open do
+      let from = ready[k]
+      let st = tcp_read_status(from, 0)
+      if st[1] == "data" then
+        if from == a then
+          if not tcp_try_write(b, st[0]) then
+            let open = false
+          end
+          let up = up + str_len(st[0])
+        else
+          if not tcp_try_write(a, st[0]) then
+            let open = false
+          end
+          let down = down + str_len(st[0])
+        end
+        vfs_write(key, up + " " + down)
+      elif st[1] != "wait" then
+        let open = false
+      end
+      let k = k + 1
+    end
+  end
+  tcp_close(a)
+  tcp_close(b)
+  vfs_delete(key)
+  return [up, down]
+end
+
+# The control thread's state. Only that thread reads or writes it.
+class Marshal {
+  field port = 0
+  field token = ""
+  field routes = []
+  field pending = []
+  field pumps = []
+  field serial = 0
+  field done = 0
+  field up = 0
+  field down = 0
+  field quitting = false
+}
+
+make a function called pm_route_index takes m, name returns i
+  let k = 0
+  while k < list_len(m.routes) do
+    if m.routes[k][0] == name then
+      return k
+    end
+    let k = k + 1
+  end
+  return 0 - 1
+end
+
+make a function called pm_drop_route takes m, name returns done
+  let kept = []
+  let k = 0
+  while k < list_len(m.routes) do
+    if m.routes[k][0] != name then
+      let kept = list_push(kept, m.routes[k])
+    end
+    let k = k + 1
+  end
+  m.routes = kept
+  return true
+end
+
+# whether something is listening on the port (connects, and closes at once)
+make a function called pm_alive takes port returns yes
+  let c = tcp_try_connect("127.0.0.1", port)
+  if c < 0 then
+    return false
+  end
+  tcp_close(c)
+  return true
+end
+
+make a function called pm_reply takes conn, text returns done
+  tcp_try_write(conn, text + chr(10))
+  tcp_close(conn)
+  return true
+end
+
+# services=N names=a,b open=N done=N up=N down=N: the bytes each way count the
+# finished pairs and what the open ones have moved so far
+make a function called pm_status_line takes m returns line
+  let up = m.up
+  let down = m.down
+  let k = 0
+  while k < list_len(m.pumps) do
+    let key = m.pumps[k][1]
+    if vfs_exists(key) then
+      let counts = pm_words(vfs_read(key))
+      if list_len(counts) == 2 then
+        let up = up + to_num(counts[0])
+        let down = down + to_num(counts[1])
+      end
+    end
+    let k = k + 1
+  end
+  let names = sb_new()
+  let k = 0
+  while k < list_len(m.routes) do
+    if k > 0 then
+      sb_push(names, ",")
+    end
+    sb_push(names, m.routes[k][0])
+    let k = k + 1
+  end
+  return "services=" + list_len(m.routes) + " names=" + sb_str(names) + " open=" + list_len(m.pumps) + " done=" + m.done + " up=" + up + " down=" + down
+end
+
+# One first line from conn, with after the bytes that came after it; the
+# connection is answered and closed, or handed to a pump. (A last parameter
+# named rest would take any further arguments as a list, spec 1.13.)
+make a function called pm_handle takes m, conn, line, after returns done
+  let words = pm_words(line)
+  let verb = ""
+  if list_len(words) > 0 then
+    let verb = words[0]
+  end
+  if (verb == "CONNECT") and (list_len(words) == 2) then
+    let name = words[1]
+    let i = pm_route_index(m, name)
+    if i < 0 then
+      return pm_reply(conn, "ERR no service " + name)
+    end
+    let backend = tcp_try_connect("127.0.0.1", m.routes[i][1])
+    if backend < 0 then
+      pm_drop_route(m, name)
+      return pm_reply(conn, "ERR no service " + name)
+    end
+    tcp_write(conn, "OK" + chr(10))
+    m.serial = m.serial + 1
+    let key = pm_count_key(m.port, m.serial)
+    let id = thread_spawn(|c, s, f, k| do
+      return pm_pump(c, s, f, k)
+    end, conn, backend, after, key)
+    m.pumps = list_push(m.pumps, [id, key])
+    return true
+  end
+  if (verb == "REGISTER") and (list_len(words) == 4) then
+    if words[3] != m.token then
+      return pm_reply(conn, "ERR wrong token")
+    end
+    let name = words[1]
+    let p = to_num(words[2])
+    if (type_of(p) != "int") or (p < 1) or (p > 65535) then
+      return pm_reply(conn, "ERR not a port: " + words[2])
+    end
+    # The new service is not probed: a connection it did not ask for could take
+    # its first accept. The name's holder is, only when the name is taken, so a
+    # service that restarts on another port can take its name back.
+    let i = pm_route_index(m, name)
+    if i >= 0 then
+      if m.routes[i][1] == p then
+        return pm_reply(conn, "OK")
+      end
+      if pm_alive(m.routes[i][1]) then
+        return pm_reply(conn, "ERR " + name + " is registered")
+      end
+      pm_drop_route(m, name)
+    end
+    m.routes = list_push(m.routes, [name, p])
+    return pm_reply(conn, "OK")
+  end
+  if (verb == "UNREGISTER") and (list_len(words) == 3) then
+    if words[2] != m.token then
+      return pm_reply(conn, "ERR wrong token")
+    end
+    if pm_route_index(m, words[1]) < 0 then
+      return pm_reply(conn, "ERR no service " + words[1])
+    end
+    pm_drop_route(m, words[1])
+    return pm_reply(conn, "OK")
+  end
+  if (verb == "LIST") and (list_len(words) == 1) then
+    let b = sb_new()
+    let k = 0
+    while k < list_len(m.routes) do
+      sb_push(b, m.routes[k][0] + " " + m.routes[k][1] + chr(10))
+      let k = k + 1
+    end
+    return pm_reply(conn, sb_str(b))
+  end
+  if (verb == "STATUS") and (list_len(words) == 1) then
+    return pm_reply(conn, pm_status_line(m))
+  end
+  if (verb == "QUIT") and (list_len(words) == 2) then
+    if words[1] != m.token then
+      return pm_reply(conn, "ERR wrong token")
+    end
+    m.quitting = true
+    return pm_reply(conn, "OK")
+  end
+  return pm_reply(conn, "ERR not understood")
+end
+
+# Pumps that have finished: their counts are added, and they leave the list.
+make a function called pm_reap takes m returns done
+  let open = []
+  let k = 0
+  while k < list_len(m.pumps) do
+    let id = m.pumps[k]
+    if thread_poll(id[0]) then
+      let moved = thread_result(id[0])
+      m.up = m.up + moved[0]
+      m.down = m.down + moved[1]
+      m.done = m.done + 1
+    else
+      let open = list_push(open, id)
+    end
+    let k = k + 1
+  end
+  m.pumps = open
+  return true
+end
+
+# A first line that has arrived on a pending connection: the pending entry
+# [conn, text so far, started] becomes a request, stays pending, or is closed.
+make a function called pm_feed takes m, entry returns keep
+  let st = tcp_read_status(entry[0], 0)
+  if st[1] == "wait" then
+    return entry
+  end
+  if st[1] != "data" then
+    tcp_close(entry[0])
+    return false
+  end
+  let text = entry[1] + st[0]
+  let parts = pm_split_line(text)
+  if parts[0] == false then
+    if str_len(text) > pm_max_line() then
+      pm_reply(entry[0], "ERR line too long")
+      return false
+    end
+    return [entry[0], text, entry[2]]
+  end
+  pm_handle(m, entry[0], pm_trim(parts[0]), parts[1])
+  return false
+end
+
+# A marshaller for the port, which is listening already, with its run token
+# written for clients: register with it as soon as this returns.
+make a function called pm_start takes port returns m
+  let m = new("Marshal")
+  m.port = port
+  m.token = signal_new_token()
+  write_file(signal_token_path(port), m.token)
+  return m
+end
+
+make a function called pm_run takes port, drain_ms returns m
+  return pm_loop(pm_start(port), drain_ms)
+end
+
+# Serves until QUIT; then lets the open pairs finish, for at most drain_ms (each
+# pump ends when either side does), and removes the token.
+make a function called pm_loop takes m, drain_ms returns m2
+  let port = m.port
+  while not m.quitting do
+    let conns = []
+    let k = 0
+    while k < list_len(m.pending) do
+      let conns = list_push(conns, m.pending[k][0])
+      let k = k + 1
+    end
+    let ready = tcp_wait_any(conns, [port], 200)
+    if list_len(ready[1]) > 0 then
+      let c = tcp_accept_timeout(port, 0)
+      if c >= 1 then
+        m.pending = list_push(m.pending, [c, "", clock_ms()])
+      end
+    end
+    # every pending connection is fed what has come, and one too slow is closed
+    let still = []
+    let k = 0
+    while k < list_len(m.pending) do
+      let e = m.pending[k]
+      let e2 = e
+      if pm_has(ready[0], e[0]) then
+        let e2 = pm_feed(m, e)
+      end
+      if e2 != false then
+        if clock_ms() - e2[2] > pm_line_ms() then
+          pm_reply(e2[0], "ERR no line")
+        else
+          let still = list_push(still, e2)
+        end
+      end
+      let k = k + 1
+    end
+    m.pending = still
+    pm_reap(m)
+  end
+  tcp_unlisten(port)
+  let k = 0
+  while k < list_len(m.pending) do
+    tcp_close(m.pending[k][0])
+    let k = k + 1
+  end
+  m.pending = []
+  let deadline = clock_ms() + drain_ms
+  while (list_len(m.pumps) > 0) and (clock_ms() < deadline) do
+    sleep_ms(20)
+    pm_reap(m)
+  end
+  let path = signal_token_path(port)
+  if file_exists(path) then
+    remove_file(path)
+  end
+  return m
+end
