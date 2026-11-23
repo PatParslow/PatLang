@@ -60,7 +60,10 @@ d-digit integer by an e-digit one costs time growing as (d - e + 1) * e, and
 a gcd of two d-digit numbers as d squared. Adding, subtracting and
 multiplying rationals reduce by the gcds of their parts' factors, never of
 the whole result (Knuth, TAOCP 4.5.1), so adding 1/k to a fraction of many
-digits costs about one division by k.
+digits costs about one division by k. `/` of two ints that divide exactly
+gives their int quotient without making a rational, and costs about what
+their remainder does (compiled, the machine's division, inline); it went
+through the rationals, and cost about 20 us, until 2026-11-23.
 
 ### 1.4 Operators are methods, and raise ordinary events
 
@@ -470,6 +473,13 @@ the ends. An interval prints as `[lo,hi]` and stays an interval when its ends ar
 - `read_file` reads every byte of a file, whatever its size, and gives `""` for one it cannot
   open or read; a file cut short while it is read gives the bytes there were. `write_file` and
   `write_file_bytes` give `true` only when every byte was written and the file closed.
+  `append_file(path, text)` and `append_file_bytes(path, data)` add to the end of a file,
+  making it and the directories above it when they are not there, with the same answer. Each
+  call's bytes go to the end however other threads or programs append to the file
+  (`FILE_APPEND_DATA` on Windows, `O_APPEND` on Linux): 4 threads appending 200 lines each
+  leave 800 whole lines. Neither flushes to the disk itself, so a write the system has taken
+  survives the program's end or crash, but not a power cut. In a browser there are no files
+  and both give `false`.
 - A thread that the system cannot start stops the program, saying so, rather than giving
   `unit` as its result. A pipe that cannot be made is a program that cannot start:
   `exec_capture` gives `""`, as for any program that cannot start, and `exec_capture_io`

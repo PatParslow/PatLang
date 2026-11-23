@@ -96,6 +96,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When dir_files reads it, and a path with no directory at it
     Then it gives the two files by name with their sizes, the later one's written the larger, no subdirectory, and [] for the missing path
 
+  Scenario: append_file and append_file_bytes add to a file's end
+    Given a path whose file and directory are not there, a file of bytes, and 4 threads that each append 200 lines to one file
+    When each appends
+    Then the file is made and holds what was appended in order, the bytes are whole, the 800 lines are all there whole, and appending to a directory gives false
+
   Scenario: the runtime's primitives and rt_ functions are the runtime's alone
     Given a program, not a quiet file, that calls runtime_state, mem_load and rt_alloc, and another that names rt_str_alloc as apply's function
     When each is built or interpreted

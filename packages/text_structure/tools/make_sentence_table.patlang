@@ -1,0 +1,288 @@
+# Makes packages/text_structure/sentence_table.patlang from Unicode's
+# Sentence_Break data, from the repository root:
+#
+#   ./self_hosting/build/v2_interp.exe packages/text_structure/tools/make_sentence_table.patlang
+#
+# It reads data/SentenceBreakProperty.txt, takes each "XXXX..YYYY ; Class" line,
+# sorts the ranges, joins neighbours of one class, and writes them as one flat
+# list [lo, hi, class, lo, hi, class, ...] with the classes numbered as
+# ts_sb_class_names() lists them. The data file's first lines (its name,
+# version, date and notice) go at the top of the table. Code points not in the
+# data are Other. It prints the ranges' count, and exits 1 if a line does not
+# parse or two ranges overlap.
+
+make a function called mt_names returns names
+  return ["Other", "CR", "LF", "Extend", "Sep", "Format", "Sp", "Lower", "Upper", "OLetter", "Numeric", "ATerm", "SContinue", "STerm", "Close"]
+end
+
+make a function called mt_hex takes b, from, to returns n
+  let n = 0
+  let i = from
+  while i < to do
+    let c = bytes_get(b, i)
+    let d = 0 - 1
+    if (c >= 48) and (c <= 57) then
+      let d = c - 48
+    elif (c >= 65) and (c <= 70) then
+      let d = c - 55
+    elif (c >= 97) and (c <= 102) then
+      let d = c - 87
+    end
+    if d < 0 then
+      return 0 - 1
+    end
+    let n = n * 16 + d
+    let i = i + 1
+  end
+  return n
+end
+
+# one data line (its bytes): [lo, hi, class], or false for a comment or blank
+make a function called mt_line takes b returns r
+  let n = bytes_len(b)
+  if (n == 0) or (bytes_get(b, 0) == 35) then
+    return false
+  end
+  let semi = 0
+  while (semi < n) and (bytes_get(b, semi) != 59) do
+    let semi = semi + 1
+  end
+  if semi == n then
+    return false
+  end
+  let e = semi
+  while (e > 0) and (bytes_get(b, e - 1) == 32) do
+    let e = e - 1
+  end
+  let dots = 0 - 1
+  let i = 0
+  while i + 1 < e do
+    if (bytes_get(b, i) == 46) and (bytes_get(b, i + 1) == 46) then
+      let dots = i
+    end
+    let i = i + 1
+  end
+  let lo = 0
+  let hi = 0
+  if dots >= 0 then
+    let lo = mt_hex(b, 0, dots)
+    let hi = mt_hex(b, dots + 2, e)
+  else
+    let lo = mt_hex(b, 0, e)
+    let hi = lo
+  end
+  let s = semi + 1
+  while (s < n) and (bytes_get(b, s) == 32) do
+    let s = s + 1
+  end
+  let t = s
+  while (t < n) and (bytes_get(b, t) != 32) and (bytes_get(b, t) != 35) do
+    let t = t + 1
+  end
+  let name = bytes_to_str(bytes_slice(b, s, t - s))
+  let names = mt_names()
+  let cls = 0 - 1
+  let k = 0
+  while k < list_len(names) do
+    if names[k] == name then
+      let cls = k
+    end
+    let k = k + 1
+  end
+  return [lo, hi, cls]
+end
+
+make a function called mt_lines takes b returns lines
+  let out = []
+  let start = 0
+  let k = 0
+  let n = bytes_len(b)
+  while k <= n do
+    if (k == n) or (bytes_get(b, k) == 10) then
+      let e = k
+      if (e > start) and (bytes_get(b, e - 1) == 13) then
+        let e = e - 1
+      end
+      let out = list_push(out, bytes_slice(b, start, e - start))
+      let start = k + 1
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+# ranges sorted by their low end: a merge sort, O(n log n), over the 3000 or
+# so ranges (the data file lists them class by class)
+make a function called mt_sort takes items returns sorted
+  let n = list_len(items)
+  if n <= 1 then
+    return items
+  end
+  let h = word_shr(n, 1)
+  let left = mt_sort(list_slice_n(items, 0, h))
+  let right = mt_sort(list_slice_n(items, h, n - h))
+  let out = []
+  let i = 0
+  let j = 0
+  while (i < list_len(left)) or (j < list_len(right)) do
+    if (j >= list_len(right)) or ((i < list_len(left)) and (left[i][0] <= right[j][0])) then
+      let out = list_push(out, left[i])
+      let i = i + 1
+    else
+      let out = list_push(out, right[j])
+      let j = j + 1
+    end
+  end
+  return out
+end
+
+# the first offset at or after from where pat is in b, or -1
+make a function called mt_find takes b, pat, from returns at
+  let n = bytes_len(b)
+  let m = bytes_len(pat)
+  let i = from
+  while i + m <= n do
+    let k = 0
+    while (k < m) and (bytes_get(b, i + k) == bytes_get(pat, k)) do
+      let k = k + 1
+    end
+    if k == m then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called list_slice_n takes items, from, n returns out
+  let out = []
+  let k = 0
+  while k < n do
+    let out = list_push(out, items[from + k])
+    let k = k + 1
+  end
+  return out
+end
+
+let source = "packages/text_structure/data/SentenceBreakProperty.txt"
+let target = "packages/text_structure/sentence_table.patlang"
+let lines = mt_lines(read_file_raw(source))
+let ranges = []
+let bad = 0
+let k = 0
+while k < list_len(lines) do
+  let r = mt_line(lines[k])
+  if r != false then
+    if (r[0] < 0) or (r[1] < r[0]) or (r[2] < 0) then
+      print("does not parse, line " + (k + 1) + ": " + bytes_to_str(lines[k]))
+      let bad = bad + 1
+    else
+      let ranges = list_push(ranges, r)
+    end
+  end
+  let k = k + 1
+end
+let sorted = mt_sort(ranges)
+# neighbours of one class joined; an overlap is an error
+let joined = []
+let k = 0
+while k < list_len(sorted) do
+  let r = sorted[k]
+  let n = list_len(joined)
+  if (n > 0) and (joined[n - 1][1] >= r[0]) then
+    print("ranges overlap at " + r[0])
+    let bad = bad + 1
+  end
+  if (n > 0) and (joined[n - 1][1] + 1 == r[0]) and (joined[n - 1][2] == r[2]) then
+    let last = joined[n - 1]
+    let joined = list_set(joined, n - 1, [last[0], r[1], last[2]])
+  else
+    let joined = list_push(joined, r)
+  end
+  let k = k + 1
+end
+if bad > 0 then
+  exit_with(1)
+end
+let out = sb_new()
+sb_push(out, "# Generated by packages/text_structure/tools/make_sentence_table.patlang from" + chr(10))
+sb_push(out, "# data/SentenceBreakProperty.txt; do not edit. That file's first lines:" + chr(10))
+let k = 0
+while k < 5 do
+  sb_push(out, bytes_to_str(lines[k]) + chr(10))
+  let k = k + 1
+end
+sb_push(out, "#" + chr(10))
+sb_push(out, "# The Sentence_Break value of each range of code points, as one flat list" + chr(10))
+sb_push(out, "# [lo, hi, class, ...] sorted by lo, the classes numbered as" + chr(10))
+sb_push(out, "# ts_sb_class_names() lists them; code points in no range are Other (0)." + chr(10))
+sb_push(out, chr(10) + "make a function called ts_sb_class_names returns names" + chr(10))
+sb_push(out, "  return [")
+let names = mt_names()
+let k = 0
+while k < list_len(names) do
+  if k > 0 then
+    sb_push(out, ", ")
+  end
+  sb_push(out, chr(34) + names[k] + chr(34))
+  let k = k + 1
+end
+sb_push(out, "]" + chr(10) + "end" + chr(10) + chr(10))
+sb_push(out, "make a function called ts_sb_ranges returns ranges" + chr(10) + "  return [")
+let k = 0
+while k < list_len(joined) do
+  if k > 0 then
+    sb_push(out, ",")
+    if k % 8 == 0 then
+      sb_push(out, chr(10) + "    ")
+    else
+      sb_push(out, " ")
+    end
+  end
+  let r = joined[k]
+  sb_push(out, "" + r[0] + ", " + r[1] + ", " + r[2])
+  let k = k + 1
+end
+sb_push(out, "]" + chr(10) + "end" + chr(10))
+# CLDR's English sentence-break suppressions: each <suppression>TEXT</suppression>
+# of data/cldr_segments_en.xml (CLDR common/segments/en.xml, Unicode licence)
+let xml = read_file_raw("packages/text_structure/data/cldr_segments_en.xml")
+let open_tag = bytes_from_str("<suppression>")
+let close_tag = bytes_from_str("</suppression>")
+let sups = []
+let p = 0
+let xn = bytes_len(xml)
+while p < xn do
+  let at = mt_find(xml, open_tag, p)
+  if at < 0 then
+    let p = xn
+  else
+    let from = at + bytes_len(open_tag)
+    let to = mt_find(xml, close_tag, from)
+    if to < 0 then
+      print("a suppression is not closed")
+      exit_with(1)
+    end
+    let sups = list_push(sups, bytes_to_str(bytes_slice(xml, from, to - from)))
+    let p = to + bytes_len(close_tag)
+  end
+end
+sb_push(out, chr(10) + "# CLDR's English sentence-break suppressions (common/segments/en.xml):" + chr(10))
+sb_push(out, "# no sentence ends straight after one of these" + chr(10))
+sb_push(out, "make a function called ts_cldr_suppressions returns texts" + chr(10) + "  return [")
+let k = 0
+while k < list_len(sups) do
+  if k > 0 then
+    sb_push(out, ",")
+    if k % 10 == 0 then
+      sb_push(out, chr(10) + "    ")
+    else
+      sb_push(out, " ")
+    end
+  end
+  sb_push(out, chr(34) + sups[k] + chr(34))
+  let k = k + 1
+end
+sb_push(out, "]" + chr(10) + "end" + chr(10))
+write_file(target, sb_str(out))
+print("" + list_len(joined) + " ranges, from " + list_len(ranges) + " lines; " + list_len(sups) + " suppressions")

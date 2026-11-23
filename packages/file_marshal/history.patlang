@@ -1,0 +1,536 @@
+# file_marshal history: every version of a file, kept on the disk.
+#
+# A file's history is a directory under the store: an append-only log, one
+# record for each version, and whole copies of some versions. A record is
+#   [version, kind, time, client, size after, hash after, data, shifts]
+# with kind one of
+#   "base"     the file as it was when its history began (a whole copy)
+#   "write"    a whole new content (a whole copy)
+#   "outside"  a content changed by something that did not go through the
+#              owner (a whole copy)
+#   "edits"    a batch of edits (data: the edits, file_marshal edits), with
+#              the shifts they made
+#   "append"   bytes added at the end (data: the bytes)
+#   "undo"     the inverse of an earlier version's edits or append (data:
+#              [the version undone, the inverse edits]), with their shifts;
+#              it replays and shifts as edits do, and can itself be undone
+# A revert to an earlier version is a "write" whose data is ["revert", v].
+# A whole copy is also kept every fh_every() versions, so reading an old
+# version replays at most that many records. A copy is written, under a name of
+# its own and renamed, before its record is appended, and the record before
+# the file is replaced, so a crash leaves at worst a record whose file was not
+# yet replaced (fh_recover finishes it) or a record cut short at the log's end
+# (fh_open leaves it out). The hash is bytes_hash, enough to tell a changed
+# file from the one recorded; nothing here guards against someone who means to
+# forge one.
+#
+# Neither the log nor the copies are flushed to the disk by the program:
+# they survive its crash, and not a power cut (spec 1.11).
+include "edits.patlang"
+
+make a function called fh_every returns k
+  return 64
+end
+
+# ---- encoding: ints, false, true, bytes, texts and lists of them ----
+# i<digits>;  -<digits>;  f  t  b<n>;<n bytes>  s<n>;<n bytes>  l<n>;<items>
+
+make a function called fh_put_text takes out, text returns done
+  bytes_extend(out, bytes_from_str(text))
+  return true
+end
+
+make a function called fh_encode_into takes out, v returns done
+  let t = type_of(v)
+  if t == "int" then
+    if v < 0 then
+      return fh_put_text(out, "-" + (0 - v) + ";")
+    end
+    return fh_put_text(out, "i" + v + ";")
+  end
+  if v == false then
+    return fh_put_text(out, "f")
+  end
+  if v == true then
+    return fh_put_text(out, "t")
+  end
+  if t == "bytes" then
+    fh_put_text(out, "b" + bytes_len(v) + ";")
+    bytes_extend(out, v)
+    return true
+  end
+  if t == "string" then
+    let b = bytes_from_str(v)
+    fh_put_text(out, "s" + bytes_len(b) + ";")
+    bytes_extend(out, b)
+    return true
+  end
+  if t == "list" then
+    fh_put_text(out, "l" + list_len(v) + ";")
+    let k = 0
+    while k < list_len(v) do
+      fh_encode_into(out, v[k])
+      let k = k + 1
+    end
+    return true
+  end
+  assert false
+  return false
+end
+
+make a function called fh_encode takes v returns b
+  let out = bytes_new(0)
+  fh_encode_into(out, v)
+  return out
+end
+
+# The number from b's offset at up to the ";" after it: [n, the offset after
+# the ";"], or [false, at] when there is no ";" before the end.
+make a function called fh_number takes b, at returns got
+  let n = 0
+  let i = at
+  let len = bytes_len(b)
+  while i < len do
+    let c = bytes_get(b, i)
+    if c == 59 then
+      return [n, i + 1]
+    end
+    if (c < 48) or (c > 57) then
+      return [false, at]
+    end
+    let n = n * 10 + c - 48
+    let i = i + 1
+  end
+  return [false, at]
+end
+
+# The value encoded at b's offset at: [true, value, next], or [false] when the
+# bytes end before it does or are not an encoding.
+make a function called fh_decode takes b, at returns got
+  if at >= bytes_len(b) then
+    return [false]
+  end
+  let tag = bytes_get(b, at)
+  if tag == 102 then
+    return [true, false, at + 1]
+  end
+  if tag == 116 then
+    return [true, true, at + 1]
+  end
+  let num = fh_number(b, at + 1)
+  if num[0] == false then
+    return [false]
+  end
+  let n = num[0]
+  let next = num[1]
+  if tag == 105 then
+    return [true, n, next]
+  end
+  if tag == 45 then
+    return [true, 0 - n, next]
+  end
+  if (tag == 98) or (tag == 115) then
+    if next + n > bytes_len(b) then
+      return [false]
+    end
+    let part = bytes_slice(b, next, n)
+    if tag == 115 then
+      return [true, bytes_to_str(part), next + n]
+    end
+    return [true, part, next + n]
+  end
+  if tag == 108 then
+    let items = []
+    let k = 0
+    let pos = next
+    while k < n do
+      let one = fh_decode(b, pos)
+      if not one[0] then
+        return [false]
+      end
+      let items = list_push(items, one[1])
+      let pos = one[2]
+      let k = k + 1
+    end
+    return [true, items, pos]
+  end
+  return [false]
+end
+
+# ---- a file's history ----
+
+class FileHistory {
+  field dir = ""
+  field records = []
+  field torn = false
+}
+
+# A directory name for a path: its letters, digits, dots and dashes, the rest
+# as _, then its hash, so two paths never share one.
+make a function called fh_dir_name takes path returns name
+  let b = bytes_from_str(path)
+  let out = bytes_new(0)
+  let k = 0
+  while k < bytes_len(b) do
+    let c = bytes_get(b, k)
+    if ((c >= 48) and (c <= 57)) or ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or (c == 46) or (c == 45) then
+      bytes_push(out, c)
+    else
+      bytes_push(out, 95)
+    end
+    let k = k + 1
+  end
+  return bytes_to_str(out) + "-" + str_hash(path)
+end
+
+make a function called fh_log takes h returns path
+  return h.dir + "/log"
+end
+
+make a function called fh_copy_path takes h, v returns path
+  return h.dir + "/copies/" + v + ".bin"
+end
+
+# The history of path in the store, read from its log: a record cut short at
+# the end is left out, and torn says so.
+make a function called fh_open takes store, path returns h
+  let h = new("FileHistory")
+  h.dir = store + "/" + fh_dir_name(path)
+  make_directory(h.dir + "/copies")
+  let log = fh_log(h)
+  if not file_exists(log) then
+    return h
+  end
+  let b = read_file_raw(log)
+  let at = 0
+  let records = []
+  let more = true
+  while more and (at < bytes_len(b)) do
+    let one = fh_decode(b, at)
+    if one[0] then
+      let records = list_push(records, one[1])
+      let at = one[2]
+    else
+      h.torn = true
+      let more = false
+    end
+  end
+  h.records = records
+  return h
+end
+
+make a function called fh_last takes h returns v
+  if list_len(h.records) == 0 then
+    return 0
+  end
+  return h.records[list_len(h.records) - 1][0]
+end
+
+make a function called fh_first takes h returns v
+  if list_len(h.records) == 0 then
+    return 0
+  end
+  return h.records[0][0]
+end
+
+make a function called fh_record_of takes h, v returns r
+  let k = 0
+  while k < list_len(h.records) do
+    if h.records[k][0] == v then
+      return h.records[k]
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# the edits an edits or undo record applies
+make a function called fh_edits_of takes r returns edits
+  if r[1] == "undo" then
+    return r[6][1]
+  end
+  return r[6]
+end
+
+make a function called fh_whole_kind takes kind returns yes
+  return (kind == "base") or (kind == "write") or (kind == "outside")
+end
+
+# Records a new version whose content is after: its number. A whole copy goes
+# first, for a whole kind or every fh_every() versions, then the record.
+make a function called fh_record takes h, kind, client, after, data, shifts returns v
+  let v = fh_last(h) + 1
+  if fh_whole_kind(kind) or (v % fh_every() == 0) then
+    let tmp = fh_copy_path(h, v) + ".tmp"
+    write_file_bytes(tmp, after)
+    try_rename_file(tmp, fh_copy_path(h, v))
+  end
+  let r = [v, kind, now_ms(), client, bytes_len(after), bytes_hash(after), data, shifts]
+  append_file_bytes(fh_log(h), fh_encode(r))
+  h.records = list_push(h.records, r)
+  return v
+end
+
+# The content of version v: ["ok", bytes], or ["gone", reason] for a version
+# not in the history (cleared, or not yet made).
+make a function called fh_content_at takes h, v returns got
+  if (v < fh_first(h)) or (v > fh_last(h)) or (v < 1) then
+    return ["gone", "version " + v + " is not in the history"]
+  end
+  # the latest whole copy at or before v
+  let c = v
+  while (c >= fh_first(h)) and (not file_exists(fh_copy_path(h, c))) do
+    let c = c - 1
+  end
+  if c < fh_first(h) then
+    return ["gone", "no whole copy at or before version " + v]
+  end
+  let content = read_file_raw(fh_copy_path(h, c))
+  let k = c + 1
+  while k <= v do
+    let r = fh_record_of(h, k)
+    if (r[1] == "edits") or (r[1] == "undo") then
+      let applied = fm_apply_batch(content, fh_edits_of(r))
+      if applied[0] != "ok" then
+        return ["gone", "version " + k + "'s edits do not replay: " + applied[2]]
+      end
+      let content = applied[1]
+    elif r[1] == "append" then
+      let next = bytes_slice(content, 0, bytes_len(content))
+      bytes_extend(next, r[6])
+      let content = next
+    else
+      let content = read_file_raw(fh_copy_path(h, k))
+    end
+    let k = k + 1
+  end
+  if bytes_hash(content) != fh_record_of(h, v)[5] then
+    return ["gone", "version " + v + " does not replay to the content recorded"]
+  end
+  return ["ok", content]
+end
+
+# The shifts made since version v, in order: ["ok", shifts], or
+# ["rewritten", w, shifts] when version w replaced the whole content, so a
+# position has no image past it (the shifts are those before w), or
+# ["gone", reason] when v is not there.
+make a function called fh_shifts_since takes h, v returns got
+  if (v < fh_first(h)) or (v > fh_last(h)) then
+    return ["gone", "version " + v + " is not in the history"]
+  end
+  let out = []
+  let k = v + 1
+  while k <= fh_last(h) do
+    let r = fh_record_of(h, k)
+    if (r[1] == "edits") or (r[1] == "undo") then
+      let j = 0
+      while j < list_len(r[7]) do
+        let out = list_push(out, r[7][j])
+        let j = j + 1
+      end
+    elif r[1] == "append" then
+      let out = list_push(out, [r[4] - bytes_len(r[6]), 0, bytes_len(r[6])])
+    else
+      return ["rewritten", k, out]
+    end
+    let k = k + 1
+  end
+  return ["ok", out]
+end
+
+# Clears all but the last keep versions (at least the last is kept): the
+# oldest kept gets a whole copy, the log is written again with only the kept
+# records and renamed over the old one, and the older copies are removed.
+# Version numbers go on from where they were.
+make a function called fh_clear takes h, keep returns kept
+  let last = fh_last(h)
+  if last == 0 then
+    return 0
+  end
+  let k = keep
+  if k < 1 then
+    let k = 1
+  end
+  let from = last - k + 1
+  if from < fh_first(h) then
+    let from = fh_first(h)
+  end
+  if not file_exists(fh_copy_path(h, from)) then
+    let got = fh_content_at(h, from)
+    assert got[0] == "ok"
+    let tmp = fh_copy_path(h, from) + ".tmp"
+    write_file_bytes(tmp, got[1])
+    try_rename_file(tmp, fh_copy_path(h, from))
+  end
+  let records = []
+  let out = bytes_new(0)
+  let j = 0
+  while j < list_len(h.records) do
+    let r = h.records[j]
+    if r[0] >= from then
+      let records = list_push(records, r)
+      fh_encode_into(out, r)
+    end
+    let j = j + 1
+  end
+  let tmp = fh_log(h) + ".tmp"
+  write_file_bytes(tmp, out)
+  try_rename_file(tmp, fh_log(h))
+  let v = fh_first(h)
+  while v < from do
+    if file_exists(fh_copy_path(h, v)) then
+      remove_file(fh_copy_path(h, v))
+    end
+    let v = v + 1
+  end
+  h.records = records
+  h.torn = false
+  return list_len(records)
+end
+
+# The file's content as it is now, checked against the last record:
+#   ["ok"]              it is the last version
+#   ["completed", v]    the last record's file was not yet replaced: it is
+#                       written now (the caller's crash came between the two)
+#   ["outside", v]      it was changed by something else: recorded as v
+#   ["started", v]      there was no history: the content is recorded as base
+make a function called fh_recover takes h, path, client returns got
+  let current = bytes_new(0)
+  if file_exists(path) then
+    let current = read_file_raw(path)
+  end
+  let last = fh_last(h)
+  if last == 0 then
+    return ["started", fh_record(h, "base", client, current, false, [])]
+  end
+  if bytes_hash(current) == h.records[list_len(h.records) - 1][5] then
+    return ["ok"]
+  end
+  if last > fh_first(h) then
+    let before = fh_record_of(h, last - 1)
+    if bytes_hash(current) == before[5] then
+      let got = fh_content_at(h, last)
+      if got[0] == "ok" then
+        fh_replace(path, got[1])
+        return ["completed", last]
+      end
+    end
+  end
+  return ["outside", fh_record(h, "outside", client, current, false, [])]
+end
+
+# path's content replaced by content, through a file beside it renamed over it,
+# so a reader sees the old content or the new and never part of either
+make a function called fh_replace takes path, content returns ok
+  let tmp = path + ".fm_tmp"
+  if not write_file_bytes(tmp, content) then
+    return false
+  end
+  return try_rename_file(tmp, path)
+end
+
+# ---- undo and revert ----
+
+# how many bytes of context an inverse edit takes on each side of its part
+make a function called fh_undo_context returns n
+  return 16
+end
+
+# The edit that turns next back into before, for one step that removed a bytes
+# at o (as they were in before) and put z there (in next): z, with up to
+# fh_undo_context() bytes of next on each side as its context, becomes what
+# was removed. Its hint is o, and it must be unique in the whole file.
+make a function called fh_inverse_step takes before, next, o, a, z returns e
+  let c = fh_undo_context()
+  let from = o - c
+  if from < 0 then
+    let from = 0
+  end
+  let after_at = o + bytes_len(z)
+  let take = c
+  if after_at + take > bytes_len(next) then
+    let take = bytes_len(next) - after_at
+  end
+  let p = bytes_slice(next, from, o - from)
+  let s = bytes_slice(next, after_at, take)
+  let removed = bytes_slice(before, o, a)
+  return fm_near(fm_with_old(fm_edit(p, s, removed), z), o, 0 - 1)
+end
+
+# The inverse edits of version k, in the order they apply: ["ok", edits], or
+# ["refused", reason] for a version whose whole content was replaced, or one
+# whose version before is no longer in the history.
+make a function called fh_inverse_of takes h, k returns got
+  let r = fh_record_of(h, k)
+  if r == false then
+    return ["refused", "version " + k + " is not in the history"]
+  end
+  if fh_whole_kind(r[1]) then
+    return ["refused", "version " + k + " replaced the whole content; revert to the version wanted instead"]
+  end
+  let prev = fh_content_at(h, k - 1)
+  if prev[0] != "ok" then
+    return ["refused", "version " + (k - 1) + ", before the one undone, is not in the history"]
+  end
+  let cur = prev[1]
+  if r[1] == "append" then
+    let size = bytes_len(cur)
+    let next = bytes_slice(cur, 0, size)
+    bytes_extend(next, r[6])
+    return ["ok", [fh_inverse_step(cur, next, size, 0, r[6])]]
+  end
+  # each step of the batch, from the content before it, its inverse made from
+  # the content after it; the inverses apply last step first
+  let edits = fh_edits_of(r)
+  let shifts = r[7]
+  let inverses = []
+  let i = 0
+  while i < list_len(edits) do
+    let o = shifts[i][0]
+    let a = shifts[i][1]
+    let z = edits[i][3]
+    let next = fm_splice(cur, o, a, z)
+    let inverses = list_push(inverses, fh_inverse_step(cur, next, o, a, z))
+    let cur = next
+    let i = i + 1
+  end
+  let out = []
+  let j = list_len(inverses) - 1
+  while j >= 0 do
+    let out = list_push(out, inverses[j])
+    let j = j - 1
+  end
+  return ["ok", out]
+end
+
+# Undoes version k in the file at path, whatever came after it, as long as what
+# k changed is still there: the inverse edits are applied to the file as it is
+# now and recorded as a new version. ["ok", v], or ["refused", reason], the
+# file left as it was. A later edit that changed the same bytes, or the bytes
+# around them, makes the undo refused.
+make a function called fh_undo_file takes h, path, k, client returns got
+  let inv = fh_inverse_of(h, k)
+  if inv[0] != "ok" then
+    return inv
+  end
+  let current = read_file_raw(path)
+  let applied = fm_apply_batch(current, inv[1])
+  if applied[0] != "ok" then
+    return ["refused", "undoing version " + k + ": " + applied[2]]
+  end
+  let v = fh_record(h, "undo", client, applied[1], [k, inv[1]], applied[2])
+  fh_replace(path, applied[1])
+  return ["ok", v]
+end
+
+# Puts the file at path back as it was at version v, recorded as a new version
+# (a write whose data says so): ["ok", the new version], or ["refused", reason].
+make a function called fh_revert_file takes h, path, v, client returns got
+  let old = fh_content_at(h, v)
+  if old[0] != "ok" then
+    return ["refused", old[1]]
+  end
+  let w = fh_record(h, "write", client, old[1], ["revert", v], [])
+  fh_replace(path, old[1])
+  return ["ok", w]
+end

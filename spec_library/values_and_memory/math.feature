@@ -36,6 +36,11 @@ Feature: powers, trigonometry, rounding, bits and the small file functions
     When a program reads each with to_num
     Then each is the exact rational in lowest terms, or the int when it divides evenly, and a printed sum reads back as itself
 
+  Scenario: an exact division of two ints costs about what their remainder does
+    Given a loop of 70000 int divisions that come out exact, and one of 70000 remainders
+    When each runs three times
+    Then the divisions' sum is an int, and the best division run takes no more than four times the best remainder run
+
   Scenario: an operation on two floats costs about what one on two ints does
     Given a loop of 200000 float additions and multiplications, and one of int ones
     When each runs three times

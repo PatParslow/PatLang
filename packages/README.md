@@ -41,6 +41,8 @@ Current packages:
 | curve25519 | 0.1.0 | X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints; depends on sha512 |
 | tls     | 0.1.0   | a TLS 1.3 client's cryptography on modints, so far ChaCha20, Poly1305 and AEAD_CHACHA20_POLY1305 (RFC 8439) (`docs/plans/http-tls.md`, stage 2) |
 | resolve | 0.1.0   | manifest reader, version constraints, and dependency resolution through `rule_add`/`solve` (`docs/plans/package-manager.md`, P1) |
+| file_marshal | 0.1.0 | one owner for the files under a root, reached through port_marshal as `files`: edits to text and flat binaries given by their context, writes if a version, appends, a durable history with undo and revert, and the shift each edit makes so positions can be carried past it (`docs/plans/file-marshal.md`, steps 1 to 3 of 4) |
+| text_structure | 0.1.0 | the structure of a text (sections, paragraphs, sentences), for edits by address through file_marshal; so far Unicode's sentence boundaries (UAX #29, Unicode 18.0), passing all of Unicode's conformance test, from the Unicode data kept in `data/` under the Unicode licence (`docs/plans/text-structure.md`) |
 | port_marshal | 0.1.0 | one well-known port (9400) for local services: a service on any free port registers a name, and a client asks for the name and is piped through (`docs/plans/port-marshal.md`) |
 | trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in (`docs/plans/package-trust.md`, T1) |
 

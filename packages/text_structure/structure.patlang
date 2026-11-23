@@ -1,0 +1,572 @@
+# text_structure core: a text's structure as a tree of units, addresses into
+# it, a walk over it, its sentences, and edits by address.
+#
+# A unit is [kind, start, end, attrs, children]: its kind ("document",
+# "section", "heading", "paragraph", "sentence", "list", "item", "code",
+# "quote", "table", "break", and each format's own), its range in the text's
+# UTF-8 bytes (end not included), its attrs as [[key, value], ...], and the
+# units inside it, in order, within its range.
+#
+# A text view is the text a unit reads as: a list of byte ranges [start, end]
+# of the source, read one after another with a space between two of them, so
+# a paragraph's lines read as one line, a quote's or a list's markers are left
+# out, and an HTML block's text is read across its inline tags. Sentences are
+# found in a view, by Unicode's rules (sentences.patlang) with two tailorings,
+# and their ranges are the source's:
+#   - a line break in a paragraph is a space (UAX #29 makes every line feed a
+#     paragraph separator, which would end a sentence at each line's end);
+#   - no sentence ends straight after one of CLDR's English suppressions
+#     ("Mr.", "e.g.", "U.S.", ...), where the default rules would end one
+#     before an uppercase word.
+# A sentence's range leaves out the spaces after it, which UAX #29 gives to it,
+# so replacing a sentence keeps the space before the next.
+include "sentences.patlang"
+include "../file_marshal/edits.patlang"
+
+make a function called ts_unit takes kind, start, end, attrs, children returns u
+  return [kind, start, end, attrs, children]
+end
+
+make a function called ts_kind takes u returns k
+  return u[0]
+end
+
+make a function called ts_start takes u returns n
+  return u[1]
+end
+
+make a function called ts_end takes u returns n
+  return u[2]
+end
+
+make a function called ts_children takes u returns c
+  return u[4]
+end
+
+# the attr's value, or false
+make a function called ts_attr takes u, key returns v
+  let a = u[3]
+  let k = 0
+  while k < list_len(a) do
+    if a[k][0] == key then
+      return a[k][1]
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+make a function called ts_bytes_of takes text, u returns b
+  return bytes_slice(text, u[1], u[2] - u[1])
+end
+
+# ---- addresses ----
+# An address is a list of steps, each [kind, n] (the nth unit of that kind
+# among the children, from 1) or [kind, title] (the one whose title attr is
+# that); a step's kind may be "*" for any kind.
+
+make a function called ts_step_matches takes u, kind returns yes
+  return (kind == "*") or (u[0] == kind)
+end
+
+# ["ok", unit], or ["none", reason]
+make a function called ts_find takes tree, address returns got
+  let u = tree
+  let s = 0
+  while s < list_len(address) do
+    let step = address[s]
+    let kids = u[4]
+    let found = []
+    let count = 0
+    let k = 0
+    while k < list_len(kids) do
+      if ts_step_matches(kids[k], step[0]) then
+        let count = count + 1
+        if type_of(step[1]) == "int" then
+          if count == step[1] then
+            let found = list_push(found, kids[k])
+          end
+        elif ts_attr(kids[k], "title") == step[1] then
+          let found = list_push(found, kids[k])
+        end
+      end
+      let k = k + 1
+    end
+    if list_len(found) == 0 then
+      return ["none", "step " + (s + 1) + ": no " + step[0] + " " + step[1]]
+    end
+    if list_len(found) > 1 then
+      return ["none", "step " + (s + 1) + ": " + list_len(found) + " of kind " + step[0] + " are titled " + step[1]]
+    end
+    let u = found[0]
+    let s = s + 1
+  end
+  return ["ok", u]
+end
+
+# every unit of a kind ("*" for all), in order, the tree itself first
+make a function called ts_all takes tree, kind returns units
+  let out = vec_new()
+  ts_all_into(tree, kind, out)
+  return vec_to_list(out)
+end
+
+make a function called ts_all_into takes u, kind, out returns done
+  if ts_step_matches(u, kind) then
+    vec_push(out, u)
+  end
+  let kids = u[4]
+  let k = 0
+  while k < list_len(kids) do
+    ts_all_into(kids[k], kind, out)
+    let k = k + 1
+  end
+  return true
+end
+
+# the innermost unit of a kind ("*" for any) whose range holds the offset, or false
+make a function called ts_unit_at takes tree, offset, kind returns u
+  let best = false
+  let cur = tree
+  let more = true
+  while more do
+    if ts_step_matches(cur, kind) then
+      let best = cur
+    end
+    let next = false
+    let kids = cur[4]
+    let k = 0
+    while k < list_len(kids) do
+      if (offset >= kids[k][1]) and (offset < kids[k][2]) then
+        let next = kids[k]
+      end
+      let k = k + 1
+    end
+    if next == false then
+      let more = false
+    else
+      let cur = next
+    end
+  end
+  return best
+end
+
+# ---- the walk ----
+# A walk yields the units of a kind one at a time, from a fibre, so a search
+# that stops at the first it wants reads no further:
+#   let w = ts_walk(tree, "sentence")
+#   let u = ts_walk_next(w)        a unit, or false when there are no more
+
+class Walk {
+  field fiber = 0
+  field arg = 0
+  field started = false
+  field done = false
+}
+
+make a function called ts_walk_yield takes u, kind returns done
+  if ts_step_matches(u, kind) then
+    fiber_yield(u)
+  end
+  let kids = u[4]
+  let k = 0
+  while k < list_len(kids) do
+    ts_walk_yield(kids[k], kind)
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called ts_walk_body takes arg returns r
+  ts_walk_yield(arg[0], arg[1])
+  return false
+end
+
+make a function called ts_walk takes tree, kind returns w
+  let w = new("Walk")
+  w.fiber = fiber_new("ts_walk_body")
+  w.arg = [tree, kind]
+  return w
+end
+
+make a function called ts_walk_next takes w returns u
+  if w.done then
+    return false
+  end
+  let r = false
+  if w.started then
+    let r = fiber_resume(w.fiber, 0)
+  else
+    w.started = true
+    let r = fiber_resume(w.fiber, w.arg)
+  end
+  if not fiber_alive(w.fiber) then
+    w.done = true
+  end
+  return r
+end
+
+# ---- sentences in a view ----
+
+class Structurer {
+  field seg = 0
+  field suppressions = []
+}
+
+make a function called ts_structurer returns st
+  let st = new("Structurer")
+  st.seg = ts_segmenter()
+  let sups = []
+  let names = ts_cldr_suppressions()
+  let k = 0
+  while k < list_len(names) do
+    let sups = list_push(sups, bytes_from_str(names[k]))
+    let k = k + 1
+  end
+  st.suppressions = sups
+  return st
+end
+
+# More abbreviations after which no sentence ends, as texts ("Dr.", which
+# CLDR's standard English list leaves out). A structurer is the program's own,
+# so this changes no other.
+make a function called ts_add_suppressions takes st, texts returns done
+  let sups = st.suppressions
+  let k = 0
+  while k < list_len(texts) do
+    let sups = list_push(sups, bytes_from_str(texts[k]))
+    let k = k + 1
+  end
+  st.suppressions = sups
+  return true
+end
+
+# The view's code points and the source offset of each, one past the last
+# ([cps, offs, ends]): a line break is a space; between two ranges a space
+# whose offset is the second's start.
+make a function called ts_view_points takes text, view returns got
+  let cps = []
+  let offs = []
+  let ends = []
+  let r = 0
+  while r < list_len(view) do
+    let a = view[r][0]
+    let b = view[r][1]
+    if (r > 0) and (list_len(cps) > 0) then
+      let cps = list_push(cps, 32)
+      let offs = list_push(offs, a)
+      let ends = list_push(ends, a)
+    end
+    let d = ts_decode(bytes_slice(text, a, b - a))
+    let k = 0
+    while k < list_len(d[0]) do
+      let cp = d[0][k]
+      if (cp == 10) or (cp == 13) then
+        let cp = 32
+      end
+      let cps = list_push(cps, cp)
+      let offs = list_push(offs, a + d[1][k])
+      let ends = list_push(ends, a + d[1][k + 1])
+      let k = k + 1
+    end
+    let r = r + 1
+  end
+  return [cps, offs, ends]
+end
+
+make a function called ts_is_space takes cp returns yes
+  return (cp == 32) or (cp == 9) or (cp == 10) or (cp == 13) or (cp == 160) or (cp == 12288)
+end
+
+# whether the code points before i (spaces left out) end with a suppression,
+# with no letter or digit straight before it
+make a function called ts_suppressed takes st, cps, i returns yes
+  let e = i
+  while (e > 0) and ts_is_space(cps[e - 1]) do
+    let e = e - 1
+  end
+  let k = 0
+  while k < list_len(st.suppressions) do
+    let s = st.suppressions[k]
+    let m = bytes_len(s)
+    if m <= e then
+      let same = true
+      let j = 0
+      while same and (j < m) do
+        if cps[e - m + j] != bytes_get(s, j) then
+          let same = false
+        end
+        let j = j + 1
+      end
+      if same then
+        let start = e - m
+        if start == 0 then
+          return true
+        end
+        let c = ts_sb_class(st.seg, cps[start - 1])
+        if not ((c == 7) or (c == 8) or (c == 9) or (c == 10)) then
+          return true
+        end
+      end
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# how many words: runs of letters and digits
+make a function called ts_words takes st, cps, a, b returns n
+  let n = 0
+  let inword = false
+  let k = a
+  while k < b do
+    let c = ts_sb_class(st.seg, cps[k])
+    let letter = (c == 7) or (c == 8) or (c == 9) or (c == 10)
+    if letter and (not inword) then
+      let n = n + 1
+    end
+    let inword = letter
+    let k = k + 1
+  end
+  return n
+end
+
+# The sentence units of a view, their ranges the source's.
+make a function called ts_sentences takes st, text, view returns units
+  let p = ts_view_points(text, view)
+  let cps = p[0]
+  let breaks = ts_sentence_breaks(st.seg, cps)
+  # the suppressions take away breaks the default rules put after them
+  let kept = []
+  let k = 0
+  while k < list_len(breaks) do
+    let b = breaks[k]
+    if (b == 0) or (b == list_len(cps)) or (not ts_suppressed(st, cps, b)) then
+      let kept = list_push(kept, b)
+    end
+    let k = k + 1
+  end
+  let out = []
+  let k = 0
+  while k + 1 < list_len(kept) do
+    let a = kept[k]
+    let b = kept[k + 1]
+    while (a < b) and ts_is_space(cps[a]) do
+      let a = a + 1
+    end
+    while (b > a) and ts_is_space(cps[b - 1]) do
+      let b = b - 1
+    end
+    if b > a then
+      let out = list_push(out, ts_unit("sentence", p[1][a], p[2][b - 1], [["words", ts_words(st, cps, a, b)]], []))
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+# ---- sections from a flat list of blocks ----
+# blocks: units in order; a "heading" has a "level" attr. A section is a
+# heading and the blocks after it up to the next heading of its level or a
+# higher one (a lower number), and holds the deeper sections in it.
+
+make a function called ts_nest takes blocks, from, level, end returns got
+  let out = []
+  let i = from
+  let more = true
+  while more and (i < list_len(blocks)) do
+    let b = blocks[i]
+    if b[0] == "heading" then
+      let lv = ts_attr(b, "level")
+      if lv <= level then
+        let more = false
+      else
+        let inner = ts_nest(blocks, i + 1, lv, end)
+        let stop = end
+        if inner[1] < list_len(blocks) then
+          let stop = blocks[inner[1]][1]
+        end
+        let kids = list_push([], b)
+        let j = 0
+        while j < list_len(inner[0]) do
+          let kids = list_push(kids, inner[0][j])
+          let j = j + 1
+        end
+        let out = list_push(out, ts_unit("section", b[1], ts_trim_end_of(kids, stop), [["title", ts_attr(b, "title")], ["level", lv]], kids))
+        let i = inner[1]
+      end
+    else
+      let out = list_push(out, b)
+      let i = i + 1
+    end
+  end
+  return [out, i]
+end
+
+# a section's end: the end of its last unit
+make a function called ts_trim_end_of takes kids, stop returns e
+  if list_len(kids) == 0 then
+    return stop
+  end
+  return kids[list_len(kids) - 1][2]
+end
+
+# ---- lines ----
+
+# each line's [start, end], its line break left out (LF, or CR LF)
+make a function called ts_lines takes text returns lines
+  let out = vec_new()
+  let n = bytes_len(text)
+  let start = 0
+  let k = 0
+  while k < n do
+    if bytes_get(text, k) == 10 then
+      let e = k
+      if (e > start) and (bytes_get(text, e - 1) == 13) then
+        let e = e - 1
+      end
+      vec_push(out, [start, e])
+      let start = k + 1
+    end
+    let k = k + 1
+  end
+  if start < n then
+    vec_push(out, [start, n])
+  end
+  return vec_to_list(out)
+end
+
+# a line's range without its spaces and tabs at either end
+make a function called ts_trim_line takes text, line returns r
+  let a = line[0]
+  let b = line[1]
+  while (a < b) and ((bytes_get(text, a) == 32) or (bytes_get(text, a) == 9)) do
+    let a = a + 1
+  end
+  while (b > a) and ((bytes_get(text, b - 1) == 32) or (bytes_get(text, b - 1) == 9)) do
+    let b = b - 1
+  end
+  return [a, b]
+end
+
+make a function called ts_blank takes text, line returns yes
+  let t = ts_trim_line(text, line)
+  return t[0] == t[1]
+end
+
+# how many spaces a line starts with (a tab as 4)
+make a function called ts_indent takes text, line returns n
+  let n = 0
+  let k = line[0]
+  let more = true
+  while more and (k < line[1]) do
+    let c = bytes_get(text, k)
+    if c == 32 then
+      let n = n + 1
+    elif c == 9 then
+      let n = n + 4
+    else
+      let more = false
+    end
+    let k = k + 1
+  end
+  return n
+end
+
+# whether a line is only c, at least 3 of it, with spaces allowed around
+make a function called ts_rule_of takes text, line, c returns yes
+  let t = ts_trim_line(text, line)
+  if t[1] - t[0] < 3 then
+    return false
+  end
+  let k = t[0]
+  while k < t[1] do
+    if bytes_get(text, k) != c then
+      return false
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called ts_line_text takes text, line returns s
+  let t = ts_trim_line(text, line)
+  return bytes_to_str(bytes_slice(text, t[0], t[1] - t[0]))
+end
+
+# a paragraph of lines: its unit, with its sentences
+make a function called ts_paragraph takes st, text, lines, kind returns u
+  let view = []
+  let k = 0
+  while k < list_len(lines) do
+    let view = list_push(view, ts_trim_line(text, lines[k]))
+    let k = k + 1
+  end
+  let first = view[0]
+  let last = view[list_len(view) - 1]
+  return ts_unit(kind, first[0], last[1], [], ts_sentences(st, text, view))
+end
+
+# ---- edits by address ----
+
+make a function called ts_context returns n
+  return 16
+end
+
+# an edit that makes the bytes from a to b into new, with up to ts_context()
+# bytes either side as its context and a as its hint
+make a function called ts_range_edit takes text, a, b, new returns e
+  let c = ts_context()
+  let from = a - c
+  if from < 0 then
+    let from = 0
+  end
+  let to = b + c
+  if to > bytes_len(text) then
+    let to = bytes_len(text)
+  end
+  let p = bytes_slice(text, from, a - from)
+  let s = bytes_slice(text, b, to - b)
+  return fm_near(fm_with_old(fm_edit(p, s, new), bytes_slice(text, a, b - a)), a, 0 - 1)
+end
+
+# the unit's bytes become new (a text, a list of byte values or a bytes)
+make a function called ts_edit_for takes text, u, new returns e
+  return ts_range_edit(text, u[1], u[2], fm_bytes_of(new))
+end
+
+make a function called ts_delete takes text, u returns e
+  return ts_range_edit(text, u[1], u[2], bytes_new(0))
+end
+
+make a function called ts_insert_before takes text, u, new returns e
+  return ts_range_edit(text, u[1], u[1], fm_bytes_of(new))
+end
+
+make a function called ts_insert_after takes text, u, new returns e
+  return ts_range_edit(text, u[2], u[2], fm_bytes_of(new))
+end
+
+# Moves unit u to just before unit target (or after it, when after is true),
+# with sep put between it and its new neighbour: a batch of two edits, applied
+# with fm_apply_batch or sent to the files service.
+make a function called ts_move takes text, u, target, after, sep returns edits
+  let moved = ts_bytes_of(text, u)
+  let ins = bytes_new(0)
+  if after then
+    bytes_extend(ins, fm_bytes_of(sep))
+    bytes_extend(ins, moved)
+  else
+    bytes_extend(ins, moved)
+    bytes_extend(ins, fm_bytes_of(sep))
+  end
+  let put = ts_insert_before(text, target, ins)
+  if after then
+    let put = ts_insert_after(text, target, ins)
+  end
+  # the later of the two first, so the earlier one's hint is not moved
+  if u[1] > target[1] then
+    return [ts_delete(text, u), put]
+  end
+  return [put, ts_delete(text, u)]
+end

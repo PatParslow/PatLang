@@ -1,0 +1,347 @@
+# file_marshal edits: a change to a file's bytes given by its context.
+#
+# An edit is [P, X, S, Z, N, W], each of P, X, S and Z a bytes:
+#   P  what comes before the part to change; empty for the start of the file
+#   X  the part as it is now, or false to take whatever lies between P and S
+#   S  what comes after it; empty for "straight after P"
+#   Z  what the part becomes
+#   N  a position where P is expected to start, or -1
+#   W  how far from N P may start, or -1 for anywhere in the file
+# Without X, the part between an occurrence of P and the first S after it is a
+# candidate; with X, a candidate is P, X and S one straight after another (so
+# "count: " + "41" + "" names the 41 after "count: "). There must be exactly
+# one candidate (within W of N, when W is given). When X is given and is not
+# there, the refusal says what lies between P and S instead. Text is edited as its UTF-8 bytes, so text and
+# flat binaries are one case. (A format with internal offsets or checksums, zip
+# or PNG, is edited at its own level: a byte edit would leave it corrupt.)
+#
+# An edit that applies gives its shift [o, a, b]: at offset o, a bytes were
+# removed and b inserted. A position n after the change (n >= o + a) moves by
+# b - a, one before it (n < o) stays, and one inside it has no image.
+
+# ---- making edits ----
+
+make a function called fm_bytes_of takes v returns b
+  if type_of(v) == "string" then
+    return bytes_from_str(v)
+  end
+  if type_of(v) == "list" then
+    return bytes_from_list(v)
+  end
+  return v
+end
+
+# the part between before and after becomes new (each a text, a list of byte
+# values, or a bytes)
+make a function called fm_edit takes before, after, new returns e
+  return [fm_bytes_of(before), false, fm_bytes_of(after), fm_bytes_of(new), 0 - 1, 0 - 1]
+end
+
+# the same edit, and the part must be old
+make a function called fm_with_old takes e, old returns e2
+  return [e[0], fm_bytes_of(old), e[2], e[3], e[4], e[5]]
+end
+
+# the same edit, its context expected at n, and within w of it (-1: anywhere,
+# the hint only says where to look first)
+make a function called fm_near takes e, n, w returns e2
+  return [e[0], e[1], e[2], e[3], n, w]
+end
+
+# ---- finding ----
+
+# whether pat's bytes are at b's offset at
+make a function called fm_at takes b, n, pat, at returns yes
+  let m = bytes_len(pat)
+  if at + m > n then
+    return false
+  end
+  let k = 0
+  while k < m do
+    if bytes_get(b, at + k) != bytes_get(pat, k) then
+      return false
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+# The offsets from lo to hi (both included) where pat starts in b, ascending.
+make a function called fm_find_all takes b, pat, lo, hi returns starts
+  let n = bytes_len(b)
+  let m = bytes_len(pat)
+  let out = []
+  if m == 0 then
+    return out
+  end
+  let first = bytes_get(pat, 0)
+  let at = lo
+  if at < 0 then
+    let at = 0
+  end
+  let last = hi
+  if last > n - m then
+    let last = n - m
+  end
+  while at <= last do
+    if bytes_get(b, at) == first then
+      if fm_at(b, n, pat, at) then
+        let out = list_push(out, at)
+      end
+    end
+    let at = at + 1
+  end
+  return out
+end
+
+# The candidates for an edit: [P's start, the part's start, the part's end] for
+# each occurrence of P (within W of N when W is given) with an S after it.
+make a function called fm_candidates takes b, e returns found
+  let n = bytes_len(b)
+  let p = e[0]
+  let s = e[2]
+  let lo = 0
+  let hi = n
+  if (e[4] >= 0) and (e[5] >= 0) then
+    let lo = e[4] - e[5]
+    let hi = e[4] + e[5]
+  end
+  let starts = []
+  if bytes_len(p) == 0 then
+    if lo <= 0 then
+      let starts = [0]
+    end
+  else
+    let starts = fm_find_all(b, p, lo, hi)
+  end
+  # each P paired with the first S after it; the S last found is kept, so the
+  # bytes are scanned for S once in all, and only as far as the last P needs
+  let out = []
+  let last = 0 - 1
+  let k = 0
+  while k < list_len(starts) do
+    let from = starts[k] + bytes_len(p)
+    if bytes_len(s) == 0 then
+      let out = list_push(out, [starts[k], from, from])
+    else
+      if (last < from) and (last != 0 - 2) then
+        let scan = from
+        if last + 1 > scan then
+          let scan = last + 1
+        end
+        let last = fm_find_next(b, s, scan)
+        if last < 0 then
+          let last = 0 - 2
+        end
+      end
+      if last >= from then
+        let out = list_push(out, [starts[k], from, last])
+      end
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+# the first offset at or after from where pat starts in b, or -1
+make a function called fm_find_next takes b, pat, from returns at
+  let n = bytes_len(b)
+  let m = bytes_len(pat)
+  let first = bytes_get(pat, 0)
+  let i = from
+  while i <= n - m do
+    if bytes_get(b, i) == first then
+      if fm_at(b, n, pat, i) then
+        return i
+      end
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# ---- applying ----
+
+# what b's bytes from at, n of them, say: as text when they are printable
+# ASCII, else as their values
+make a function called fm_show takes b returns text
+  let n = bytes_len(b)
+  let plain = true
+  let k = 0
+  while k < n do
+    let c = bytes_get(b, k)
+    if (c < 32) or (c > 126) then
+      let plain = false
+    end
+    let k = k + 1
+  end
+  if plain then
+    return chr(34) + bytes_to_str(b) + chr(34)
+  end
+  return "" + bytes_to_list(b)
+end
+
+# "its context is found N times, at a, b and c", from candidates
+make a function called fm_times takes found returns text
+  let where = sb_new()
+  let k = 0
+  while k < list_len(found) do
+    if k > 0 then
+      if k == list_len(found) - 1 then
+        sb_push(where, " and ")
+      else
+        sb_push(where, ", ")
+      end
+    end
+    sb_push(where, "" + found[k][0])
+    let k = k + 1
+  end
+  return "its context is found " + list_len(found) + " times, at " + sb_str(where)
+end
+
+# b with the part from o, a bytes long, replaced by z: a new bytes
+make a function called fm_splice takes b, o, a, z returns b2
+  let n = bytes_len(b)
+  let out = bytes_slice(b, 0, o)
+  bytes_extend(out, z)
+  bytes_extend(out, bytes_slice(b, o + a, n - o - a))
+  return out
+end
+
+# With the old part X given, the candidates are where P, X and S come one
+# straight after another: [P's start, X's start, X's end].
+make a function called fm_exact takes b, e returns found
+  let n = bytes_len(b)
+  let p = e[0]
+  let x = e[1]
+  let s = e[2]
+  let lo = 0
+  let hi = n
+  if (e[4] >= 0) and (e[5] >= 0) then
+    let lo = e[4] - e[5]
+    let hi = e[4] + e[5]
+  end
+  let starts = []
+  if bytes_len(p) == 0 then
+    if lo <= 0 then
+      let starts = [0]
+    end
+  else
+    let starts = fm_find_all(b, p, lo, hi)
+  end
+  let out = []
+  let k = 0
+  while k < list_len(starts) do
+    let from = starts[k] + bytes_len(p)
+    if fm_at(b, n, x, from) and fm_at(b, n, s, from + bytes_len(x)) then
+      let out = list_push(out, [starts[k], from, from + bytes_len(x)])
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+# One edit on b: ["ok", the new bytes, [o, a, len Z]], or ["refused", reason].
+# With X given the edit is P, X, S one straight after another; when that is
+# not there, the part between P and S says what is there instead.
+make a function called fm_apply takes b, e returns r
+  if e[1] != false then
+    let exact = fm_exact(b, e)
+    if list_len(exact) == 1 then
+      let o = exact[0][1]
+      let a = exact[0][2] - o
+      return ["ok", fm_splice(b, o, a, e[3]), [o, a, bytes_len(e[3])]]
+    end
+    if list_len(exact) > 1 then
+      return ["refused", fm_times(exact)]
+    end
+  end
+  let found = fm_candidates(b, e)
+  if list_len(found) == 0 then
+    return ["refused", "its context is not found"]
+  end
+  if list_len(found) > 1 then
+    return ["refused", fm_times(found)]
+  end
+  let o = found[0][1]
+  let a = found[0][2] - o
+  if e[1] != false then
+    let part = bytes_slice(b, o, a)
+    if not bytes_eq(part, e[1]) then
+      return ["refused", "the part between is " + fm_show(part) + ", not " + fm_show(e[1])]
+    end
+  end
+  return ["ok", fm_splice(b, o, a, e[3]), [o, a, bytes_len(e[3])]]
+end
+
+# ---- shifts ----
+
+# n carried past one shift: ["at", n2], or ["inside"] when the shift changed it
+make a function called fm_shift_one takes n, sh returns r
+  let o = sh[0]
+  let a = sh[1]
+  let b = sh[2]
+  if n < o then
+    return ["at", n]
+  end
+  if n >= o + a then
+    return ["at", n + b - a]
+  end
+  return ["inside"]
+end
+
+# n carried past each shift in turn: ["at", n2], or ["inside", k], k counted
+# from 1, for the first shift that changed the byte at n.
+make a function called fm_map_position takes n, shifts returns r
+  let at = n
+  let k = 0
+  while k < list_len(shifts) do
+    let r1 = fm_shift_one(at, shifts[k])
+    if r1[0] != "at" then
+      return ["inside", k + 1]
+    end
+    let at = r1[1]
+    let k = k + 1
+  end
+  return ["at", at]
+end
+
+# An edit's hint moved past the shifts before it. A hint inside a change goes
+# to the change's end, where what followed the changed part now starts.
+make a function called fm_shift_hint takes e, shifts returns e2
+  if e[4] < 0 then
+    return e
+  end
+  let n = e[4]
+  let k = 0
+  while k < list_len(shifts) do
+    let r1 = fm_shift_one(n, shifts[k])
+    if r1[0] == "at" then
+      let n = r1[1]
+    else
+      let n = shifts[k][0] + shifts[k][2]
+    end
+    let k = k + 1
+  end
+  return [e[0], e[1], e[2], e[3], n, e[5]]
+end
+
+# Edits applied in turn, every one or none: ["ok", the new bytes, the shifts],
+# or ["refused", k, reason] for the first edit, counted from 1, that does not
+# apply, the bytes left as they were. Each edit's hint is moved by the shifts of
+# the edits before it.
+make a function called fm_apply_batch takes b, edits returns r
+  let cur = b
+  let shifts = []
+  let k = 0
+  while k < list_len(edits) do
+    let r1 = fm_apply(cur, fm_shift_hint(edits[k], shifts))
+    if r1[0] != "ok" then
+      return ["refused", k + 1, r1[1]]
+    end
+    let cur = r1[1]
+    let shifts = list_push(shifts, r1[2])
+    let k = k + 1
+  end
+  return ["ok", cur, shifts]
+end

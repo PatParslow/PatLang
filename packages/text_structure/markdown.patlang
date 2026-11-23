@@ -1,0 +1,304 @@
+# text_structure Markdown: CommonMark's blocks, as far as the units go.
+#
+#   ATX headings (1 to 6 #) and setext ones (a paragraph underlined with at
+#   least 3 = or -) start sections; fenced code (``` or ~~~, its language in
+#   "lang") and indented code (4 spaces, not inside a paragraph) are "code";
+#   lines starting with > are a "quote" holding paragraphs; "-", "*", "+" or a
+#   number with "." or ")" start an "item" of a "list"; lines starting with |
+#   are a "table"; ---, *** or ___ alone are a "break"; the rest are
+#   paragraphs. Sentences are found in paragraphs, items and quotes' paragraphs,
+#   never in code or tables.
+#
+# Not attempted yet: nested lists are read as one list whose items keep their
+# indent in "indent"; a quote's lazy continuation lines (without >) end it;
+# HTML blocks are paragraphs; reference definitions are paragraphs.
+#
+#   let tree = ts_markdown(ts_structurer(), bytes)
+include "structure.patlang"
+
+# the number of c at the start of a line's trimmed text
+make a function called md_run_of takes text, t, c returns n
+  let n = 0
+  while (t[0] + n < t[1]) and (bytes_get(text, t[0] + n) == c) do
+    let n = n + 1
+  end
+  return n
+end
+
+# an ATX heading's level, or 0
+make a function called md_atx takes text, line returns level
+  if ts_indent(text, line) >= 4 then
+    return 0
+  end
+  let t = ts_trim_line(text, line)
+  let n = md_run_of(text, t, 35)
+  if (n < 1) or (n > 6) then
+    return 0
+  end
+  if t[0] + n == t[1] then
+    return n
+  end
+  let c = bytes_get(text, t[0] + n)
+  if (c == 32) or (c == 9) then
+    return n
+  end
+  return 0
+end
+
+make a function called md_atx_title takes text, line returns title
+  let t = ts_trim_line(text, line)
+  let a = t[0] + md_run_of(text, t, 35)
+  let b = t[1]
+  while (b > a) and (bytes_get(text, b - 1) == 35) do
+    let b = b - 1
+  end
+  return ts_line_text(text, [a, b])
+end
+
+# a fence's character and length, [c, n], or [0, 0]
+make a function called md_fence takes text, line returns f
+  if ts_indent(text, line) >= 4 then
+    return [0, 0]
+  end
+  let t = ts_trim_line(text, line)
+  let n = md_run_of(text, t, 96)
+  if n >= 3 then
+    return [96, n]
+  end
+  let n = md_run_of(text, t, 126)
+  if n >= 3 then
+    return [126, n]
+  end
+  return [0, 0]
+end
+
+# where a list item's content starts, or -1: after "- ", "* ", "+ ", "1. ", "1) "
+make a function called md_item takes text, line returns at
+  let t = ts_trim_line(text, line)
+  if t[0] >= t[1] then
+    return 0 - 1
+  end
+  let c = bytes_get(text, t[0])
+  if (c == 45) or (c == 42) or (c == 43) then
+    if (t[0] + 1 < t[1]) and (bytes_get(text, t[0] + 1) == 32) then
+      return t[0] + 2
+    end
+    return 0 - 1
+  end
+  let k = t[0]
+  while (k < t[1]) and (bytes_get(text, k) >= 48) and (bytes_get(text, k) <= 57) do
+    let k = k + 1
+  end
+  if (k > t[0]) and (k - t[0] <= 9) and (k + 1 < t[1]) then
+    let d = bytes_get(text, k)
+    if ((d == 46) or (d == 41)) and (bytes_get(text, k + 1) == 32) then
+      return k + 2
+    end
+  end
+  return 0 - 1
+end
+
+make a function called md_starts_with takes text, line, c returns yes
+  let t = ts_trim_line(text, line)
+  return (t[0] < t[1]) and (bytes_get(text, t[0]) == c)
+end
+
+make a function called md_thematic takes text, line returns yes
+  return ts_rule_of(text, line, 45) or ts_rule_of(text, line, 42) or ts_rule_of(text, line, 95)
+end
+
+# whether a line starts a block that ends a paragraph
+make a function called md_interrupts takes text, line returns yes
+  if md_atx(text, line) > 0 then
+    return true
+  end
+  if md_fence(text, line)[0] != 0 then
+    return true
+  end
+  if md_starts_with(text, line, 62) or md_starts_with(text, line, 124) then
+    return true
+  end
+  return md_item(text, line) >= 0
+end
+
+# a quote's lines without their ">" (and one space after it): its paragraphs
+make a function called md_quote_body takes st, text, lines returns kids
+  let kids = []
+  let run = []
+  let k = 0
+  while k <= list_len(lines) do
+    let piece = false
+    if k < list_len(lines) then
+      let t = ts_trim_line(text, lines[k])
+      let a = t[0] + 1
+      if (a < t[1]) and (bytes_get(text, a) == 32) then
+        let a = a + 1
+      end
+      let piece = [a, t[1]]
+    end
+    if (piece == false) or (piece[0] >= piece[1]) then
+      if list_len(run) > 0 then
+        let kids = list_push(kids, ts_paragraph(st, text, run, "paragraph"))
+      end
+      let run = []
+    else
+      let run = list_push(run, piece)
+    end
+    let k = k + 1
+  end
+  return kids
+end
+
+make a function called ts_markdown takes st, text returns tree
+  let lines = ts_lines(text)
+  let n = list_len(lines)
+  let blocks = []
+  let run = []
+  let items = []
+  let i = 0
+  while i < n do
+    let line = lines[i]
+    let item_at = md_item(text, line)
+    # a list ends at a line that is neither an item, nor blank, nor indented under one
+    if (list_len(items) > 0) and (item_at < 0) and (not ts_blank(text, line)) and (ts_indent(text, line) < 2) then
+      let blocks = list_push(blocks, md_list(st, text, items))
+      let items = []
+    end
+    if ts_blank(text, line) then
+      if list_len(run) > 0 then
+        let blocks = list_push(blocks, ts_paragraph(st, text, run, "paragraph"))
+        let run = []
+      end
+      let i = i + 1
+    elif (list_len(run) > 0) and (ts_rule_of(text, line, 61) or ts_rule_of(text, line, 45)) then
+      # a setext heading: the paragraph so far is its title
+      let level = 2
+      if ts_rule_of(text, line, 61) then
+        let level = 1
+      end
+      let title = sb_new()
+      let k = 0
+      while k < list_len(run) do
+        if k > 0 then
+          sb_push(title, " ")
+        end
+        sb_push(title, ts_line_text(text, run[k]))
+        let k = k + 1
+      end
+      let t = ts_trim_line(text, run[0])
+      let blocks = list_push(blocks, ts_unit("heading", t[0], line[1], [["title", sb_str(title)], ["level", level]], []))
+      let run = []
+      let i = i + 1
+    elif (list_len(run) > 0) and (not md_interrupts(text, line)) then
+      let run = list_push(run, line)
+      let i = i + 1
+    else
+      if list_len(run) > 0 then
+        let blocks = list_push(blocks, ts_paragraph(st, text, run, "paragraph"))
+        let run = []
+      end
+      let fence = md_fence(text, line)
+      if md_atx(text, line) > 0 then
+        let t = ts_trim_line(text, line)
+        let blocks = list_push(blocks, ts_unit("heading", t[0], t[1], [["title", md_atx_title(text, line)], ["level", md_atx(text, line)]], []))
+        let i = i + 1
+      elif fence[0] != 0 then
+        let t = ts_trim_line(text, line)
+        let lang = ts_line_text(text, [t[0] + fence[1], t[1]])
+        let j = i + 1
+        let closed = false
+        while (j < n) and (not closed) do
+          let f2 = md_fence(text, lines[j])
+          let t2 = ts_trim_line(text, lines[j])
+          if (f2[0] == fence[0]) and (f2[1] >= fence[1]) and (t2[0] + f2[1] == t2[1]) then
+            let closed = true
+          else
+            let j = j + 1
+          end
+        end
+        let last = j
+        if last >= n then
+          let last = n - 1
+        end
+        let blocks = list_push(blocks, ts_unit("code", t[0], lines[last][1], [["lang", lang]], []))
+        let i = last + 1
+      elif md_starts_with(text, line, 62) then
+        let qs = []
+        let j = i
+        while (j < n) and md_starts_with(text, lines[j], 62) do
+          let qs = list_push(qs, lines[j])
+          let j = j + 1
+        end
+        let t = ts_trim_line(text, line)
+        let blocks = list_push(blocks, ts_unit("quote", t[0], lines[j - 1][1], [], md_quote_body(st, text, qs)))
+        let i = j
+      elif md_starts_with(text, line, 124) then
+        let j = i
+        while (j < n) and md_starts_with(text, lines[j], 124) do
+          let j = j + 1
+        end
+        let t = ts_trim_line(text, line)
+        let blocks = list_push(blocks, ts_unit("table", t[0], ts_trim_line(text, lines[j - 1])[1], [], []))
+        let i = j
+      elif item_at >= 0 then
+        let items = list_push(items, [line, item_at, []])
+        let i = i + 1
+      elif (list_len(items) > 0) and (ts_indent(text, line) >= 2) then
+        # a line under an item belongs to it
+        let last = items[list_len(items) - 1]
+        let items = list_set(items, list_len(items) - 1, [last[0], last[1], list_push(last[2], line)])
+        let i = i + 1
+      elif ts_indent(text, line) >= 4 then
+        let j = i
+        let end_at = i
+        while (j < n) and (ts_blank(text, lines[j]) or (ts_indent(text, lines[j]) >= 4)) do
+          if not ts_blank(text, lines[j]) then
+            let end_at = j
+          end
+          let j = j + 1
+        end
+        let blocks = list_push(blocks, ts_unit("code", line[0], lines[end_at][1], [["lang", ""]], []))
+        let i = end_at + 1
+      elif md_thematic(text, line) then
+        let t = ts_trim_line(text, line)
+        let blocks = list_push(blocks, ts_unit("break", t[0], t[1], [], []))
+        let i = i + 1
+      else
+        let run = [line]
+        let i = i + 1
+      end
+    end
+  end
+  if list_len(run) > 0 then
+    let blocks = list_push(blocks, ts_paragraph(st, text, run, "paragraph"))
+  end
+  if list_len(items) > 0 then
+    let blocks = list_push(blocks, md_list(st, text, items))
+  end
+  let nested = ts_nest(blocks, 0, 0, bytes_len(text))
+  return ts_unit("document", 0, bytes_len(text), [["format", "markdown"]], nested[0])
+end
+
+# a list from its items, each [marker line, where its content starts, the lines under it]
+make a function called md_list takes st, text, items returns u
+  let kids = []
+  let k = 0
+  while k < list_len(items) do
+    let it = items[k]
+    let t = ts_trim_line(text, it[0])
+    let view = [[it[1], t[1]]]
+    let last_end = t[1]
+    let j = 0
+    while j < list_len(it[2]) do
+      let tl = ts_trim_line(text, it[2][j])
+      if tl[0] < tl[1] then
+        let view = list_push(view, tl)
+        let last_end = tl[1]
+      end
+      let j = j + 1
+    end
+    let kids = list_push(kids, ts_unit("item", t[0], last_end, [["indent", ts_indent(text, it[0])]], ts_sentences(st, text, view)))
+    let k = k + 1
+  end
+  return ts_unit("list", kids[0][1], kids[list_len(kids) - 1][2], [], kids)
+end

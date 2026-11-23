@@ -1,0 +1,296 @@
+# file_marshal service: one owner in front of the files under a root.
+#
+# Every operation on a file goes through the service, which applies them one
+# at a time, in the order they arrive, so each file's versions have one order.
+# Requests and replies are values in the history's encoding (fh_encode), one
+# after another on a connection; contents and contexts are bytes, so text and
+# binary pass through untouched. Requests:
+#   ["read", path]                          ["ok", version, content]
+#   ["edit", path, base, edits, client]     ["ok", version, shifts]
+#                                           ["refused", k, reason, version now]
+#   ["write", path, if_version, content, client]
+#                                           ["ok", version], or ["refused",
+#                                           reason, version now]; if_version
+#                                           -1 writes whatever the version
+#   ["append", path, bytes, client]         ["ok", version]
+#   ["shifts", path, since]                 as fh_shifts_since
+#   ["version", path, v]                    ["ok", content], or ["gone", reason]
+#   ["undo", path, k, client]               ["ok", version], or ["refused", reason]
+#   ["revert", path, v, client]             the same
+#   ["clear", path, keep, token]            ["ok", records kept]
+#   ["status"]                              ["ok", files, operations]
+#   ["quit", token]                         ["ok"], and the service ends
+# An edit's base is the version its hints were made against: each hint is
+# carried past the shifts since then (fh_shifts_since), so an edit made against
+# an older version starts its search where its context now is. A hint that
+# cannot be carried (the content was rewritten since) is dropped, and the
+# context alone finds the place.
+#
+# Before each operation the file's content is checked against its history
+# (fh_recover), so a change made by something else is recorded as a version of
+# its own: a write if_version made before it is then refused.
+#
+# A path is relative to the root, its parts separated by /, with no part that
+# is empty, ".", ".." or holds ":" or "\": anything else is refused before any
+# file is touched.
+include "history.patlang"
+include "../port_marshal/port_marshal.patlang"
+
+class FileService {
+  field root = ""
+  field store = ""
+  field token = ""
+  field histories = []
+  field operations = 0
+  field quitting = false
+}
+
+# whether path stays under the root
+make a function called fs_path_ok takes path returns yes
+  if type_of(path) != "string" then
+    return false
+  end
+  let b = bytes_from_str(path)
+  let n = bytes_len(b)
+  if n == 0 then
+    return false
+  end
+  let start = 0
+  let i = 0
+  while i <= n do
+    if (i == n) or (bytes_get(b, i) == 47) then
+      let part = bytes_to_str(bytes_slice(b, start, i - start))
+      if (part == "") or (part == ".") or (part == "..") or str_contains(part, ":") or str_contains(part, chr(92)) then
+        return false
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called fs_history takes s, path returns h
+  let k = 0
+  while k < list_len(s.histories) do
+    if s.histories[k][0] == path then
+      return s.histories[k][1]
+    end
+    let k = k + 1
+  end
+  let h = fh_open(s.store, path)
+  s.histories = list_push(s.histories, [path, h])
+  return h
+end
+
+# an edit's hint carried from version base to now: the edit with its hint
+# moved, or with no hint when the content was rewritten since
+make a function called fs_carry takes e, got returns e2
+  if e[4] < 0 then
+    return e
+  end
+  if got[0] == "ok" then
+    return fm_shift_hint(e, got[1])
+  end
+  return [e[0], e[1], e[2], e[3], 0 - 1, 0 - 1]
+end
+
+make a function called fs_edit takes s, h, full, req returns reply
+  let base = req[2]
+  let edits = req[3]
+  let carried = []
+  if base != fh_last(h) then
+    let got = fh_shifts_since(h, base)
+    let k = 0
+    while k < list_len(edits) do
+      let carried = list_push(carried, fs_carry(edits[k], got))
+      let k = k + 1
+    end
+  else
+    let carried = edits
+  end
+  let r = fm_apply_batch(read_file_raw(full), carried)
+  if r[0] != "ok" then
+    return ["refused", r[1], r[2], fh_last(h)]
+  end
+  let v = fh_record(h, "edits", req[4], r[1], carried, r[2])
+  fh_replace(full, r[1])
+  return ["ok", v, r[2]]
+end
+
+# One request: its reply.
+make a function called fs_handle takes s, req returns reply
+  s.operations = s.operations + 1
+  if type_of(req) != "list" then
+    return ["refused", "not a request"]
+  end
+  if list_len(req) == 0 then
+    return ["refused", "not a request"]
+  end
+  let op = req[0]
+  if op == "status" then
+    return ["ok", list_len(s.histories), s.operations]
+  end
+  if op == "quit" then
+    if (list_len(req) < 2) or (req[1] != s.token) then
+      return ["refused", "wrong token"]
+    end
+    s.quitting = true
+    return ["ok"]
+  end
+  if (list_len(req) < 2) or (not fs_path_ok(req[1])) then
+    return ["refused", "a path under the root, with no empty, . or .. part, and no : or \\"]
+  end
+  let path = req[1]
+  let full = s.root + "/" + path
+  let h = fs_history(s, path)
+  fh_recover(h, full, "outside")
+  if op == "read" then
+    return ["ok", fh_last(h), read_file_raw(full)]
+  end
+  if (op == "edit") and (list_len(req) == 5) then
+    return fs_edit(s, h, full, req)
+  end
+  if (op == "write") and (list_len(req) == 5) then
+    if (req[2] >= 0) and (req[2] != fh_last(h)) then
+      return ["refused", "the file is at version " + fh_last(h) + ", not " + req[2], fh_last(h)]
+    end
+    let v = fh_record(h, "write", req[4], req[3], false, [])
+    fh_replace(full, req[3])
+    return ["ok", v]
+  end
+  if (op == "append") and (list_len(req) == 4) then
+    let after = read_file_raw(full)
+    bytes_extend(after, req[2])
+    let v = fh_record(h, "append", req[3], after, req[2], [])
+    append_file_bytes(full, req[2])
+    return ["ok", v]
+  end
+  if (op == "shifts") and (list_len(req) == 3) then
+    return fh_shifts_since(h, req[2])
+  end
+  if (op == "version") and (list_len(req) == 3) then
+    return fh_content_at(h, req[2])
+  end
+  if (op == "undo") and (list_len(req) == 4) then
+    return fh_undo_file(h, full, req[2], req[3])
+  end
+  if (op == "revert") and (list_len(req) == 4) then
+    return fh_revert_file(h, full, req[2], req[3])
+  end
+  if (op == "clear") and (list_len(req) == 4) then
+    if req[3] != s.token then
+      return ["refused", "wrong token"]
+    end
+    return ["ok", fh_clear(h, req[2])]
+  end
+  return ["refused", "not understood: " + op]
+end
+
+# ---- serving ----
+
+# A service for the files under root, its history in store, listening on port
+# (already listening), with a token written where port_marshal's clients find
+# one (signal_token_path).
+make a function called fs_start takes port, root, store returns s
+  let s = new("FileService")
+  s.root = root
+  s.store = store
+  s.token = signal_new_token()
+  write_file(signal_token_path(port), s.token)
+  return s
+end
+
+# Serves until quit: each connection's bytes are gathered until a whole request
+# has come, which is handled and answered; a connection may send any number.
+make a function called fs_loop takes s, port returns s2
+  let conns = []
+  while not s.quitting do
+    let ids = []
+    let k = 0
+    while k < list_len(conns) do
+      let ids = list_push(ids, conns[k][0])
+      let k = k + 1
+    end
+    let ready = tcp_wait_any(ids, [port], 200)
+    if list_len(ready[1]) > 0 then
+      let c = tcp_accept_timeout(port, 0)
+      if c >= 1 then
+        let conns = list_push(conns, [c, bytes_new(0)])
+      end
+    end
+    let still = []
+    let k = 0
+    while k < list_len(conns) do
+      let e = conns[k]
+      let keep = true
+      if pm_has(ready[0], e[0]) then
+        let st = tcp_read_status(e[0], 0)
+        if st[1] == "data" then
+          bytes_extend(e[1], bytes_from_str(st[0]))
+          let more = true
+          while more do
+            let got = fh_decode(e[1], 0)
+            if got[0] then
+              let reply = fs_handle(s, got[1])
+              tcp_try_write(e[0], bytes_to_str(fh_encode(reply)))
+              let rest = bytes_slice(e[1], got[2], bytes_len(e[1]) - got[2])
+              let e = [e[0], rest]
+            else
+              let more = false
+            end
+          end
+        elif st[1] != "wait" then
+          tcp_close(e[0])
+          let keep = false
+        end
+      end
+      if keep then
+        let still = list_push(still, e)
+      end
+      let k = k + 1
+    end
+    let conns = still
+  end
+  let k = 0
+  while k < list_len(conns) do
+    tcp_close(conns[k][0])
+    let k = k + 1
+  end
+  tcp_unlisten(port)
+  let path = signal_token_path(port)
+  if file_exists(path) then
+    remove_file(path)
+  end
+  return s
+end
+
+# ---- the client side ----
+
+# A connection to the file service registered with the marshaller on mport as
+# name ("files" by default): [conn, rest], as pm_connect_at gives.
+make a function called fs_connect_at takes mport, name returns got
+  return pm_connect_at(mport, name)
+end
+
+# One request on a connection [conn, rest]: its reply, and the connection with
+# what came after it. [reply, conn2]; the reply is ["error", reason] when the
+# connection ends first.
+make a function called fs_call takes c, req returns got
+  tcp_write(c[0], bytes_to_str(fh_encode(req)))
+  let buf = bytes_from_str(c[1])
+  while true do
+    let one = fh_decode(buf, 0)
+    if one[0] then
+      let rest = bytes_to_str(bytes_slice(buf, one[2], bytes_len(buf) - one[2]))
+      return [one[1], [c[0], rest]]
+    end
+    let st = tcp_read_status(c[0], 30000)
+    if st[1] == "data" then
+      bytes_extend(buf, bytes_from_str(st[0]))
+    elif st[1] != "wait" then
+      return [["error", "the connection ended"], c]
+    end
+  end
+  return [["error", "the connection ended"], c]
+end

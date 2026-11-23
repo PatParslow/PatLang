@@ -275,8 +275,8 @@ function start(init) {
     // processes or sockets: each of those reports failure
     CreateFileA(name, access) {
       const path = norm(cstr(num(name)));
-      // GENERIC_READ alone
-      if ((num(access) & 0x40000000) !== 0) { lastError = 5; return -1; }
+      // GENERIC_READ alone: GENERIC_WRITE and FILE_APPEND_DATA are refused
+      if ((num(access) & 0x40000004) !== 0) { lastError = 5; return -1; }
       if (!(path in files)) { lastError = dirs.has(path) ? 5 : 2; return -1; }
       const h = FILE_H + nextFile++;
       opened.set(h, { data: files[path], pos: 0 });
@@ -375,9 +375,17 @@ function start(init) {
       CreateFileA(name, access, share, sec, disposition) {
         const path = realPath(num(name));
         const write = (num(access) & 0x40000000) !== 0;
+        // FILE_APPEND_DATA alone (append_file): every write goes to the end
+        const append = !write && (num(access) & 4) !== 0;
         const d = num(disposition);
         try {
           if (fs.existsSync(path) && fs.statSync(path).isDirectory()) { lastError = 5; return -1; }
+          if (append) {
+            const fd = fs.openSync(path, "a");
+            const h = FILE_H + nextFile++;
+            opened.set(h, { fd, pos: 0, append: true });
+            return h;
+          }
           let flags = "r";
           if (write) {
             if (d === 1) flags = "wx+";
@@ -405,7 +413,8 @@ function start(init) {
         const f = opened.get(num(h));
         if (!f || f.fd === undefined) return base.WriteFile(h, buf, n, written);
         const len = num(n);
-        const put = fs.writeSync(f.fd, u8().slice(num(buf), num(buf) + len), 0, len, f.pos);
+        // an appending handle writes at the end, wherever it last wrote
+        const put = fs.writeSync(f.fd, u8().slice(num(buf), num(buf) + len), 0, len, f.append ? null : f.pos);
         f.pos += put;
         if (num(written) !== 0) dv().setUint32(num(written), put, true);
         return 1;
