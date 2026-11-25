@@ -300,6 +300,9 @@ make a function called xv_op takes b, op, d, a, c, n, plus_events returns done
   if mw then
     xv_modint_word_op(b, op, d, a, c, n, done)
   end
+  if (op == "shl") or (op == "shr") then
+    xv_modint_word_shift(b, op, d, a, c, n, done)
+  end
   xv_call(b, xv_op_fn(op), [a, c], d)
   sb_push(b, done + ":" + xv_nl())
   return true
@@ -369,6 +372,99 @@ make a function called xv_modint_word_op takes b, op, d, a, c, n, done returns o
     xv_line(b, "mov " + xv_t(d) + ", rdx")
     xv_line(b, "mov " + xv_d(d) + ", rax")
   end
+  xv_line(b, "jmp " + done)
+  sb_push(b, call + ":" + xv_nl())
+  return true
+end
+
+# The checks of a word shift or rotation, the modint a and the int count c:
+# a is a modint held as a word (k, its bits, in r8), c an int from 0 to k
+# (in rdx); anything else jumps to call, the runtime's function, which stops
+# as spec 1.14 says or takes the block path.
+make a function called xv_modint_word_count takes b, a, c, call returns ok
+  xv_line(b, "mov rax, " + xv_t(a))
+  xv_line(b, "mov r8, rax")
+  xv_line(b, "shr r8, 40")
+  xv_line(b, "test r8, r8")
+  xv_line(b, "je " + call)
+  xv_line(b, "mov rdx, 4294967295")
+  xv_line(b, "and rdx, rax")
+  xv_line(b, "cmp rdx, 15")
+  xv_line(b, "jne " + call)
+  xv_line(b, "and r8, 127")
+  xv_line(b, "mov rdx, " + xv_t(c))
+  xv_line(b, "cmp rdx, 2")
+  xv_line(b, "jne " + call)
+  xv_line(b, "mov rdx, " + xv_d(c))
+  xv_line(b, "cmp rdx, 0")
+  xv_line(b, "jl " + call)
+  xv_line(b, "cmp rdx, r8")
+  xv_line(b, "jg " + call)
+  return true
+end
+
+# The word in rax kept to its k (r8) low bits, stored in d with a's type word.
+make a function called xv_modint_word_store takes b, d, a, masked returns ok
+  xv_line(b, "cmp r8, 64")
+  xv_line(b, "jae " + masked)
+  xv_line(b, "mov rcx, r8")
+  xv_line(b, "mov rdx, 1")
+  xv_line(b, "shl rdx, cl")
+  xv_line(b, "sub rdx, 1")
+  xv_line(b, "and rax, rdx")
+  sb_push(b, masked + ":" + xv_nl())
+  xv_line(b, "mov rdx, " + xv_t(a))
+  xv_line(b, "mov " + xv_t(d) + ", rdx")
+  xv_line(b, "mov " + xv_d(d) + ", rax")
+  return true
+end
+
+# a shl c and a shr c for a word modint and an int count from 0 to k below 64,
+# inline: the machine shift and the k low bits (spec 1.14: bits shifted out are
+# lost, zeros come in). A count of 64 (k = 64), or anything else, is the
+# runtime's. The time depends on k alone. (They were calls, about 1,000 cycles
+# each, until 2026-11-24.)
+make a function called xv_modint_word_shift takes b, op, d, a, c, n, done returns ok
+  let call = ".op_mwscall_" + n
+  xv_modint_word_count(b, a, c, call)
+  xv_line(b, "cmp rdx, 64")
+  xv_line(b, "jge " + call)
+  xv_line(b, "mov rcx, rdx")
+  xv_line(b, "mov rax, " + xv_d(a))
+  if op == "shl" then
+    xv_line(b, "shl rax, cl")
+  else
+    xv_line(b, "shr rax, cl")
+  end
+  xv_modint_word_store(b, d, a, ".op_mwsmask_" + n)
+  xv_line(b, "jmp " + done)
+  sb_push(b, call + ":" + xv_nl())
+  return true
+end
+
+# rotl(a, c) and rotr(a, c), the runtime's (not a program's own of the name),
+# for a word modint and an int count from 0 to k, inline: (w shl s) bor
+# (w shr (k - s)), kept to k bits, rotr's s being k - c. A machine shift takes
+# its count modulo 64, which happens only for a count of 64, when k is 64 and
+# s is 0 or 64, and either gives w, as the rotation does. Anything else falls
+# through to the call that follows. (They were calls, about 660 cycles each.)
+make a function called xv_modint_word_rot takes b, name, d, a, c, n, done returns ok
+  let call = ".rot_call_" + n
+  xv_modint_word_count(b, a, c, call)
+  if name == "rotr" then
+    xv_line(b, "mov rcx, r8")
+    xv_line(b, "sub rcx, rdx")
+    xv_line(b, "mov rdx, rcx")
+  end
+  xv_line(b, "mov rax, " + xv_d(a))
+  xv_line(b, "mov r9, rax")
+  xv_line(b, "mov rcx, rdx")
+  xv_line(b, "shl rax, cl")
+  xv_line(b, "mov rcx, r8")
+  xv_line(b, "sub rcx, rdx")
+  xv_line(b, "shr r9, cl")
+  xv_line(b, "or rax, r9")
+  xv_modint_word_store(b, d, a, ".rot_mask_" + n)
   xv_line(b, "jmp " + done)
   sb_push(b, call + ":" + xv_nl())
   return true
@@ -1333,7 +1429,14 @@ make a function called xv_fn_asm takes func, facts returns asm
       xv_line(b, "mov rax, " + xv_d(ins[2]))
       xv_line(b, "mov " + xv_d(ins[1]) + ", rax")
     elif op == "call" then
-      xv_call(b, ins[2], ins[3], ins[1])
+      if ((ins[2] == "rotl") or (ins[2] == "rotr")) and (list_len(ins[3]) == 2) then
+        let rot_done = ".rot_done_" + i
+        xv_modint_word_rot(b, ins[2], ins[1], ins[3][0], ins[3][1], i, rot_done)
+        xv_call(b, ins[2], ins[3], ins[1])
+        sb_push(b, rot_done + ":" + xv_nl())
+      else
+        xv_call(b, ins[2], ins[3], ins[1])
+      end
     elif op == "op" then
       xv_op(b, ins[2], ins[1], ins[3], ins[4], i, plus_events)
     elif op == "un" then

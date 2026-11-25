@@ -1,0 +1,143 @@
+# HMAC (RFC 2104), HKDF (RFC 5869) and TLS 1.3's HKDF-Expand-Label and
+# Derive-Secret (RFC 8446 section 7.1), over SHA-256 or SHA-384 on modints,
+# so the constant-time check (spec 2.7) follows a secret from the key share
+# to the traffic keys. A hash is named "sha256" or "sha384". Keys, data and
+# results are lists of bytes; what comes back is modints modulo 256.
+#
+#   tls_hash(alg, bytes)                         the digest
+#   tls_hash_len(alg)                            32 or 48
+#   tls_hmac(alg, key, data)                     the MAC
+#   tls_hkdf_extract(alg, salt, ikm)             the pseudorandom key ([] salt: zeros)
+#   tls_hkdf_expand(alg, prk, info, length)      length bytes of output key
+#   tls_expand_label(alg, secret, label, context, length)
+#   tls_derive_secret(alg, secret, label, transcript_hash)
+include "sha256m.patlang"
+include "../sha512/sha512.patlang"
+
+make a function called tls_hash_len takes alg returns n
+  require (alg == "sha256") or (alg == "sha384")
+  if alg == "sha256" then
+    return 32
+  end
+  return 48
+end
+
+make a function called tls_block_len takes alg returns n
+  require (alg == "sha256") or (alg == "sha384")
+  if alg == "sha256" then
+    return 64
+  end
+  return 128
+end
+
+make a function called tls_hash takes alg, bytes returns digest
+  require ((alg == "sha256") or (alg == "sha384")) and (type_of(bytes) == "list")
+  if alg == "sha256" then
+    let digest = tls_sha256(bytes)
+  else
+    let digest = sha384(bytes)
+  end
+  ensure list_len(digest) == tls_hash_len(alg)
+  return digest
+end
+
+# a then b, as one list
+make a function called tls_cat takes a, b returns out
+  require (type_of(a) == "list") and (type_of(b) == "list")
+  let out = a
+  let i = 0
+  while i < list_len(b) do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(a) + list_len(b)
+  return out
+end
+
+make a function called tls_hmac takes alg, key, data returns mac
+  require (type_of(key) == "list") and (type_of(data) == "list")
+  let block = tls_block_len(alg)
+  let k = key
+  if list_len(k) > block then
+    let k = tls_hash(alg, k)
+  end
+  let byte = mod_make(0, 256)
+  let inner = []
+  let outer = []
+  let i = 0
+  while i < block do
+    if i < list_len(k) then
+      let b = mod_make(k[i], byte)
+    else
+      let b = mod_make(0, byte)
+    end
+    let inner = list_push(inner, b bxor 54)
+    let outer = list_push(outer, b bxor 92)
+    let i = i + 1
+  end
+  let mac = tls_hash(alg, tls_cat(outer, tls_hash(alg, tls_cat(inner, data))))
+  ensure list_len(mac) == tls_hash_len(alg)
+  return mac
+end
+
+make a function called tls_hkdf_extract takes alg, salt, ikm returns prk
+  require (type_of(salt) == "list") and (type_of(ikm) == "list")
+  let s = salt
+  if list_len(s) == 0 then
+    let s = []
+    let i = 0
+    while i < tls_hash_len(alg) do
+      let s = list_push(s, 0)
+      let i = i + 1
+    end
+  end
+  let prk = tls_hmac(alg, s, ikm)
+  ensure list_len(prk) == tls_hash_len(alg)
+  return prk
+end
+
+make a function called tls_hkdf_expand takes alg, prk, info, length returns okm
+  require (type_of(prk) == "list") and (type_of(info) == "list") and (length >= 0) and (length <= 255 * tls_hash_len(alg))
+  let okm = []
+  let t = []
+  let n = 1
+  while list_len(okm) < length do
+    let t = tls_hmac(alg, prk, tls_cat(tls_cat(t, info), [n]))
+    let i = 0
+    while (i < list_len(t)) and (list_len(okm) < length) do
+      let okm = list_push(okm, t[i])
+      let i = i + 1
+    end
+    let n = n + 1
+  end
+  ensure list_len(okm) == length
+  return okm
+end
+
+# The HkdfLabel struct (RFC 8446 section 7.1): the length as two bytes, then
+# "tls13 " and the label, and the context, each after its length as a byte.
+make a function called tls_hkdf_label takes label, context, length returns info
+  require (type_of(label) == "string") and (type_of(context) == "list") and (length >= 0) and (length < 65536)
+  let full = tls_text_bytes("tls13 " + label)
+  let info = [length shr 8, length band 255, list_len(full)]
+  let info = tls_cat(tls_cat(info, full), [list_len(context)])
+  let info = tls_cat(info, context)
+  ensure list_len(info) == 4 + list_len(full) + list_len(context)
+  return info
+end
+
+make a function called tls_expand_label takes alg, secret, label, context, length returns out
+  require (type_of(secret) == "list") and (type_of(label) == "string") and (type_of(context) == "list")
+  let out = tls_hkdf_expand(alg, secret, tls_hkdf_label(label, context, length), length)
+  ensure list_len(out) == length
+  return out
+end
+
+# Derive-Secret(secret, label, messages), given the hash of the messages
+# (a handshake keeps its transcript's hash as it goes).
+make a function called tls_derive_secret takes alg, secret, label, transcript_hash returns out
+  require (type_of(secret) == "list") and (list_len(transcript_hash) == tls_hash_len(alg))
+  let out = tls_expand_label(alg, secret, label, transcript_hash, tls_hash_len(alg))
+  ensure list_len(out) == tls_hash_len(alg)
+  return out
+end

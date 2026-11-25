@@ -49,6 +49,19 @@ Feature: file_marshal service: one owner in front of the files under a root
     And it undoes version 2 of notes.txt
     Then notes.txt says "the curly haired dog sat on the mat" again
 
+  Scenario: find with a cursor gives each match in turn, carried past edits made between calls
+    Given a file find.txt saying "x cat y cat z cat"
+    When a client finds "cat" in find.txt from the start
+    Then it is found at 2
+    When another client puts "big " between "x " and "cat" in find.txt
+    And the client finds "cat" in find.txt from its cursor
+    Then it is found at 12
+    When the client finds "cat" in find.txt from its cursor
+    Then it is found at 18
+    When the client finds "cat" in find.txt from its cursor
+    Then the search has ended
+    And finding "" is refused, saying a pattern is at least one byte
+
   Scenario: the service answers status, and quits with its token
     When a client reads notes.txt
     Then a status query says 1 file and at least 2 operations

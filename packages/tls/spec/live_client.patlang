@@ -1,0 +1,92 @@
+# server.feature's client, a Linux build run under WSL (or on Linux): it
+# starts openssl s_server with the test PKI on this machine's loopback,
+# connects, completes the TLS 1.3 handshake, and asks for "/". It prints the
+# handshake's result, then the response's first line.
+#
+#   live_client CERTDIR LEAF KEY HOST ROOTS [S_SERVER_OPTION VALUE]
+#     ROOTS "test" trusts the test root alone; "system" the system's roots;
+#     "http" asks through lib/http_client.patlang's http_request for
+#     https://HOST:PORT/, trusting the test root, and prints the status;
+#     "get:PATH" serves the certificate directory's files (s_server -WWW,
+#     run in it) and fetches PATH with tls_https_get, printing the status
+#     and whether the body is the file's bytes
+#
+# s_server exits after two connections (the readiness probe and the client)
+# or 600 seconds, whichever comes first, so nothing is left running. (60
+# seconds was too short on a loaded machine: a handshake and the server's
+# start took longer, and the server was gone before the request.)
+include "../../../self_hosting/lib/includes.patlang"
+include "../../../self_hosting/lib/http_client.patlang"
+
+let a = argv()
+let certs = a[0]
+let leaf = a[1]
+let key = a[2]
+let host = a[3]
+let port = 47100 + (now_ms() % 800)
+if str_starts_with(a[4], "get:") then
+  # s_server -WWW serves the files under its working directory, the certs'
+  let pid = spawn("timeout", "600", "openssl", "s_server", "-tls1_3", "-accept", "" + port, "-naccept", "2", "-cert", certs + "/" + leaf + ".pem", "-key", certs + "/" + key + ".key", "-cert_chain", certs + "/chain_ec.pem", "-WWW")
+elif list_len(a) > 6 then
+  let pid = spawn("timeout", "600", "openssl", "s_server", "-tls1_3", "-accept", "" + port, "-naccept", "2", "-cert", certs + "/" + leaf + ".pem", "-key", certs + "/" + key + ".key", "-cert_chain", certs + "/chain_ec.pem", "-www", a[5], a[6])
+else
+  let pid = spawn("timeout", "600", "openssl", "s_server", "-tls1_3", "-accept", "" + port, "-naccept", "2", "-cert", certs + "/" + leaf + ".pem", "-key", certs + "/" + key + ".key", "-cert_chain", certs + "/chain_ec.pem", "-www")
+end
+# ready when a connection is accepted: the probe is the first of the two
+let conn = 0 - 1
+let tries = 0
+while (conn < 0) and (tries < 150) do
+  let conn = tcp_try_connect("localhost", port)
+  if conn < 0 then
+    sleep_ms(100)
+  end
+  let tries = tries + 1
+end
+if conn < 0 then
+  print(["no server", port])
+elif str_starts_with(a[4], "get:") then
+  tcp_close(conn)
+  let root = bytes_to_list(read_file_raw(certs + "/root.der"))
+  let path = substr(a[4], 4, str_len(a[4]) - 4)
+  let r = tls_https_get("https://" + host + ":" + port + path, [root], 1048576)
+  if r[0] == "ok" then
+    print([r[0], r[1], tls_hex(r[2]) == tls_hex(bytes_to_list(read_file_raw(certs + path)))])
+  else
+    print(r)
+  end
+elif a[4] == "http" then
+  tcp_close(conn)
+  let root = bytes_to_list(read_file_raw(certs + "/root.der"))
+  let r = http_request("GET", "https://" + host + ":" + port + "/", [], "", [["roots", [root]]])
+  print([r[0], r[1]])
+else
+  tcp_close(conn)
+  let conn = tcp_try_connect("localhost", port)
+  let c = tls13_new(tls_io_tcp(conn), host)
+  if a[4] == "test" then
+    c.roots = [bytes_to_list(read_file_raw(certs + "/root.der"))]
+  end
+  let r = tls13_handshake(c)
+  print(r)
+  if r[0] == "ok" then
+    tls13_send(c, tls_text_bytes("GET / HTTP/1.0" + chr(13) + chr(10) + chr(13) + chr(10)))
+    let got = []
+    let going = true
+    while going do
+      let d = tls13_recv(c)
+      if d[0] == "data" then
+        let got = got + d[1]
+      else
+        let going = false
+      end
+    end
+    let first = []
+    let i = 0
+    while (i < list_len(got)) and (got[i] != 13) do
+      let first = list_push(first, got[i])
+      let i = i + 1
+    end
+    print(bytes_to_str(bytes_from_list(first)))
+  end
+  tcp_close(conn)
+end

@@ -193,6 +193,84 @@ make a function called fm_find_next takes b, pat, from returns at
   return 0 - 1
 end
 
+# ---- finding lazily ----
+#
+# A finder is a fibre that yields each offset where a pattern starts, one each
+# time it is resumed, and so does no more scanning than the matches asked for:
+#   let f = fm_finder(b, pat, from)
+#   fm_finder_next(f)     the next offset, or -1 when there is none (the
+#                         fibre has then ended)
+#   fm_finder_close(f)    ends the fibre before its end, so nothing is left
+#                         paused
+# Matches may overlap, as fm_find_all's do. A finder is for bytes held in the
+# program; across the files service, whose file can change between two calls,
+# a search is a cursor the service carries past the edits (service.patlang,
+# "find").
+
+make a function called fm_finder_run takes job returns done
+  if job == "stop" then
+    return 0 - 1
+  end
+  let b = job[0]
+  let pat = job[1]
+  let at = fm_find_next(b, pat, job[2])
+  while at >= 0 do
+    if fiber_yield(at) == "stop" then
+      return 0 - 1
+    end
+    let at = fm_find_next(b, pat, at + 1)
+  end
+  return 0 - 1
+end
+
+# [fibre, job, state]: state false before the first resume, true while it
+# runs, "done" once it has ended
+make a function called fm_finder takes b, pat, from returns f
+  let p = fm_bytes_of(pat)
+  require bytes_len(p) > 0
+  let from_at = from
+  if from_at < 0 then
+    let from_at = 0
+  end
+  let f = vec_new()
+  vec_push(f, fiber_new("fm_finder_run"))
+  vec_push(f, [b, p, from_at])
+  vec_push(f, false)
+  return f
+end
+
+make a function called fm_finder_next takes f returns at
+  let id = vec_get(f, 0)
+  let state = vec_get(f, 2)
+  if state == "done" then
+    return 0 - 1
+  end
+  if state == false then
+    vec_set(f, 2, true)
+    let at = fiber_resume(id, vec_get(f, 1))
+  else
+    let at = fiber_resume(id, "next")
+  end
+  if not fiber_alive(id) then
+    vec_set(f, 2, "done")
+  end
+  return at
+end
+
+make a function called fm_finder_close takes f returns done
+  let id = vec_get(f, 0)
+  if (vec_get(f, 2) != "done") and fiber_alive(id) then
+    fiber_resume(id, "stop")
+  end
+  vec_set(f, 2, "done")
+  return not fiber_alive(id)
+end
+
+# whether the finder's fibre is still there to resume
+make a function called fm_finder_alive takes f returns yes
+  return fiber_alive(vec_get(f, 0))
+end
+
 # ---- applying ----
 
 # what b's bytes from at, n of them, say: as text when they are printable

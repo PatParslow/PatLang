@@ -1,7 +1,7 @@
 # resolve
 
 Chooses one version of each package from a set of manifests, using
-PatLang's logic engine (`rule_add`, `rule ... :- ...`, `solve`). It is
+PatLang's logic engine (`rule_add_to`, `solve_in`). It is
 phase P1 of `docs/plans/package-manager.md`.
 
 ```patlang
@@ -24,7 +24,8 @@ print(rs_result_text(result))      # resolved deflate 0.1.0, zip 0.1.0
 - `rs_universe_read(paths)` reads manifests from `.pkg` files and
   directories (a directory's `manifest.pkg`, or else every `.pkg` in it), and
   refuses a package version given twice.
-- `rs_resolve(manifests, [name, constraints])` asserts
+- `rs_resolve(manifests, [name, constraints])` makes a rule store of its
+  own (`logic_store_new`) and asserts in it
   `pkg_available(Name, Ver)`, `pkg_requires(Pkg, PVer, Dep, Op, Bound)` and
   `version_order(A, B, lt|eq|gt)` for every pair of known versions and
   bounds (compared in PatLang), declares the `satisfies` and `dep_candidate`
@@ -40,7 +41,8 @@ print(rs_result_text(result))      # resolved deflate 0.1.0, zip 0.1.0
   each requirer with its constraints (read back from `pkg_requires`), and the
   versions available.
 
-`rs_assert_facts` is the one function that calls `rule_add`.
+`rs_assert_facts(store, manifests, request)` is the one function that adds
+rules, and `rs_choose(store, request)` chooses from them.
 
 ## Specs and benchmark
 
@@ -60,6 +62,8 @@ in place, and a goal visits only its own predicate's rules, skipping one whose
 head contradicts a constant in the goal. Asserting D known versions and bounds
 still asserts D^2 `version_order` facts, one for each pair.
 
-The facts go in the process's default rule store, which has no retraction, so
-a process resolves once and the runner starts a child for each resolution.
-Rule stores are now values (#255), so a store per resolution can replace that.
+From 0.2.0 each resolution has a rule store of its own, so one process may
+resolve any number of times, each seeing only its own universe (an installer
+resolves once per request). In 0.1.x the facts went in the process's default
+store, which has no retraction, so a process could resolve only once; the
+runner still starts children, which also checks the command line.

@@ -1,0 +1,244 @@
+# pkg: the publisher's and the consumer's tool for package trust
+# (docs/plans/package-trust.md, phases S3 and S4). From the repository root:
+#
+#   ./self_hosting/build/v2.exe packages/tools/pkg.patlang packages/tools/build/pkg.exe --workers 4
+#   ./packages/tools/build/pkg.exe [--profile DIR] COMMAND ...
+#
+# Commands:
+#   keygen NAME                     make a key; prints its public key
+#   public NAME                     print a key's public key
+#   genesis PKGDIR NAME [NAME ...]  found the package's group with these keys
+#                                   as its members; prints the genesis hash,
+#                                   the pin a consumer gives
+#   propose PKGDIR                  write the release statement for the
+#                                   manifest's version; prints its hash
+#   sign PKGDIR VERSION NAME        sign the release with a key
+#   certify PKGDIR VERSION          check the signatures make a quorum and
+#                                   write the certificate
+#   withdraw PKGDIR VERSION REASON NAME [NAME ...]
+#                                   withdraw a certified release, signed with
+#                                   these keys; REASON is one argument
+#   pin NAME HASH                   pin a package to its genesis hash, as
+#                                   given by its publisher
+#   verify [--pins FILE] PKGDIR...  check each package directory against the
+#                                   pin for its name (the store's, else one in
+#                                   FILE, shipped pins) and the epoch the store
+#                                   has seen; writes nothing
+#   install NAME [CONSTRAINT] --from SOURCE [--from SOURCE ...]
+#           [--project DIR] [--pins FILE] [--pin-first-use] [--update]
+#                                   install NAME and what it needs into
+#                                   DIR/packages (default: the current
+#                                   directory), from package directories,
+#                                   zip archives of them, or https URLs of
+#                                   such archives (trusting the system's
+#                                   roots); CONSTRAINT as resolve reads it,
+#                                   one argument (">= 0.2.0, < 0.3.0")
+#
+# Keys live in DIR/keys/ and pins in DIR/pins/ (default: the trust store's
+# directory, the user's own). Every refusal is printed with its reason and exits 1; a usage error
+# exits 2. The work is in the trust package (packages/trust/publish.patlang).
+include "../installer/installer.patlang"
+
+# an https source may be any host (spec 1.8)
+tcp_allow_remote()
+
+make a function called pk_usage returns code
+  print("usage: pkg [--profile DIR] keygen NAME | public NAME | genesis PKGDIR NAME... | propose PKGDIR | sign PKGDIR VERSION NAME | certify PKGDIR VERSION | withdraw PKGDIR VERSION REASON NAME... | pin NAME HASH | verify [--pins FILE] PKGDIR... | install NAME [CONSTRAINT] --from SOURCE... [--project DIR] [--pins FILE] [--pin-first-use] [--update]")
+  return 2
+end
+
+# shipped pins from a file: ["ok", pins] or ["refused", why]
+make a function called pk_pins takes path returns got
+  if not file_exists(path) then
+    return ["refused", "no pins file " + path]
+  end
+  let sp = trust_read_pins(bytes_to_list(read_file_raw(path)))
+  if sp[0] != "ok" then
+    return ["refused", path + ": " + sp[1]]
+  end
+  return sp
+end
+
+# pkg install: each package installed, or each reason it was refused
+make a function called pk_install takes dir, words returns code
+  let project = "."
+  let shipped = []
+  let sources = []
+  let first_use = false
+  let update = false
+  let names = []
+  let k = 1
+  while k < list_len(words) do
+    let w = words[k]
+    if ((w == "--from") or (w == "--project") or (w == "--pins")) and (k + 1 >= list_len(words)) then
+      return pk_usage()
+    end
+    if w == "--from" then
+      let sources = list_push(sources, words[k + 1])
+      let k = k + 1
+    elif w == "--project" then
+      let project = words[k + 1]
+      let k = k + 1
+    elif w == "--pins" then
+      let sp = pk_pins(words[k + 1])
+      if sp[0] != "ok" then
+        print("refused: " + sp[1])
+        return 1
+      end
+      let shipped = sp[1]
+      let k = k + 1
+    elif w == "--pin-first-use" then
+      let first_use = true
+    elif w == "--update" then
+      let update = true
+    else
+      let names = list_push(names, w)
+    end
+    let k = k + 1
+  end
+  if (list_len(names) < 1) or (list_len(names) > 2) or (list_len(sources) == 0) then
+    return pk_usage()
+  end
+  let cons = "any"
+  if list_len(names) == 2 then
+    let cons = names[1]
+  end
+  let r = in_install(project, trust_store_open(dir), shipped, names[0], cons, sources, [first_use, update, ""])
+  if r[0] == "ok" then
+    if list_len(r[1]) == 0 then
+      print("installed already: nothing to do")
+    end
+    let j = 0
+    while j < list_len(r[1]) do
+      let e = r[1][j]
+      let how = "pin " + e[2]
+      if e[2] == "first-use" then
+        let how = "pin taken on first use"
+      end
+      print("installed " + e[0] + " " + e[1] + " epoch " + e[3] + " " + how)
+      let j = j + 1
+    end
+    return 0
+  end
+  let j = 0
+  while j < list_len(r[1]) do
+    let e = r[1][j]
+    print("refused " + e[0] + " " + e[1] + ": " + e[2] + ": " + e[3] + ": " + e[4])
+    let j = j + 1
+  end
+  return 1
+end
+
+# pkg verify: each directory's verdict on a line; 1 when any is refused
+make a function called pk_verify takes dir, words returns code
+  let shipped = []
+  let first = 1
+  if (list_len(words) >= 3) and (words[1] == "--pins") then
+    let sp = pk_pins(words[2])
+    if sp[0] != "ok" then
+      print("refused: " + sp[1])
+      return 1
+    end
+    let shipped = sp[1]
+    let first = 3
+  end
+  if first >= list_len(words) then
+    return pk_usage()
+  end
+  let st = trust_store_open(dir)
+  let verify = trust_ed25519_verifier()
+  let code = 0
+  let k = first
+  while k < list_len(words) do
+    let r = trust_verify_pinned(st, shipped, words[k], verify)
+    if r[0] == "ok" then
+      let v = r[1]
+      print("verified " + v[0] + " " + v[1] + " epoch " + v[2] + " signers " + list_len(v[3]) + " pin " + v[4])
+      if v[5] != "" then
+        print("  note: " + v[5])
+      end
+    else
+      print("refused " + words[k] + ": " + r[2] + ": " + r[1] + ": " + r[3])
+      let code = 1
+    end
+    let k = k + 1
+  end
+  return code
+end
+
+make a function called pk_done takes r, label returns code
+  if r[0] == "ok" then
+    print(label + " " + r[1])
+    return 0
+  end
+  print("refused: " + r[1])
+  return 1
+end
+
+make a function called pk_main takes args returns code
+  let dir = trust_store_dir()
+  let words = args
+  if (list_len(args) >= 2) and (args[0] == "--profile") then
+    let dir = args[1]
+    let words = []
+    let k = 2
+    while k < list_len(args) do
+      let words = list_push(words, args[k])
+      let k = k + 1
+    end
+  end
+  if dir == false then
+    print("refused: no user directory for keys (LOCALAPPDATA, XDG_DATA_HOME or HOME); give --profile DIR")
+    return 1
+  end
+  if list_len(words) == 0 then
+    return pk_usage()
+  end
+  let cmd = words[0]
+  let n = list_len(words)
+  if (cmd == "keygen") and (n == 2) then
+    return pk_done(trust_keygen(dir, words[1]), "public")
+  elif (cmd == "public") and (n == 2) then
+    return pk_done(trust_key_public(dir, words[1]), "public")
+  elif (cmd == "genesis") and (n >= 3) then
+    let names = []
+    let j = 2
+    while j < n do
+      let names = list_push(names, words[j])
+      let j = j + 1
+    end
+    return pk_done(trust_genesis(dir, words[1], names), "genesis")
+  elif (cmd == "propose") and (n == 2) then
+    return pk_done(trust_propose(words[1]), "release")
+  elif (cmd == "sign") and (n == 4) then
+    return pk_done(trust_sign_release(dir, words[1], words[2], words[3]), "signed as slot")
+  elif (cmd == "certify") and (n == 3) then
+    return pk_done(trust_certify(words[1], words[2]), "certified, signatures")
+  elif (cmd == "withdraw") and (n >= 5) then
+    let names = []
+    let j = 4
+    while j < n do
+      let names = list_push(names, words[j])
+      let j = j + 1
+    end
+    return pk_done(trust_withdraw(dir, words[1], words[2], words[3], names), "withdrawn, signatures")
+  elif (cmd == "pin") and (n == 3) then
+    let r = trust_store_pin(trust_store_open(dir), words[1], words[2], "given")
+    if r[0] == "ok" then
+      print("pinned " + r[1][0] + " " + r[1][1] + " (" + r[1][2] + ")")
+      return 0
+    end
+    print("refused: " + r[1])
+    return 1
+  elif (cmd == "verify") and (n >= 2) then
+    return pk_verify(dir, words)
+  elif (cmd == "install") and (n >= 4) then
+    return pk_install(dir, words)
+  end
+  return pk_usage()
+end
+
+let code = pk_main(argv())
+if code != 0 then
+  exit_with(code)
+end

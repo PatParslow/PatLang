@@ -176,6 +176,52 @@ ten times faster). An edit by address takes, where its context repeats within
 1 KB of its place, the candidate nearest its place (`fm_nearest`): a document
 can repeat its own text so that no context near a unit is unique.
 
+Step 7, first part, 2026-11-23 (`facts.patlang`): units numbered with ids
+(`ts_number`) and kept across updates (`ts_renumber`: the document's id, a
+section's whose heading was carried, and a block read again into the same
+shape as one gone takes its ids, since its facts would be the same); the
+facts `unit`, `child`, `attr` and `words`; `ts_facts_update` taking out and
+adding only what differs (one sentence made long in a document of 123 facts
+changes 16); the document rules `long_sentence`, `empty_section` (with `not`)
+and `untitled_code`. They need the logic goals added the same day (spec 1.13:
+`lt`, `le`, `gt`, `ge`, `not`, `fact_remove_in`). Then, the same day: the
+history as facts (`fh_to_facts` in file_marshal: `version`, `touched` carried
+to the file as it is now, and the rule `touches` for "which versions changed
+this range"), and a structural goal (`goals.patlang`: every section has
+content, planned with `plan_in` from the facts and `has_content` derived into a
+planning store, each step an edit by address, the plan applied as one batch and
+the tree and facts updated from its shifts). Re-planning, the same day
+(`ts_pursue_sections`): the goal for a file the files service keeps, each
+round reading the file, planning from its facts and sending the plan as one
+batch against the version read; when the service refuses it (another
+client's edit took an edit's context), the goal is planned again from the
+file as it now is, and a refusal at the version planned from ends the pursuit,
+since planning again would make the same plan. Its scenarios: a rename of the
+empty section's heading arriving just before the first batch, met in a second
+round, and a service refusing with no change, ended after one. Not yet: goals
+beyond this one; the planner's
+actions are the program's own, so the package adds its one action once, under
+its own name.
+
+Step 6, Gherkin, 2026-11-23 (`gherkin.patlang`): Feature, Rule,
+Background/Scenario/Outline and Examples as headings of levels 1 to 4, steps
+with their keywords, doc strings, tables, comments and description paragraphs,
+a heading's tags in its attrs (only with blank, comment and tag lines between:
+any other line drops them, as Gherkin has it). `ts_update` reads it as it reads
+Markdown, its region taken up over the tag lines above it and on past those
+below it (tags reach forward to the next heading), and to the end when it
+holds a doc string's fence; 150 random edits in the suite, and 1200 more from
+four other seeds checked by hand, each give a full read's tree.
+
+PatLang source, the same day (`patlang_source.patlang`): the program's
+`# ---- name ----` comments as headings, functions and classes titled by their
+names and running to the `end` or `}` at their own indentation, comment runs
+with sentences, and other top-level lines as statements. A function or class
+whose end does not come is "open", and `ts_update` then reads to the text's
+end. 200 random edits in the suite and 1200 from four other seeds each give a
+full read's tree. Not attempted: the statements inside a function as units of
+their own (a function is one unit), and other languages.
+
 1. The sentence table from the data file, the UAX #29 rules, and the
    conformance test (all 512 lines), interpreted and compiled.
 2. The core tree, addresses, the walk as a fibre, and edits by address.

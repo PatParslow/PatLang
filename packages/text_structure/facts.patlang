@@ -1,0 +1,391 @@
+# text_structure facts: a document's structure in a logic store, for rules
+# about it and goals over it (docs/plans/text-structure.md, step 7).
+#
+#   let ids = ts_ids()                        a document's id counter
+#   let tree = ts_number(ids, tree)           every unit given an id it keeps
+#   ts_to_facts(tree, store, doc)             the facts, added to store
+#   let new = ts_renumber(ids, old, ts_update(st, old, text, shifts)[0])
+#                                             the document's and the carried
+#                                             sections' ids kept, the rest new
+#   ts_facts_update(store, doc, old, new)     after ts_update: the facts of
+#                                             what went taken out, of what
+#                                             came added
+#   ts_add_document_rules(store)              the rules below
+#
+# The facts are relations, never positions, so a block that ts_update carries
+# keeps its facts as they were:
+#   unit(Doc, Id, Kind)        each unit, sentences among them
+#   child(Parent, Id, N)       Id is the Nth unit inside Parent, from 1
+#   attr(Id, Key, Value)       a unit's title, level and lang
+#   words(Id, N)               a sentence's words
+# A unit's range is read from the tree when a rule's answer needs it
+# (ts_span_of), since every unit after an edit moves.
+
+include "update.patlang"
+
+class FactIds {
+  field next = 1
+}
+
+make a function called ts_ids returns ids
+  return new("FactIds")
+end
+
+# the tree with an id in the attrs of every unit that has none
+make a function called ts_number takes ids, u returns u2
+  let attrs = u[3]
+  if ts_attr(u, "id") == false then
+    let attrs = list_push(attrs, ["id", ids.next])
+    ids.next = ids.next + 1
+  end
+  let kids = []
+  let k = 0
+  while k < list_len(u[4]) do
+    let kids = list_push(kids, ts_number(ids, u[4][k]))
+    let k = k + 1
+  end
+  return [u[0], u[1], u[2], attrs, kids]
+end
+
+# After ts_update, which makes the document and its sections again: the
+# document keeps the old one's id, and a section whose heading was carried
+# keeps the id of the section that heading began, so their facts stay as they
+# were. Then every unit still without an id gets a new one.
+make a function called ts_renumber takes ids, old, new returns u
+  let new = ts_match_blocks(old, new)
+  let by_heading = vec_new()
+  ts_section_ids_into(old, by_heading)
+  let kept = ts_carry_section_ids(new, vec_to_list(by_heading))
+  let attrs = []
+  let k = 0
+  while k < list_len(kept[3]) do
+    if kept[3][k][0] != "id" then
+      let attrs = list_push(attrs, kept[3][k])
+    end
+    let k = k + 1
+  end
+  let attrs = list_push(attrs, ["id", ts_attr(old, "id")])
+  return ts_number(ids, [kept[0], kept[1], kept[2], attrs, kept[4]])
+end
+
+# A unit's shape: what its facts say of it, its kind, attrs (but its id) and
+# its children's shapes, without positions. Two units of one shape have the
+# same facts but for their ids.
+make a function called ts_shape takes u returns s
+  let attrs = []
+  let k = 0
+  while k < list_len(u[3]) do
+    if (u[3][k][0] != "id") and (u[3][k][0] != "node") then
+      let attrs = list_push(attrs, u[3][k])
+    end
+    let k = k + 1
+  end
+  let kids = []
+  let k = 0
+  while k < list_len(u[4]) do
+    let kids = list_push(kids, ts_shape(u[4][k]))
+    let k = k + 1
+  end
+  return [u[0], attrs, kids]
+end
+
+# new with the ids of a unit of the same shape put on it and all inside it
+make a function called ts_copy_ids takes from, to returns u
+  let attrs = []
+  let k = 0
+  while k < list_len(to[3]) do
+    if to[3][k][0] != "id" then
+      let attrs = list_push(attrs, to[3][k])
+    end
+    let k = k + 1
+  end
+  let attrs = list_push(attrs, ["id", ts_attr(from, "id")])
+  let kids = []
+  let k = 0
+  while k < list_len(to[4]) do
+    let kids = list_push(kids, ts_copy_ids(from[4][k], to[4][k]))
+    let k = k + 1
+  end
+  return [to[0], to[1], to[2], attrs, kids]
+end
+
+# The blocks of new that ts_update read again (no id yet) take the ids of an
+# old block of the same shape that new no longer holds, each old block once:
+# a neighbour read again unchanged keeps its facts.
+make a function called ts_match_blocks takes old, new returns u
+  let held = vec_new()
+  ts_ids_into(new, held)
+  let held_ids = vec_to_list(held)
+  let spare = []
+  let olds = ts_flat_blocks(old)
+  let k = 0
+  while k < list_len(olds) do
+    if not ts_has_id(held_ids, ts_attr(olds[k], "id")) then
+      let spare = list_push(spare, [ts_shape(olds[k]), olds[k], false])
+    end
+    let k = k + 1
+  end
+  let got = ts_match_into(new, spare)
+  return got[0]
+end
+
+make a function called ts_has_id takes ids, id returns yes
+  let k = 0
+  while k < list_len(ids) do
+    if ids[k] == id then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+make a function called ts_ids_into takes u, out returns done
+  let id = ts_attr(u, "id")
+  if id != false then
+    vec_push(out, id)
+  end
+  let k = 0
+  while k < list_len(u[4]) do
+    ts_ids_into(u[4][k], out)
+    let k = k + 1
+  end
+  return true
+end
+
+# [unit, spare]: sections and the document walked into, each block with no id
+# given the ids of the first spare old block of its shape
+make a function called ts_match_into takes u, spare returns got
+  if (u[0] == "section") or (u[0] == "document") then
+    let kids = []
+    let sp = spare
+    let k = 0
+    while k < list_len(u[4]) do
+      let r = ts_match_into(u[4][k], sp)
+      let kids = list_push(kids, r[0])
+      let sp = r[1]
+      let k = k + 1
+    end
+    return [[u[0], u[1], u[2], u[3], kids], sp]
+  end
+  if ts_attr(u, "id") != false then
+    return [u, spare]
+  end
+  let shape = ts_shape(u)
+  let k = 0
+  while k < list_len(spare) do
+    if (not spare[k][2]) and (spare[k][0] == shape) then
+      let used = list_set(spare, k, [spare[k][0], spare[k][1], true])
+      return [ts_copy_ids(spare[k][1], u), used]
+    end
+    let k = k + 1
+  end
+  return [u, spare]
+end
+
+# [heading id, section id] of every section
+make a function called ts_section_ids_into takes u, out returns done
+  if (u[0] == "section") and (list_len(u[4]) > 0) then
+    vec_push(out, [ts_attr(u[4][0], "id"), ts_attr(u, "id")])
+  end
+  let k = 0
+  while k < list_len(u[4]) do
+    ts_section_ids_into(u[4][k], out)
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called ts_carry_section_ids takes u, pairs returns u2
+  let attrs = u[3]
+  if (u[0] == "section") and (list_len(u[4]) > 0) and (ts_attr(u, "id") == false) then
+    let hid = ts_attr(u[4][0], "id")
+    if hid != false then
+      let k = 0
+      while k < list_len(pairs) do
+        if pairs[k][0] == hid then
+          let attrs = list_push(attrs, ["id", pairs[k][1]])
+        end
+        let k = k + 1
+      end
+    end
+  end
+  let kids = []
+  let k = 0
+  while k < list_len(u[4]) do
+    let kids = list_push(kids, ts_carry_section_ids(u[4][k], pairs))
+    let k = k + 1
+  end
+  return [u[0], u[1], u[2], attrs, kids]
+end
+
+# a tree without its ids, as a fresh read gives it
+make a function called ts_without_ids takes u returns u2
+  let attrs = []
+  let k = 0
+  while k < list_len(u[3]) do
+    if u[3][k][0] != "id" then
+      let attrs = list_push(attrs, u[3][k])
+    end
+    let k = k + 1
+  end
+  let kids = []
+  let k = 0
+  while k < list_len(u[4]) do
+    let kids = list_push(kids, ts_without_ids(u[4][k]))
+    let k = k + 1
+  end
+  return [u[0], u[1], u[2], attrs, kids]
+end
+
+# The facts of a numbered tree, as [pred, args] in order.
+make a function called ts_fact_list takes tree, doc returns facts
+  let out = vec_new()
+  ts_facts_into(tree, doc, out)
+  return vec_to_list(out)
+end
+
+make a function called ts_facts_into takes u, doc, out returns done
+  let id = ts_attr(u, "id")
+  vec_push(out, ["unit", [doc, id, u[0]]])
+  let keys = ["title", "level", "lang"]
+  let k = 0
+  while k < list_len(keys) do
+    let v = ts_attr(u, keys[k])
+    if v != false then
+      vec_push(out, ["attr", [id, keys[k], v]])
+    end
+    let k = k + 1
+  end
+  if u[0] == "sentence" then
+    vec_push(out, ["words", [id, ts_attr(u, "words")]])
+  end
+  let kids = u[4]
+  let k = 0
+  while k < list_len(kids) do
+    vec_push(out, ["child", [id, ts_attr(kids[k], "id"), k + 1]])
+    ts_facts_into(kids[k], doc, out)
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called ts_to_facts takes tree, store, doc returns n
+  let facts = ts_fact_list(tree, doc)
+  let k = 0
+  while k < list_len(facts) do
+    rule_add_to(store, facts[k][0], facts[k][1], [])
+    let k = k + 1
+  end
+  return list_len(facts)
+end
+
+# The facts of the old tree that the new one has not, taken out, and those of
+# the new one the old had not, added: [taken out, added]. Both trees numbered,
+# the new one from the old by ts_update and then ts_number, so its carried
+# blocks keep their ids and their facts.
+make a function called ts_facts_update takes store, doc, old, new returns counts
+  let before = ts_fact_list(old, doc)
+  let after = ts_fact_list(new, doc)
+  let seen = ts_fact_set(after)
+  let had = ts_fact_set(before)
+  let out = 0
+  let k = 0
+  while k < list_len(before) do
+    if not ts_fact_in(seen, before[k]) then
+      fact_remove_in(store, before[k][0], before[k][1])
+      let out = out + 1
+    end
+    let k = k + 1
+  end
+  let added = 0
+  let k = 0
+  while k < list_len(after) do
+    if not ts_fact_in(had, after[k]) then
+      rule_add_to(store, after[k][0], after[k][1], [])
+      let added = added + 1
+    end
+    let k = k + 1
+  end
+  return [out, added]
+end
+
+# a set of facts: buckets by the hash of their text
+make a function called ts_fact_set takes facts returns set
+  let buckets = vec_new()
+  let n = 64
+  while n < list_len(facts) * 2 do
+    let n = n * 2
+  end
+  let k = 0
+  while k < n do
+    vec_push(buckets, [])
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(facts) do
+    let at = word_and(str_hash("" + facts[k]), n - 1)
+    vec_set(buckets, at, list_push(vec_get(buckets, at), facts[k]))
+    let k = k + 1
+  end
+  return buckets
+end
+
+make a function called ts_fact_in takes set, f returns yes
+  let at = word_and(str_hash("" + f), vec_len(set) - 1)
+  let bucket = vec_get(set, at)
+  let k = 0
+  while k < list_len(bucket) do
+    if bucket[k] == f then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# the unit with this id, or false
+make a function called ts_unit_by_id takes tree, id returns u
+  if ts_attr(tree, "id") == id then
+    return tree
+  end
+  let kids = tree[4]
+  let k = 0
+  while k < list_len(kids) do
+    let found = ts_unit_by_id(kids[k], id)
+    if found != false then
+      return found
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# a unit's [start, end] in the tree's text, or false
+make a function called ts_span_of takes tree, id returns span
+  let u = ts_unit_by_id(tree, id)
+  if u == false then
+    return false
+  end
+  return [u[1], u[2]]
+end
+
+# Rules a document's writing can be checked by, added to a store:
+#   long_sentence(Id)      a sentence of more than 40 words
+#   empty_section(Id)      a section holding nothing but its heading
+#   has_content(S)         a section holding a unit that is not a heading
+#   untitled_code(Id)      a code block that names no language
+make a function called ts_add_document_rules takes store returns done
+  let id = logic_var("Id")
+  let n = logic_var("N")
+  let d = logic_var("D")
+  let s = logic_var("S")
+  let c = logic_var("C")
+  let k = logic_var("K")
+  let m = logic_var("M")
+  rule_add_to(store, "long_sentence", [id], [["words", [id, n]], ["gt", [n, 40]]])
+  rule_add_to(store, "has_content", [s], [["child", [s, c, m]], ["unit", [d, c, k]], ["neq", [k, "heading"]]])
+  rule_add_to(store, "empty_section", [id], [["unit", [d, id, "section"]], ["not", ["has_content", id]]])
+  rule_add_to(store, "untitled_code", [id], [["unit", [d, id, "code"]], ["attr", [id, "lang", ""]]])
+  return true
+end

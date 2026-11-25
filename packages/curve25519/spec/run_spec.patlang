@@ -7,6 +7,7 @@
 include "../../../self_hosting/lib/includes.patlang"
 include "../../../self_hosting/lib/gherkin.patlang"
 include "../curve25519.patlang"
+include "../../../self_hosting/lib/json.patlang"
 
 make a function called st_cv_scalar takes ctx returns ok
   ctx_set(ctx, "k", cv_hex_bytes(step_arg(ctx, "hex")))
@@ -101,7 +102,161 @@ make a function called register_curve25519_steps takes ctx returns ok
   step(ctx, "its signature is \"{hex}\"", "st_cv_signature")
   step(ctx, "the signature verifies", "st_cv_verifies")
   step(ctx, "the signature does not verify for the message with a byte added", "st_cv_altered")
+  step(ctx, "the vectors of RFC 8032 section 7.1, from spec/data/rfc8032_ed25519.txt", "st_cv_rfc_vectors")
+  step(ctx, "for each, the public key made from its secret key, and its signature of its message, are the RFC's, and the signature verifies", "st_cv_rfc_all")
+  step(ctx, "each is refused with one bit of its signature changed", "st_cv_rfc_flipped")
+  step(ctx, "Wycheproof's Ed25519 test set, from spec/data/wycheproof_ed25519_test.json", "st_cv_wycheproof")
+  step(ctx, "every case marked valid verifies, every case marked invalid is refused, and each marked acceptable gives an answer", "st_cv_wycheproof_all")
   return true
+end
+
+# ---- the published vectors ----
+
+# a line's words, split at single spaces (the data file's lines are ASCII)
+make a function called cv_words takes line returns words
+  let out = []
+  let start = 0
+  let k = 0
+  while k <= str_len(line) do
+    if (k == str_len(line)) or (char_code(line, k) == 32) then
+      if k > start then
+        let out = list_push(out, substr(line, start, k - start))
+      end
+      let start = k + 1
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+make a function called cv_hex_or_empty takes text returns bytes
+  if text == "-" then
+    return []
+  end
+  return cv_hex_bytes(text)
+end
+
+make a function called st_cv_rfc_vectors takes ctx returns ok
+  let lines = split_lines(read_file("packages/curve25519/spec/data/rfc8032_ed25519.txt"))
+  let vs = []
+  let k = 0
+  while k < list_len(lines) do
+    let l = lines[k]
+    if (str_len(l) > 0) and (not starts_with(l, "#")) then
+      let parts = cv_words(l)
+      let vs = list_push(vs, [parts[0], cv_hex_bytes(parts[1]), cv_hex_bytes(parts[2]), cv_hex_or_empty(parts[3]), cv_hex_bytes(parts[4])])
+    end
+    let k = k + 1
+  end
+  ctx_set(ctx, "rfc", vs)
+  return expect(ctx, "the RFC's five Ed25519 vectors", list_len(vs), 5)
+end
+
+make a function called st_cv_rfc_all takes ctx returns ok
+  let vs = ctx_get(ctx, "rfc")
+  let bad = []
+  let k = 0
+  while k < list_len(vs) do
+    let v = vs[k]
+    let pk = ed25519_public(v[1])
+    let sig = ed25519_sign(v[1], v[3])
+    if (pk != v[2]) or (sig != v[4]) or (not ed25519_verify(v[2], v[3], v[4])) then
+      let bad = list_push(bad, v[0])
+    end
+    let k = k + 1
+  end
+  return expect(ctx, "the vectors whose key, signature or verification differ from the RFC's", bad, [])
+end
+
+make a function called st_cv_rfc_flipped takes ctx returns ok
+  let vs = ctx_get(ctx, "rfc")
+  let accepted = []
+  let k = 0
+  while k < list_len(vs) do
+    let v = vs[k]
+    let sig = v[4]
+    let i = 0
+    while i < 64 do
+      # the bytes are modints modulo 256, so the changed one is too
+      let changed = list_set(sig, i, sig[i] bxor cv_byte(1))
+      if ed25519_verify(v[2], v[3], changed) then
+        let accepted = list_push(accepted, v[0] + " byte " + i)
+      end
+      let i = i + 8
+    end
+    let k = k + 1
+  end
+  return expect(ctx, "a changed signature accepted", accepted, [])
+end
+
+make a function called cv_json_field takes obj, key returns v
+  let pairs = obj[1]
+  let k = 0
+  while k < list_len(pairs) do
+    if pairs[k][0] == key then
+      return pairs[k][1]
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+make a function called st_cv_wycheproof takes ctx returns ok
+  let doc = json_parse(read_file("packages/curve25519/spec/data/wycheproof_ed25519_test.json"))
+  let cases = []
+  let groups = cv_json_field(doc, "testGroups")[1]
+  let g = 0
+  while g < list_len(groups) do
+    let pk = cv_json_field(cv_json_field(groups[g], "publicKey"), "pk")[1]
+    let tests = cv_json_field(groups[g], "tests")[1]
+    let t = 0
+    while t < list_len(tests) do
+      let c = tests[t]
+      let cases = list_push(cases, [cv_json_field(c, "tcId")[1], pk, cv_json_field(c, "msg")[1], cv_json_field(c, "sig")[1], cv_json_field(c, "result")[1]])
+      let t = t + 1
+    end
+    let g = g + 1
+  end
+  ctx_set(ctx, "wycheproof", cases)
+  return expect(ctx, "Wycheproof's Ed25519 cases", list_len(cases), 210)
+end
+
+# a hex text as bytes, or false when it is not whole bytes of hex (some
+# invalid cases' signatures have an odd length)
+make a function called cv_hex_maybe takes text returns bytes
+  if str_len(text) % 2 != 0 then
+    return false
+  end
+  let k = 0
+  while k < str_len(text) do
+    let c = char_code(text, k)
+    if not (((c >= 48) and (c <= 57)) or ((c >= 97) and (c <= 102))) then
+      return false
+    end
+    let k = k + 1
+  end
+  return cv_hex_bytes(text)
+end
+
+make a function called st_cv_wycheproof_all takes ctx returns ok
+  let cases = ctx_get(ctx, "wycheproof")
+  let wrong = []
+  let k = 0
+  while k < list_len(cases) do
+    let c = cases[k]
+    let pk = cv_hex_maybe(c[1])
+    let msg = cv_hex_maybe(c[2])
+    let sig = cv_hex_maybe(c[3])
+    let got = false
+    if (pk != false) and (msg != false) and (sig != false) then
+      let got = ed25519_verify(pk, msg, sig)
+    end
+    if ((c[4] == "valid") and (not got)) or ((c[4] == "invalid") and got) then
+      let wrong = list_push(wrong, "tcId " + c[0] + " (" + c[4] + ")")
+    end
+    let k = k + 1
+  end
+  return expect(ctx, "cases answered against their mark", wrong, [])
 end
 
 let ctx = ctx_new()

@@ -7,14 +7,18 @@ repository, one directory per package:
 ```
 packages/
   README.md                this file
-  tools/                   programs that work on packages (verify_manifest.patlang)
+  tools/                   programs that work on packages (verify_manifest.patlang, pkg.patlang)
+  trust.pins               the genesis hash of each package's group (shipped pins)
+  .staging/                in an installation's packages/: an install in progress (pkg install)
   <name>/
     manifest.pkg           the manifest (format below)
     <name>.patlang         the package's entry include
     *.patlang              the rest of its includes
+    trust/                 its group's log and its release certificates (pkg genesis, certify)
     spec/*.feature         its Gherkin features
     spec/run_spec.patlang  the runner for those features
     spec/*.py              test oracles (Python, tests only; never shipped as code)
+    tools/                 programs that make or check the package (not shipped)
     build/                 scratch output of runners and benchmarks (ignored by git)
 ```
 
@@ -37,14 +41,15 @@ Current packages:
 | deflate | 0.2.0   | DEFLATE (RFC 1951) inflate and deflate, the zlib wrapper (RFC 1950), Adler-32, CRC-32 |
 | zip     | 0.2.0   | zip archive reader and writer (stored and deflate entries, CRC-checked) |
 | sha256  | 0.1.1   | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104) over bytes, strings and files |
-| sha512  | 0.1.0   | SHA-512 (FIPS 180-4) on modint words, secret to the constant-time check (spec 2.7) |
-| curve25519 | 0.1.0 | X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints; depends on sha512 |
-| tls     | 0.1.0   | a TLS 1.3 client's cryptography on modints, so far ChaCha20, Poly1305 and AEAD_CHACHA20_POLY1305 (RFC 8439) (`docs/plans/http-tls.md`, stage 2) |
-| resolve | 0.1.0   | manifest reader, version constraints, and dependency resolution through `rule_add`/`solve` (`docs/plans/package-manager.md`, P1) |
-| file_marshal | 0.1.0 | one owner for the files under a root, reached through port_marshal as `files`: edits to text and flat binaries given by their context, writes if a version, appends, a durable history with undo and revert, and the shift each edit makes so positions can be carried past it (`docs/plans/file-marshal.md`, steps 1 to 3 of 4) |
-| text_structure | 0.1.0 | the structure of a text (sections, paragraphs, sentences), for edits by address through file_marshal; so far Unicode's sentence boundaries (UAX #29, Unicode 18.0), passing all of Unicode's conformance test, from the Unicode data kept in `data/` under the Unicode licence (`docs/plans/text-structure.md`) |
-| port_marshal | 0.1.0 | one well-known port (9400) for local services: a service on any free port registers a name, and a client asks for the name and is piped through (`docs/plans/port-marshal.md`) |
-| trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in (`docs/plans/package-trust.md`, T1) |
+| sha512  | 0.1.2   | SHA-512 and SHA-384 (FIPS 180-4) on modint words, secret to the constant-time check (spec 2.7) |
+| curve25519 | 0.1.1 | X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints, verifying by declared reveals (`mod_reveal`), so a program that signs and verifies passes the constant-time check; depends on sha512 |
+| tls     | 0.2.2   | a TLS 1.3 client (RFC 8446), checked against RFC 8448's trace and OpenSSL's server, and its cryptography on modints: ChaCha20-Poly1305 and AES-128-GCM, SHA-256/384, HMAC and HKDF, x25519 and P-256 key shares, RSA and ECDSA checks, X.509 chains to the system's roots (`trust_roots`), and `tls_https_get` for packages; the secret paths (the AEADs, the key schedule, P-256) pass the constant-time check; depends on sha512 and curve25519 (`docs/plans/http-tls.md`, stages 2 to 4) |
+| resolve | 0.2.0   | manifest reader, version constraints, and dependency resolution through `rule_add_to`/`solve_in`, each resolution in a rule store of its own (`docs/plans/package-manager.md`, P1) |
+| file_marshal | 0.1.1 | one owner for the files under a root, reached through port_marshal as `files`: edits to text and flat binaries given by their context, writes if a version, appends, a durable history with undo and revert, and the shift each edit makes so positions can be carried past it; a lazy finder (a fibre yielding each match) and, in the service, `find` with a cursor carried past edits (`docs/plans/file-marshal.md`, steps 1 to 3 of 4); depends on port_marshal |
+| text_structure | 0.1.1 | the structure of a text (sections, paragraphs, sentences), for edits by address through file_marshal; so far Unicode's sentence boundaries (UAX #29, Unicode 18.0), passing all of Unicode's conformance test, from the Unicode data kept in `data/` under the Unicode licence (`docs/plans/text-structure.md`); depends on file_marshal |
+| installer | 0.2.0 | `pkg install` from package directories, zip archives of them, or https URLs of such archives: candidates verified against the trust store's pins, resolution, a GOAP plan that stages, verifies and installs each package after its dependencies, a commit written down first and finished after a crash, the store's epochs and `trust.lock`; depends on trust, resolve, zip and tls (`docs/plans/package-trust.md`, S5 and S6) |
+| port_marshal | 0.1.1 | one well-known port (9400) for local services: a service on any free port registers a name, and a client asks for the name and is piped through (`docs/plans/port-marshal.md`) |
+| trust   | 0.1.0   | trust records (view, genesis, transition, release, withdrawal) and every check of a release against its group's log, with the signature check passed in, and that check in PatLang (`trust_ed25519_verifier`, Ed25519 from curve25519), and the trust store (pins, epochs, shipped pins) and `trust.lock`; depends on sha256 and curve25519 (`docs/plans/package-trust.md`, T1, S1, S2, S3's publishing and S4's verifying against the store) |
 
 deflate and zip take their data as a `bytes` or a list of ints from 0 to 255,
 and give a `bytes` (one byte of memory a byte, where a list holds sixteen):
@@ -110,10 +115,14 @@ checks them:
 
 It prints `ok`, `MISMATCH`, `MISSING` or `MALFORMED` for each `file` line,
 `OUTSIDE` for a `file` line whose path leaves the package (a `..` part, a
-leading `/` or `\`, or a `:`), which it never reads, and `UNLISTED` for each
-PatLang file the package ships (any outside `spec/` and `build/`) that no
-`file` line names. It exits non-zero on any of these, and the repository
-checks run it over every package. The files are committed with LF line ends
+leading `/` or `\`, or a `:`), which it never reads, `UNLISTED` for each
+PatLang file the package ships (any outside `spec/`, `tools/` and `build/`)
+that no `file` line names, `NO-INCLUDE` for a `file` line no `include` names
+and `NO-FILE` for an `include` with no `file` line (both refused by
+`packages/resolve`'s reader), and `NO-DEPENDS` for a sibling package an
+include file includes by path (`include "../NAME/..."`) with no `depends`
+line, since an installer brings only what `depends` names. It exits non-zero
+on any of these, and the repository checks run it over every package. The files are committed with LF line ends
 whatever the platform (`.gitattributes`: `packages/** text eol=lf`), so a
 checkout's bytes are the ones hashed.
 
@@ -123,9 +132,21 @@ The plan is in `docs/plans/package-manager.md`. Resolution is built
 (`packages/resolve`, P1): manifests become facts, version constraints become
 rules over version-order facts computed in PatLang, and the resolver chooses
 the newest versions that fit, reporting a conflict with its requirers when
-none do. Installation is planned, not built: a GOAP plan whose fetch, verify
-and install actions have each dependency's installation as a precondition,
-run by a `pkg` tool.
+none do. Installation is built (`packages/installer`): a GOAP plan whose
+stage, verify and install actions have each dependency's installation as a
+precondition, run by `pkg install` from package directories:
+
+```
+./packages/tools/build/pkg.exe install zip --from SOURCES --project .
+```
+
+It installs into `./packages/`, records each package's version, pin and
+manifest hash in `./trust.lock`, and refuses a package that does not verify
+against its pin (below). A source may be a directory, a zip archive of one
+(`--from packages.zip`), or an https URL of such an archive
+(`--from https://example.org/packages.zip`, fetched with TLS 1.3 and the
+system's roots); an archive's entry whose name would leave its directory is
+refused before anything is written.
 
 ## Trust
 
@@ -141,10 +162,50 @@ in `docs/plans/package-trust.md`. In outline:
 
 The records and their checks are built (`packages/trust`, T1), and
 `self_hosting/v2/examples/trust_attacks.patlang` runs them with Ed25519
-written in PatLang. The `pkg` tool that signs and certifies releases, the
-operating-system signing calls and the consumer's trust store are not built,
-so today a package is trusted because it is in this repository, and its
-`file` hashes pin its content.
+written in PatLang. The consumer's trust store (pins, epochs that only rise,
+shipped pins and `trust.lock`) is built, and so is `pkg`, the publisher's
+and the consumer's tool:
+
+```
+./self_hosting/build/v2.exe packages/tools/pkg.patlang packages/tools/build/pkg.exe --workers 4
+./packages/tools/build/pkg.exe keygen owner
+./packages/tools/build/pkg.exe genesis packages/zip owner
+./packages/tools/build/pkg.exe propose packages/zip
+./packages/tools/build/pkg.exe sign packages/zip 0.2.0 owner
+./packages/tools/build/pkg.exe certify packages/zip 0.2.0
+./packages/tools/build/pkg.exe pin zip GENESIS-HASH
+./packages/tools/build/pkg.exe verify packages/zip
+```
+
+`pkg verify` checks a package directory against the pin for its name (the
+store's, else one from `--pins FILE`, lines of `pin NAME HASH`), runs every
+check of the package and its log, and refuses a log behind the epoch the
+store has seen. Keys and pins are kept in the user's own directory
+(`--profile DIR` for another). `pkg install` runs the same checks on every
+package it considers, and `pkg withdraw PKGDIR VERSION REASON NAME...` lets a
+group withdraw a release.
+
+Each of the repository's own packages has a group of one member, the
+owner's key, with a genesis in its `trust/log/` and a release certificate
+for its version in `trust/release/`, and `packages/trust.pins` lists their
+genesis hashes. So a project can install them from a checkout:
+
+```
+./packages/tools/build/pkg.exe install text_structure --from packages --project DIR --pins packages/trust.pins
+```
+
+which installs port_marshal, file_marshal and text_structure, in that
+order. A change to a package's manifest (any file it ships, a dependency, its
+version) needs a new version and its release, made with the owner's key,
+which only the owner holds: `pkg propose packages/NAME`, `pkg sign
+packages/NAME VERSION owner`, `pkg certify packages/NAME VERSION`. Until
+then `pkg verify` refuses the package, since its manifest is not the one the
+release names.
+
+Two packages include libraries of the repository outside `packages/`
+(port_marshal `self_hosting/lib/signals.patlang`, text_structure
+`self_hosting/lib/dom.patlang`), so they work installed only where that
+directory is found beside the project's `packages/`.
 
 ## Running a package's specs
 

@@ -1,0 +1,130 @@
+# text_structure goals: a goal about a document planned from its facts, and
+# the plan carried out as one batch of edits (docs/plans/text-structure.md,
+# step 7).
+#
+#   let r = ts_fill_sections(st, ids, store, doc, tree, text, filler)
+#     -> ["ok", new text, new tree, steps] or ["refused", reason]
+#   let r = ts_pursue_sections(st, call, path, client, filler)
+#     -> ["ok", version, rounds, refusals] or ["refused", reason, version,
+#        refusals]: the same goal for a Markdown file the files service
+#        keeps, call(request) giving the service's reply (fs_call over a
+#        connection, or fs_handle in the same process)
+#
+# The goal "every section has content" is met by the planner (plan_in) from
+# the document's facts: each section the rule has_content finds is a fact of
+# the planning state, and the action ts_add_content(S), which needs a section S,
+# makes has_content(S) true. Each step of the plan becomes an edit by address,
+# filler put as a paragraph after the section's heading, and the edits go as
+# one batch, all or none (fm_apply_batch, or the files service). The tree and
+# its facts are then updated from the batch's shifts (ts_update, ts_renumber,
+# ts_facts_update), so the next goal is planned from the new state without a
+# full read.
+#
+# The planner's actions are the program's own, not a store's: the action is
+# added once in a program, under a name of this package's.
+include "facts.patlang"
+
+make a function called ts_goal_actions returns done
+  if vfs_exists("/text_structure/actions_added") then
+    return true
+  end
+  let s = logic_var("S")
+  let d = logic_var("D")
+  action_add("ts_add_content", [["unit", [d, s, "section"]]], [["has_content", [s]]], [], 1)
+  vfs_write("/text_structure/actions_added", "1")
+  return true
+end
+
+# The plan for every section to have content: its steps, from the facts in
+# store (has_content derived into a planning store of its own).
+make a function called ts_plan_sections takes store returns steps
+  ts_goal_actions()
+  let state = logic_store_new()
+  let s = logic_var("S")
+  let d = logic_var("D")
+  solve_into(state, store, "unit", [d, s, "section"])
+  solve_into(state, store, "has_content", [s])
+  let sections = solve_in(store, "unit", [d, s, "section"])
+  let goals = []
+  let k = 0
+  while k < list_len(sections) do
+    let goals = list_push(goals, ["has_content", [sections[k][1]]])
+    let k = k + 1
+  end
+  return plan_in([state], goals)
+end
+
+# The plan's steps as edits: filler after the heading of each section a step names.
+make a function called ts_steps_to_edits takes tree, text, steps, filler returns edits
+  let out = []
+  let k = 0
+  while k < list_len(steps) do
+    if step_name(steps[k]) == "ts_add_content" then
+      let id = step_values(steps[k])[1]
+      let section = ts_unit_by_id(tree, id)
+      if section == false then
+        let id = step_values(steps[k])[0]
+        let section = ts_unit_by_id(tree, id)
+      end
+      if section != false then
+        let heading = section[4][0]
+        let out = list_push(out, ts_insert_after(text, heading, chr(10) + chr(10) + filler))
+      end
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+make a function called ts_fill_sections takes st, ids, store, doc, tree, text, filler returns got
+  let steps = ts_plan_sections(store)
+  let edits = ts_steps_to_edits(tree, text, steps, filler)
+  if list_len(edits) == 0 then
+    return ["ok", text, tree, steps]
+  end
+  let r = fm_apply_batch(text, edits)
+  if r[0] != "ok" then
+    return ["refused", "step " + r[1] + ": " + r[2]]
+  end
+  let updated = ts_renumber(ids, tree, ts_update(st, tree, r[1], r[2])[0])
+  ts_facts_update(store, doc, tree, updated)
+  return ["ok", r[1], updated, steps]
+end
+
+# The goal for a file the files service keeps, planned again after a refusal.
+# Each round reads the file, plans from its facts, and sends the plan's edits
+# as one batch made against the version read. The service carries the edits
+# past whatever was written since; it refuses the batch when an edit's context
+# is gone, as when another client changed the heading it names. The goal is
+# then planned again from the file as it now is. A refusal at the version the
+# plan was made from means nothing else changed, so planning again would make
+# the same plan: the pursuit ends there, refused with the service's reason.
+make a function called ts_pursue_sections takes st, call, path, client, filler returns got
+  let rounds = 0
+  let refusals = 0
+  while true do
+    let rd = call(["read", path])
+    if rd[0] != "ok" then
+      return ["refused", "the file cannot be read: " + rd, 0 - 1, refusals]
+    end
+    let version = rd[1]
+    let text = rd[2]
+    let tree = ts_number(ts_ids(), ts_markdown(st, text))
+    let store = logic_store_new()
+    ts_to_facts(tree, store, path)
+    ts_add_document_rules(store)
+    let edits = ts_steps_to_edits(tree, text, ts_plan_sections(store), filler)
+    let rounds = rounds + 1
+    if list_len(edits) == 0 then
+      return ["ok", version, rounds, refusals]
+    end
+    let r = call(["edit", path, version, edits, client])
+    if r[0] == "ok" then
+      return ["ok", r[1], rounds, refusals]
+    end
+    let refusals = refusals + 1
+    if (list_len(r) < 4) or (r[3] == version) then
+      return ["refused", "edit " + r[1] + ": " + r[2], version, refusals]
+    end
+  end
+end

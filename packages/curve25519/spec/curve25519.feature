@@ -26,3 +26,12 @@ Feature: curve25519 package: X25519 (RFC 7748) and Ed25519 (RFC 8032) on modints
     And its signature is "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
     And the signature verifies
     And the signature does not verify for the message with a byte added
+
+  Scenario: every Ed25519 vector of RFC 8032 section 7.1
+    Given the vectors of RFC 8032 section 7.1, from spec/data/rfc8032_ed25519.txt
+    Then for each, the public key made from its secret key, and its signature of its message, are the RFC's, and the signature verifies
+    And each is refused with one bit of its signature changed
+
+  Scenario: Wycheproof's Ed25519 set: every valid signature verifies and every invalid one is refused
+    Given Wycheproof's Ed25519 test set, from spec/data/wycheproof_ed25519_test.json
+    Then every case marked valid verifies, every case marked invalid is refused, and each marked acceptable gives an answer

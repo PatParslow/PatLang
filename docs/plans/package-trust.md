@@ -346,14 +346,225 @@ reader, the view and transition checks, and the signature calls. Package trust b
 
 ## Decisions for the owner
 
-1. Where the first pin comes from (shipped, first use, given; or a combination).
+1. Where the first pin comes from (shipped, first use, given; or a combination). **Decided
+   2026-11-23:** all three, combined: shipped pins for the repository's own packages, pins the user
+   gives for any other, and recording at first install only when the user asks for it, for that
+   package.
 2. Whether a manifest's `trust` recommendations are ever used, and the default policy.
 3. The signature algorithm, once the OS and browser check above is done: Ed25519, or ECDSA P-256.
+   **Decided 2026-11-23:** Ed25519, verified in PatLang (decision 4).
 4. Whether a PatLang signature verifier is allowed before #251, under the test-vector condition
-   above, where the OS or browser has none.
+   above, where the OS or browser has none. **Decided 2026-11-23:** #251 is in (modints, and the
+   `curve25519` package's `ed25519_verify`), and verification is PatLang's on every engine, the
+   browser included, once it passes all of RFC 8032's vectors and Wycheproof's Ed25519 set, the
+   negative cases among them. The OS is not called.
 5. The default quorum for a new group (majority, or all founders), whether a group may change it
    by a transition (T1 allows it), and the quorum for excluding a member under `quorum k` (T1 uses
    min(k, N-1)).
 6. Whether withdrawal needs the same quorum as release, or fewer (withdrawing is the safer act).
 7. Whether T2's OS calls are built first, or wait for integers modulo n (#251, phase W) so that
-   signing is PatLang from the start.
+   signing is PatLang from the start. **Overtaken 2026-11-23:** integers modulo n came first, so
+   there are no OS calls; see "The trust store and the installer" below.
+8. Where packages are fetched from before TLS exists. **Decided 2026-11-23:** local paths only
+   (a directory, or a zip archive on the disk) until the TLS client exists (`docs/plans/http-tls.md`,
+   Stage 4). Verification does not depend on the channel, so HTTPS is then a new source and
+   nothing else changes.
+9. Where the trust store lives. **Decided 2026-11-23:** in the user's profile, and a project may
+   also commit a lock file of the pins and versions it was built with.
+
+## The trust store and the installer (planned 2026-11-23)
+
+### What exists, and what this adds
+
+T0 and T1 are built: manifests carry file hashes, and the `trust` package reads and writes every
+record and runs every check, with the signature check passed in as a function. Phase W is far
+enough on that T2 is not needed: integers modulo n are in the language, and the `curve25519` package
+signs and verifies Ed25519 in PatLang on them, passing the constant-time check. What is missing is
+everything that makes verification something a user does: a verifier that has passed its vectors,
+a store of pins and epochs, the publisher's tool, and an installer.
+
+### The trust store
+
+- **Where:** `<profile>/PatLang/trust/`, in a directory only the user can write: LOCALAPPDATA
+  on Windows, as for the signal tokens; on Linux `XDG_DATA_HOME`, else `~/.local/share`, and not
+  the signal tokens' `XDG_RUNTIME_DIR`, which is emptied at logout. A program that finds none
+  refuses to install.
+- **What:** one file for each package, `pins/<package>`, in the trust records' own form (printable
+  ASCII, one `key value` field a line, fixed order): `package`, `pin` (the genesis hash), `source`
+  (`shipped`, `given` or `first-use`), `epoch` (the highest the log has reached here), `added`.
+  One file a package means two installers working on different packages never write one file.
+- **How it changes:** a file is written beside its old one and renamed over it (`try_rename_file`),
+  so a crash leaves the old pin or the new, never half of either. An epoch only rises: a log that
+  ends below the stored epoch is refused (step 4 of "Verifying a package", the one adversarial case
+  T1 left open).
+- **Shipped pins:** `packages/trust.pins` in the repository, one `pin <package> <hash>` line a
+  package, for the repository's own packages once they have groups (S4). The installer reads it as
+  `source shipped`; a pin the user gave for the same package wins, and a difference between them is
+  reported, not resolved silently.
+- **First use**, only when asked (`pkg install NAME --pin-first-use`): the genesis hash of what is
+  being installed is recorded with `source first-use`, and the installer says so in its output.
+- **The project lock file**, `trust.lock` beside a project's `packages/`, committed with it: one line
+  a package, `package <name> <version> pin <hash> manifest <hash>`. An install that would change a
+  locked package's version, pin or manifest is refused unless asked to update, so a checkout builds
+  with the packages it was tested with.
+
+### The verifier
+
+`trust_verify_package(dir, pin, verify)` already takes the signature check as a function. The
+installer passes `|alg, pub, msg, sig| ed25519_verify(...)` from the `curve25519` package, which is
+used only once it passes:
+- every test vector of RFC 8032 section 7.1 (TEST 1, 2, 3, 1024 and SHA(abc)), today it has TEST 2;
+- Wycheproof's `ed25519_test.json`, every case, the invalid ones refused (non-canonical encodings,
+  points of small order, a signature's S at or above the group order);
+- the T1 features, with this verifier in place of the Python oracle's.
+
+### The publisher's tool, `pkg`
+
+`pkg keygen`, `pkg genesis`, `pkg propose`, `pkg sign`, `pkg certify` (T3), signing with
+`ed25519_sign`. A member's secret key is a file in the same profile directory, `keys/<group>`,
+written as the trust store is; the signing path is built with `--constant-time` and must pass it, as
+`ct_curve25519` does. The repository's own packages then get a one-member group each (the owner's
+key), a genesis, and release certificates, and their genesis hashes go into `packages/trust.pins`.
+
+### The installer
+
+`pkg install NAME [VERSION-RANGE] --from SOURCE` into the project's `packages/`:
+
+1. **Read the sources.** A source is a directory holding package directories, or a zip archive of
+   one (read with the `zip` package); several `--from` may be given. Nothing is fetched from the
+   network before TLS.
+2. **Resolve.** The `resolve` package chooses versions from the manifests found, as it does today;
+   a package the trust store has no pin for, and that is not pinned first-use by request, is not a
+   candidate, and the refusal names it.
+3. **Plan.** Verification results are facts (`pkg_trusted`, `pkg_withdrawn`), and the GOAP plan
+   (T5) fetches, verifies and installs, every `install` step with a `verified` precondition, a
+   withdrawn version never offered.
+4. **Stage.** Each package is copied into `packages/.staging/<name>-<version>/` and verified there:
+   manifest hashes, the log against the pin, the epoch against the store, the release and its
+   withdrawals and revocations.
+5. **Commit.** Only when every package of the plan has verified: each staged directory is renamed
+   into `packages/<name>/`, the store's epochs are raised, and `trust.lock` is written beside its old
+   copy and renamed over it. A crash before this step leaves `packages/` as it was, and the next run
+   removes the staging directory; a crash during it is finished on the next run from the staging
+   directory and the plan written there first.
+6. **Report** each package installed, its version, its pin's source and its epoch, and every
+   package refused with the check that refused it.
+
+`pkg verify DIR` runs steps 4's checks alone; `pkg pin NAME HASH` adds a given pin.
+
+### Phases
+
+| phase | builds | done when |
+|-------|--------|-----------|
+| S1 | `ed25519_verify` against RFC 8032 7.1 in full and Wycheproof's Ed25519 set; the T1 features with it as `verify` | every vector passes, the invalid ones refused, and the trust features pass with no oracle in the signature check |
+| S2 | the trust store library in the `trust` package: read, pin, raise the epoch, refuse a rollback, shipped pins, the lock file | scenarios: a store made, a pin given, a rolled-back log refused, a crash between writes leaving a whole store, two installers on different packages, a lock file refusing a changed version |
+| S3 | `pkg keygen`, `genesis`, `propose`, `sign`, `certify`, with the signing path through `--constant-time` | the repository's packages each get a group, a genesis and release certificates, and `packages/trust.pins` lists them |
+| S4 | `pkg pin` and `pkg verify` | `pkg verify` accepts the repository's packages and refuses every T4 adversarial case |
+| S5 | `pkg install` from local sources: resolution, the plan, staging, commit, the lock file, the report | installing zip from a directory installs deflate first; a tampered copy, a withdrawn version and an unpinned package are each refused, and `packages/` is untouched by a refused install or a crash at any step |
+| S6 | HTTPS sources, once the TLS client exists (`docs/plans/http-tls.md`, Stage 4) | an install from an HTTPS URL verifies as one from a directory does |
+
+S1 and S2 need nothing from each other and can go first, side by side.
+
+**S1, done 2026-11-23:** `ed25519_verify` gives the RFC's key, signature and verdict for all five
+vectors of RFC 8032 section 7.1, refuses each with a changed byte of its signature, and answers all
+210 of Wycheproof's Ed25519 cases as marked (117 valid accepted, 64 invalid refused, 29 acceptable
+answered either way), in `packages/curve25519/spec/` with the vectors in `spec/data/` and their
+sources in `spec/data/SOURCES.md`. One verification takes about 3 s, interpreted or compiled, so
+checking a release's few signatures costs seconds. The trust package gives it as
+`trust_ed25519_verifier()` (`packages/trust/ed25519.patlang`, which refuses any other algorithm,
+key or signature length, or text that is not lowercase hex), and the T1 features run with it in
+place of the oracle's: 127 checks pass, the oracle now only making keys and signatures. They take
+about 27 minutes compiled, nearly all of it in verification; a faster scalar multiplication would
+help the installer little (a release has few signatures) and the suite a great deal.
+
+**S2, done 2026-11-23:** `packages/trust/store.patlang`. The store is a directory (by default
+`trust_store_dir()`: `%LOCALAPPDATA%/PatLang/trust`, else `$XDG_DATA_HOME` or
+`~/.local/share`), one file a package under `pins/`, in the records' form: package, pin, source
+(shipped, given or first-use), epoch, and the time it was added. Each file is written beside its
+old one and renamed over it, so a crash leaves the old entry or the new, and a half-written
+`.tmp` beside it is never read; one file a package means two installers on different packages
+never write one file. `trust_store_pin` refuses a different pin for a package already pinned
+(unpin first), `trust_store_check_epoch` refuses a log ending below the epoch held, and
+`trust_store_raise` never lowers it. `trust_read_pins` reads shipped pins (`pin PACKAGE HASH`), and
+`trust_store_choose` prefers the store's pin, with a note when a shipped one differs.
+`trust_lock_write`, `trust_lock_read` and `trust_lock_check` keep a project's `trust.lock`
+(`package NAME VERSION pin HASH manifest HASH`), refusing another version, pin or manifest. Its
+scenarios are `packages/trust/spec/store.feature`: 30 checks pass compiled, among them four
+threads pinning ten packages each at once.
+
+**S3, publishing built 2026-11-23:** `packages/trust/publish.patlang` and the `pkg` tool
+(`packages/tools/pkg.patlang`: `keygen`, `public`, `genesis`, `propose`, `sign`, `certify`, with
+`--profile DIR`). A key is `keys/<name>` in the profile, its 32-byte seed as 64 lowercase hex
+digits, written as the store's entries are; `keygen` refuses a name already taken. `genesis` writes
+a view with one member for each founder's key and a majority quorum and the genesis signed by every founder;
+`propose` writes a release statement naming the manifest's hash and the log's state; `sign` adds a
+member's pending signature (`release/<v>.sig.<slot>`); `certify` combines them into
+`release/<v>.sig` and checks the certificate as a consumer would. Its scenarios are
+`packages/trust/spec/publish.feature`. The whole tool passes `--constant-time` (3.7 minutes), with one
+declared reveal: a public key and a signature are revealed with `mod_reveal` before they are
+written as hex. A seed stays hex text until the call that signs with it, since the check does not
+tell one element of a list from another: held as bytes in an `["ok", seed]` result, it made the
+test of that `"ok"` a branch on a secret, and 190 places were reported. The curve25519 package's
+verification reads the public key and signature it is given with `mod_reveal`, so a program that
+signs and verifies directly also passes (`constant_time.feature`, the sign and verify scenario).
+
+**S3, done 2026-11-24:** the owner's key is `keys/owner` in the owner's profile, and each of the
+repository's twelve packages has a group of that one member: a genesis in `trust/log/`, and a
+release certificate for its current version in `trust/release/`. `packages/trust.pins` lists the
+twelve genesis hashes. Installing from the checkout (`pkg install text_structure --from packages
+--pins packages/trust.pins`) found three defects no check had: port_marshal shipped its
+marshaller as a `file` with no `include`, text_structure hashed its Unicode data and table
+generator as `file` lines with no `include` (both manifests the resolver refuses, so the whole
+source was refused), and file_marshal and text_structure included a sibling package with no
+`depends` line, which an install would have left out. `verify_manifest` now reports each
+(`NO-INCLUDE`, `NO-FILE`, `NO-DEPENDS`), a package's `tools/` is not shipped, as `spec/` is not,
+and the three packages are 0.1.1 with releases of their own.
+
+**S4, built 2026-11-23:** `trust_verify_pinned(st, shipped, dir, verify)` in
+`packages/trust/store.patlang`, and `pkg pin NAME HASH` and `pkg verify [--pins FILE] PKGDIR...`.
+It reads the manifest's package name, takes the store's pin for it, else a shipped one (a shipped
+pin that differs from the store's is told in the result, and in the reason when the package is
+refused), runs every check of `trust_verify_package`, then refuses a log ending below the epoch
+the store holds. It writes nothing: an epoch is raised only by an install. Its scenarios are
+`packages/trust/spec/pinned.feature`: a pinned package accepted with its pin's source, an unpinned
+one refused saying how to pin it, a shipped pin used, the store's pin winning over a shipped one,
+a rolled-back log, and a file changed after the release; 30 checks pass. The T4 adversarial cases
+are `trust_verify_package`'s, in the T1 features. `pkg verify --pins packages/trust.pins` accepts
+all twelve of the repository's packages (2026-11-24), each with its pin's source `shipped`, and an
+install from a copy of zip with one line added to `zip.patlang` is refused at the file's hash,
+leaving the project untouched.
+
+**S6, done 2026-11-24:** a source may also be a zip archive of package
+directories, or an https URL of one. `in_install` writes an archive's
+entries under `packages/.sources/` in the project, first refusing any entry
+whose name would leave it (`..`, a leading `/`, `:` or `\`), and fetches an
+https source with the tls package's `tls_https_get` (TLS 1.3, its
+certificates checked against the system's roots or the roots given as the
+fourth option); an `http://` source is refused. From there the install is
+the directory install, every package verified against its pin, and the
+extracted copies are removed after. The scenarios
+(`packages/installer/spec/sources.feature`) install this repository's zip and
+deflate, with their releases and `packages/trust.pins`, from an archive and
+from an https URL of it served by `openssl s_server`, and refuse an archive
+whose entry is `../escaped.txt`, writing nothing.
+
+**S5, built 2026-11-23:** the `installer` package (`packages/installer/installer.patlang`) and
+`pkg install NAME [CONSTRAINT] --from SOURCE... [--project DIR] [--pins FILE] [--pin-first-use]
+[--update]`. Every package directory in the sources is examined with `trust_verify_pinned`, and
+only those that verify are candidates; `resolve` (0.2.0, which now resolves in a rule store of
+its own, so one process may resolve many times) chooses among them; the lock file refuses a
+changed version, pin or manifest unless `--update`; and the plan is GOAP's (`plan_in`): stage,
+verify and install actions for each chosen package not already installed, install needing the
+package verified and every dependency installed. Staging copies the manifest, its files and the
+trust records into `packages/.staging/NAME-VERSION`, and verifying checks the copy again. The
+commit is written to `packages/.staging/commit` before anything in `packages/` moves; each staged
+directory is then renamed into place (the version it replaces moved aside), the store's pins and
+epochs are recorded, `trust.lock` is rewritten, and staging is removed. A run that finds a commit
+finishes it, and one that finds staging without one clears it. To withdraw a release the
+publisher has `pkg withdraw PKGDIR VERSION REASON NAME...` (`trust_withdraw`). The scenarios
+(`packages/installer/spec/install.feature`, 65 checks) install zip after deflate, refuse a tampered
+copy, a withdrawn version and an unpinned package (and install with a pin taken on first use),
+stop after each of seven steps (staging, verifying, installing, the commit, a move, the store,
+the lock) and check `packages/` is as it was before the commit or whole after the next run, and
+hold a project to its locked versions until `--update`. The sources are directories; a zip
+archive as a source is not built yet.

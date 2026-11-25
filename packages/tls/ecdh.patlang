@@ -1,0 +1,213 @@
+# ECDHE on P-256 (RFC 8446 4.2.8.2, SEC 1), for a server that asks for it
+# in a HelloRetryRequest: the private scalar is secret, so the scalar
+# multiplication is a Montgomery ladder over all 256 bits, each step the
+# complete addition formulas of Renes, Costello and Batina (2016, algorithm
+# 4, for a = -3) on projective points, and the ladder's swap is arithmetic
+# by a 0 or 1 that is itself a modint: no branch or address depends on the
+# scalar. The arithmetic is on modints modulo p, whose time depends on p
+# alone (spec 1.14). The peer's point is public, and checked on the curve.
+#
+#   tls_p256_public(scalar)          -> the 65-byte key share 04 || x || y (public)
+#   tls_p256_shared(scalar, peer)    -> the 32-byte x of scalar times the
+#                                       peer's point (secret), or [] when the
+#                                       peer's share is not a point on the curve
+#
+# A scalar is 32 bytes, big-endian, ints or modints modulo 256; any value
+# from 1 is a scalar (a multiple of n gives the point at infinity, refused).
+
+# The inverse of a modulo m, public integers with no common factor, by the
+# extended Euclidean algorithm.
+make a function called tls_inverse_int takes a, m returns inv
+  require (a > 0) and (m > 1)
+  let r0 = m
+  let r1 = a % m
+  let t0 = 0
+  let t1 = 1
+  while r1 != 0 do
+    let q = floor(r0 / r1)
+    let r2 = r0 - q * r1
+    let r0 = r1
+    let r1 = r2
+    let t2 = t0 - q * t1
+    let t0 = t1
+    let t1 = t2
+  end
+  let inv = t0 % m
+  if inv < 0 then
+    let inv = inv + m
+  end
+  ensure (inv * a) % m == 1
+  return inv
+end
+
+# Projective points [X, Y, Z], modints modulo p; (0 : 1 : 0) is the point at
+# infinity, which the formulas need no case for. field is a modint modulo p:
+# each coordinate read from a point's list is made a modint against it again,
+# since the constant-time check knows a list's element only as some value.
+make a function called tls_rcb_add takes c, a, b, field returns r
+  let bb = c[2]
+  let x1 = mod_make(a[0], field)
+  let y1 = mod_make(a[1], field)
+  let z1 = mod_make(a[2], field)
+  let x2 = mod_make(b[0], field)
+  let y2 = mod_make(b[1], field)
+  let z2 = mod_make(b[2], field)
+  let t0 = x1 * x2
+  let t1 = y1 * y2
+  let t2 = z1 * z2
+  let t3 = x1 + y1
+  let t4 = x2 + y2
+  let t3 = t3 * t4
+  let t4 = t0 + t1
+  let t3 = t3 - t4
+  let t4 = y1 + z1
+  let x3 = y2 + z2
+  let t4 = t4 * x3
+  let x3 = t1 + t2
+  let t4 = t4 - x3
+  let x3 = x1 + z1
+  let y3 = x2 + z2
+  let x3 = x3 * y3
+  let y3 = t0 + t2
+  let y3 = x3 - y3
+  let z3 = t2 * bb
+  let x3 = y3 - z3
+  let z3 = x3 + x3
+  let x3 = x3 + z3
+  let z3 = t1 - x3
+  let x3 = t1 + x3
+  let y3 = y3 * bb
+  let t1 = t2 + t2
+  let t2 = t1 + t2
+  let y3 = y3 - t2
+  let y3 = y3 - t0
+  let t1 = y3 + y3
+  let y3 = t1 + y3
+  let t1 = t0 + t0
+  let t0 = t1 + t0
+  let t0 = t0 - t2
+  let t1 = t4 * y3
+  let t2 = t0 * y3
+  let y3 = x3 * z3
+  let y3 = y3 + t2
+  let x3 = x3 * t3
+  let x3 = x3 - t1
+  let z3 = t4 * z3
+  let t1 = t3 * t0
+  let z3 = z3 + t1
+  let r = [x3, y3, z3]
+  ensure list_len(r) == 3
+  return r
+end
+
+# [a, b] exchanged when bit (a modint 0 or 1 modulo p) is 1: a - (a - b) bit
+# and b + (a - b) bit, coordinate by coordinate.
+make a function called tls_rcb_swap takes a, b, bit, field returns ab
+  let na = []
+  let nb = []
+  let i = 0
+  while i < 3 do
+    let ai = mod_make(a[i], field)
+    let bi = mod_make(b[i], field)
+    let d = (ai - bi) * bit
+    let na = list_push(na, ai - d)
+    let nb = list_push(nb, bi + d)
+    let i = i + 1
+  end
+  ensure list_len([na, nb]) == 2
+  return [na, nb]
+end
+
+# scalar times the point (x, y), integers on the curve: projective [X, Y, Z].
+make a function called tls_p256_ladder takes c, scalar, x, y returns pt
+  require list_len(scalar) == 32
+  let p = c[1]
+  let field = mod_make(0, p)
+  let byte = mod_make(0, 256)
+  let r0 = [mod_make(0, p), mod_make(1, p), mod_make(0, p)]
+  let r1 = [mod_make(x, p), mod_make(y, p), mod_make(1, p)]
+  let i = 0
+  while i < 256 do
+    let b = mod_make(scalar[(i - i % 8) / 8], byte)
+    let bit = mod_make((b shr (7 - i % 8)) band 1, field)
+    let sw = tls_rcb_swap(r0, r1, bit, field)
+    let r1 = tls_rcb_add(c, sw[0], sw[1], field)
+    let r0 = tls_rcb_add(c, sw[0], sw[0], field)
+    let sw = tls_rcb_swap(r0, r1, bit, field)
+    let r0 = sw[0]
+    let r1 = sw[1]
+    let i = i + 1
+  end
+  let pt = r0
+  ensure list_len(pt) == 3
+  return pt
+end
+
+make a function called tls_p256_public takes scalar returns share
+  require list_len(scalar) == 32
+  let c = tls_curve("p256")
+  let pt = tls_p256_ladder(c, scalar, c[3], c[4])
+  # the public key is public: its coordinates are declared revealed
+  let field = mod_make(0, c[1])
+  # 1 / Z as Z^(p - 2) (Fermat), the ladder whose steps depend on p alone;
+  # an inverse by division may run Euclid's steps on the residue
+  let zi = pow(mod_make(pt[2], field), c[1] - 2)
+  let x = mod_reveal(mod_make(pt[0], field) * zi)
+  let y = mod_reveal(mod_make(pt[1], field) * zi)
+  let share = [4] + tls_int_bytes(x, 32) + tls_int_bytes(y, 32)
+  ensure list_len(share) == 65
+  return share
+end
+
+make a function called tls_p256_shared takes scalar, peer returns secret
+  require (list_len(scalar) == 32) and (type_of(peer) == "list")
+  let c = tls_curve("p256")
+  if (list_len(peer) != 65) or (peer[0] != 4) then
+    return []
+  end
+  let xs = []
+  let ys = []
+  let i = 1
+  while i <= 32 do
+    let xs = list_push(xs, peer[i])
+    let ys = list_push(ys, peer[32 + i])
+    let i = i + 1
+  end
+  let px = tls_bytes_int(xs)
+  let py = tls_bytes_int(ys)
+  if not tls_ec_on_curve(c, px, py) then
+    return []
+  end
+  let pt = tls_p256_ladder(c, scalar, px, py)
+  # infinity (a scalar that is a multiple of n) has no x: refused, and that
+  # it was is the one fact revealed
+  let field = mod_make(0, c[1])
+  if mod_reveal(mod_make(pt[2], field)) == 0 then
+    return []
+  end
+  let x = mod_make(pt[0], field) * pow(mod_make(pt[2], field), c[1] - 2)
+  # the x coordinate's 32 bytes, big-endian, each a modint modulo 256, from
+  # the residue's words, without leaving the modint class
+  # each step takes the low byte off and multiplies by the inverse of 256, a
+  # public integer, as curve25519's cv_to_bytes does: a division of the
+  # modint by 256 would take the general path, past the class
+  let byte = mod_make(0, 256)
+  let inv = mod_make(tls_inverse_int(256, c[1]), field)
+  let secret = []
+  let w = x
+  let i = 0
+  while i < 32 do
+    let b = mod_make(w, byte)
+    let secret = list_push(secret, b)
+    let w = (w - mod_make(b, field)) * inv
+    let i = i + 1
+  end
+  let out = []
+  let i = 31
+  while i >= 0 do
+    let out = list_push(out, secret[i])
+    let i = i - 1
+  end
+  ensure list_len(out) == 32
+  return out
+end

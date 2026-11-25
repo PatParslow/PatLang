@@ -167,8 +167,22 @@ finished.
   among them `block_model/library_selftest_parity` (11), `part2/compiler_structure`
   (24) and `part1_v2/programs` (23).
 - **`--failed`** reruns only the units whose last run failed, and the record drops
-  rows for units that no longer exist at the end of each run.
+  rows for units that no longer exist at the end of each run. A feature that
+  failed after more than ten minutes runs split from then on: `--failed` chooses
+  its scenario units by the feature's name, and the feature's row is kept until
+  one of them has a row, since it holds the decision to split and the failure.
+  Before 2026-11-24 the row was dropped at once, so `--failed` ran nothing and the
+  next run ran the feature whole again. The record logic is in
+  `self_hosting/v2/tools/gates_logic.patlang`, tested by
+  `self_hosting/gates_record_selftest.patlang`.
 - **`tools/edit_files.py`** has its tests as the `edit_tool` unit.
+- **Live TLS cases** (2026-11-24): `pkg_tls/server` and `pkg_installer/sources`
+  (its https scenario) build a client as a Linux program and run it under WSL
+  (Ubuntu-24.04) beside `openssl s_server`, on that system's loopback: this
+  machine's WSL forwards no localhost connection from Windows. They fail,
+  naming what is missing, when `wsl` or WSL's `openssl` is not there. Each
+  server exits after two connections or 600 seconds, so none is left running
+  (60 seconds was too short under the gates' load: gates run 15).
 - **A unit that reports a failed test fails** even when it exits 0: its last
   `tests: N passed, M failed` line decides too. `interp_run_selftest` had passed
   that way with two checks failing after `get` began giving `unit`.
@@ -187,7 +201,8 @@ finished.
 
 - **The packages' specs are suites,** `pkg_deflate`, `pkg_zip`, `pkg_sha256`,
   `pkg_resolve` and `pkg_trust` (and since then `pkg_sha512`, `pkg_curve25519`,
-  `pkg_tls` and `pkg_port_marshal`): each package's `spec/run_spec.patlang` on the
+  `pkg_tls`, `pkg_port_marshal`, `pkg_file_marshal`, `pkg_text_structure` and
+  `pkg_installer`): each package's `spec/run_spec.patlang` on the
   interpreter, which lists its feature files with `--list` (`run_suite`) and
   exits 1 on a failure. They read `packages/` and `self_hosting/lib`, and call
   Python's oracle (`spec/oracle.py`) as their steps say. Until now they ran only

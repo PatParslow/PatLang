@@ -1,0 +1,131 @@
+# SHA-256 (FIPS 180-4) on 32-bit words, each a modint modulo 2^32 (spec 1.14),
+# for the TLS 1.3 key schedule: HKDF over it handles every secret of a
+# handshake, so the constant-time check (spec 2.7) must follow them through
+# the hash. packages/sha256 is the same hash on plain ints, for files and
+# manifests, where nothing is secret.
+#
+# A message is a list of bytes, each an int or a modint modulo 256; the digest
+# is 32 bytes, each a modint modulo 256. Only the message's length decides how
+# many steps it takes.
+
+make a function called tls_sha256_k returns k
+  let k = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+  ensure list_len(k) == 64
+  return k
+end
+
+# Element i of a list or vec, made a word modulo shape's modulus (as
+# sha512_at: the check knows an element only as some value).
+make a function called tls_s256_at takes words, i, shape returns w
+  require i >= 0
+  if type_of(words) == "list" then
+    let w = mod_make(words[i], shape)
+  else
+    let w = mod_make(vec_get(words, i), shape)
+  end
+  ensure mod_modulus(w) == 4294967296
+  return w
+end
+
+# The message padded to whole 64-byte blocks: a 1 bit, zeros, and the length
+# in bits as a 64-bit number; each byte a modint modulo 256.
+make a function called tls_s256_pad takes bytes returns padded
+  require type_of(bytes) == "list"
+  let byte = mod_make(0, 256)
+  let n = list_len(bytes)
+  let padded = vec_new()
+  let i = 0
+  while i < n do
+    vec_push(padded, mod_make(bytes[i], byte))
+    let i = i + 1
+  end
+  vec_push(padded, mod_make(128, byte))
+  while vec_len(padded) % 64 != 56 do
+    vec_push(padded, mod_make(0, byte))
+  end
+  let bits = n * 8
+  let shift = 56
+  while shift >= 0 do
+    vec_push(padded, mod_make((bits shr shift) band 255, byte))
+    let shift = shift - 8
+  end
+  ensure vec_len(padded) % 64 == 0
+  return padded
+end
+
+make a function called tls_sha256 takes bytes returns digest
+  require type_of(bytes) == "list"
+  let ks = tls_sha256_k()
+  let shape = mod_make(0, 4294967296)
+  let h0 = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+  let hw = []
+  let i = 0
+  while i < 8 do
+    let hw = list_push(hw, mod_make(h0[i], shape))
+    let i = i + 1
+  end
+  let padded = tls_s256_pad(bytes)
+  let block = 0
+  while block < vec_len(padded) do
+    let w = vec_new()
+    let t = 0
+    while t < 16 do
+      let at = block + 4 * t
+      let x = mod_make(vec_get(padded, at), shape)
+      let x = (x shl 8) bor mod_make(vec_get(padded, at + 1), shape)
+      let x = (x shl 8) bor mod_make(vec_get(padded, at + 2), shape)
+      let x = (x shl 8) bor mod_make(vec_get(padded, at + 3), shape)
+      vec_push(w, x)
+      let t = t + 1
+    end
+    while t < 64 do
+      let x = tls_s256_at(w, t - 15, shape)
+      let y = tls_s256_at(w, t - 2, shape)
+      let s0 = rotr(x, 7) bxor rotr(x, 18) bxor (x shr 3)
+      let s1 = rotr(y, 17) bxor rotr(y, 19) bxor (y shr 10)
+      vec_push(w, tls_s256_at(w, t - 16, shape) + s0 + tls_s256_at(w, t - 7, shape) + s1)
+      let t = t + 1
+    end
+    let a = tls_s256_at(hw, 0, shape)
+    let b = tls_s256_at(hw, 1, shape)
+    let c = tls_s256_at(hw, 2, shape)
+    let d = tls_s256_at(hw, 3, shape)
+    let e = tls_s256_at(hw, 4, shape)
+    let f = tls_s256_at(hw, 5, shape)
+    let g = tls_s256_at(hw, 6, shape)
+    let hh = tls_s256_at(hw, 7, shape)
+    let t = 0
+    while t < 64 do
+      let big1 = rotr(e, 6) bxor rotr(e, 11) bxor rotr(e, 25)
+      let ch = (e band f) bxor ((bnot e) band g)
+      let t1 = hh + big1 + ch + tls_s256_at(ks, t, shape) + tls_s256_at(w, t, shape)
+      let big0 = rotr(a, 2) bxor rotr(a, 13) bxor rotr(a, 22)
+      let maj = (a band b) bxor (a band c) bxor (b band c)
+      let t2 = big0 + maj
+      let hh = g
+      let g = f
+      let f = e
+      let e = d + t1
+      let d = c
+      let c = b
+      let b = a
+      let a = t1 + t2
+      let t = t + 1
+    end
+    let hw = [tls_s256_at(hw, 0, shape) + a, tls_s256_at(hw, 1, shape) + b, tls_s256_at(hw, 2, shape) + c, tls_s256_at(hw, 3, shape) + d, tls_s256_at(hw, 4, shape) + e, tls_s256_at(hw, 5, shape) + f, tls_s256_at(hw, 6, shape) + g, tls_s256_at(hw, 7, shape) + hh]
+    let block = block + 64
+  end
+  let byte = mod_make(0, 256)
+  let digest = []
+  let i = 0
+  while i < 8 do
+    let shift = 24
+    while shift >= 0 do
+      let digest = list_push(digest, mod_make(tls_s256_at(hw, i, shape) shr shift, byte))
+      let shift = shift - 8
+    end
+    let i = i + 1
+  end
+  ensure list_len(digest) == 32
+  return digest
+end

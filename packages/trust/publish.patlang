@@ -1,0 +1,440 @@
+# The publisher's side of package trust (docs/plans/package-trust.md, "The
+# publisher's tool, pkg", phase S3): a member's key, a group's genesis, and a
+# release proposed, signed and certified. The `pkg` command line
+# (packages/tools/pkg.patlang) is a thin wrapper over these.
+#
+#   trust_keygen(dir, name)              ["ok", public key hex]
+#   trust_key_public(dir, name)          ["ok", public key hex]
+#   trust_genesis(dir, pkgdir, names)    ["ok", genesis hash]: a group whose
+#                                        epoch-0 view is these keys, slots in
+#                                        the order given, quorum majority,
+#                                        signed by every founder
+#   trust_propose(pkgdir)                ["ok", release hash, version]
+#   trust_sign_release(dir, pkgdir, version, name)
+#                                        ["ok", slot]
+#   trust_certify(pkgdir, version)       ["ok", signers]
+#   trust_withdraw(dir, pkgdir, version, reason, names)
+#                                        ["ok", signers]: a certified
+#                                        withdrawal of a release, signed by
+#                                        these keys, at the log's last epoch
+#
+# Each gives ["refused", why] for what it cannot do, and stops nothing.
+#
+# dir is the publisher's profile directory (trust_store_dir() in use); a key
+# is <dir>/keys/<name>: its 32-byte seed as 64 lowercase hex digits and LF,
+# written as the store's entries are (beside, then renamed over). Only the
+# signing reads it. A package's records go where "Where they live" says:
+# <pkgdir>/trust/log/0000-view.rec, 0000-genesis.rec, 0000-genesis.sig, and
+# <pkgdir>/trust/release/<version>.rec and .sig. A signature waiting to be
+# certified is <version>.sig.<slot>, one line `sign <slot> <hex>`. A
+# withdrawal is <pkgdir>/trust/withdraw/<version>.rec and .sig.
+
+# ---- dates and hex ----
+
+# "YYYY-MM-DD" (UTC) for ms since 1970: days to a civil date, by the
+# proleptic Gregorian calendar's 400-year eras
+make a function called trust_civil_date takes ms returns text
+  require ms >= 0
+  let z = tp_q(ms, 86400000) + 719468
+  let era = tp_q(z, 146097)
+  let doe = z - era * 146097
+  let yoe = tp_q(doe - tp_q(doe, 1460) + tp_q(doe, 36524) - tp_q(doe, 146096), 365)
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + tp_q(yoe, 4) - tp_q(yoe, 100))
+  let mp = tp_q(5 * doy + 2, 153)
+  let d = doy - tp_q(153 * mp + 2, 5) + 1
+  let m = mp + 3
+  if mp >= 10 then
+    let m = mp - 9
+  end
+  if m <= 2 then
+    let y = y + 1
+  end
+  let text = "" + y + "-" + tp_two(m) + "-" + tp_two(d)
+  ensure str_len(text) == 10
+  return text
+end
+
+# the quotient of naturals a and b, rounded down
+make a function called tp_q takes a, b returns q
+  return int_divmod(a, b)[0]
+end
+
+make a function called tp_two takes n returns text
+  if n < 10 then
+    return "0" + n
+  end
+  return "" + n
+end
+
+# plain ints 0 to 255 as lowercase hex
+make a function called tp_hex_ints takes bytes returns text
+  let digits = "0123456789abcdef"
+  let b = sb_new()
+  let k = 0
+  while k < list_len(bytes) do
+    let v = bytes[k]
+    sb_push(b, digits[tp_q(v, 16)])
+    sb_push(b, digits[v % 16])
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+# A public key or a signature is made from the secret seed, so its bytes
+# are modints the constant-time check keeps secret (spec 2.7). They are
+# meant to be published: each is revealed (spec 1.14), then written as hex.
+make a function called tp_public_hex takes bytes returns text
+  let plain = []
+  let k = 0
+  while k < list_len(bytes) do
+    let plain = list_push(plain, mod_reveal(bytes[k]))
+    let k = k + 1
+  end
+  return tp_hex_ints(plain)
+end
+
+# ---- keys ----
+
+make a function called tp_key_path takes dir, name returns path
+  return dir + "/keys/" + name
+end
+
+make a function called trust_keygen takes dir, name returns got
+  if not trs_package_ok(name) then
+    return ["refused", "a key's name is lowercase letters, digits and _, not " + name]
+  end
+  let path = tp_key_path(dir, name)
+  if file_exists(path) then
+    return ["refused", "a key named " + name + " exists: " + path]
+  end
+  make_directory(dir)
+  make_directory(dir + "/keys")
+  let seed = tp_hex_ints(random_bytes(32))
+  if not trs_replace(path, seed + chr(10)) then
+    return ["refused", "the key could not be written: " + path]
+  end
+  return ["ok", tp_seed_public(seed)]
+end
+
+# The seed stays hex text until the call that uses it: as bytes it is
+# modints, and the constant-time check does not tell one element of a list
+# from another, so a seed held in a result beside "ok" would make the test of
+# that "ok" a branch on a secret.
+make a function called tp_seed_public takes seed returns pub
+  return tp_public_hex(ed25519_public(cv_hex_bytes(seed)))
+end
+
+# the seed as hex text, or ["refused", why]
+make a function called tp_key_seed takes dir, name returns got
+  if not trs_package_ok(name) then
+    return ["refused", "not a key's name: " + name]
+  end
+  let path = tp_key_path(dir, name)
+  if not file_exists(path) then
+    return ["refused", "no key named " + name + " in " + dir + "/keys"]
+  end
+  let lines = tr_manifest_lines(bytes_to_list(read_file_raw(path)))
+  if (list_len(lines) != 1) or (not trs_hash_ok(lines[0])) then
+    return ["refused", "the key file " + path + " is not 64 lowercase hex digits"]
+  end
+  return ["ok", lines[0]]
+end
+
+make a function called trust_key_public takes dir, name returns got
+  let s = tp_key_seed(dir, name)
+  if s[0] != "ok" then
+    return s
+  end
+  return ["ok", tp_seed_public(s[1])]
+end
+
+# ---- reading what a package holds ----
+
+make a function called tp_manifest takes pkgdir returns got
+  let path = pkgdir + "/manifest.pkg"
+  if not file_exists(path) then
+    return ["refused", "no manifest.pkg in " + pkgdir]
+  end
+  let m = trust_manifest_names(bytes_to_list(read_file_raw(path)))
+  if m[0] != "ok" then
+    return ["refused", "the manifest cannot be read: " + m]
+  end
+  return ["ok", m[1][0], m[1][1], sha256_file_hex(path)]
+end
+
+# the log's state, read against its own genesis: the publisher trusts the
+# log it keeps, and a consumer checks it against a pin
+make a function called tp_log_state takes pkgdir returns got
+  let log = pkgdir + "/trust/log/"
+  let g = trust_read_file(log + "0000-genesis.rec", trust_max_record_bytes(), "genesis")
+  if g[0] != "ok" then
+    return ["refused", "the package has no group: " + g]
+  end
+  let pin = sha256_hex(g[1])
+  let s = trust_check_log(log, pin, trust_ed25519_verifier())
+  if s[0] != "ok" then
+    return ["refused", "the package's log does not check: " + s]
+  end
+  return ["ok", s[1], pin]
+end
+
+make a function called tp_sign_hex takes seed, hash returns sig
+  return tp_public_hex(ed25519_sign(cv_hex_bytes(seed), cv_hex_bytes(hash)))
+end
+
+# ---- genesis ----
+
+make a function called trust_genesis takes dir, pkgdir, names returns got
+  if (type_of(names) != "list") or (list_len(names) == 0) then
+    return ["refused", "a group needs at least one founder's key"]
+  end
+  let m = tp_manifest(pkgdir)
+  if m[0] != "ok" then
+    return m
+  end
+  let log = pkgdir + "/trust/log/"
+  if file_exists(log + "0000-genesis.rec") then
+    return ["refused", "the package's log exists: " + log + "0000-genesis.rec"]
+  end
+  let seeds = []
+  let members = []
+  let k = 0
+  while k < list_len(names) do
+    let s = tp_key_seed(dir, names[k])
+    if s[0] != "ok" then
+      return s
+    end
+    let seeds = list_push(seeds, s[1])
+    let members = list_push(members, [k, "ed25519", tp_seed_public(s[1])])
+    let k = k + 1
+  end
+  let vw = trust_write_view("", 0, "majority", members)
+  if vw[0] != "ok" then
+    return ["refused", "the view cannot be written: " + vw]
+  end
+  let view = trust_read_view(vw[1])
+  let gw = trust_write_genesis(m[1], trust_rec_hash(view[1]), trust_civil_date(now_ms()))
+  if gw[0] != "ok" then
+    return ["refused", "the genesis cannot be written: " + gw]
+  end
+  let ghash = sha256_hex(gw[1])
+  let sigs = []
+  let j = 0
+  while j < list_len(seeds) do
+    let sigs = list_push(sigs, [j, tp_sign_hex(seeds[j], ghash)])
+    let j = j + 1
+  end
+  let sw = trust_write_sigs(sigs)
+  make_directory(pkgdir + "/trust")
+  make_directory(log)
+  # the view and the signatures first, the genesis last: a log without its
+  # genesis is no log, and genesis is made again
+  write_file_bytes(log + "0000-view.rec", vw[1])
+  write_file_bytes(log + "0000-genesis.sig", sw[1])
+  write_file_bytes(log + "0000-genesis.rec.tmp", gw[1])
+  if not try_rename_file(log + "0000-genesis.rec.tmp", log + "0000-genesis.rec") then
+    return ["refused", "the genesis could not be written in " + log]
+  end
+  return ["ok", ghash]
+end
+
+# ---- a release ----
+
+make a function called tp_release_path takes pkgdir, version returns path
+  return pkgdir + "/trust/release/" + version
+end
+
+make a function called trust_propose takes pkgdir returns got
+  let m = tp_manifest(pkgdir)
+  if m[0] != "ok" then
+    return m
+  end
+  let st = tp_log_state(pkgdir)
+  if st[0] != "ok" then
+    return st
+  end
+  let epoch = trust_state_epoch(st[1])
+  let view = trust_state_view(st[1], epoch)
+  let rw = trust_write_release(st[2], epoch, trust_rec_hash(view), m[1], m[2], m[3], trust_civil_date(now_ms()))
+  if rw[0] != "ok" then
+    return ["refused", "the release cannot be written: " + rw]
+  end
+  let path = tp_release_path(pkgdir, m[2]) + ".rec"
+  if file_exists(path) then
+    let held = trust_read_release(bytes_to_list(read_file_raw(path)))
+    # the same statement but its date: proposed already
+    if (held[0] == "ok") and (held[1][6] == m[1]) and (held[1][7] == m[3]) and (held[1][3] == epoch) then
+      return ["ok", held[1][1], m[2]]
+    end
+    return ["refused", "a different release of " + m[1] + " " + m[2] + " is proposed already: " + path]
+  end
+  make_directory(pkgdir + "/trust/release")
+  write_file_bytes(path, rw[1])
+  return ["ok", sha256_hex(rw[1]), m[2]]
+end
+
+# the release's record and the view of its epoch
+make a function called tp_release_view takes pkgdir, version returns got
+  let path = tp_release_path(pkgdir, version) + ".rec"
+  if not file_exists(path) then
+    return ["refused", "no release of version " + version + " is proposed: " + path]
+  end
+  let rel = trust_read_release(bytes_to_list(read_file_raw(path)))
+  if rel[0] != "ok" then
+    return ["refused", "the release cannot be read: " + rel]
+  end
+  let st = tp_log_state(pkgdir)
+  if st[0] != "ok" then
+    return st
+  end
+  let epoch = rel[1][3]
+  if epoch > trust_state_epoch(st[1]) then
+    return ["refused", "the release names epoch " + epoch + ", past the log's"]
+  end
+  return ["ok", rel[1], trust_state_view(st[1], epoch)]
+end
+
+make a function called trust_sign_release takes dir, pkgdir, version, name returns got
+  let rv = tp_release_view(pkgdir, version)
+  if rv[0] != "ok" then
+    return rv
+  end
+  let s = tp_key_seed(dir, name)
+  if s[0] != "ok" then
+    return s
+  end
+  let pub = tp_seed_public(s[1])
+  let members = rv[2][5]
+  let slot = 0 - 1
+  let k = 0
+  while k < list_len(members) do
+    if members[k][2] == pub then
+      let slot = members[k][0]
+    end
+    let k = k + 1
+  end
+  if slot < 0 then
+    return ["refused", "the key " + name + " is not a member of the release's view"]
+  end
+  let sw = trust_write_sigs([[slot, tp_sign_hex(s[1], trust_rec_hash(rv[1]))]])
+  write_file_bytes(tp_release_path(pkgdir, version) + ".sig." + slot, sw[1])
+  return ["ok", slot]
+end
+
+make a function called trust_certify takes pkgdir, version returns got
+  let rv = tp_release_view(pkgdir, version)
+  if rv[0] != "ok" then
+    return rv
+  end
+  let stem = tp_release_path(pkgdir, version)
+  let members = rv[2][5]
+  let sigs = []
+  let parts = []
+  let k = 0
+  while k < list_len(members) do
+    let part = stem + ".sig." + members[k][0]
+    if file_exists(part) then
+      let one = trust_read_sigs(bytes_to_list(read_file_raw(part)))
+      if one[0] != "ok" then
+        return ["refused", "the signature " + part + " cannot be read: " + one]
+      end
+      let sigs = list_push(sigs, one[1][2][0])
+      let parts = list_push(parts, part)
+    end
+    let k = k + 1
+  end
+  let need = trust_quorum_need(rv[2], false)
+  if list_len(sigs) < need then
+    return ["refused", "the quorum is not met: " + list_len(sigs) + " signatures of the " + need + " needed"]
+  end
+  let sw = trust_write_sigs(sigs)
+  let read = trust_read_sigs(sw[1])
+  let c = trust_check_cert(rv[2], trust_rec_hash(rv[1]), read[1], trust_ed25519_verifier(), 0 - 1, "release")
+  if c[0] != "ok" then
+    return ["refused", "the signatures do not certify the release: " + c]
+  end
+  write_file_bytes(stem + ".sig.tmp", sw[1])
+  if not try_rename_file(stem + ".sig.tmp", stem + ".sig") then
+    return ["refused", "the certificate could not be written: " + stem + ".sig"]
+  end
+  let j = 0
+  while j < list_len(parts) do
+    remove_file(parts[j])
+    let j = j + 1
+  end
+  return ["ok", list_len(sigs)]
+end
+
+# ---- withdrawing a release ----
+
+# writes bytes beside path and renames them over it: whether it is there whole
+make a function called tp_replace_bytes takes path, bytes returns ok
+  write_file_bytes(path + ".tmp", bytes)
+  return try_rename_file(path + ".tmp", path)
+end
+
+# A withdrawal of a certified release, at the log's last epoch, signed by the
+# keys named, which must make that epoch's quorum. Its certificate is
+# written first and the statement second, each beside its place and renamed
+# over it; a reader finding either alone refuses the package, as it should
+# a withdrawal half made.
+make a function called trust_withdraw takes dir, pkgdir, version, reason, names returns got
+  let rv = tp_release_view(pkgdir, version)
+  if rv[0] != "ok" then
+    return rv
+  end
+  let st = tp_log_state(pkgdir)
+  if st[0] != "ok" then
+    return st
+  end
+  let epoch = trust_state_epoch(st[1])
+  let view = trust_state_view(st[1], epoch)
+  let w = trust_write_withdraw(st[2], epoch, trust_rec_hash(view), rv[1][5], rv[1][6], reason)
+  if w[0] != "ok" then
+    return ["refused", "the withdrawal cannot be written: " + w]
+  end
+  let hash = trust_rec_hash(trust_read_withdraw(w[1])[1])
+  let members = view[5]
+  let sigs = []
+  let k = 0
+  while k < list_len(names) do
+    let s = tp_key_seed(dir, names[k])
+    if s[0] != "ok" then
+      return s
+    end
+    let pub = tp_seed_public(s[1])
+    let slot = 0 - 1
+    let m = 0
+    while m < list_len(members) do
+      if members[m][2] == pub then
+        let slot = members[m][0]
+      end
+      let m = m + 1
+    end
+    if slot < 0 then
+      return ["refused", "the key " + names[k] + " is not a member of epoch " + epoch + "'s view"]
+    end
+    let sigs = list_push(sigs, [slot, tp_sign_hex(s[1], hash)])
+    let k = k + 1
+  end
+  let need = trust_quorum_need(view, false)
+  if list_len(sigs) < need then
+    return ["refused", "the quorum is not met: " + list_len(sigs) + " signatures of the " + need + " needed"]
+  end
+  let sw = trust_write_sigs(sigs)
+  let read = trust_read_sigs(sw[1])
+  let c = trust_check_cert(view, hash, read[1], trust_ed25519_verifier(), 0 - 1, "withdrawal")
+  if c[0] != "ok" then
+    return ["refused", "the signatures do not certify the withdrawal: " + c]
+  end
+  let stem = pkgdir + "/trust/withdraw/" + version
+  make_directory(pkgdir + "/trust/withdraw")
+  if not tp_replace_bytes(stem + ".sig", sw[1]) then
+    return ["refused", "the certificate could not be written: " + stem + ".sig"]
+  end
+  if not tp_replace_bytes(stem + ".rec", w[1]) then
+    return ["refused", "the withdrawal could not be written: " + stem + ".rec"]
+  end
+  return ["ok", list_len(sigs)]
+end

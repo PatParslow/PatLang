@@ -1,0 +1,392 @@
+# The trust store and the project lock file (docs/plans/package-trust.md,
+# "The trust store and the installer", phase S2).
+#
+#   let st = trust_store_open(dir)         dir: trust_store_dir() in use
+#   trust_store_get(st, package)           ["ok", entry] | ["none"] | ["err", why]
+#   trust_store_pin(st, package, pin, source)
+#                                          ["ok", entry] | ["refused", why]
+#   trust_store_check_epoch(st, package, epoch)
+#                                          ["ok"] | ["refused", why]: a log
+#                                          ending below the epoch held is
+#                                          rolled back
+#   trust_store_raise(st, package, epoch)  the epoch held, made no lower
+#   trust_read_pins(bytes)                 shipped pins: ["ok", [[package, pin]]]
+#   trust_store_choose(st, package, shipped)
+#                                          the pin to use, and any difference
+#   trust_lock_read(bytes), trust_lock_write(path, entries)
+#   trust_lock_check(lock, package, version, pin, manifest)
+#   trust_verify_pinned(st, shipped, dir, verify)
+#                                          a package directory checked against
+#                                          the pin chosen for its name and the
+#                                          epoch held (phase S4, pkg verify)
+#
+# An entry is one file, <dir>/pins/<package>, in the records' form (printable
+# ASCII, one "key value" field a line, LF ends, fixed order):
+#   package <name>
+#   pin <genesis hash, 64 lowercase hex>
+#   source shipped | given | first-use
+#   epoch <the highest the log has reached, from 0>
+#   added <ms since 1970 when the pin was made>
+# A file is written beside its old one and renamed over it, so a crash leaves
+# the old entry or the new one; a file left half written beside it (".tmp")
+# is never read. One file a package means two installers working on different
+# packages never write one file. Every reader refuses what it cannot read
+# rather than stopping the program.
+include "records.patlang"
+
+class TrustStore {
+  field dir = ""
+}
+
+# The user's own directory for the store: LOCALAPPDATA on Windows; on Linux
+# XDG_DATA_HOME, else ~/.local/share (not XDG_RUNTIME_DIR, which is emptied
+# at logout); false when there is none.
+make a function called trust_store_dir returns dir
+  let base = "" + getenv("LOCALAPPDATA")
+  if base == "" then
+    let base = "" + getenv("XDG_DATA_HOME")
+  end
+  if (base == "") and ("" + getenv("HOME") != "") then
+    let base = getenv("HOME") + "/.local/share"
+  end
+  if base == "" then
+    return false
+  end
+  return base + "/PatLang/trust"
+end
+
+make a function called trust_store_open takes dir returns st
+  require type_of(dir) == "string"
+  let st = new("TrustStore")
+  st.dir = dir
+  make_directory(dir + "/pins")
+  return st
+end
+
+# a package name, by the records' own rule (tr_is_name), for any value
+make a function called trs_package_ok takes name returns yes
+  if type_of(name) != "string" then
+    return false
+  end
+  return tr_is_name(name)
+end
+
+make a function called trs_hash_ok takes h returns yes
+  if (type_of(h) != "string") or (str_len(h) != 64) then
+    return false
+  end
+  let b = bytes_from_str(h)
+  let k = 0
+  while k < 64 do
+    let c = bytes_get(b, k)
+    if not (((c >= 48) and (c <= 57)) or ((c >= 97) and (c <= 102))) then
+      return false
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+# a decimal count of no more than 18 digits, no sign, no leading zero, or false
+make a function called trs_count takes text returns n
+  let b = bytes_from_str(text)
+  let len = bytes_len(b)
+  if (len == 0) or (len > 18) or ((len > 1) and (bytes_get(b, 0) == 48)) then
+    return false
+  end
+  let n = 0
+  let k = 0
+  while k < len do
+    let c = bytes_get(b, k)
+    if (c < 48) or (c > 57) then
+      return false
+    end
+    let n = n * 10 + c - 48
+    let k = k + 1
+  end
+  return n
+end
+
+make a function called trs_path takes st, package returns path
+  return st.dir + "/pins/" + package
+end
+
+# text written beside path and renamed over it: whether both worked
+make a function called trs_replace takes path, text returns ok
+  let tmp = path + ".tmp"
+  if not write_file(tmp, text) then
+    return false
+  end
+  return try_rename_file(tmp, path)
+end
+
+make a function called trs_text takes e returns text
+  return "package " + e[0] + chr(10) + "pin " + e[1] + chr(10) + "source " + e[2] + chr(10) + "epoch " + e[3] + chr(10) + "added " + e[4] + chr(10)
+end
+
+# An entry's fields from its bytes: ["ok", [package, pin, source, epoch,
+# added]] or ["err", why].
+make a function called trs_read takes bytes, package returns got
+  let f = trust_fields(bytes)
+  if f[0] != "ok" then
+    return ["err", "the entry for " + package + " is not in the records' form"]
+  end
+  let pairs = f[1]
+  let keys = ["package", "pin", "source", "epoch", "added"]
+  if list_len(pairs) != 5 then
+    return ["err", "the entry for " + package + " has " + list_len(pairs) + " fields, not 5"]
+  end
+  let k = 0
+  while k < 5 do
+    if pairs[k][0] != keys[k] then
+      return ["err", "the entry for " + package + ": field " + (k + 1) + " is " + pairs[k][0] + ", not " + keys[k]]
+    end
+    let k = k + 1
+  end
+  if pairs[0][1] != package then
+    return ["err", "the entry for " + package + " names " + pairs[0][1]]
+  end
+  if not trs_hash_ok(pairs[1][1]) then
+    return ["err", "the entry for " + package + " holds a pin that is not a hash"]
+  end
+  let source = pairs[2][1]
+  if (source != "shipped") and (source != "given") and (source != "first-use") then
+    return ["err", "the entry for " + package + " has the source " + source]
+  end
+  let epoch = trs_count(pairs[3][1])
+  let added = trs_count(pairs[4][1])
+  if (epoch == false) or (added == false) then
+    return ["err", "the entry for " + package + " has an epoch or a time that is not a count"]
+  end
+  return ["ok", [package, pairs[1][1], source, epoch, added]]
+end
+
+make a function called trust_store_get takes st, package returns got
+  if not trs_package_ok(package) then
+    return ["err", "not a package name: " + package]
+  end
+  let path = trs_path(st, package)
+  if not file_exists(path) then
+    return ["none"]
+  end
+  return trs_read(bytes_to_list(read_file_raw(path)), package)
+end
+
+# Pins a package to a genesis hash. A package already pinned to that hash
+# keeps its entry; one pinned to another is refused, naming both, since a pin
+# is changed only on purpose (trust_store_unpin, then pin again).
+make a function called trust_store_pin takes st, package, pin, source returns got
+  if not trs_package_ok(package) then
+    return ["refused", "not a package name: " + package]
+  end
+  if not trs_hash_ok(pin) then
+    return ["refused", "a pin is a genesis hash, 64 lowercase hex digits"]
+  end
+  if (source != "shipped") and (source != "given") and (source != "first-use") then
+    return ["refused", "a pin's source is shipped, given or first-use, not " + source]
+  end
+  let held = trust_store_get(st, package)
+  if held[0] == "ok" then
+    if held[1][1] == pin then
+      return ["ok", held[1]]
+    end
+    return ["refused", package + " is pinned to " + held[1][1] + " (" + held[1][2] + "), not " + pin]
+  end
+  if held[0] == "err" then
+    return ["refused", held[1]]
+  end
+  let e = [package, pin, source, 0, now_ms()]
+  if not trs_replace(trs_path(st, package), trs_text(e)) then
+    return ["refused", "the entry for " + package + " could not be written"]
+  end
+  return ["ok", e]
+end
+
+make a function called trust_store_unpin takes st, package returns gone
+  let path = trs_path(st, package)
+  if file_exists(path) then
+    return remove_file(path)
+  end
+  return false
+end
+
+# ["ok"] when a log reaching epoch is not behind the store; ["refused", why]
+# when it ends below the epoch held (step 4 of "Verifying a package")
+make a function called trust_store_check_epoch takes st, package, epoch returns got
+  let held = trust_store_get(st, package)
+  if held[0] != "ok" then
+    return ["refused", package + " is not pinned"]
+  end
+  if epoch < held[1][3] then
+    return ["refused", package + "'s log ends at epoch " + epoch + ", and this store has seen epoch " + held[1][3] + ": a rolled-back log"]
+  end
+  return ["ok"]
+end
+
+# the epoch held made epoch, when that is higher: ["ok", the epoch held]
+make a function called trust_store_raise takes st, package, epoch returns got
+  let held = trust_store_get(st, package)
+  if held[0] != "ok" then
+    return ["refused", package + " is not pinned"]
+  end
+  let e = held[1]
+  if epoch <= e[3] then
+    return ["ok", e[3]]
+  end
+  if not trs_replace(trs_path(st, package), trs_text([e[0], e[1], e[2], epoch, e[4]])) then
+    return ["refused", "the entry for " + package + " could not be written"]
+  end
+  return ["ok", epoch]
+end
+
+# Shipped pins, "pin <package> <hash>" a line ("#" lines and blank ones left
+# out): ["ok", [[package, hash], ...]] or ["err", why].
+make a function called trust_read_pins takes bytes returns got
+  let lines = tr_manifest_lines(bytes)
+  let out = []
+  let k = 0
+  while k < list_len(lines) do
+    let l = lines[k]
+    if (str_len(l) > 0) and (char_code(l, 0) != 35) then
+      let w = tr_manifest_words(l)
+      if (list_len(w) != 3) or (w[0] != "pin") or (not trs_package_ok(w[1])) or (not trs_hash_ok(w[2])) then
+        return ["err", "line " + (k + 1) + " is not pin PACKAGE HASH"]
+      end
+      let out = list_push(out, [w[1], w[2]])
+    end
+    let k = k + 1
+  end
+  return ["ok", out]
+end
+
+# The pin to use for a package: ["ok", pin, source, note], the note telling of
+# a shipped pin that differs from the one the store holds (the store's wins:
+# the user gave it, or kept it); ["none"] with neither.
+make a function called trust_store_choose takes st, package, shipped returns got
+  let ship = false
+  let k = 0
+  while k < list_len(shipped) do
+    if shipped[k][0] == package then
+      let ship = shipped[k][1]
+    end
+    let k = k + 1
+  end
+  let held = trust_store_get(st, package)
+  if held[0] == "ok" then
+    let note = ""
+    if (ship != false) and (ship != held[1][1]) then
+      let note = "the shipped pin for " + package + " is " + ship + ", and this store's, kept, is " + held[1][1]
+    end
+    return ["ok", held[1][1], held[1][2], note]
+  end
+  if ship != false then
+    return ["ok", ship, "shipped", ""]
+  end
+  return ["none"]
+end
+
+# ---- verifying against the store ----
+
+# The package in dir checked as an installer checks it before installing
+# (step 4 of "The installer"): the pin is the store's for the manifest's
+# package name, else a shipped one; then every check of trust_verify_package;
+# then the log's epoch against the epoch the store holds. Nothing is
+# written: the epoch is raised only when a package is installed.
+# ["ok", [package, version, epoch, signers, source, note]], the note telling
+# of a shipped pin that differs from the store's, or the first failure as
+# trust_err gives it: stage "pin" (code "unpinned"), "epoch" ("rolled-back"),
+# or a stage of trust_verify_package, whose detail then ends with the note.
+make a function called trust_verify_pinned takes st, shipped, dir, verify returns r
+  require (type_of(shipped) == "list") and (type_of(dir) == "string")
+  let mf = trust_read_file(dir + "/manifest.pkg", trust_max_manifest_bytes(), "manifest")
+  if mf[0] != "ok" then
+    return mf
+  end
+  let mr = trust_manifest_names(mf[1])
+  if mr[0] != "ok" then
+    return mr
+  end
+  let pkg = mr[1][0]
+  let ch = trust_store_choose(st, pkg, shipped)
+  if ch[0] != "ok" then
+    return trust_err("unpinned", "pin", pkg + " is not pinned: give its genesis hash with pkg pin " + pkg + " HASH")
+  end
+  let note = ch[3]
+  let v = trust_verify_package(dir, ch[1], verify)
+  if v[0] != "ok" then
+    if note == "" then
+      return v
+    end
+    return trust_err(v[1], v[2], v[3] + "; " + note)
+  end
+  let held = trust_store_get(st, pkg)
+  if held[0] == "ok" then
+    let ep = trust_store_check_epoch(st, pkg, v[1][2])
+    if ep[0] != "ok" then
+      return trust_err("rolled-back", "epoch", ep[1])
+    end
+  end
+  let r = ["ok", [v[1][0], v[1][1], v[1][2], v[1][3], ch[2], note]]
+  ensure list_len(r[1]) == 6
+  return r
+end
+
+# ---- the project lock file ----
+# trust.lock: one line a package,
+#   package <name> <version> pin <hash> manifest <hash>
+# ("#" lines and blank ones left out).
+
+make a function called trust_lock_read takes bytes returns got
+  let lines = tr_manifest_lines(bytes)
+  let out = []
+  let k = 0
+  while k < list_len(lines) do
+    let l = lines[k]
+    if (str_len(l) > 0) and (char_code(l, 0) != 35) then
+      let w = tr_manifest_words(l)
+      if (list_len(w) != 7) or (w[0] != "package") or (w[3] != "pin") or (w[5] != "manifest") or (not trs_package_ok(w[1])) or (not trs_hash_ok(w[4])) or (not trs_hash_ok(w[6])) then
+        return ["err", "line " + (k + 1) + " is not package NAME VERSION pin HASH manifest HASH"]
+      end
+      let out = list_push(out, [w[1], w[2], w[4], w[6]])
+    end
+    let k = k + 1
+  end
+  return ["ok", out]
+end
+
+# entries [[package, version, pin, manifest hash], ...], one line each, in the
+# order given, written beside path and renamed over it
+make a function called trust_lock_write takes path, entries returns ok
+  let b = sb_new()
+  sb_push(b, "# the packages this project was built with: trust_lock_check refuses another" + chr(10))
+  let k = 0
+  while k < list_len(entries) do
+    let e = entries[k]
+    sb_push(b, "package " + e[0] + " " + e[1] + " pin " + e[2] + " manifest " + e[3] + chr(10))
+    let k = k + 1
+  end
+  return trs_replace(path, sb_str(b))
+end
+
+# ["ok"] when the lock names nothing for package, or names exactly this
+# version, pin and manifest; ["refused", why] for any difference
+make a function called trust_lock_check takes lock, package, version, pin, manifest returns got
+  let k = 0
+  while k < list_len(lock) do
+    let e = lock[k]
+    if e[0] == package then
+      if e[1] != version then
+        return ["refused", package + " is locked at " + e[1] + ", not " + version]
+      end
+      if e[2] != pin then
+        return ["refused", package + " is locked to the pin " + e[2] + ", not " + pin]
+      end
+      if e[3] != manifest then
+        return ["refused", package + " " + version + " is locked to the manifest " + e[3] + ", not " + manifest]
+      end
+      return ["ok"]
+    end
+    let k = k + 1
+  end
+  return ["ok"]
+end

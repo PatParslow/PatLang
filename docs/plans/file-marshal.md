@@ -123,4 +123,18 @@ refused.
    values in the history's encoding, so binary passes untouched. A slow
    operation holds up the others: an owner thread for each file is the next
    step if that matters.
+   **Finding lazily** (done 2026-11-23): in the edits library, a finder
+   (`fm_finder`, `fm_finder_next`, `fm_finder_close`) is a fibre yielding each
+   offset where a pattern starts, one each time it is resumed, so it scans only
+   as far as the matches asked for; closing it early resumes it with a stop, so
+   no paused fibre is left. Across the service a search is a cursor, not a
+   fibre, since the file can change between two calls and a fibre in the
+   service could be neither carried nor sent: `["find", path, pattern,
+   [version, position]]` gives the next match and the cursor after it, the
+   position carried past the shifts since its version (one inside a change
+   goes to the change's start). A scenario edits the file before the first
+   match between two finds, and fails with the carrying turned off. The
+   uniqueness check still collects every candidate: its refusal lists them all,
+   which tells the client where to put a hint, and stopping at the second would
+   lose that.
 4. **Subscriptions.**

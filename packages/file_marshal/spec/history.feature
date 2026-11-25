@@ -42,6 +42,12 @@ Feature: file_marshal history: every version of a file, kept on the disk
     When the file is changed by something else to "a cat"
     Then recovering it records version 3 as an outside change, and version 3 reads back as "a cat"
 
+  Scenario: the history as facts says which versions touched a part of the file as it is now
+    Given a history begun from the text "the curly haired dog sat on the mat"
+    When "ann" makes "haired" into "furry", "bob" makes "mat" into "rug", and "ann" makes "curly" into "straight"
+    Then the versions that touched the range of "rug" in the file as it is now are bob's version 3 alone
+    And the versions that touched the range of "furry" are ann's version 2 alone, its range carried past version 4's edit before it
+
   Scenario: recording a version costs the same however long the history is
     Given a history begun from the text "count: 0"
     Then recording a version after 1000 takes at most three times as long as recording one after 10, the cheapest of five each

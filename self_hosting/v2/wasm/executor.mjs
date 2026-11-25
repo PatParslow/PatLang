@@ -516,7 +516,10 @@ function start(init) {
     if (im.kind !== "function") continue;
     const lib = im.module, func = im.name;
     imports[lib] = imports[lib] || {};
-    const found = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : lib === "BCRYPT.DLL" ? bcrypt[func] : undefined;
+    // CRYPT32 (trust_roots): a browser has no root store to give a program,
+    // so opening it fails and trust_roots() gives []
+    const crypt32 = { CertOpenSystemStoreW() { return 0; }, CertEnumCertificatesInStore() { return 0; }, CertCloseStore() { return 1; } };
+    const found = lib === "KERNEL32.DLL" ? kernel[func] : lib === "WS2_32.DLL" ? (winsock[func] || (() => { lastError = 10050; return -1; })) : lib === "BCRYPT.DLL" ? bcrypt[func] : lib === "CRYPT32.DLL" ? crypt32[func] : undefined;
     // failure injection (launcher.mjs, run's fail): the nth call this worker
     // makes to the named function fails as the system's does, -1 for one
     // that gives a handle and 0 for the rest, ERROR_IO_DEVICE its last error

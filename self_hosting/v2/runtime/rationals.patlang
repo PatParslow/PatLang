@@ -24,6 +24,76 @@ make a function called rational_den takes r returns d
   return d
 end
 
+# ---- small parts (#285) ----
+#
+# When the numerators and denominators of both operands are ints under 31
+# bits either side of 0, every product of two of them is under 2^62 and a
+# sum of two such products under 2^63, so the arithmetic is on words: no
+# [num, den] lists, no int_* calls, one gcd on words, and the result's block
+# made directly. Anything larger takes the general path below.
+
+# Whether x is an int under 2^31 either side of 0.
+make a function called rt_fits31 takes x returns yes
+  require value_live(x)
+  let yes =(value_class(x) == 2) and (x < 2147483648) and (x > 0 - 2147483648)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# An integer's or a rational's numerator, and its denominator (1 for an
+# integer), read without making a list.
+make a function called rt_frac_num takes v returns n
+  require rt_is_integer(v) or (value_class(v) == 5)
+  if value_class(v) == 5 then
+    let n = mem_load_value(value_data(v), 16)
+    ensure rt_is_integer(n)
+    return n
+  end
+  let n = v
+  ensure rt_is_integer(n)
+  return n
+end
+
+make a function called rt_frac_den takes v returns d
+  require rt_is_integer(v) or (value_class(v) == 5)
+  if value_class(v) == 5 then
+    let d = mem_load_value(value_data(v), 32)
+    ensure rt_is_integer(d)
+    return d
+  end
+  let d = 1
+  ensure rt_is_integer(d)
+  return d
+end
+
+# n / d in lowest terms for words n and d, d positive and both under 2^63
+# in size: an int when it divides evenly.
+make a function called rt_small_fraction takes n, d returns r
+  require (value_class(n) == 2) and (value_class(d) == 2) and (d > 0)
+  let m = n
+  if m < 0 then
+    let m = word_sub(0, m)
+  end
+  let g = rt_word_gcd(m, d)
+  let n2 = n
+  let d2 = d
+  if g != 1 then
+    let n2 = word_div(n, g)
+    let d2 = word_div(d, g)
+  end
+  if d2 == 1 then
+    let r = n2
+    ensure rt_is_integer(r)
+    return r
+  end
+  let block = rt_alloc(32)
+  mem_init_value(block, 16, n2)
+  mem_init_value(block, 32, d2)
+  let r = value_make(rt_rational_heap_type(), block)
+  ensure value_class(r) == 5
+  return r
+end
+
 # n / d in lowest terms: an integer when it divides evenly.
 make a function called rational_make takes n, d returns r
   require rt_is_integer(n) and rt_is_integer(d)
@@ -33,9 +103,19 @@ make a function called rational_make takes n, d returns r
     ensure rt_is_integer(r) or (value_class(r) == 5)
     return r
   end
+  if rt_small_ints(n, d, 62) then
+    if d < 0 then
+      let r = rt_small_fraction(word_sub(0, n), word_sub(0, d))
+      ensure rt_is_integer(r) or (value_class(r) == 5)
+      return r
+    end
+    let r = rt_small_fraction(n, d)
+    ensure rt_is_integer(r) or (value_class(r) == 5)
+    return r
+  end
   let g = int_gcd(n, d)
-  let n2 = int_divmod(n, g)[0]
-  let d2 = int_divmod(d, g)[0]
+  let n2 = int_quot(n, g)
+  let d2 = int_quot(d, g)
   if rt_int_negative(d2) then
     let n2 = int_neg(n2)
     let d2 = int_neg(d2)
@@ -90,6 +170,19 @@ end
 # division by k.
 make a function called rt_rational_add_signed takes a, b, negate returns r
   require (rt_is_integer(a) or (value_class(a) == 5)) and (rt_is_integer(b) or (value_class(b) == 5))
+  let n1 = rt_frac_num(a)
+  let d1 = rt_frac_den(a)
+  let n2 = rt_frac_num(b)
+  let d2 = rt_frac_den(b)
+  if rt_fits31(n1) and rt_fits31(d1) and rt_fits31(n2) and rt_fits31(d2) then
+    let p = word_mul(n2, d1)
+    if negate then
+      let p = word_sub(0, p)
+    end
+    let r = rt_small_fraction(word_add(word_mul(n1, d2), p), word_mul(d1, d2))
+    ensure rt_is_integer(r) or (value_class(r) == 5)
+    return r
+  end
   let x = rt_as_fraction(a)
   let y = rt_as_fraction(b)
   let c = y[0]
@@ -103,8 +196,8 @@ make a function called rt_rational_add_signed takes a, b, negate returns r
     ensure rt_is_integer(r) or (value_class(r) == 5)
     return r
   end
-  let s = int_divmod(x[1], g)[0]
-  let t = int_divmod(y[1], g)[0]
+  let s = int_quot(x[1], g)
+  let t = int_quot(y[1], g)
   let n = int_add(int_mul(x[0], t), int_mul(c, s))
   if n == 0 then
     let r = 0
@@ -114,8 +207,8 @@ make a function called rt_rational_add_signed takes a, b, negate returns r
   let d = int_mul(x[1], t)
   let g2 = int_gcd(n, g)
   if g2 != 1 then
-    let n = int_divmod(n, g2)[0]
-    let d = int_divmod(d, g2)[0]
+    let n = int_quot(n, g2)
+    let d = int_quot(d, g2)
   end
   let r = rt_rational_lowest(n, d)
   ensure rt_is_integer(r) or (value_class(r) == 5)
@@ -151,14 +244,14 @@ make a function called rt_rational_mul_parts takes a, b, c, d returns r
   let a2 = a
   let d2 = d
   if g1 != 1 then
-    let a2 = int_divmod(a, g1)[0]
-    let d2 = int_divmod(d, g1)[0]
+    let a2 = int_quot(a, g1)
+    let d2 = int_quot(d, g1)
   end
   let c2 = c
   let b2 = b
   if g2 != 1 then
-    let c2 = int_divmod(c, g2)[0]
-    let b2 = int_divmod(b, g2)[0]
+    let c2 = int_quot(c, g2)
+    let b2 = int_quot(b, g2)
   end
   let r = rt_rational_lowest(int_mul(a2, c2), int_mul(b2, d2))
   ensure rt_is_integer(r) or (value_class(r) == 5)
@@ -167,6 +260,15 @@ end
 
 make a function called rational_mul takes a, b returns r
   require (rt_is_integer(a) or (value_class(a) == 5)) and (rt_is_integer(b) or (value_class(b) == 5))
+  let n1 = rt_frac_num(a)
+  let d1 = rt_frac_den(a)
+  let n2 = rt_frac_num(b)
+  let d2 = rt_frac_den(b)
+  if rt_fits31(n1) and rt_fits31(d1) and rt_fits31(n2) and rt_fits31(d2) then
+    let r = rt_small_fraction(word_mul(n1, n2), word_mul(d1, d2))
+    ensure rt_is_integer(r) or (value_class(r) == 5)
+    return r
+  end
   let x = rt_as_fraction(a)
   let y = rt_as_fraction(b)
   let r = rt_rational_mul_parts(x[0], x[1], y[0], y[1])
@@ -176,7 +278,23 @@ end
 
 # (a/b) / (c/d) is (a/b) * (d/c), the sign moved to the numerator.
 make a function called rational_div takes a, b returns r
-  require (rt_is_integer(a) or (value_class(a) == 5)) and (rt_is_integer(b) or (value_class(b) == 5)) and (b != 0)
+  require (rt_is_integer(a) or (value_class(a) == 5)) and (rt_is_integer(b) or (value_class(b) == 5)) and ((value_class(b) == 5) or (b != 0))
+  let n1 = rt_frac_num(a)
+  let d1 = rt_frac_den(a)
+  let n2 = rt_frac_num(b)
+  let d2 = rt_frac_den(b)
+  if rt_fits31(n1) and rt_fits31(d1) and rt_fits31(n2) and rt_fits31(d2) then
+    # (n1/d1) / (n2/d2) is (n1*d2) / (d1*n2), the sign moved to the top
+    let top = word_mul(n1, d2)
+    let bottom = word_mul(d1, n2)
+    if bottom < 0 then
+      let top = word_sub(0, top)
+      let bottom = word_sub(0, bottom)
+    end
+    let r = rt_small_fraction(top, bottom)
+    ensure rt_is_integer(r) or (value_class(r) == 5)
+    return r
+  end
   let x = rt_as_fraction(a)
   let y = rt_as_fraction(b)
   let num = y[1]
@@ -192,6 +310,23 @@ end
 
 make a function called rational_cmp takes a, b returns c
   require (rt_is_integer(a) or (value_class(a) == 5)) and (rt_is_integer(b) or (value_class(b) == 5))
+  let n1 = rt_frac_num(a)
+  let d1 = rt_frac_den(a)
+  let n2 = rt_frac_num(b)
+  let d2 = rt_frac_den(b)
+  if rt_fits31(n1) and rt_fits31(d1) and rt_fits31(n2) and rt_fits31(d2) then
+    # denominators are positive, so the order of the cross products is theirs
+    let l = word_mul(n1, d2)
+    let r = word_mul(n2, d1)
+    let c = 0
+    if l < r then
+      let c = 0 - 1
+    elif l > r then
+      let c = 1
+    end
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
   let x = rt_as_fraction(a)
   let y = rt_as_fraction(b)
   let c = int_cmp(int_mul(x[0], y[1]), int_mul(y[0], x[1]))

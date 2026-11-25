@@ -7,6 +7,8 @@
 # every check passes, 1 otherwise.
 include "../../../self_hosting/lib/includes.patlang"
 include "../../../self_hosting/lib/gherkin.patlang"
+include "../../../self_hosting/lib/program_run.patlang"
+include "../../../self_hosting/lib/v2_engines.patlang"
 include "../tls.patlang"
 
 # One line from the oracle, trimmed.
@@ -19,8 +21,10 @@ make a function called tl_py takes a returns out
     let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2])
   elif n == 4 then
     let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2], a[3])
-  else
+  elif n == 5 then
     let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2], a[3], a[4])
+  else
+    let raw = exec_capture("py", "-3", "-I", o, a[0], a[1], a[2], a[3], a[4], a[5])
   end
   let out = str_trim(raw)
   ensure value_class(out) == 8
@@ -132,7 +136,844 @@ make a function called st_tl_random takes ctx returns ok
   return all
 end
 
+# ---- hash.feature: SHA-256 and SHA-384 on modints, HMAC, HKDF ----
+
+# Bytes as the oracle's hex, "-" for none; and back.
+make a function called tl_hx takes bytes returns text
+  if list_len(bytes) == 0 then
+    return "-"
+  end
+  return tls_hex(bytes)
+end
+
+make a function called tl_unhx takes text returns bytes
+  if text == "-" then
+    return []
+  end
+  return tls_hex_bytes(text)
+end
+
+make a function called st_th_sha256 takes ctx returns ok
+  return expect(ctx, "SHA-256 of " + step_arg(ctx, "text"), tls_hex(tls_hash("sha256", tls_text_bytes(step_arg(ctx, "text")))), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_sha256_empty takes ctx returns ok
+  return expect(ctx, "SHA-256 of nothing", tls_hex(tls_hash("sha256", [])), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_sha384 takes ctx returns ok
+  return expect(ctx, "SHA-384 of " + step_arg(ctx, "text"), tls_hex(tls_hash("sha384", tls_text_bytes(step_arg(ctx, "text")))), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_sha384_empty takes ctx returns ok
+  return expect(ctx, "SHA-384 of nothing", tls_hex(tls_hash("sha384", [])), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_edges takes ctx returns ok
+  let all = true
+  let lengths = [0, 1, 55, 56, 63, 64, 65, 111, 112, 127, 128, 129, 300]
+  let i = 0
+  while i < list_len(lengths) do
+    let text = random_bytes(lengths[i])
+    let got = [tls_hex(tls_hash("sha256", text)), tls_hex(tls_hash("sha384", text))]
+    let want = [tl_py(["hash", "sha256", tl_hx(text)]), tl_py(["hash", "sha384", tl_hx(text)])]
+    if not expect(ctx, "length " + lengths[i], got, want) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_th_hmac256 takes ctx returns ok
+  return expect(ctx, "HMAC-SHA256", tls_hex(tls_hmac("sha256", tls_text_bytes(step_arg(ctx, "key")), tls_text_bytes(step_arg(ctx, "text")))), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_hmac384 takes ctx returns ok
+  return expect(ctx, "HMAC-SHA384", tls_hex(tls_hmac("sha384", tls_text_bytes(step_arg(ctx, "key")), tls_text_bytes(step_arg(ctx, "text")))), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_hkdf_inputs takes ctx returns ok
+  ctx_set(ctx, "ikm", tl_unhx(step_arg(ctx, "ikm")))
+  ctx_set(ctx, "salt", tl_unhx(step_arg(ctx, "salt")))
+  ctx_set(ctx, "info", tl_unhx(step_arg(ctx, "info")))
+  return true
+end
+
+make a function called st_th_extract takes ctx returns ok
+  let prk = tls_hkdf_extract("sha256", ctx_get(ctx, "salt"), ctx_get(ctx, "ikm"))
+  ctx_set(ctx, "prk", prk)
+  return expect(ctx, "HKDF-Extract", tls_hex(prk), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_expand takes ctx returns ok
+  let n = to_num(step_arg(ctx, "n"))
+  return expect(ctx, "HKDF-Expand", tls_hex(tls_hkdf_expand("sha256", ctx_get(ctx, "prk"), ctx_get(ctx, "info"), n)), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_hkdf384 takes ctx returns ok
+  let all = true
+  let lengths = [16, 48, 100]
+  let i = 0
+  while i < list_len(lengths) do
+    let ikm = random_bytes(1 + i * 20)
+    let salt = random_bytes(i * 17)
+    let info = random_bytes(5 + i)
+    let n = lengths[i]
+    let got = tls_hex(tls_hkdf_expand("sha384", tls_hkdf_extract("sha384", salt, ikm), info, n))
+    let want = tl_py(["hkdf", "sha384", tl_hx(ikm), tl_hx(salt), tl_hx(info), "" + n])
+    if not expect(ctx, "HKDF-SHA384 to " + n + " bytes", got, want) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_th_early takes ctx returns ok
+  let zeros = []
+  let i = 0
+  while i < 32 do
+    let zeros = list_push(zeros, 0)
+    let i = i + 1
+  end
+  let early = tls_hkdf_extract("sha256", [], zeros)
+  ctx_set(ctx, "early", early)
+  return expect(ctx, "the early secret", tls_hex(early), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_derived takes ctx returns ok
+  let got = tls_derive_secret("sha256", ctx_get(ctx, "early"), step_arg(ctx, "label"), tls_hash("sha256", []))
+  return expect(ctx, "Derive-Secret", tls_hex(got), step_arg(ctx, "hex"))
+end
+
+make a function called st_th_label takes ctx returns ok
+  let all = true
+  let algs = ["sha256", "sha384"]
+  let i = 0
+  while i < 2 do
+    let alg = algs[i]
+    let secret = random_bytes(tls_hash_len(alg))
+    let context = random_bytes(tls_hash_len(alg))
+    let got = tls_hex(tls_expand_label(alg, secret, "c hs traffic", context, tls_hash_len(alg)))
+    let want = tl_py(["label", alg, tls_hex(secret), "c hs traffic", tls_hex(context), "" + tls_hash_len(alg)])
+    if not expect(ctx, "HKDF-Expand-Label with " + alg, got, want) then
+      let all = false
+    end
+    let got = tls_hex(tls_expand_label(alg, secret, "key", [], 16))
+    let want = tl_py(["label", alg, tls_hex(secret), "key", "-", "16"])
+    if not expect(ctx, "HKDF-Expand-Label with " + alg + ", no context", got, want) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+# ---- aes.feature: AES-128 and AES-128-GCM ----
+
+make a function called st_ta_block takes ctx returns ok
+  let rks = aes128_key_schedule(ctx_get(ctx, "key"))
+  return expect(ctx, "AES-128", tls_hex(aes128_encrypt(rks, tls_hex_bytes(step_arg(ctx, "block")))), step_arg(ctx, "hex"))
+end
+
+make a function called st_ta_seal_nothing takes ctx returns ok
+  return expect(ctx, "sealing nothing", tls_hex(aes128_gcm_seal(ctx_get(ctx, "key"), ctx_get(ctx, "nonce"), [], [])), step_arg(ctx, "hex"))
+end
+
+make a function called st_ta_seal takes ctx returns ok
+  let text = tls_hex_bytes(step_arg(ctx, "text"))
+  ctx_set(ctx, "text", text)
+  ctx_set(ctx, "aad", [])
+  let sealed = aes128_gcm_seal(ctx_get(ctx, "key"), ctx_get(ctx, "nonce"), [], text)
+  ctx_set(ctx, "sealed", sealed)
+  return expect(ctx, "sealing", tls_hex(sealed), step_arg(ctx, "hex"))
+end
+
+make a function called st_ta_seal_aad takes ctx returns ok
+  let text = tls_hex_bytes(step_arg(ctx, "text"))
+  let aad = tls_hex_bytes(step_arg(ctx, "aad"))
+  ctx_set(ctx, "text", text)
+  ctx_set(ctx, "aad", aad)
+  let sealed = aes128_gcm_seal(ctx_get(ctx, "key"), ctx_get(ctx, "nonce"), aad, text)
+  ctx_set(ctx, "sealed", sealed)
+  return expect(ctx, "sealing with additional data", tls_hex(sealed), step_arg(ctx, "hex"))
+end
+
+make a function called st_ta_open takes ctx returns ok
+  let key = ctx_get(ctx, "key")
+  let nonce = ctx_get(ctx, "nonce")
+  let aad = ctx_get(ctx, "aad")
+  let sealed = ctx_get(ctx, "sealed")
+  let opened = aes128_gcm_open(key, nonce, aad, sealed)
+  let back = "refused"
+  if type_of(opened) == "list" then
+    let back = tls_hex(opened)
+  end
+  let a = expect(ctx, "opening gives the text", back, tls_hex(ctx_get(ctx, "text")))
+  # one byte changed at a time: the first, one in the middle, and the tag's last
+  let all = a
+  let spots = [0, list_len(sealed) / 2, list_len(sealed) - 1]
+  let i = 0
+  while i < 3 do
+    let at = floor(spots[i])
+    # a modint byte wraps by itself
+    let bad = list_set(sealed, at, sealed[at] + 1)
+    if not expect(ctx, "byte " + at + " changed is refused", aes128_gcm_open(key, nonce, aad, bad), false) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_ta_random takes ctx returns ok
+  let all = true
+  let lengths = [0, 1, 15, 16, 17, 31, 32, 33, 100]
+  let i = 0
+  while i < list_len(lengths) do
+    let key = random_bytes(16)
+    let nonce = random_bytes(12)
+    let aad = random_bytes(i * 3)
+    let text = random_bytes(lengths[i])
+    let sealed = aes128_gcm_seal(key, nonce, aad, text)
+    let opened = aes128_gcm_open(key, nonce, aad, sealed)
+    let back = "refused"
+    if type_of(opened) == "list" then
+      let back = tls_hex(opened)
+    end
+    let got = [tls_hex(sealed), back]
+    let want = [tl_py(["aesgcm", tls_hex(key), tls_hex(nonce), tl_hx(aad), tl_hx(text)]), tls_hex(text)]
+    if not expect(ctx, "length " + lengths[i], got, want) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+# ---- sig.feature: RSA and ECDSA ----
+
+# An integer from the oracle's hex (any number of digits).
+make a function called tl_hexint takes h returns x
+  if str_len(h) % 2 == 1 then
+    return tls_bytes_int(tls_hex_bytes("0" + h))
+  end
+  return tls_bytes_int(tls_hex_bytes(h))
+end
+
+# The oracle's line as its words, split at spaces (ASCII hex).
+make a function called tl_words takes line returns words
+  let b = bytes_from_str(str_trim(line))
+  let words = []
+  let cur = sb_new()
+  let i = 0
+  while i < bytes_len(b) do
+    let ch = bytes_get(b, i)
+    if ch == 32 then
+      let words = list_push(words, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, chr(ch))
+    end
+    let i = i + 1
+  end
+  let words = list_push(words, sb_str(cur))
+  return words
+end
+
+make a function called st_ts_curves takes ctx returns ok
+  let all = true
+  let names = ["p256", "p384"]
+  let i = 0
+  while i < 2 do
+    let c = tls_curve(names[i])
+    let on = tls_ec_on_curve(c, c[3], c[4])
+    let inf = tls_ec_mul(c, c[5], c[3], c[4])
+    let d = tls_bytes_int(random_bytes(20)) + 2
+    let got = tls_ec_mul(c, d, c[3], c[4])
+    let pub = tl_words(tl_py(["ecpub", names[i], tls_hex(tls_int_bytes(d, 20))]))
+    let want = [tl_hexint(pub[0]), tl_hexint(pub[1])]
+    if not expect(ctx, names[i] + ": generator on the curve, n G infinite, d G as cryptography's", [on, list_len(inf), got], [true, 0, want]) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_ts_pkcs1 takes ctx returns ok
+  let all = true
+  let algs = ["sha256", "sha384", "sha512"]
+  let msg = random_bytes(50)
+  let other = tl_words(tl_py(["rsasign", "pkcs1", "sha256", "2048", tls_hex(msg)]))
+  let other_n = tl_hexint(other[0])
+  let i = 0
+  while i < 3 do
+    let alg = algs[i]
+    let w = tl_words(tl_py(["rsasign", "pkcs1", alg, "2048", tls_hex(msg)]))
+    let n = tl_hexint(w[0])
+    let e = tl_hexint(w[1])
+    let sig = tls_hex_bytes(w[2])
+    let k = list_len(sig)
+    let bad_sig = list_set(sig, k / 2, sig[k / 2] bxor 1)
+    let short = []
+    let j = 1
+    while j < k do
+      let short = list_push(short, sig[j])
+      let j = j + 1
+    end
+    let got = [tls_rsa_pkcs1_verify(n, e, alg, msg, sig), tls_rsa_pkcs1_verify(n, e, alg, msg + [7], sig), tls_rsa_pkcs1_verify(n, e, alg, msg, bad_sig), tls_rsa_pkcs1_verify(other_n, e, alg, msg, sig), tls_rsa_pkcs1_verify(n, e, alg, msg, short)]
+    if not expect(ctx, "PKCS#1 v1.5 with " + alg + ": verifies, then refused four ways", got, [true, false, false, false, false]) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_ts_pss takes ctx returns ok
+  let msg = random_bytes(70)
+  let w = tl_words(tl_py(["rsasign", "pss", "sha256", "2048", tls_hex(msg)]))
+  let other = tl_words(tl_py(["rsasign", "pss", "sha256", "2048", tls_hex(msg)]))
+  let n = tl_hexint(w[0])
+  let e = tl_hexint(w[1])
+  let sig = tls_hex_bytes(w[2])
+  let k = list_len(sig)
+  let bad_sig = list_set(sig, k / 2, sig[k / 2] bxor 1)
+  let got = [tls_rsa_pss_verify(n, e, "sha256", msg, sig), tls_rsa_pss_verify(n, e, "sha256", msg + [7], sig), tls_rsa_pss_verify(n, e, "sha256", msg, bad_sig), tls_rsa_pss_verify(tl_hexint(other[0]), e, "sha256", msg, sig)]
+  return expect(ctx, "PSS with SHA-256: verifies, then refused three ways", got, [true, false, false, false])
+end
+
+make a function called st_ts_ecdsa takes ctx returns ok
+  let all = true
+  let names = ["p256", "p384"]
+  let algs = ["sha256", "sha384"]
+  let i = 0
+  while i < 2 do
+    let cname = names[i]
+    let alg = algs[i]
+    let n = tls_curve(cname)[5]
+    let msg = random_bytes(40)
+    let w = tl_words(tl_py(["ecsign", cname, tls_hex(msg)]))
+    let other = tl_words(tl_py(["ecsign", cname, tls_hex(msg)]))
+    let x = tl_hexint(w[0])
+    let y = tl_hexint(w[1])
+    let r = tl_hexint(w[2])
+    let s = tl_hexint(w[3])
+    let got = [tls_ecdsa_verify(cname, x, y, alg, msg, r, s), tls_ecdsa_verify(cname, x, y, alg, msg + [7], r, s), tls_ecdsa_verify(cname, x, y, alg, msg, r + 1, s), tls_ecdsa_verify(cname, x, y, alg, msg, r, s + 1), tls_ecdsa_verify(cname, tl_hexint(other[0]), tl_hexint(other[1]), alg, msg, r, s), tls_ecdsa_verify(cname, x, y, alg, msg, 0, s), tls_ecdsa_verify(cname, x, y, alg, msg, r, 0), tls_ecdsa_verify(cname, x, y, alg, msg, n, s)]
+    if not expect(ctx, "ECDSA on " + cname + ": verifies, then refused seven ways", got, [true, false, false, false, false, false, false, false]) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_ts_ecdh takes ctx returns ok
+  let all = true
+  let k = 0
+  while k < 2 do
+    let da = random_bytes(32)
+    let db = random_bytes(32)
+    let share_a = tls_p256_public(da)
+    let share_b = tls_p256_public(db)
+    let pub = tl_words(tl_py(["ecpub", "p256", tls_hex(da)]))
+    let want_a = "04" + tls_hex(tls_int_bytes(tl_hexint(pub[0]), 32)) + tls_hex(tls_int_bytes(tl_hexint(pub[1]), 32))
+    let ours = tls_hex(tls_p256_shared(da, share_b))
+    let theirs = tl_py(["p256dh", tls_hex(db), tls_hex(share_a)])
+    let bad = list_set(share_b, 64, (share_b[64] + 1) % 256)
+    let got = [tls_hex(share_a), ours, list_len(tls_p256_shared(da, bad))]
+    if not expect(ctx, "ECDHE on P-256, keys " + k, got, [want_a, theirs, 0]) then
+      let all = false
+    end
+    let k = k + 1
+  end
+  return all
+end
+
+# ---- x509.feature ----
+
+make a function called tl_cert_path takes name returns path
+  return "packages/tls/spec/data/certs/" + name + ".der"
+end
+
+make a function called tl_cert takes name returns der
+  return bytes_to_list(read_file_raw(tl_cert_path(name)))
+end
+
+# Unix seconds at midnight UTC of 1 June of the year.
+make a function called tl_june takes y returns secs
+  return x509_days(y, 6, 1) * 86400
+end
+
+# Text split at a separator (short ASCII).
+make a function called tl_split takes s, sep returns parts
+  let b = bytes_from_str(s)
+  let c = char_code(sep, 0)
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i < bytes_len(b) do
+    if bytes_get(b, i) == c then
+      let parts = list_push(parts, str_trim(sb_str(cur)))
+      let cur = sb_new()
+    else
+      sb_push(cur, chr(bytes_get(b, i)))
+    end
+    let i = i + 1
+  end
+  let parts = list_push(parts, str_trim(sb_str(cur)))
+  return parts
+end
+
+make a function called st_tx_read takes ctx returns ok
+  let all = true
+  let names = ["root", "inter", "leaf_ec", "leaf_rsa", "expired", "wrong_name", "not_ca", "leaf_under_not_ca", "no_signing", "unknown_critical"]
+  let i = 0
+  while i < list_len(names) do
+    let r = x509_parse(tl_cert(names[i]))
+    if r[0] != "ok" then
+      expect(ctx, names[i] + " reads", r, "ok")
+      let all = false
+    else
+      let c = r[1]
+      let ca = "false"
+      if c.ca then
+        let ca = "true"
+      end
+      let got = str_join([c.subject_cn, c.issuer_cn, "" + c.serial, "" + c.not_before, "" + c.not_after, str_join(c.dns_names, ","), ca], "|")
+      if not expect(ctx, names[i] + " as cryptography reads it", got, tl_py(["x509", tl_cert_path(names[i]), "-"])) then
+        let all = false
+      end
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_tx_good takes ctx returns ok
+  let roots = [tl_cert("root")]
+  let inters = [tl_cert("inter")]
+  let now = tl_june(2026)
+  let a = x509_check_chain(tl_cert("leaf_ec"), inters, roots, "localhost", now)[0]
+  let b = x509_check_chain(tl_cert("leaf_ec"), inters, roots, "a.test.example", now)[0]
+  let c = x509_check_chain(tl_cert("leaf_rsa"), inters, roots, "localhost", now)[0]
+  return expect(ctx, "the three chains check", [a, b, c], ["ok", "ok", "ok"])
+end
+
+make a function called st_tx_refusals takes ctx returns ok
+  let lines = split_lines(step_doc(ctx))
+  let inters = [tl_cert("inter"), tl_cert("not_ca")]
+  let all = true
+  let i = 0
+  while i < list_len(lines) do
+    if str_trim(lines[i]) != "" then
+      let f = tl_split(lines[i], "|")
+      let roots = [tl_cert("root")]
+      let host = f[1]
+      if str_contains(host, " none") then
+        let roots = []
+        let host = tl_split(host, " ")[0]
+      end
+      let r = x509_check_chain(tl_cert(f[0]), inters, roots, host, tl_june(2026))
+      let why = "accepted"
+      if r[0] != "ok" then
+        let why = r[2]
+      end
+      if not expect(ctx, f[0] + " for " + host + " refused as " + f[2] + " (" + why + ")", str_starts_with(why, f[2]), true) then
+        let all = false
+      end
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_tx_years takes ctx returns ok
+  let leaf = tl_cert("leaf_ec")
+  let a = x509_check_chain(leaf, [tl_cert("inter")], [tl_cert("root")], "localhost", tl_june(2026))
+  let b = x509_check_chain(leaf, [tl_cert("inter")], [tl_cert("root")], "localhost", tl_june(2037))
+  return expect(ctx, "valid in 2026, expired in 2037", [a[0], str_starts_with(b[2], "expired")], ["ok", true])
+end
+
+# A random int from 0 to n - 1 (n under 65536).
+make a function called tl_rand takes n returns v
+  let b = random_bytes(2)
+  return (b[0] * 256 + b[1]) % n
+end
+
+make a function called st_tx_fuzz takes ctx returns ok
+  let base = tl_cert("leaf_ec")
+  let n = list_len(base)
+  let ok_count = 0
+  let err_count = 0
+  let k = 0
+  while k < 300 do
+    let at = tl_rand(n)
+    if k % 3 == 0 then
+      let bad = list_set(base, at, (base[at] + 1 + tl_rand(255)) % 256)
+    elif k % 3 == 1 then
+      let bad = []
+      let j = 0
+      while j < n do
+        if j != at then
+          let bad = list_push(bad, base[j])
+        end
+        let j = j + 1
+      end
+    else
+      let bad = []
+      let j = 0
+      while j < at do
+        let bad = list_push(bad, base[j])
+        let j = j + 1
+      end
+    end
+    let r = x509_parse(bad)
+    if r[0] == "ok" then
+      let ok_count = ok_count + 1
+    elif (r[0] == "err") and str_starts_with(r[2], "malformed") then
+      let err_count = err_count + 1
+    end
+    let k = k + 1
+  end
+  return expect(ctx, "each of the 300 read or refused as malformed (" + ok_count + " read, " + err_count + " refused)", ok_count + err_count, 300)
+end
+
+make a function called st_tx_system takes ctx returns ok
+  let roots = x509_system_roots()
+  let read = 0
+  let i = 0
+  while i < list_len(roots) do
+    if x509_parse(roots[i])[0] == "ok" then
+      let read = read + 1
+    end
+    let i = i + 1
+  end
+  return expect(ctx, "the system's " + list_len(roots) + " roots read", [read == list_len(roots), list_len(roots) > 10], [true, true])
+end
+
+# ---- tls13.feature: RFC 8448 section 3 ----
+
+# The trace's nth value (from 1) for who, step and label, as hex.
+make a function called tl_trace takes who, step_name, label, nth returns hex
+  let lines = split_lines(read_file("packages/tls/spec/data/rfc8448_simple.txt"))
+  let seen = 0
+  let i = 0
+  while i < list_len(lines) do
+    let f = tl_split(lines[i], "|")
+    if (list_len(f) == 4) and (f[0] == who) and (f[1] == step_name) and (f[2] == label) then
+      let seen = seen + 1
+      if seen == nth then
+        return f[3]
+      end
+    end
+    let i = i + 1
+  end
+  return "missing: " + who + " " + step_name + " " + label + " " + nth
+end
+
+make a function called tl_server_record takes nth returns bytes
+  return tls_hex_bytes(tl_trace("server", "send handshake record", "complete record", nth))
+end
+
+# A client on the trace: its ClientHello and key, the server's records given,
+# and a chain check that accepts the trace's self-signed certificate.
+make a function called tl_trace_client takes server_bytes returns c
+  let io = tls_io_script(server_bytes)
+  let c = tls13_new(io, "server")
+  c.hello = tls_hex_bytes(tl_trace("client", "construct a ClientHello handshake message", "ClientHello", 1))
+  c.private_key = tls_hex_bytes(tl_trace("client", "create an ephemeral x25519 key pair", "private key", 1))
+  c.chain_check = |leaf, inters, host| do
+    return x509_parse(leaf)
+  end
+  return c
+end
+
+make a function called tl_all_server_records returns bytes
+  return tl_server_record(1) + tl_server_record(2) + tl_server_record(3) + tls_hex_bytes(tl_trace("server", "send application_data record", "complete record", 1)) + tls_hex_bytes(tl_trace("server", "send alert record", "complete record", 1))
+end
+
+make a function called st_t13_given takes ctx returns ok
+  ctx_set(ctx, "client", tl_trace_client(tl_all_server_records()))
+  return true
+end
+
+make a function called st_t13_run takes ctx returns ok
+  ctx_set(ctx, "result", tls13_handshake(ctx_get(ctx, "client")))
+  return true
+end
+
+make a function called st_t13_hs takes ctx returns ok
+  let c = ctx_get(ctx, "client")
+  let got = [ctx_get(ctx, "result"), tls_hex(c.c_hs), tls_hex(c.s_hs)]
+  let want = [["ok"], tl_trace("server", "derive secret \"tls13 c hs traffic\"", "expanded", 1), tl_trace("server", "derive secret \"tls13 s hs traffic\"", "expanded", 1)]
+  return expect(ctx, "accepted, with the trace's handshake secrets", got, want)
+end
+
+make a function called st_t13_fin takes ctx returns ok
+  let c = ctx_get(ctx, "client")
+  let sent = c.io.sent
+  # after the ClientHello's record (5 + its length)
+  let hello_len = 5 + list_len(c.hello)
+  let fin = der_slice(sent, hello_len, list_len(sent) - hello_len)
+  return expect(ctx, "the client's Finished record", tls_hex(fin), tl_trace("client", "send handshake record", "complete record", 2))
+end
+
+make a function called st_t13_ap takes ctx returns ok
+  let c = ctx_get(ctx, "client")
+  let got = [tls_hex(c.c_ap), tls_hex(c.s_ap)]
+  let want = [tl_trace("server", "derive secret \"tls13 c ap traffic\"", "expanded", 1), tl_trace("server", "derive secret \"tls13 s ap traffic\"", "expanded", 1)]
+  return expect(ctx, "the trace's application secrets", got, want)
+end
+
+make a function called st_t13_done takes ctx returns ok
+  let c = tl_trace_client(tl_all_server_records())
+  let r = tls13_handshake(c)
+  ctx_set(ctx, "client", c)
+  return expect(ctx, "the handshake completes", r, ["ok"])
+end
+
+make a function called st_t13_read takes ctx returns ok
+  let c = ctx_get(ctx, "client")
+  let r = tls13_recv(c)
+  let got = "nothing"
+  if r[0] == "data" then
+    let got = tls_hex(r[1])
+  end
+  return expect(ctx, "the server's 50 bytes", got, tl_trace("server", "send application_data record", "payload", 1))
+end
+
+make a function called st_t13_write takes ctx returns ok
+  let c = ctx_get(ctx, "client")
+  let before = list_len(c.io.sent)
+  tls13_send(c, tls_hex_bytes(tl_trace("client", "send application_data record", "payload", 1)))
+  let mid = list_len(c.io.sent)
+  tls13_close(c)
+  let data = der_slice(c.io.sent, before, mid - before)
+  let alert = der_slice(c.io.sent, mid, list_len(c.io.sent) - mid)
+  let got = [tls_hex(data), tls_hex(alert)]
+  let want = [tl_trace("client", "send application_data record", "complete record", 1), tl_trace("client", "send alert record", "complete record", 1)]
+  return expect(ctx, "the client's data and close_notify records", got, want)
+end
+
+make a function called st_t13_tamper takes ctx returns ok
+  let sh = tl_server_record(1)
+  let flight = tl_server_record(2)
+  let n = list_len(flight)
+  let spots = [5, floor(n / 2), n - 1]
+  let all = true
+  let i = 0
+  while i < 3 do
+    let at = spots[i]
+    let bad = list_set(flight, at, (flight[at] + 1) % 256)
+    let r = tls13_handshake(tl_trace_client(sh + bad))
+    let why = ""
+    if r[0] == "err" then
+      let why = r[2]
+    end
+    if not expect(ctx, "byte " + at + " changed: refused (" + why + ")", str_contains(why, "did not decrypt"), true) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_t13_chain takes ctx returns ok
+  let c = tl_trace_client(tl_server_record(1) + tl_server_record(2))
+  c.chain_check = |leaf, inters, host| do
+    return ["err", "cert", "untrusted: refused by the test"]
+  end
+  let r = tls13_handshake(c)
+  let why = ""
+  if r[0] == "err" then
+    let why = r[2]
+  end
+  return expect(ctx, "refused, naming the certificate (" + why + ")", str_contains(why, "certificate: untrusted"), true)
+end
+
+make a function called st_t13_hello takes ctx returns ok
+  let share = random_bytes(32)
+  let h = tls_hex(tls_client_hello("example.org", random_bytes(32), 29, share))
+  let parts = ["002b0003020304", "130313010", "001d0020" + tls_hex(share), tls_hex(tls_text_bytes("example.org")), "0804", "0403", "0503", tls_hex(tls_text_bytes("http/1.1"))]
+  let got = []
+  let i = 0
+  while i < list_len(parts) do
+    let got = list_push(got, str_contains(h, parts[i]))
+    let i = i + 1
+  end
+  return expect(ctx, "the ClientHello's offers", got, [true, true, true, true, true, true, true, true])
+end
+
+# ---- server.feature: against openssl s_server ----
+
+# Why the live cases cannot run here, or "" when they can.
+make a function called tl_live_missing takes ctx returns why
+  if not has_program("wsl") then
+    return "wsl is not on the PATH"
+  end
+  let v = exec_capture("wsl", "-d", "Ubuntu-24.04", "-e", "openssl", "version")
+  if not str_contains(v, "OpenSSL") then
+    return "openssl is not in WSL's Ubuntu-24.04 (" + str_trim(v) + ")"
+  end
+  return ""
+end
+
+# The live client built for Linux, once a run: its WSL path, or "" (and the
+# reason in ctx's "live_error").
+make a function called tl_live_client takes ctx returns path
+  let done = ctx_get(ctx, "live_client")
+  if type_of(done) == "string" then
+    return done
+  end
+  let out = spec_out() + "/tls_live_client"
+  let r = v2_compile(["packages/tls/spec/live_client.patlang", out, "--linux", "--workers", "4"])
+  if not contains_text(r[0], "v2: " + out) then
+    ctx_set(ctx, "live_error", "building the live client failed: " + r[0])
+    ctx_set(ctx, "live_client", "")
+    return ""
+  end
+  let path = v2_wsl_path(path_absolute(out))
+  ctx_set(ctx, "live_client", path)
+  return path
+end
+
+# One case: the client's output lines.
+make a function called tl_live takes ctx, leaf, host, roots, opt, val returns lines
+  let exe = tl_live_client(ctx)
+  if exe == "" then
+    return [ctx_get(ctx, "live_error")]
+  end
+  let key = "other"
+  if (leaf == "leaf_ec") or (leaf == "leaf_rsa") then
+    let key = leaf
+  end
+  let certs = v2_wsl_path(path_absolute("packages/tls/spec/data/certs"))
+  if opt == "" then
+    let out = exec_capture("wsl", "-d", "Ubuntu-24.04", "--cd", certs, "-e", exe, certs, leaf, key, host, roots)
+  else
+    let out = exec_capture("wsl", "-d", "Ubuntu-24.04", "--cd", certs, "-e", exe, certs, leaf, key, host, roots, opt, val)
+  end
+  return split_lines(str_trim(out))
+end
+
+make a function called st_tv_ok takes ctx returns ok
+  let missing = tl_live_missing(ctx)
+  if missing != "" then
+    return expect(ctx, "the live cases can run", missing, "")
+  end
+  let all = true
+  let lines = split_lines(step_doc(ctx))
+  let i = 0
+  while i < list_len(lines) do
+    if str_trim(lines[i]) != "" then
+      let f = tl_split(lines[i], "|")
+      let opt = ""
+      let val = ""
+      if list_len(f) > 2 then
+        let opt = f[2]
+        let val = f[3]
+      end
+      let out = tl_live(ctx, f[0], f[1], "test", opt, val)
+      if not expect(ctx, lines[i], out, ["[ok]", "HTTP/1.0 200 ok"]) then
+        let all = false
+      end
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_tv_refused takes ctx returns ok
+  let missing = tl_live_missing(ctx)
+  if missing != "" then
+    return expect(ctx, "the live cases can run", missing, "")
+  end
+  let all = true
+  let lines = split_lines(step_doc(ctx))
+  let i = 0
+  while i < list_len(lines) do
+    if str_trim(lines[i]) != "" then
+      let f = tl_split(lines[i], "|")
+      let out = tl_live(ctx, f[0], f[1], f[2], "", "")
+      let first = ""
+      if list_len(out) > 0 then
+        let first = out[0]
+      end
+      if not expect(ctx, lines[i] + " (" + first + ")", str_contains(first, "[err, tls, " + f[3]), true) then
+        let all = false
+      end
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_tv_http takes ctx returns ok
+  let missing = tl_live_missing(ctx)
+  if missing != "" then
+    return expect(ctx, "the live cases can run", missing, "")
+  end
+  return expect(ctx, "http_request over https", tl_live(ctx, "leaf_ec", "localhost", "http", "", ""), ["[ok, 200]"])
+end
+
+make a function called st_tv_get takes ctx returns ok
+  let missing = tl_live_missing(ctx)
+  if missing != "" then
+    return expect(ctx, "the live cases can run", missing, "")
+  end
+  return expect(ctx, "tls_https_get of /root.pem", tl_live(ctx, "leaf_ec", "localhost", "get:/root.pem", "", ""), ["[ok, 200, true]"])
+end
+
 make a function called register_tls_steps takes ctx returns ok
+  step(ctx, "tls_https_get of a certificate file served by s_server -WWW gives status 200 and the file's bytes", "st_tv_get")
+  step(ctx, "http_request of https://localhost on the server with leaf_ec, trusting the test root, gives status 200", "st_tv_http")
+  step(ctx, "the client reads \"HTTP/1.0 200 ok\" from each server, trusting the test root:", "st_tv_ok")
+  step(ctx, "the client refuses each server, its reason starting as given:", "st_tv_refused")
+  step(ctx, "the trace's ClientHello and the client's x25519 private key", "st_t13_given")
+  step(ctx, "the client reads the server's ServerHello and encrypted flight", "st_t13_run")
+  step(ctx, "its handshake traffic secrets are the trace's, and it accepts the server's CertificateVerify and Finished", "st_t13_hs")
+  step(ctx, "its Finished record is the trace's", "st_t13_fin")
+  step(ctx, "its application traffic secrets are the trace's", "st_t13_ap")
+  step(ctx, "the client has completed RFC 8448's handshake", "st_t13_done")
+  step(ctx, "it reads past the server's NewSessionTicket to the server's 50 bytes", "st_t13_read")
+  step(ctx, "its own 50 bytes and its close_notify are the trace's records", "st_t13_write")
+  step(ctx, "the server's flight with its first, middle or last byte changed is refused, saying the record did not decrypt", "st_t13_tamper")
+  step(ctx, "the flight as traced is refused when the chain check refuses the certificate, saying why", "st_t13_chain")
+  step(ctx, "a ClientHello the client makes for \"example.org\" offers TLS 1.3 alone, ChaCha20-Poly1305 then AES-128-GCM, an x25519 key share, the name, RSA-PSS and ECDSA signatures, and ALPN http/1.1", "st_t13_hello")
+  step(ctx, "each of the system's roots (trust_roots) reads, and there are more than ten", "st_tx_system")
+  step(ctx, "for each certificate, its subject and issuer names, serial number, validity, DNS names and CA flag are cryptography's", "st_tx_read")
+  step(ctx, "leaf_ec through inter to root checks for \"localhost\" and \"a.test.example\" on 1 June 2026, and so does leaf_rsa for \"localhost\"", "st_tx_good")
+  step(ctx, "on 1 June 2026, against the test root with inter and not_ca sent, each refusal starts with its reason (leaf, host, reason; \"none\" for no roots):", "st_tx_refusals")
+  step(ctx, "leaf_ec checks for \"localhost\" in 2026 but is refused as expired in 2037", "st_tx_years")
+  step(ctx, "300 copies of leaf_ec with a byte changed, a byte removed, or the end cut off each read as a certificate or are refused as malformed, and the program goes on", "st_tx_fuzz")
+  step(ctx, "for random private keys, the key share is cryptography's public key for the same key, each side's shared secret is the other's, and a share not on the curve is refused", "st_ts_ecdh")
+  step(ctx, "for each curve, its generator is on it, n times it is the point at infinity, and a public key cryptography makes is the private key times the generator", "st_ts_curves")
+  step(ctx, "for each hash, a signature cryptography makes with a fresh 2048-bit key verifies, and is refused with the message changed, a byte of the signature changed, another key, or a byte too few", "st_ts_pkcs1")
+  step(ctx, "a PSS signature cryptography makes with a fresh 2048-bit key and a 32-byte salt verifies, and is refused with the message changed, a byte of the signature changed, or another key", "st_ts_pss")
+  step(ctx, "for each curve, a signature cryptography makes with a fresh key verifies, and is refused with the message changed, r or s changed, another key, r or s zero, or r equal to the group's order", "st_ts_ecdsa")
+  step(ctx, "AES-128 of the block \"{block}\" is \"{hex}\"", "st_ta_block")
+  step(ctx, "sealing nothing with no additional data under AES-128-GCM gives \"{hex}\"", "st_ta_seal_nothing")
+  step(ctx, "sealing the text \"{text}\" with no additional data under AES-128-GCM gives \"{hex}\"", "st_ta_seal")
+  step(ctx, "sealing the text \"{text}\" with the additional data \"{aad}\" under AES-128-GCM gives \"{hex}\"", "st_ta_seal_aad")
+  step(ctx, "opening that under AES-128-GCM gives the text back, and with any one byte changed is refused", "st_ta_open")
+  step(ctx, "for random keys, nonces and additional data, and texts of lengths 0, 1, 15, 16, 17, 31, 32, 33 and 100, AES-128-GCM sealing agrees with cryptography and opening gives each text back", "st_ta_random")
+  step(ctx, "SHA-256 of the empty text is \"{hex}\"", "st_th_sha256_empty")
+  step(ctx, "SHA-384 of the empty text is \"{hex}\"", "st_th_sha384_empty")
+  step(ctx, "SHA-256 of \"{text}\" is \"{hex}\"", "st_th_sha256")
+  step(ctx, "SHA-384 of \"{text}\" is \"{hex}\"", "st_th_sha384")
+  step(ctx, "for random texts of lengths 0, 1, 55, 56, 63, 64, 65, 111, 112, 127, 128, 129 and 300, SHA-256 and SHA-384 agree with hashlib", "st_th_edges")
+  step(ctx, "HMAC-SHA256 with the key \"{key}\" of \"{text}\" is \"{hex}\"", "st_th_hmac256")
+  step(ctx, "HMAC-SHA384 with the key \"{key}\" of \"{text}\" is \"{hex}\"", "st_th_hmac384")
+  step(ctx, "the input key \"{ikm}\", the salt \"{salt}\", and the info \"{info}\"", "st_th_hkdf_inputs")
+  step(ctx, "HKDF-Extract with SHA-256 gives \"{hex}\"", "st_th_extract")
+  step(ctx, "HKDF-Expand of that to {n} bytes gives \"{hex}\"", "st_th_expand")
+  step(ctx, "for random input keys, salts and infos, HKDF-SHA384 to 16, 48 and 100 bytes agrees with cryptography", "st_th_hkdf384")
+  step(ctx, "the early secret, HKDF-Extract with SHA-256 of 32 zero bytes under no salt, is \"{hex}\"", "st_th_early")
+  step(ctx, "Derive-Secret of it with the label \"{label}\" and no messages is \"{hex}\"", "st_th_derived")
+  step(ctx, "HKDF-Expand-Label agrees with cryptography's HKDF-Expand of the label's encoding, for each hash", "st_th_label")
   step(ctx, "the key \"{hex}\"", "st_tl_key")
   step(ctx, "the nonce \"{hex}\"", "st_tl_nonce")
   step(ctx, "the additional data \"{hex}\"", "st_tl_aad")
@@ -150,4 +991,4 @@ end
 let ctx = ctx_new()
 register_tls_steps(ctx)
 # --list names the feature files (the gates run each); a failure exits 1
-run_suite(ctx, ["packages/tls/spec/tls.feature"], argv())
+run_suite(ctx, ["packages/tls/spec/tls.feature", "packages/tls/spec/hash.feature", "packages/tls/spec/aes.feature", "packages/tls/spec/sig.feature", "packages/tls/spec/x509.feature", "packages/tls/spec/tls13.feature", "packages/tls/spec/server.feature"], argv())

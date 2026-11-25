@@ -1,0 +1,495 @@
+# AES-128 (FIPS-197) and AES-128-GCM (NIST SP 800-38D) on modints, with no
+# table indexed by a secret: the S-box is computed, the inverse in GF(2^8)
+# (x^254) and the affine map, on eight bytes packed in a 64-bit modint at a
+# time, each step the same shifts, masks and XORs whatever the bytes are.
+# GHASH multiplies in GF(2^128) by 128 fixed steps of select-by-mask and
+# shift. The tag's verdict is the one value revealed (mod_reveal), as in
+# aead.patlang.
+#
+#   aes128_key_schedule(key)                         -> the expanded key
+#   aes128_encrypt(expanded, block)                  -> 16 bytes
+#   aes128_gcm_seal(key, nonce, aad, plaintext)      -> ciphertext, then the 16-byte tag
+#   aes128_gcm_check(key, nonce, aad, sealed)        -> whether the tag is right (public)
+#   aes128_gcm_open(key, nonce, aad, sealed)         -> the plaintext, or false
+#
+# Bytes come in as ints or modints modulo 256 and go out as modints modulo
+# 256; a nonce is 12 bytes and public.
+#
+# The state is held by rows, packed once a block: one word holds rows 0 and
+# 1, the other rows 2 and 3, row r's byte of column c in lane c of its half.
+# So ShiftRows rotates each half's lanes, and MixColumns is XORs of whole
+# rows, doubled in GF(2^8) lane by lane. Every mask and multiplier is a
+# modint, so each step is two modints of one modulus, which the compiler does
+# inline (an int or a bigint beside a modint is a runtime call).
+#
+# The constant-time check (spec 2.7) knows a value read from a list only as
+# some value, carrying the list's secrecy, not as a modint; arithmetic on it
+# looks like arithmetic on a secret of any class. So every value read from a
+# list is made a modint again with mod_make before arithmetic, as sha512_at
+# does: the constants and round keys once a block, the rest where they are
+# read. The hot functions take their constants as parameters.
+
+# A public int c in every byte lane: c * 0x0101010101010101.
+make a function called aes_lanes takes c returns v
+  require (c >= 0) and (c < 256)
+  let v = c * 72340172838076673
+  ensure v >= 0
+  return v
+end
+
+make a function called aes_shape returns s
+  let s = mod_make(0, 18446744073709551616)
+  ensure type_of(s) == "modint"
+  return s
+end
+
+# The constants, as modints modulo 2^64, by position:
+#   0 zero, 1 lanes of 1, 2 lanes of 127, 3 the multiplier 27, 4 the
+#   multiplier 255, 5 lanes of 99, 6 to 9 rotl8's kept-high masks for k = 1
+#   to 4, 10 to 13 its kept-low masks, 14 the low 32 bits, 15 the high 32,
+#   16 to 18 a 32-bit half's low masks for byte rotations of 1 to 3, 19 to
+#   21 their high masks, 22 GHASH's R (0xe1 << 56), 23 one.
+make a function called aes_consts returns c
+  let shape = aes_shape()
+  let c = [shape, mod_make(aes_lanes(1), shape), mod_make(aes_lanes(127), shape), mod_make(27, shape), mod_make(255, shape), mod_make(aes_lanes(99), shape)]
+  let k = 1
+  while k <= 4 do
+    let c = list_push(c, mod_make(aes_lanes((255 shl k) band 255), shape))
+    let k = k + 1
+  end
+  let k = 1
+  while k <= 4 do
+    let c = list_push(c, mod_make(aes_lanes(255 shr (8 - k)), shape))
+    let k = k + 1
+  end
+  let c = list_push(c, mod_make(4294967295, shape))
+  let c = list_push(c, mod_make(4294967295 * 4294967296, shape))
+  let k = 1
+  while k <= 3 do
+    let lowbits = 32 - 8 * k
+    let c = list_push(c, mod_make(((1 shl lowbits) - 1) * 4294967297, shape))
+    let k = k + 1
+  end
+  let k = 1
+  while k <= 3 do
+    let lowbits = 32 - 8 * k
+    let c = list_push(c, mod_make((4294967295 - ((1 shl lowbits) - 1)) * 4294967297, shape))
+    let k = k + 1
+  end
+  let c = list_push(c, mod_make(225 * 72057594037927936, shape))
+  let c = list_push(c, mod_make(1, shape))
+  ensure list_len(c) == 24
+  return c
+end
+
+# The constants read out of their list once, each made a modint again, in
+# the order the functions below take them.
+make a function called aes_k takes c, shape returns k
+  let k = []
+  let i = 0
+  while i < list_len(c) do
+    let k = list_push(k, mod_make(c[i], shape))
+    let i = i + 1
+  end
+  ensure list_len(k) == list_len(c)
+  return k
+end
+
+# Each lane times x in GF(2^8), modulo x^8 + x^4 + x^3 + x + 1.
+make a function called aes_xtime takes w, l1, l127, m27 returns r
+  let r = ((w band l127) shl 1) bxor (((w shr 7) band l1) * m27)
+  ensure type_of(r) == "modint"
+  return r
+end
+
+# Each lane of a times the same lane of b in GF(2^8): for each bit of b, a
+# lane mask of 0 or 255 chooses whether a, doubled that many times, is added.
+make a function called aes_gmul takes a, b, zero, l1, l127, m27, m255 returns p
+  let p = zero
+  let x = a
+  let i = 0
+  while i < 8 do
+    let p = p bxor (x band (((b shr i) band l1) * m255))
+    let x = ((x band l127) shl 1) bxor (((x shr 7) band l1) * m27)
+    let i = i + 1
+  end
+  ensure type_of(p) == "modint"
+  return p
+end
+
+# Each lane's inverse in GF(2^8), 0 for 0: x^254, by a fixed chain of seven
+# squarings and four products.
+make a function called aes_inverse takes x, zero, l1, l127, m27, m255 returns y
+  let x2 = aes_gmul(x, x, zero, l1, l127, m27, m255)
+  let x3 = aes_gmul(x2, x, zero, l1, l127, m27, m255)
+  let x6 = aes_gmul(x3, x3, zero, l1, l127, m27, m255)
+  let x7 = aes_gmul(x6, x, zero, l1, l127, m27, m255)
+  let x12 = aes_gmul(x6, x6, zero, l1, l127, m27, m255)
+  let x15 = aes_gmul(x12, x3, zero, l1, l127, m27, m255)
+  let x30 = aes_gmul(x15, x15, zero, l1, l127, m27, m255)
+  let x60 = aes_gmul(x30, x30, zero, l1, l127, m27, m255)
+  let x120 = aes_gmul(x60, x60, zero, l1, l127, m27, m255)
+  let x127 = aes_gmul(x120, x7, zero, l1, l127, m27, m255)
+  let y = aes_gmul(x127, x127, zero, l1, l127, m27, m255)
+  ensure type_of(y) == "modint"
+  return y
+end
+
+# Each lane rotated left by k bits within its byte, given its two masks.
+make a function called aes_rotl8 takes w, k, high, low returns r
+  require (k >= 1) and (k <= 4)
+  let r = ((w shl k) band high) bor ((w shr (8 - k)) band low)
+  ensure type_of(r) == "modint"
+  return r
+end
+
+# The S-box on every lane: the inverse, then the affine map. k is aes_k's.
+make a function called aes_sub takes w, k returns s
+  let zero = mod_make(k[0], k[0])
+  let l1 = mod_make(k[1], zero)
+  let l127 = mod_make(k[2], zero)
+  let m27 = mod_make(k[3], zero)
+  let m255 = mod_make(k[4], zero)
+  let b = aes_inverse(w, zero, l1, l127, m27, m255)
+  let s = b bxor aes_rotl8(b, 1, mod_make(k[6], zero), mod_make(k[10], zero)) bxor aes_rotl8(b, 2, mod_make(k[7], zero), mod_make(k[11], zero)) bxor aes_rotl8(b, 3, mod_make(k[8], zero), mod_make(k[12], zero)) bxor aes_rotl8(b, 4, mod_make(k[9], zero), mod_make(k[13], zero)) bxor mod_make(k[5], zero)
+  ensure type_of(s) == "modint"
+  return s
+end
+
+# Each 32-bit half's lanes rotated down by n: lane i takes lane i + n of its
+# half, given the rotation's low and high masks.
+make a function called aes_halfrot takes w, n, low, high returns r
+  require (n >= 1) and (n <= 3)
+  let r = ((w shr (8 * n)) band low) bor ((w shl (32 - 8 * n)) band high)
+  ensure type_of(r) == "modint"
+  return r
+end
+
+# A block's 16 bytes (column by column) as [rows 0 and 1, rows 2 and 3].
+make a function called aes_pack_rows takes bytes, shape returns st
+  require list_len(bytes) == 16
+  let w01 = mod_make(0, shape)
+  let w23 = mod_make(0, shape)
+  let col = 0
+  while col < 4 do
+    let w01 = w01 bor (mod_make(bytes[4 * col], shape) shl (8 * col)) bor (mod_make(bytes[4 * col + 1], shape) shl (32 + 8 * col))
+    let w23 = w23 bor (mod_make(bytes[4 * col + 2], shape) shl (8 * col)) bor (mod_make(bytes[4 * col + 3], shape) shl (32 + 8 * col))
+    let col = col + 1
+  end
+  ensure list_len([w01, w23]) == 2
+  return [w01, w23]
+end
+
+# [rows 0 and 1, rows 2 and 3] as 16 modint bytes, column by column.
+make a function called aes_unpack_rows takes w01, w23 returns bytes
+  let byte = mod_make(0, 256)
+  let bytes = []
+  let col = 0
+  while col < 4 do
+    let bytes = list_push(bytes, mod_make(w01 shr (8 * col), byte))
+    let bytes = list_push(bytes, mod_make(w01 shr (32 + 8 * col), byte))
+    let bytes = list_push(bytes, mod_make(w23 shr (8 * col), byte))
+    let bytes = list_push(bytes, mod_make(w23 shr (32 + 8 * col), byte))
+    let col = col + 1
+  end
+  ensure list_len(bytes) == 16
+  return bytes
+end
+
+# The expanded key: [the constants, the 11 round keys each packed by rows].
+make a function called aes128_key_schedule takes key returns ex
+  require list_len(key) == 16
+  let c = aes_consts()
+  let shape = aes_shape()
+  let k = aes_k(c, shape)
+  let byte = mod_make(0, 256)
+  let w = []
+  let i = 0
+  while i < 16 do
+    let w = list_push(w, mod_make(key[i], byte))
+    let i = i + 1
+  end
+  let rcon = [1, 2, 4, 8, 16, 32, 64, 128, 27, 54]
+  let i = 4
+  while i < 44 do
+    let t = [mod_make(w[4 * i - 4], byte), mod_make(w[4 * i - 3], byte), mod_make(w[4 * i - 2], byte), mod_make(w[4 * i - 1], byte)]
+    if i % 4 == 0 then
+      # RotWord, then SubWord on four lanes, then the round constant
+      let packed = mod_make(t[1], shape) bor (mod_make(t[2], shape) shl 8) bor (mod_make(t[3], shape) shl 16) bor (mod_make(t[0], shape) shl 24)
+      let s = aes_sub(packed, k)
+      let t = [mod_make(s, byte) bxor rcon[i / 4 - 1], mod_make(s shr 8, byte), mod_make(s shr 16, byte), mod_make(s shr 24, byte)]
+    end
+    let j = 0
+    while j < 4 do
+      let w = list_push(w, mod_make(w[4 * (i - 4) + j], byte) bxor mod_make(t[j], byte))
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  let rks = []
+  let r = 0
+  while r < 11 do
+    let rk = []
+    let j = 0
+    while j < 16 do
+      let rk = list_push(rk, w[16 * r + j])
+      let j = j + 1
+    end
+    let rks = list_push(rks, aes_pack_rows(rk, shape))
+    let r = r + 1
+  end
+  let ex = [c, rks]
+  ensure list_len(ex[1]) == 11
+  return ex
+end
+
+make a function called aes128_encrypt takes ex, block returns out
+  require (list_len(ex) == 2) and (list_len(block) == 16)
+  let shape = aes_shape()
+  let k = aes_k(ex[0], shape)
+  let rks = ex[1]
+  let l1 = mod_make(k[1], shape)
+  let l127 = mod_make(k[2], shape)
+  let m27 = mod_make(k[3], shape)
+  let low32 = mod_make(k[14], shape)
+  let high32 = mod_make(k[15], shape)
+  let lo1 = mod_make(k[16], shape)
+  let lo2 = mod_make(k[17], shape)
+  let lo3 = mod_make(k[18], shape)
+  let hi1 = mod_make(k[19], shape)
+  let hi2 = mod_make(k[20], shape)
+  let hi3 = mod_make(k[21], shape)
+  let st = aes_pack_rows(block, shape)
+  let k0 = rks[0]
+  let x = mod_make(st[0], shape) bxor mod_make(k0[0], shape)
+  let y = mod_make(st[1], shape) bxor mod_make(k0[1], shape)
+  let round = 1
+  while round <= 10 do
+    # SubBytes
+    let x = aes_sub(x, k)
+    let y = aes_sub(y, k)
+    # ShiftRows: row r's lanes rotated down by r
+    let x = (x band low32) bor (aes_halfrot(x, 1, lo1, hi1) band high32)
+    let y = (aes_halfrot(y, 2, lo2, hi2) band low32) bor (aes_halfrot(y, 3, lo3, hi3) band high32)
+    if round < 10 then
+      # MixColumns by rows: with X = [r0, r1], Y = [r2, r3], P = [r1, r2] and
+      # Q = [r3, r0], [b0, b1] = 2X + 3P + Y + Q and [b2, b3] = 2Y + 3Q + X + P
+      let p = (x shr 32) bor (y shl 32)
+      let q = (y shr 32) bor (x shl 32)
+      let p2 = aes_xtime(p, l1, l127, m27)
+      let q2 = aes_xtime(q, l1, l127, m27)
+      let nx = aes_xtime(x, l1, l127, m27) bxor p2 bxor p bxor y bxor q
+      let ny = aes_xtime(y, l1, l127, m27) bxor q2 bxor q bxor x bxor p
+      let x = nx
+      let y = ny
+    end
+    let rk = rks[round]
+    let x = x bxor mod_make(rk[0], shape)
+    let y = y bxor mod_make(rk[1], shape)
+    let round = round + 1
+  end
+  let out = aes_unpack_rows(x, y)
+  ensure list_len(out) == 16
+  return out
+end
+
+# a XOR b, bytes, as modints.
+make a function called aes_xor takes a, b returns out
+  require list_len(a) == list_len(b)
+  let byte = mod_make(0, 256)
+  let out = []
+  let i = 0
+  while i < list_len(a) do
+    let out = list_push(out, mod_make(a[i], byte) bxor mod_make(b[i], byte))
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(a)
+  return out
+end
+
+# ---- GCM ----
+
+# Sixteen bytes as two big-endian words [hi, lo].
+make a function called gcm_split takes b, shape returns hl
+  require list_len(b) == 16
+  let hi = mod_make(0, shape)
+  let lo = mod_make(0, shape)
+  let i = 0
+  while i < 8 do
+    let hi = (hi shl 8) bor mod_make(b[i], shape)
+    let lo = (lo shl 8) bor mod_make(b[8 + i], shape)
+    let i = i + 1
+  end
+  ensure list_len([hi, lo]) == 2
+  return [hi, lo]
+end
+
+# X times Y in GF(2^128) with GCM's bit order (SP 800-38D 6.3), each as
+# hi and lo words: for each bit of X, from the first, Z takes V by a mask of
+# all ones or none, and V is halved with R added by the mask of its last bit.
+make a function called gcm_mul takes xh, xl, yh, yl, zero, one, rr returns z
+  let zh = zero
+  let zl = zero
+  let vh = yh
+  let vl = yl
+  let i = 0
+  while i < 128 do
+    if i < 64 then
+      let bit = (xh shr (63 - i)) band one
+    else
+      let bit = (xl shr (127 - i)) band one
+    end
+    let m = zero - bit
+    let zh = zh bxor (vh band m)
+    let zl = zl bxor (vl band m)
+    let last = zero - (vl band one)
+    let vl = (vl shr 1) bor (vh shl 63)
+    let vh = (vh shr 1) bxor (last band rr)
+    let i = i + 1
+  end
+  ensure list_len([zh, zl]) == 2
+  return [zh, zl]
+end
+
+# GHASH under H ([hi, lo]) of the additional data and the ciphertext, each
+# padded with zeros to 16 bytes, then their lengths in bits.
+make a function called gcm_ghash takes h, aad, ct, k returns s
+  let shape = aes_shape()
+  let zero = mod_make(k[0], shape)
+  let one = mod_make(k[23], shape)
+  let rr = mod_make(k[22], shape)
+  let hh = mod_make(h[0], shape)
+  let hl = mod_make(h[1], shape)
+  let yh = zero
+  let yl = zero
+  let parts = [aad, ct]
+  let p = 0
+  while p < 2 do
+    let part = parts[p]
+    let at = 0
+    while at < list_len(part) do
+      let block = []
+      let j = 0
+      while j < 16 do
+        if at + j < list_len(part) then
+          let block = list_push(block, part[at + j])
+        else
+          let block = list_push(block, 0)
+        end
+        let j = j + 1
+      end
+      let x = gcm_split(block, shape)
+      let z = gcm_mul(yh bxor mod_make(x[0], shape), yl bxor mod_make(x[1], shape), hh, hl, zero, one, rr)
+      let yh = mod_make(z[0], shape)
+      let yl = mod_make(z[1], shape)
+      let at = at + 16
+    end
+    let p = p + 1
+  end
+  let z = gcm_mul(yh bxor (8 * list_len(aad)), yl bxor (8 * list_len(ct)), hh, hl, zero, one, rr)
+  let byte = mod_make(0, 256)
+  let s = []
+  let words = [mod_make(z[0], shape), mod_make(z[1], shape)]
+  let wi = 0
+  while wi < 2 do
+    let word = mod_make(words[wi], shape)
+    let shift = 56
+    while shift >= 0 do
+      let s = list_push(s, mod_make(word shr shift, byte))
+      let shift = shift - 8
+    end
+    let wi = wi + 1
+  end
+  ensure list_len(s) == 16
+  return s
+end
+
+# The counter block: the nonce, then the 32-bit count big-endian (public).
+make a function called gcm_counter takes nonce, n returns block
+  require (list_len(nonce) == 12) and (n >= 0)
+  let block = []
+  let i = 0
+  while i < 12 do
+    let block = list_push(block, nonce[i])
+    let i = i + 1
+  end
+  let block = list_push(block, (n shr 24) band 255)
+  let block = list_push(block, (n shr 16) band 255)
+  let block = list_push(block, (n shr 8) band 255)
+  let block = list_push(block, n band 255)
+  ensure list_len(block) == 16
+  return block
+end
+
+# The text XOR the key stream from counter 2 on.
+make a function called gcm_ctr takes ex, nonce, text returns out
+  let byte = mod_make(0, 256)
+  let out = []
+  let at = 0
+  let n = 2
+  while at < list_len(text) do
+    let ks = aes128_encrypt(ex, gcm_counter(nonce, n))
+    let j = 0
+    while (j < 16) and (at + j < list_len(text)) do
+      let out = list_push(out, mod_make(text[at + j], byte) bxor mod_make(ks[j], byte))
+      let j = j + 1
+    end
+    let at = at + 16
+    let n = n + 1
+  end
+  ensure list_len(out) == list_len(text)
+  return out
+end
+
+make a function called gcm_tag takes ex, nonce, aad, ct returns tag
+  let zero = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let shape = aes_shape()
+  let h = gcm_split(aes128_encrypt(ex, zero), shape)
+  let tag = aes_xor(aes128_encrypt(ex, gcm_counter(nonce, 1)), gcm_ghash(h, aad, ct, aes_k(ex[0], shape)))
+  ensure list_len(tag) == 16
+  return tag
+end
+
+make a function called aes128_gcm_seal takes key, nonce, aad, plaintext returns sealed
+  require (list_len(key) == 16) and (list_len(nonce) == 12) and (type_of(aad) == "list") and (type_of(plaintext) == "list")
+  let ex = aes128_key_schedule(key)
+  let ct = gcm_ctr(ex, nonce, plaintext)
+  let sealed = ct + gcm_tag(ex, nonce, aad, ct)
+  ensure list_len(sealed) == list_len(plaintext) + 16
+  return sealed
+end
+
+make a function called aes128_gcm_check takes key, nonce, aad, sealed returns ok
+  require (list_len(key) == 16) and (list_len(nonce) == 12) and (type_of(aad) == "list") and (type_of(sealed) == "list")
+  if list_len(sealed) < 16 then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let ct = aead_body(sealed)
+  let n = list_len(ct)
+  let want = gcm_tag(aes128_key_schedule(key), nonce, aad, ct)
+  let byte = mod_make(0, 256)
+  let diff = mod_make(0, byte)
+  let i = 0
+  while i < 16 do
+    let diff = diff bor (mod_make(sealed[n + i], byte) bxor mod_make(want[i], byte))
+    let i = i + 1
+  end
+  # the verdict, and only it, is public
+  let ok = mod_reveal(diff) == 0
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called aes128_gcm_open takes key, nonce, aad, sealed returns r
+  require (list_len(key) == 16) and (list_len(nonce) == 12) and (type_of(aad) == "list") and (type_of(sealed) == "list")
+  if not aes128_gcm_check(key, nonce, aad, sealed) then
+    let r = false
+    ensure r == false
+    return r
+  end
+  let r = gcm_ctr(aes128_key_schedule(key), nonce, aead_body(sealed))
+  ensure list_len(r) == list_len(sealed) - 16
+  return r
+end

@@ -1,0 +1,745 @@
+# The TLS 1.3 client (RFC 8446): the handshake, the record layer, and
+# application data, over a TCP connection or, for tests, a scripted one.
+#
+#   tls13_new(io, host)        -> a client, its fields to set before the handshake:
+#     roots       the trusted roots (lists of DER bytes); [] means the system's
+#     now         Unix seconds the certificates are checked at (now_ms() / 1000)
+#     hello       a ClientHello to send instead of making one (tests: RFC 8448)
+#     private_key the x25519 private key to use instead of a random one
+#   tls13_handshake(c)         -> ["ok"] or ["err", "tls", why]
+#   tls13_send(c, bytes)       -> true, the bytes sent as application data
+#   tls13_recv(c)              -> ["data", bytes], ["eof"] (close_notify or the
+#                                 connection's end), or ["err", "tls", why]
+#   tls13_close(c)             -> sends close_notify
+#   tls_io_tcp(conn), tls_io_script(server_bytes) make an io; io.sent holds
+#   what a scripted client wrote.
+#
+# Offered: TLS 1.3 alone; TLS_CHACHA20_POLY1305_SHA256, then
+# TLS_AES_128_GCM_SHA256; x25519, then P-256 after a HelloRetryRequest asking
+# for it; server signatures RSA-PSS with SHA-256 and ECDSA on P-256 and P-384;
+# ALPN http/1.1. No resumption, no 0-RTT, no client certificates: a session
+# ticket is read and dropped. The certificates are always checked (x509.patlang),
+# with the system's roots unless roots are given; a test may replace the
+# check itself (chain_check), which nothing outside the tests does.
+#
+# What is decrypted is revealed (mod_reveal) once its record's tag is right:
+# the program reads it, and the constant-time check lists each reveal as
+# declared. Keys and secrets stay modints.
+include "../curve25519/curve25519.patlang"
+
+class TlsIo {
+  field conn = -1
+  field input = []
+  field pos = 0
+  field sent = []
+  field scripted = false
+  field ended = false
+  field timeout_ms = 30000
+  field timed_out = false
+}
+
+class TlsClient {
+  field io = 0
+  field host = ""
+  field roots = []
+  field now = 0
+  field hello = []
+  field private_key = []
+  field chain_check = false
+  field suite = 0
+  field alg = "sha256"
+  field transcript = []
+  field rkey = []
+  field riv = []
+  field rseq = 0
+  field wkey = []
+  field wiv = []
+  field wseq = 0
+  field c_hs = []
+  field s_hs = []
+  field c_ap = []
+  field s_ap = []
+  field pending = []
+  field closed = false
+  field cert = 0
+  field timings = []
+}
+
+# Notes when a step of the handshake finished (clock_ms), in c.timings as
+# [step, ms]: where a slow handshake spends its time.
+make a function called tls_mark takes c, step_name returns ok
+  c.timings = list_push(c.timings, [step_name, clock_ms()])
+  return true
+end
+
+# ---- the transport ----
+
+make a function called tls_io_tcp takes conn returns io
+  let io = new("TlsIo")
+  io.conn = conn
+  return io
+end
+
+make a function called tls_io_script takes server_bytes returns io
+  let io = new("TlsIo")
+  io.input = server_bytes
+  io.scripted = true
+  return io
+end
+
+make a function called tls_io_write takes io, bytes returns ok
+  if io.scripted then
+    io.sent = io.sent + bytes
+    return true
+  end
+  if not tcp_try_write(io.conn, bytes_to_str(bytes_from_list(bytes))) then
+    io.ended = true
+    return false
+  end
+  return true
+end
+
+# Whether n more bytes are there to read, reading the connection as needed.
+make a function called tls_io_need takes io, n returns ok
+  while list_len(io.input) - io.pos < n do
+    if io.scripted or io.ended then
+      return false
+    end
+    let st = tcp_read_status(io.conn, io.timeout_ms)
+    if st[1] == "data" then
+      # drop what has been read, then add what came
+      let rest = der_slice(io.input, io.pos, list_len(io.input) - io.pos)
+      io.input = rest + bytes_to_list(bytes_from_str(st[0]))
+      io.pos = 0
+    else
+      # the end, an error, or nothing for timeout_ms: no more comes
+      if st[1] == "wait" then
+        io.timed_out = true
+      end
+      io.ended = true
+      return false
+    end
+  end
+  return true
+end
+
+make a function called tls_io_take takes io, n returns bytes
+  let bytes = der_slice(io.input, io.pos, n)
+  io.pos = io.pos + n
+  return bytes
+end
+
+# ---- bytes ----
+
+make a function called tls_u16 takes n returns b
+  return [(n shr 8) band 255, n band 255]
+end
+
+make a function called tls_u24 takes n returns b
+  return [(n shr 16) band 255, (n shr 8) band 255, n band 255]
+end
+
+make a function called tls_get16 takes b, at returns n
+  return b[at] * 256 + b[at + 1]
+end
+
+make a function called tls_get24 takes b, at returns n
+  return (b[at] * 256 + b[at + 1]) * 256 + b[at + 2]
+end
+
+# Modint bytes as public ints.
+make a function called tls_reveal_bytes takes bytes returns out
+  let out = []
+  let i = 0
+  while i < list_len(bytes) do
+    let out = list_push(out, mod_reveal(bytes[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called tls_err takes why returns r
+  return ["err", "tls", why]
+end
+
+# ---- the ClientHello ----
+
+# An extension: its type, then its data after its length.
+make a function called tls_ext takes kind, data returns b
+  return tls_u16(kind) + tls_u16(list_len(data)) + data
+end
+
+# The ClientHello for host, with the client's random and key share (the
+# group's number, then its public key).
+make a function called tls_client_hello takes host, random, group, share returns msg
+  let name = tls_text_bytes(host)
+  let sni = tls_u16(list_len(name) + 3) + [0] + tls_u16(list_len(name)) + name
+  # x25519 (29), secp256r1 (23)
+  let groups = tls_u16(4) + tls_u16(29) + tls_u16(23)
+  # ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256,
+  # rsa_pss_rsae_sha384, rsa_pkcs1_sha256 (certificates), rsa_pkcs1_sha384
+  let schemes = [4, 3, 5, 3, 8, 4, 8, 5, 4, 1, 5, 1]
+  let sigs = tls_u16(list_len(schemes)) + schemes
+  let ks = tls_u16(group) + tls_u16(list_len(share)) + share
+  let alpn_name = tls_text_bytes("http/1.1")
+  let alpn = tls_u16(list_len(alpn_name) + 1) + [list_len(alpn_name)] + alpn_name
+  let exts = tls_ext(0, sni) + tls_ext(10, groups) + tls_ext(13, sigs) + tls_ext(16, alpn) + tls_ext(43, [2, 3, 4]) + tls_ext(51, tls_u16(list_len(ks)) + ks)
+  # legacy_version 0x0303, the random, an empty session id, the two suites,
+  # no compression
+  let body = [3, 3] + random + [0] + tls_u16(4) + tls_u16(4867) + tls_u16(4865) + [1, 0] + tls_u16(list_len(exts)) + exts
+  let msg = [1] + tls_u24(list_len(body)) + body
+  ensure list_len(msg) == 4 + list_len(body)
+  return msg
+end
+
+# ---- records ----
+
+make a function called tls_write_plain takes c, kind, payload returns ok
+  return tls_io_write(c.io, [kind, 3, 1] + tls_u16(list_len(payload)) + payload)
+end
+
+# The nonce of record seq: the iv XOR the sequence number, big-endian.
+make a function called tls_nonce takes iv, seq returns nonce
+  let byte = mod_make(0, 256)
+  let nonce = []
+  let i = 0
+  while i < 12 do
+    let shift = 8 * (11 - i)
+    let s = 0
+    if shift < 64 then
+      let s = (seq shr shift) band 255
+    end
+    let nonce = list_push(nonce, mod_make(iv[i], byte) bxor s)
+    let i = i + 1
+  end
+  return nonce
+end
+
+make a function called tls_seal takes c, key, nonce, aad, inner returns sealed
+  if c.suite == 4867 then
+    return chacha20_poly1305_seal(key, nonce, aad, inner)
+  end
+  return aes128_gcm_seal(key, nonce, aad, inner)
+end
+
+make a function called tls_open takes c, key, nonce, aad, sealed returns r
+  if c.suite == 4867 then
+    return chacha20_poly1305_open(key, nonce, aad, sealed)
+  end
+  return aes128_gcm_open(key, nonce, aad, sealed)
+end
+
+# One encrypted record of kind (the inner content type) holding payload.
+make a function called tls_write_record takes c, kind, payload returns ok
+  let inner = payload + [kind]
+  let header = [23, 3, 3] + tls_u16(list_len(inner) + 16)
+  let sealed = tls_seal(c, c.wkey, tls_nonce(c.wiv, c.wseq), header, inner)
+  c.wseq = c.wseq + 1
+  # the record goes on the wire: its bytes are public
+  return tls_io_write(c.io, header + tls_reveal_bytes(sealed))
+end
+
+# The next record: [type, payload] with an encrypted record opened, its
+# inner type and payload; ["eof"] at the end; ["err", ...] when one does not
+# decrypt or is malformed. change_cipher_spec records are passed over.
+make a function called tls_read_record takes c returns r
+  let io = c.io
+  while true do
+    if not tls_io_need(io, 5) then
+      return ["eof"]
+    end
+    let header = tls_io_take(io, 5)
+    let len = tls_get16(header, 3)
+    if len > 16384 + 256 then
+      return tls_err("a record of " + len + " bytes")
+    end
+    if not tls_io_need(io, len) then
+      return tls_err("the connection ended inside a record")
+    end
+    let body = tls_io_take(io, len)
+    if header[0] == 20 then
+      # change_cipher_spec, for middleboxes: nothing to do
+    elif header[0] == 23 then
+      if list_len(c.rkey) == 0 then
+        return tls_err("an encrypted record before the keys")
+      end
+      let opened = tls_open(c, c.rkey, tls_nonce(c.riv, c.rseq), header, body)
+      if type_of(opened) != "list" then
+        return tls_err("a record did not decrypt (bad record MAC)")
+      end
+      c.rseq = c.rseq + 1
+      let plain = tls_reveal_bytes(opened)
+      # the inner type is the last byte that is not padding
+      let n = list_len(plain)
+      while (n > 0) and (plain[n - 1] == 0) do
+        let n = n - 1
+      end
+      if n == 0 then
+        return tls_err("a record with no inner type")
+      end
+      return [plain[n - 1], der_slice(plain, 0, n - 1)]
+    else
+      return [header[0], body]
+    end
+  end
+  return ["eof"]
+end
+
+# The next handshake message: [type, the whole message], reading records as
+# needed; ["err", ...] for anything else.
+make a function called tls_next_message takes c returns r
+  while list_len(c.pending) < 4 do
+    let rec = tls_read_record(c)
+    if rec[0] == "err" then
+      return rec
+    end
+    if rec[0] == "eof" then
+      if c.io.timed_out then
+        return tls_err("the server sent nothing for " + c.io.timeout_ms + " ms in the handshake")
+      end
+      return tls_err("the connection ended in the handshake")
+    end
+    if rec[0] == 21 then
+      return tls_err("the server sent an alert: " + rec[1])
+    end
+    if rec[0] != 22 then
+      return tls_err("a record of type " + rec[0] + " in the handshake")
+    end
+    c.pending = c.pending + rec[1]
+  end
+  let len = tls_get24(c.pending, 1)
+  while list_len(c.pending) < 4 + len do
+    let rec = tls_read_record(c)
+    if (rec[0] == "err") then
+      return rec
+    end
+    if rec[0] != 22 then
+      return tls_err("a handshake message cut short")
+    end
+    c.pending = c.pending + rec[1]
+  end
+  let msg = der_slice(c.pending, 0, 4 + len)
+  c.pending = der_slice(c.pending, 4 + len, list_len(c.pending) - 4 - len)
+  return [msg[0], msg]
+end
+
+# ---- the key schedule ----
+
+make a function called tls_keys_for takes c, secret returns kv
+  let keylen = 16
+  if c.suite == 4867 then
+    let keylen = 32
+  end
+  return [tls_expand_label(c.alg, secret, "key", [], keylen), tls_expand_label(c.alg, secret, "iv", [], 12)]
+end
+
+make a function called tls_transcript_hash takes c returns h
+  return tls_hash(c.alg, c.transcript)
+end
+
+make a function called tls_zeros takes n returns z
+  let z = []
+  let i = 0
+  while i < n do
+    let z = list_push(z, 0)
+    let i = i + 1
+  end
+  return z
+end
+
+# ---- the handshake ----
+
+make a function called tls13_new takes io, host returns c
+  let c = new("TlsClient")
+  c.io = io
+  c.host = host
+  c.now = floor(now_ms() / 1000)
+  return c
+end
+
+# The ServerHello's fields: [suite, group, key share], or why not.
+make a function called tls_server_hello takes msg returns r
+  # 4 header, 2 version, 32 random, session id
+  if list_len(msg) < 4 + 2 + 32 + 1 then
+    return tls_err("a ServerHello too short")
+  end
+  let at = 4 + 2 + 32
+  let sid = msg[at]
+  let at = at + 1 + sid
+  let suite = tls_get16(msg, at)
+  let at = at + 3
+  let ext_end = at + 2 + tls_get16(msg, at)
+  let at = at + 2
+  let version = 0
+  let group = 0
+  let share = []
+  while at + 4 <= ext_end do
+    let kind = tls_get16(msg, at)
+    let len = tls_get16(msg, at + 2)
+    let data = der_slice(msg, at + 4, len)
+    if kind == 43 then
+      let version = tls_get16(data, 0)
+    elif kind == 51 then
+      let group = tls_get16(data, 0)
+      if list_len(data) >= 4 then
+        let share = der_slice(data, 4, tls_get16(data, 2))
+      end
+    end
+    let at = at + 4 + len
+  end
+  if version != 772 then
+    return tls_err("the server does not speak TLS 1.3")
+  end
+  if (suite != 4867) and (suite != 4865) then
+    return tls_err("the server chose a suite not offered: " + suite)
+  end
+  return ["ok", suite, group, share]
+end
+
+# The magic random of a HelloRetryRequest (RFC 8446 4.1.3).
+make a function called tls_hrr_random returns r
+  return tls_hex_bytes("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+end
+
+make a function called tls13_handshake takes c returns r
+  let curve_group = 29
+  if list_len(c.private_key) == 32 then
+    let priv = c.private_key
+  else
+    let priv = random_bytes(32)
+  end
+  let base = tls_zeros(32)
+  let base = list_set(base, 0, 9)
+  tls_mark(c, "start")
+  let share = tls_reveal_bytes(x25519(priv, base))
+  tls_mark(c, "key share")
+  if list_len(c.hello) > 0 then
+    let hello = c.hello
+  else
+    let hello = tls_client_hello(c.host, random_bytes(32), 29, share)
+  end
+  if not tls_write_plain(c, 22, hello) then
+    return tls_err("the ClientHello could not be sent: the connection failed")
+  end
+  c.transcript = hello
+  let m = tls_next_message(c)
+  tls_mark(c, "ServerHello")
+  if m[0] == "err" then
+    return m
+  end
+  if m[0] != 2 then
+    return tls_err("the first message is not a ServerHello")
+  end
+  let sh = tls_server_hello(m[1])
+  if sh[0] != "ok" then
+    return sh
+  end
+  if der_slice(m[1], 6, 32) == tls_hrr_random() then
+    # a HelloRetryRequest: the transcript starts again from the first
+    # hello's hash, and the second hello offers the group asked for
+    if sh[2] != 23 then
+      return tls_err("the server asked for a group not offered: " + sh[2])
+    end
+    let h1 = tls_reveal_bytes(tls_hash("sha256", hello))
+    c.transcript = [254, 0, 0, 32] + h1 + m[1]
+    let curve_group = 23
+    let priv = random_bytes(32)
+    let share = tls_p256_public(priv)
+    let hello = tls_client_hello(c.host, random_bytes(32), 23, share)
+    tls_write_plain(c, 22, hello)
+    c.transcript = c.transcript + hello
+    let m = tls_next_message(c)
+    if m[0] == "err" then
+      return m
+    end
+    if m[0] != 2 then
+      return tls_err("no ServerHello after the HelloRetryRequest")
+    end
+    let sh = tls_server_hello(m[1])
+    if sh[0] != "ok" then
+      return sh
+    end
+  end
+  if sh[2] != curve_group then
+    return tls_err("the server's key share is for another group")
+  end
+  c.suite = sh[1]
+  c.transcript = c.transcript + m[1]
+  if curve_group == 29 then
+    if list_len(sh[3]) != 32 then
+      return tls_err("an x25519 key share of " + list_len(sh[3]) + " bytes")
+    end
+    let shared = x25519(priv, sh[3])
+  else
+    let shared = tls_p256_shared(priv, sh[3])
+    if list_len(shared) == 0 then
+      return tls_err("the server's P-256 key share is not a point on the curve")
+    end
+  end
+  # the key schedule (RFC 8446 7.1) to the handshake secrets
+  let hlen = tls_hash_len(c.alg)
+  let early = tls_hkdf_extract(c.alg, [], tls_zeros(hlen))
+  let empty = tls_hash(c.alg, [])
+  let hs = tls_hkdf_extract(c.alg, tls_derive_secret(c.alg, early, "derived", empty), shared)
+  let th = tls_transcript_hash(c)
+  tls_mark(c, "shared secret")
+  c.c_hs = tls_derive_secret(c.alg, hs, "c hs traffic", th)
+  c.s_hs = tls_derive_secret(c.alg, hs, "s hs traffic", th)
+  let master = tls_hkdf_extract(c.alg, tls_derive_secret(c.alg, hs, "derived", empty), tls_zeros(hlen))
+  let rk = tls_keys_for(c, c.s_hs)
+  c.rkey = rk[0]
+  c.riv = rk[1]
+  c.rseq = 0
+  # the server's encrypted flight
+  let ee = tls_next_message(c)
+  if ee[0] == "err" then
+    return ee
+  end
+  if ee[0] != 8 then
+    return tls_err("no EncryptedExtensions")
+  end
+  c.transcript = c.transcript + ee[1]
+  let cm = tls_next_message(c)
+  if cm[0] == "err" then
+    return cm
+  end
+  if cm[0] != 11 then
+    return tls_err("no Certificate (the server asked for a client certificate, or sent none)")
+  end
+  let certs = tls_certificates(cm[1])
+  if list_len(certs) == 0 then
+    return tls_err("an empty or malformed Certificate")
+  end
+  c.transcript = c.transcript + cm[1]
+  tls_mark(c, "handshake keys, server flight read")
+  let check = tls_check_certificates(c, certs)
+  tls_mark(c, "certificates checked")
+  if check[0] != "ok" then
+    return check
+  end
+  c.cert = check[1]
+  let cv = tls_next_message(c)
+  if cv[0] == "err" then
+    return cv
+  end
+  if cv[0] != 15 then
+    return tls_err("no CertificateVerify")
+  end
+  # 64 spaces, the context string, a 0, then the transcript's hash (4.4.3)
+  let content = []
+  let i = 0
+  while i < 64 do
+    let content = list_push(content, 32)
+    let i = i + 1
+  end
+  let content = content + tls_text_bytes("TLS 1.3, server CertificateVerify") + [0] + tls_reveal_bytes(tls_transcript_hash(c))
+  let sig_ok = tls_verify_signature(c.cert, cv[1], content)
+  tls_mark(c, "CertificateVerify checked")
+  if not sig_ok then
+    return tls_err("the server's CertificateVerify does not verify with its certificate's key")
+  end
+  c.transcript = c.transcript + cv[1]
+  let fin = tls_next_message(c)
+  if fin[0] == "err" then
+    return fin
+  end
+  if fin[0] != 20 then
+    return tls_err("no Finished")
+  end
+  let s_fin_key = tls_expand_label(c.alg, c.s_hs, "finished", [], hlen)
+  let want = tls_hmac(c.alg, s_fin_key, tls_transcript_hash(c))
+  let got = der_slice(fin[1], 4, list_len(fin[1]) - 4)
+  if list_len(got) != hlen then
+    return tls_err("a Finished of the wrong length")
+  end
+  let byte = mod_make(0, 256)
+  let diff = mod_make(0, byte)
+  let i = 0
+  while i < hlen do
+    let diff = diff bor (mod_make(got[i], byte) bxor want[i])
+    let i = i + 1
+  end
+  if mod_reveal(diff) != 0 then
+    return tls_err("the server's Finished is wrong")
+  end
+  c.transcript = c.transcript + fin[1]
+  # the application secrets, from the transcript through the server's Finished
+  let th2 = tls_transcript_hash(c)
+  c.c_ap = tls_derive_secret(c.alg, master, "c ap traffic", th2)
+  c.s_ap = tls_derive_secret(c.alg, master, "s ap traffic", th2)
+  # the client's Finished, under the client's handshake keys
+  let wk = tls_keys_for(c, c.c_hs)
+  c.wkey = wk[0]
+  c.wiv = wk[1]
+  c.wseq = 0
+  let c_fin_key = tls_expand_label(c.alg, c.c_hs, "finished", [], hlen)
+  let verify = tls_reveal_bytes(tls_hmac(c.alg, c_fin_key, th2))
+  let cfin = [20] + tls_u24(hlen) + verify
+  tls_write_record(c, 22, cfin)
+  tls_mark(c, "Finished sent")
+  c.transcript = c.transcript + cfin
+  # the application keys
+  let wk = tls_keys_for(c, c.c_ap)
+  c.wkey = wk[0]
+  c.wiv = wk[1]
+  c.wseq = 0
+  let rk = tls_keys_for(c, c.s_ap)
+  c.rkey = rk[0]
+  c.riv = rk[1]
+  c.rseq = 0
+  return ["ok"]
+end
+
+# The certificate_list's DER certificates, leaf first; [] when malformed.
+make a function called tls_certificates takes msg returns certs
+  if list_len(msg) < 8 then
+    return []
+  end
+  let at = 4 + 1 + msg[4]
+  let end = at + 3 + tls_get24(msg, at)
+  if end > list_len(msg) then
+    return []
+  end
+  let at = at + 3
+  let certs = []
+  while at + 3 <= end do
+    let len = tls_get24(msg, at)
+    if at + 3 + len + 2 > end then
+      return []
+    end
+    let certs = list_push(certs, der_slice(msg, at + 3, len))
+    let at = at + 3 + len
+    let at = at + 2 + tls_get16(msg, at)
+  end
+  return certs
+end
+
+# The chain check: the test's own when one is set, else x509_check_chain with
+# the given roots or the system's.
+make a function called tls_check_certificates takes c, certs returns r
+  let inters = []
+  let i = 1
+  while i < list_len(certs) do
+    let inters = list_push(inters, certs[i])
+    let i = i + 1
+  end
+  if type_of(c.chain_check) != "bool" then
+    let check = c.chain_check
+    let r = check(certs[0], inters, c.host)
+  else
+    let roots = c.roots
+    if list_len(roots) == 0 then
+      let roots = x509_system_roots()
+    end
+    let r = x509_check_chain(certs[0], inters, roots, c.host, c.now)
+  end
+  if r[0] != "ok" then
+    return tls_err("the server's certificate: " + r[2])
+  end
+  return r
+end
+
+# Whether the CertificateVerify message's signature, under its scheme, is the
+# leaf's key's over content.
+make a function called tls_verify_signature takes cert, msg, content returns ok
+  if list_len(msg) < 8 then
+    return false
+  end
+  let scheme = tls_get16(msg, 4)
+  let sig = der_slice(msg, 8, tls_get16(msg, 6))
+  if (scheme == 2052) or (scheme == 2053) then
+    if cert.key_alg != "1.2.840.113549.1.1.1" then
+      return false
+    end
+    let h = "sha256"
+    if scheme == 2053 then
+      let h = "sha384"
+    end
+    let ne = x509_rsa_key(cert)
+    return tls_rsa_pss_verify(ne[0], ne[1], h, content, sig)
+  end
+  if (scheme == 1027) or (scheme == 1283) then
+    let curve = "p256"
+    let h = "sha256"
+    if scheme == 1283 then
+      let curve = "p384"
+      let h = "sha384"
+    end
+    if (cert.key_alg != "1.2.840.10045.2.1") or (cert.key_curve != curve) then
+      return false
+    end
+    let rs = x509_ecdsa_rs(sig)
+    let size = tls_curve(curve)[6]
+    let pt = cert.key_point
+    if (list_len(rs) == 0) or (list_len(pt) != 1 + 2 * size) then
+      return false
+    end
+    return tls_ecdsa_verify(curve, tls_bytes_int(der_slice(pt, 1, size)), tls_bytes_int(der_slice(pt, 1 + size, size)), h, content, rs[0], rs[1])
+  end
+  return false
+end
+
+# ---- application data ----
+
+make a function called tls13_send takes c, bytes returns ok
+  let at = 0
+  while at < list_len(bytes) do
+    let n = list_len(bytes) - at
+    if n > 16384 then
+      let n = 16384
+    end
+    if not tls_write_record(c, 23, der_slice(bytes, at, n)) then
+      return false
+    end
+    let at = at + n
+  end
+  return true
+end
+
+make a function called tls13_recv takes c returns r
+  while true do
+    if c.closed then
+      return ["eof"]
+    end
+    let rec = tls_read_record(c)
+    if (rec[0] == "err") or (rec[0] == "eof") then
+      return rec
+    end
+    if rec[0] == 23 then
+      return ["data", rec[1]]
+    end
+    if rec[0] == 21 then
+      if (list_len(rec[1]) >= 2) and (rec[1][1] == 0) then
+        c.closed = true
+        return ["eof"]
+      end
+      return tls_err("the server sent an alert: " + rec[1])
+    end
+    if rec[0] == 22 then
+      let msg = rec[1]
+      if (list_len(msg) >= 5) and (msg[0] == 24) then
+        # KeyUpdate: the server's next keys; and ours when it asks
+        c.s_ap = tls_expand_label(c.alg, c.s_ap, "traffic upd", [], tls_hash_len(c.alg))
+        let rk = tls_keys_for(c, c.s_ap)
+        c.rkey = rk[0]
+        c.riv = rk[1]
+        c.rseq = 0
+        if msg[4] == 1 then
+          tls_write_record(c, 22, [24, 0, 0, 1, 0])
+          c.c_ap = tls_expand_label(c.alg, c.c_ap, "traffic upd", [], tls_hash_len(c.alg))
+          let wk = tls_keys_for(c, c.c_ap)
+          c.wkey = wk[0]
+          c.wiv = wk[1]
+          c.wseq = 0
+        end
+      end
+      # NewSessionTicket (4) and anything else after the handshake: dropped
+    end
+  end
+  return ["eof"]
+end
+
+make a function called tls13_close takes c returns ok
+  tls_write_record(c, 21, [1, 0])
+  return true
+end

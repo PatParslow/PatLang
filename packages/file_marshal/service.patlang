@@ -14,6 +14,13 @@
 #                                           -1 writes whatever the version
 #   ["append", path, bytes, client]         ["ok", version]
 #   ["shifts", path, since]                 as fh_shifts_since
+#   ["find", path, pattern, cursor]         ["found", at, next cursor], or
+#                                           ["end", version now], or
+#                                           ["refused", reason, version now]
+#     a cursor is [version, position], [-1, 0] for the start: the search
+#     goes on from the position, carried past the edits since its version
+#     (one inside a change goes to the change's start, so the new text there
+#     is searched too); one whose content was rewritten since is refused
 #   ["version", path, v]                    ["ok", content], or ["gone", reason]
 #   ["undo", path, k, client]               ["ok", version], or ["refused", reason]
 #   ["revert", path, v, client]             the same
@@ -118,6 +125,49 @@ make a function called fs_edit takes s, h, full, req returns reply
   return ["ok", v, r[2]]
 end
 
+# a position carried past shifts; one inside a change goes to its start
+make a function called fs_carry_position takes n, shifts returns at
+  let at = n
+  let k = 0
+  while k < list_len(shifts) do
+    let sh = shifts[k]
+    if at >= sh[0] + sh[1] then
+      let at = at + sh[2] - sh[1]
+    elif at > sh[0] then
+      let at = sh[0]
+    end
+    let k = k + 1
+  end
+  return at
+end
+
+make a function called fs_find takes h, full, pattern, cursor returns reply
+  let now = fh_last(h)
+  let pat = fm_bytes_of(pattern)
+  if bytes_len(pat) == 0 then
+    return ["refused", "a pattern is at least one byte", now]
+  end
+  if (type_of(cursor) != "list") or (list_len(cursor) != 2) then
+    return ["refused", "a cursor is [version, position]", now]
+  end
+  let pos = cursor[1]
+  if pos < 0 then
+    let pos = 0
+  end
+  if (cursor[0] >= 0) and (cursor[0] != now) then
+    let got = fh_shifts_since(h, cursor[0])
+    if got[0] != "ok" then
+      return ["refused", "the cursor's version " + cursor[0] + " cannot be carried to " + now + ": " + got[0], now]
+    end
+    let pos = fs_carry_position(pos, got[1])
+  end
+  let at = fm_find_next(read_file_raw(full), pat, pos)
+  if at < 0 then
+    return ["end", now]
+  end
+  return ["found", at, [now, at + 1]]
+end
+
 # One request: its reply.
 make a function called fs_handle takes s, req returns reply
   s.operations = s.operations + 1
@@ -165,6 +215,9 @@ make a function called fs_handle takes s, req returns reply
     let v = fh_record(h, "append", req[3], after, req[2], [])
     append_file_bytes(full, req[2])
     return ["ok", v]
+  end
+  if (op == "find") and (list_len(req) == 4) then
+    return fs_find(h, full, req[2], req[3])
   end
   if (op == "shifts") and (list_len(req) == 3) then
     return fh_shifts_since(h, req[2])

@@ -55,3 +55,13 @@ Feature: integers modulo n (spec 1.14)
     Given mod_make(1, 7) band mod_make(1, 7), and mod_make(1, 256) shl 9
     When each is evaluated
     Then each program stops at the bit operator, naming the modint class
+
+  Scenario: a bigint beside a modint modulo 2^k is reduced as an int is, at about an int's cost
+    Given 64- and 32-bit modints, and bigints at and past 2^64, positive and negative, as masks and as numbers
+    When band, bor, bxor, +, - and * take a modint and a bigint, and a mask of all ones is anded 20000 times
+    Then each gives what the bigint reduced first gives, and the bigint mask costs at most four times an int mask
+
+  Scenario: shifts and rotations of a modint modulo 2^k are exact at the edges and cost about what bxor does
+    Given modints modulo 2^8, 2^32 and 2^64, and the counts 0, 1, k - 1 and k
+    When each is shifted and rotated by each count, and shl, shr, rotl and rotr are done 20000 times
+    Then each result is the shift or rotation done on the residue and masked to k bits, and each costs at most four times bxor of two such words

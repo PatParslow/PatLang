@@ -13,9 +13,12 @@
 #   MISSING <path>
 #   MALFORMED line <n>: <text>
 #
+# and, after the entries, OUTSIDE, UNLISTED, NO-INCLUDE <path> for a file line
+# no include line names, and NO-FILE <path> for an include with no file line;
 # then a summary line. The exit code is 0 when every entry of every package
-# is ok, 1 when any is mismatched, missing or malformed (or a manifest has
-# no file entries, or cannot be read), and 2 when no directory is given.
+# is ok, 1 when any is mismatched, missing, malformed or reported (or a
+# manifest has no file entries, or cannot be read), and 2 when no directory
+# is given.
 include "../sha256/sha256.patlang"
 
 # A manifest's lines (as Strings, without line ends), from its bytes. The
@@ -108,9 +111,17 @@ make a function called vm_check_package takes dir returns counts
   let bad = 0
   let entries = 0
   let listed = []
+  let includes = []
+  let depends = []
   let i = 0
   while i < list_len(lines) do
     let words = vm_words(lines[i])
+    if (list_len(words) == 2) and (words[0] == "include") then
+      let includes = list_push(includes, words[1])
+    end
+    if (list_len(words) >= 2) and (words[0] == "depends") then
+      let depends = list_push(depends, words[1])
+    end
     if (list_len(words) > 0) and (words[0] == "file") then
       let entries = entries + 1
       if (list_len(words) != 4) or (words[2] != "sha256") or (words[3].length != 64) then
@@ -142,6 +153,43 @@ make a function called vm_check_package takes dir returns counts
   if entries == 0 then
     print("  NO file entries in " + mpath)
     let bad = bad + 1
+  end
+  # every file line names an include and every include has a file line, as
+  # packages/resolve's reader requires (packages/README.md)
+  let k = 0
+  while k < list_len(listed) do
+    if not vm_has(includes, listed[k]) then
+      print("  NO-INCLUDE " + listed[k])
+      let bad = bad + 1
+    end
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(includes) do
+    if not vm_has(listed, includes[k]) then
+      print("  NO-FILE " + includes[k])
+      let bad = bad + 1
+    end
+    let k = k + 1
+  end
+  # a sibling package an include file includes by path needs a depends line,
+  # since an installer brings only what depends names
+  let told = []
+  let k = 0
+  while k < list_len(includes) do
+    if vm_inside(includes[k]) and file_exists(base + includes[k]) then
+      let sibs = vm_siblings(vm_lines(read_file_bytes(base + includes[k], 0, 16777216)))
+      let j = 0
+      while j < list_len(sibs) do
+        if (not vm_has(depends, sibs[j])) and (not vm_has(told, sibs[j])) then
+          print("  NO-DEPENDS " + sibs[j])
+          let told = list_push(told, sibs[j])
+          let bad = bad + 1
+        end
+        let j = j + 1
+      end
+    end
+    let k = k + 1
   end
   let shipped = vm_shipped(base, "")
   let k = 0
@@ -199,9 +247,42 @@ make a function called vm_has takes items, x returns yes
   return false
 end
 
+# The sibling packages a file's lines include by path: NAME for each line
+# `include "../NAME/...`; a path leaving the packages directory ("../../")
+# names none.
+make a function called vm_siblings takes lines returns names
+  let out = []
+  let lead = chr(34) + "../"
+  let i = 0
+  while i < list_len(lines) do
+    let words = vm_words(lines[i])
+    if (list_len(words) == 2) and (words[0] == "include") and (words[1].length > 4) then
+      let path = words[1]
+      if (substr(path, 0, 4) == lead) and (substr(path, 4, 3) != "../") then
+        # the name runs from after "../ to the next /
+        let name = sb_new()
+        let k = 4
+        while (k < path.length) and (char_code(path, k) != 47) do
+          sb_push(name, chr(char_code(path, k)))
+          let k = k + 1
+        end
+        let n = sb_str(name)
+        if (k < path.length) and (n != "") and (not vm_has(out, n)) then
+          let out = list_push(out, n)
+        end
+      end
+    end
+    let i = i + 1
+  end
+  let names = out
+  ensure value_class(names) == 9
+  return names
+end
+
 # The files a package ships, relative to its directory: the PatLang files a
-# program can include, every .patlang file under it but those under spec/ and
-# build/ (packages/README.md: the file lines cover include files only).
+# program can include, every .patlang file under it but those under spec/,
+# build/ and tools/ (packages/README.md: the file lines cover include files
+# only; tools/ holds programs that make or check the package).
 make a function called vm_shipped takes base, rel returns files
   let out = []
   let entries = list_dir(base + rel)
@@ -210,7 +291,7 @@ make a function called vm_shipped takes base, rel returns files
     let e = entries[i]
     let path = rel + e
     if ends_with_slash(e) then
-      if (path != "spec/") and (path != "build/") then
+      if (path != "spec/") and (path != "build/") and (path != "tools/") then
         let inner = vm_shipped(base, path)
         let j = 0
         while j < list_len(inner) do

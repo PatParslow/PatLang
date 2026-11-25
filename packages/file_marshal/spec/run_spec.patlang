@@ -760,7 +760,135 @@ make a function called st_fs_quit takes ctx returns ok
   return a and b and c
 end
 
+# ---- the history as facts ----
+
+make a function called fh_edit_by takes ctx, client, x, z returns v
+  let h = ctx_get(ctx, "h")
+  let path = ctx_get(ctx, "path")
+  let r = fm_apply_batch(read_file_raw(path), [fu_word(x, z)])
+  assert r[0] == "ok"
+  let v = fh_record(h, "edits", client, r[1], [fu_word(x, z)], r[2])
+  fh_replace(path, r[1])
+  return v
+end
+
+make a function called st_ff_three takes ctx returns ok
+  let a = fh_edit_by(ctx, "ann", "haired", "furry")
+  let b = fh_edit_by(ctx, "bob", "mat", "rug")
+  let c = fh_edit_by(ctx, "ann", "curly", "straight")
+  let store = logic_store_new()
+  fh_to_facts(ctx_get(ctx, "h"), store, "notes.txt")
+  ctx_set(ctx, "fstore", store)
+  return expect(ctx, "versions 2 to 4", [a, b, c], [2, 3, 4])
+end
+
+# [version, client] of each version that touched the range of word in the file now
+make a function called ff_touching takes ctx, word returns found
+  let b = read_file_raw(ctx_get(ctx, "path"))
+  let w = bytes_from_str(word)
+  let at = fm_find_next(b, w, 0)
+  let store = ctx_get(ctx, "fstore")
+  let v = logic_var("V")
+  let got = solve_in(store, "touches", ["notes.txt", v, at, at + bytes_len(w)])
+  let out = []
+  let k = 0
+  while k < list_len(got) do
+    let ver = got[k][1]
+    let who = solve_in(store, "version", ["notes.txt", ver, logic_var("K"), logic_var("C"), logic_var("T")])
+    let out = list_push(out, [ver, who[0][3]])
+    let k = k + 1
+  end
+  return out
+end
+
+make a function called st_ff_rug takes ctx returns ok
+  return expect(ctx, "the versions that touched rug", ff_touching(ctx, "rug"), [[3, "bob"]])
+end
+
+make a function called st_ff_furry takes ctx returns ok
+  return expect(ctx, "the versions that touched furry", ff_touching(ctx, "furry"), [[2, "ann"]])
+end
+
+# ---- finding ----
+
+make a function called st_fe_finder_four takes ctx returns ok
+  let f = fm_finder(ctx_get(ctx, "bytes"), step_arg(ctx, "p"), 0)
+  let got = []
+  let k = 0
+  while k < 4 do
+    let got = list_push(got, fm_finder_next(f))
+    let k = k + 1
+  end
+  ctx_set(ctx, "found", got)
+  ctx_set(ctx, "finder", f)
+  return true
+end
+
+make a function called st_fe_finder_gave takes ctx returns ok
+  return expect(ctx, "the offsets, and the fibre alive", [ctx_get(ctx, "found"), fm_finder_alive(ctx_get(ctx, "finder"))], [[0, 14, 21, 0 - 1], false])
+end
+
+make a function called st_fe_finder_closed takes ctx returns ok
+  let f = fm_finder(ctx_get(ctx, "bytes"), "a", 0)
+  let first = fm_finder_next(f)
+  let alive = fm_finder_alive(f)
+  let closed = fm_finder_close(f)
+  return expect(ctx, "first, alive before closing, ended after", [first, alive, closed, fm_finder_alive(f), fm_finder_next(f)], [0, true, true, false, 0 - 1])
+end
+
+make a function called fs_find_step takes ctx, cursor returns ok
+  let r = fs_ask(ctx_get(ctx, "pm_port"), ["find", step_arg(ctx, "name"), step_arg(ctx, "p"), cursor])
+  ctx_set(ctx, "found", r)
+  if r[0] == "found" then
+    ctx_set(ctx, "cursor", r[2])
+  end
+  return true
+end
+
+make a function called st_fs_find_start takes ctx returns ok
+  return fs_find_step(ctx, [0 - 1, 0])
+end
+
+make a function called st_fs_find_on takes ctx returns ok
+  return fs_find_step(ctx, ctx_get(ctx, "cursor"))
+end
+
+make a function called st_fs_found_at takes ctx returns ok
+  let r = ctx_get(ctx, "found")
+  return expect(ctx, "the find: " + r, [r[0], r[1]], ["found", to_num(step_arg(ctx, "n"))])
+end
+
+make a function called st_fs_find_ended takes ctx returns ok
+  let r = ctx_get(ctx, "found")
+  return expect(ctx, "the find: " + r, r[0], "end")
+end
+
+make a function called st_fs_put_between takes ctx returns ok
+  let port = ctx_get(ctx, "pm_port")
+  let name = step_arg(ctx, "name")
+  let now = fs_ask(port, ["read", name])
+  let r = fs_ask(port, ["edit", name, now[1], [fm_edit(step_arg(ctx, "p"), step_arg(ctx, "s"), step_arg(ctx, "z"))], "other"])
+  return expect(ctx, "the other client's edit: " + r, r[0], "ok")
+end
+
+make a function called st_fs_find_empty takes ctx returns ok
+  let r = fs_ask(ctx_get(ctx, "pm_port"), ["find", "find.txt", "", [0 - 1, 0]])
+  return expect(ctx, "finding nothing: " + r, [r[0], r[1]], ["refused", "a pattern is at least one byte"])
+end
+
 let ctx = ctx_new()
+step(ctx, "a finder for \"{p}\" is asked four times", "st_fe_finder_four")
+step(ctx, "it gives 0, 14, 21 and -1, and its fibre has ended", "st_fe_finder_gave")
+step(ctx, "a finder for \"a\" asked once and then closed gives 0, and its fibre has ended", "st_fe_finder_closed")
+step(ctx, "a client finds \"{p}\" in {name} from the start", "st_fs_find_start")
+step(ctx, "the client finds \"{p}\" in {name} from its cursor", "st_fs_find_on")
+step(ctx, "it is found at {n}", "st_fs_found_at")
+step(ctx, "the search has ended", "st_fs_find_ended")
+step(ctx, "another client puts \"{z}\" between \"{p}\" and \"{s}\" in {name}", "st_fs_put_between")
+step(ctx, "finding \"\" is refused, saying a pattern is at least one byte", "st_fs_find_empty")
+step(ctx, "\"ann\" makes \"haired\" into \"furry\", \"bob\" makes \"mat\" into \"rug\", and \"ann\" makes \"curly\" into \"straight\"", "st_ff_three")
+step(ctx, "the versions that touched the range of \"rug\" in the file as it is now are bob's version 3 alone", "st_ff_rug")
+step(ctx, "the versions that touched the range of \"furry\" are ann's version 2 alone, its range carried past version 4's edit before it", "st_ff_furry")
 step(ctx, "a marshaller and a file service registered as \"files\", over a root holding notes.txt saying \"the curly haired dog sat on the mat\"", "st_fs_background")
 step(ctx, "a client reads notes.txt", "st_fs_read")
 step(ctx, "it gets version {v} and \"{text}\"", "st_fs_got")

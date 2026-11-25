@@ -31,10 +31,30 @@ Feature: the constant-time check (spec 1.14 and 2.7)
     When the constant-time check reads it
     Then it lists the tag check's verdict as declared by chacha20_poly1305_check, reports nothing, and exits 0
 
+  Scenario: AES-128-GCM seals and opens with no value-dependent step but its declared verdict
+    Given AES-128-GCM from the tls package, its S-box computed, sealing and opening a text under a secret key
+    When the constant-time check reads it
+    Then it lists the tag check's verdict as declared by aes128_gcm_check, reports nothing, and exits 0
+
+  Scenario: ECDHE on P-256 has no value-dependent step but its declared reveals
+    Given the tls package's P-256 key share and shared secret, by a ladder over a secret scalar
+    When the constant-time check reads it
+    Then it lists the public key, the peer's point being on the curve, and the result not being infinity as declared reveals, reports nothing, and exits 0
+
+  Scenario: the TLS 1.3 key schedule has no value-dependent step
+    Given HKDF-Extract, Derive-Secret and HKDF-Expand-Label from the tls package, with SHA-256 and SHA-384, on a secret shared secret
+    When the constant-time check reads it
+    Then it reports nothing in the key schedule and exits 0
+
   Scenario: X25519, Ed25519 key making and Ed25519 signing have no value-dependent step
     Given a program that agrees an X25519 secret, makes an Ed25519 key and signs a message, all written in PatLang on modints
     When the constant-time check reads it
     Then it reports nothing in them and exits 0
+
+  Scenario: a program that signs with Ed25519 and verifies the signature reports nothing but verification's declared reveals
+    Given a program that makes an Ed25519 key, signs a message and verifies the signature, all written in PatLang on modints
+    When the constant-time check reads it
+    Then it lists the reads of the public key and signature as declared by ed_decode and cv_int, reports nothing, and exits 0
 
   Scenario: a stream cipher's round on 32-bit modints has no value-dependent step, and a branch on one of their bits is reported
     Given ChaCha20's quarter round on modints modulo 2^32, and a program with an if on such a modint's low bit

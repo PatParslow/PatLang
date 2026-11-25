@@ -81,6 +81,11 @@ Feature: what functions, commands and includes give (spec 1.13)
     When each resolves names and connects
     Then the first is stopped, the second resolves names and connects to one, and dns_query reads the server's records, its NXDOMAIN and its CNAME, and gives no addresses where nothing answers
 
+  Scenario: trust_roots gives the system's root certificates
+    Given a program that asks trust_roots for the system's roots
+    When it runs
+    Then it gets a list of more than ten, each a bytes holding one whole DER certificate
+
   Scenario: tcp_read_status tells data, a wait and the peer's end apart
     Given a connection whose peer writes one byte, waits for an answer, then closes
     When tcp_read_status reads it three times
@@ -274,7 +279,7 @@ Feature: what functions, commands and includes give (spec 1.13)
     Then each call reaches the program's function, and the runtime goes on using its own
 
   Scenario: two of a program's files defining one name is an error
-    Given a program and a file it includes that define one function name
+    Given a program and a file it includes that define one function name, the same number of parameters in one pair and different numbers in another
     When the program is given
     Then both engines report that the name is declared twice, and nothing runs
 

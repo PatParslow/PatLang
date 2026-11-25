@@ -1,0 +1,698 @@
+# The installer: packages from local sources into a project's packages/
+# (docs/plans/package-trust.md, "The installer", phase S5).
+#
+#   in_install(project, st, shipped, name, cons, sources, opts)
+#       project   the directory holding packages/ and trust.lock
+#       st        the trust store (trust_store_open)
+#       shipped   shipped pins, [[package, hash]] (trust_read_pins)
+#       name      the package asked for; cons its constraint ("any", or
+#                 resolve's form: ">= 0.2.0, < 0.3.0")
+#       sources   each a directory (a package, or a directory of packages),
+#                 a zip archive of one (a path ending ".zip"), or an https
+#                 URL of such an archive (phase S6): an archive is written
+#                 under packages/.sources/ in the project, every entry's
+#                 name first checked to stay there, and removed after
+#       opts      [first_use, update, crash] or [first_use, update, crash,
+#                 roots]: take an unpinned package's genesis hash as its
+#                 pin; allow trust.lock's versions to change; for tests, the
+#                 kind of step after whose first instance to stop as a crash
+#                 would ("" for none): stage, verify, install, commit, move,
+#                 store or lock; and the roots an https source's certificate
+#                 is checked against (DER certificates as lists of bytes; []
+#                 or none, the system's)
+#     gives ["ok", [[package, version, pin source, epoch], ...]] in the order
+#     installed, ["refused", [[package, version, stage, code, detail], ...]],
+#     or ["crashed", step]
+#   in_recover(project, st)
+#       finishes an install whose commit was written, or clears one that
+#       stopped before it: ["clean"], ["finished"], ["cleared"], or
+#       ["refused", why]
+#
+# The work, in order:
+# 1. Each package directory in the sources is a candidate when it verifies
+#    against its pin (trust_verify_pinned: the store's pin, else a shipped
+#    one, else, with first_use, its own genesis hash): its files, its log,
+#    the epoch the store has seen, its release, and no withdrawal. One that
+#    does not is no candidate, and the refusal says why.
+# 2. The resolve package chooses among the candidates.
+# 3. The lock file refuses a change to a locked version, pin or manifest
+#    unless update is asked for.
+# 4. A GOAP plan over the chosen packages not already installed: for each,
+#    stage, verify and install actions, install needing the package verified
+#    and every dependency installed, the goals every chosen package
+#    installed. Staging copies a package into packages/.staging/NAME-VERSION
+#    and verifying checks that copy again.
+# 5. The commit: once every package has verified, the list of what to
+#    install is written to packages/.staging/commit; then each staged
+#    directory is renamed into packages/NAME (the version it replaces moved
+#    aside first), the store's pins and epochs are recorded, trust.lock is
+#    rewritten, and the staging directory is removed. A run that finds a
+#    commit list finishes it; one that finds staging without it removes it.
+include "../trust/trust.patlang"
+include "../resolve/resolve.patlang"
+include "../zip/zip.patlang"
+include "../tls/tls.patlang"
+
+# ---- directories ----
+
+make a function called in_ends_with takes text, tail returns yes
+  let n = str_len(text)
+  let m = str_len(tail)
+  if m > n then
+    return false
+  end
+  return substr(text, n - m, m) == tail
+end
+
+make a function called in_rm_tree takes path returns done
+  let names = list_dir(path)
+  let k = 0
+  while k < list_len(names) do
+    let n = names[k]
+    if in_ends_with(n, "/") then
+      in_rm_tree(path + "/" + substr(n, 0, str_len(n) - 1))
+    else
+      remove_file(path + "/" + n)
+    end
+    let k = k + 1
+  end
+  if file_exists(path) then
+    remove_file(path)
+  end
+  return not file_exists(path)
+end
+
+make a function called in_copy_tree takes from, to returns ok
+  make_directory(to)
+  let names = list_dir(from)
+  let k = 0
+  while k < list_len(names) do
+    let n = names[k]
+    if in_ends_with(n, "/") then
+      let sub = substr(n, 0, str_len(n) - 1)
+      if not in_copy_tree(from + "/" + sub, to + "/" + sub) then
+        return false
+      end
+    elif substr(copy_file(from + "/" + n, to + "/" + n), 0, 2) != "OK" then
+      return false
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+# A package as an installation holds it: its manifest, the files the
+# manifest names, and its trust records; nothing else it was shipped with.
+make a function called in_copy_package takes from, to, files returns ok
+  make_directory(to)
+  if substr(copy_file(from + "/manifest.pkg", to + "/manifest.pkg"), 0, 2) != "OK" then
+    return false
+  end
+  let k = 0
+  while k < list_len(files) do
+    if substr(copy_file(from + "/" + files[k][0], to + "/" + files[k][0]), 0, 2) != "OK" then
+      return false
+    end
+    let k = k + 1
+  end
+  return in_copy_tree(from + "/trust", to + "/trust")
+end
+
+make a function called in_staging takes project returns dir
+  return project + "/packages/.staging"
+end
+
+# ---- candidates ----
+
+# the package directories the sources name
+make a function called in_candidate_dirs takes sources returns dirs
+  let dirs = []
+  let k = 0
+  while k < list_len(sources) do
+    let src = sources[k]
+    if in_ends_with(src, "/") then
+      let src = substr(src, 0, str_len(src) - 1)
+    end
+    if file_exists(src + "/manifest.pkg") then
+      let dirs = list_push(dirs, src)
+    else
+      let names = list_dir(src)
+      let j = 0
+      while j < list_len(names) do
+        if in_ends_with(names[j], "/") then
+          let d = src + "/" + substr(names[j], 0, str_len(names[j]) - 1)
+          if file_exists(d + "/manifest.pkg") then
+            let dirs = list_push(dirs, d)
+          end
+        end
+        let j = j + 1
+      end
+    end
+    let k = k + 1
+  end
+  return dirs
+end
+
+# A candidate checked: ["ok", [dir, package, version, pin, source, epoch,
+# manifest hash, the pins it verified with, its files]] or ["refused",
+# [package, version, stage, code, detail]].
+make a function called in_examine takes st, shipped, dir, first_use, verify returns r
+  let mf = trust_read_file(dir + "/manifest.pkg", trust_max_manifest_bytes(), "manifest")
+  if mf[0] != "ok" then
+    return ["refused", [dir, "", mf[2], mf[1], mf[3]]]
+  end
+  let mr = trust_manifest_names(mf[1])
+  if mr[0] != "ok" then
+    return ["refused", [dir, "", mr[2], mr[1], mr[3]]]
+  end
+  let name = mr[1][0]
+  let version = mr[1][1]
+  let pins = shipped
+  let first = false
+  let ch = trust_store_choose(st, name, shipped)
+  if (ch[0] != "ok") and first_use then
+    let g = trust_read_file(dir + "/trust/log/0000-genesis.rec", trust_max_record_bytes(), "genesis")
+    if g[0] == "ok" then
+      let pins = list_push(shipped, [name, sha256_hex(g[1])])
+      let first = true
+    end
+  end
+  let v = trust_verify_pinned(st, pins, dir, verify)
+  if v[0] != "ok" then
+    return ["refused", [name, version, v[2], v[1], v[3]]]
+  end
+  let source = v[1][4]
+  if first then
+    let source = "first-use"
+  end
+  let pin = trust_store_choose(st, name, pins)[1]
+  return ["ok", [dir, name, version, pin, source, v[1][2], sha256_hex(mf[1]), pins, mr[1][2]]]
+end
+
+make a function called in_find takes cands, name returns c
+  let k = 0
+  while k < list_len(cands) do
+    if cands[k][1] == name then
+      return cands[k]
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# the installed package's manifest hash, or "" when there is none
+make a function called in_installed_hash takes project, name returns h
+  let path = project + "/packages/" + name + "/manifest.pkg"
+  if not file_exists(path) then
+    return ""
+  end
+  return sha256_file_hex(path)
+end
+
+# ---- the commit ----
+
+make a function called in_commit_text takes entries returns text
+  let b = sb_new()
+  let k = 0
+  while k < list_len(entries) do
+    let e = entries[k]
+    sb_push(b, "package " + e[0] + " " + e[1] + " pin " + e[2] + " manifest " + e[3] + " epoch " + e[4] + " source " + e[5] + chr(10))
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+# ["ok", entries] or ["err", why]
+make a function called in_commit_read takes bytes returns r
+  let lines = tr_manifest_lines(bytes)
+  let out = []
+  let k = 0
+  while k < list_len(lines) do
+    let w = tr_manifest_words(lines[k])
+    if (list_len(w) != 11) or (w[0] != "package") or (w[3] != "pin") or (w[5] != "manifest") or (w[7] != "epoch") or (w[9] != "source") or (trs_count(w[8]) == false) then
+      return ["err", "line " + (k + 1) + " of the commit is not package NAME VERSION pin HASH manifest HASH epoch N source S"]
+    end
+    let out = list_push(out, [w[1], w[2], w[4], w[6], trs_count(w[8]), w[10]])
+    let k = k + 1
+  end
+  return ["ok", out]
+end
+
+# Carries out a written commit; each part may already be done.
+make a function called in_finish takes project, st, entries, crash returns r
+  let sdir = in_staging(project)
+  let k = 0
+  while k < list_len(entries) do
+    let e = entries[k]
+    let staged = sdir + "/" + e[0] + "-" + e[1]
+    let target = project + "/packages/" + e[0]
+    if file_exists(staged) then
+      if file_exists(target) then
+        let old = sdir + "/old-" + e[0]
+        in_rm_tree(old)
+        if not try_rename_file(target, old) then
+          return ["refused", "the installed " + e[0] + " could not be moved aside: " + target]
+        end
+      end
+      if not try_rename_file(staged, target) then
+        return ["refused", "the staged " + e[0] + " could not be moved into place: " + target]
+      end
+      if crash == "move" then
+        return ["crashed", "move"]
+      end
+    end
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(entries) do
+    let e = entries[k]
+    if trust_store_get(st, e[0])[0] != "ok" then
+      let p = trust_store_pin(st, e[0], e[2], e[5])
+      if p[0] != "ok" then
+        return ["refused", p[1]]
+      end
+    end
+    let rz = trust_store_raise(st, e[0], e[4])
+    if rz[0] != "ok" then
+      return ["refused", rz[1]]
+    end
+    let k = k + 1
+  end
+  if crash == "store" then
+    return ["crashed", "store"]
+  end
+  let lockpath = project + "/trust.lock"
+  let lock = []
+  if file_exists(lockpath) then
+    let lr = trust_lock_read(bytes_to_list(read_file_raw(lockpath)))
+    if lr[0] != "ok" then
+      return ["refused", "trust.lock: " + lr[1]]
+    end
+    let lock = lr[1]
+  end
+  let kept = []
+  let j = 0
+  while j < list_len(lock) do
+    let named = false
+    let k = 0
+    while k < list_len(entries) do
+      if entries[k][0] == lock[j][0] then
+        let named = true
+      end
+      let k = k + 1
+    end
+    if not named then
+      let kept = list_push(kept, lock[j])
+    end
+    let j = j + 1
+  end
+  let k = 0
+  while k < list_len(entries) do
+    let kept = list_push(kept, [entries[k][0], entries[k][1], entries[k][2], entries[k][3]])
+    let k = k + 1
+  end
+  if not trust_lock_write(lockpath, rs_sort(kept, "first")) then
+    return ["refused", "trust.lock could not be written: " + lockpath]
+  end
+  if crash == "lock" then
+    return ["crashed", "lock"]
+  end
+  if not in_rm_tree(sdir) then
+    return ["refused", "the staging directory could not be removed: " + sdir]
+  end
+  return ["ok"]
+end
+
+make a function called in_recover takes project, st returns r
+  let sdir = in_staging(project)
+  if not file_exists(sdir) then
+    return ["clean"]
+  end
+  if file_exists(sdir + "/commit") then
+    let cr = in_commit_read(bytes_to_list(read_file_raw(sdir + "/commit")))
+    if cr[0] != "ok" then
+      return ["refused", cr[1]]
+    end
+    let f = in_finish(project, st, cr[1], "")
+    if f[0] != "ok" then
+      return f
+    end
+    return ["finished"]
+  end
+  if not in_rm_tree(sdir) then
+    return ["refused", "the staging directory could not be removed: " + sdir]
+  end
+  return ["cleared"]
+end
+
+# ---- installing ----
+
+make a function called in_refused takes name, version, stage, code, detail returns r
+  return ["refused", [[name, version, stage, code, detail]]]
+end
+
+# ---- archives and https sources (S6) ----
+
+# Whether an archive entry's name stays under the directory it is written
+# into: parts separated by "/", none empty (but a directory's last), "." or
+# "..", none holding ":" or "\".
+make a function called in_safe_name takes name returns yes
+  let b = tls_text_bytes(name)
+  let n = list_len(b)
+  if n == 0 then
+    return false
+  end
+  let parts = []
+  let part = sb_new()
+  let i = 0
+  while i < n do
+    if (b[i] == 58) or (b[i] == 92) then
+      return false
+    end
+    if b[i] == 47 then
+      let parts = list_push(parts, sb_str(part))
+      let part = sb_new()
+    else
+      sb_push(part, chr(b[i]))
+    end
+    let i = i + 1
+  end
+  let parts = list_push(parts, sb_str(part))
+  let k = 0
+  while k < list_len(parts) do
+    let p = parts[k]
+    # "" only last, a directory's trailing "/" (so a leading "/" is refused)
+    if ((p == "") and (k != list_len(parts) - 1)) or (p == ".") or (p == "..") then
+      return false
+    end
+    let k = k + 1
+  end
+  return parts[0] != ""
+end
+
+# Makes path's directory and each above it that is not there.
+make a function called in_make_dirs takes path returns done
+  let b = tls_text_bytes(path)
+  let i = 1
+  while i <= list_len(b) do
+    if (i == list_len(b)) or (b[i] == 47) then
+      make_directory(bytes_to_str(bytes_from_list(der_slice(b, 0, i))))
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Writes a zip archive's entries under dest: "" when written, or why not
+# (nothing is written when a name would leave dest).
+make a function called in_extract takes archive, dest returns why
+  let r = zip_read(archive)
+  if r[0] != "ok" then
+    return "not a zip archive: " + r[1]
+  end
+  let entries = r[1]
+  let k = 0
+  while k < list_len(entries) do
+    if not in_safe_name(entries[k][0]) then
+      return "an entry's name leaves its directory: " + entries[k][0]
+    end
+    let k = k + 1
+  end
+  in_make_dirs(dest)
+  let k = 0
+  while k < list_len(entries) do
+    let name = entries[k][0]
+    if in_ends_with(name, "/") then
+      in_make_dirs(dest + "/" + substr(name, 0, str_len(name) - 1))
+    else
+      let path = dest + "/" + name
+      let slash = 0 - 1
+      let pb = tls_text_bytes(path)
+      let j = 0
+      while j < list_len(pb) do
+        if pb[j] == 47 then
+          let slash = j
+        end
+        let j = j + 1
+      end
+      if slash > 0 then
+        in_make_dirs(substr(path, 0, slash))
+      end
+      write_file_bytes(path, entries[k][1])
+    end
+    let k = k + 1
+  end
+  return ""
+end
+
+make a function called in_sources_dir takes project returns dir
+  return project + "/packages/.sources"
+end
+
+# The sources as directories: an archive written out, an https URL fetched
+# and written out. ["ok", dirs] or ["refused", source, why].
+make a function called in_materialize takes project, sources, roots returns r
+  let out = []
+  let k = 0
+  while k < list_len(sources) do
+    let src = sources[k]
+    let dest = in_sources_dir(project) + "/" + k
+    if substr(src, 0, 8) == "https://" then
+      let got = tls_https_get(src, roots, 268435456)
+      if got[0] != "ok" then
+        return ["refused", src, "fetching it: " + got[1] + ": " + got[2]]
+      end
+      if got[1] != 200 then
+        return ["refused", src, "fetching it: status " + got[1]]
+      end
+      let why = in_extract(got[2], dest)
+      if why != "" then
+        return ["refused", src, why]
+      end
+      let out = list_push(out, dest)
+    elif substr(src, 0, 7) == "http://" then
+      return ["refused", src, "a source is fetched over https, not http"]
+    elif in_ends_with(src, ".zip") then
+      if not file_exists(src) then
+        return ["refused", src, "no such archive"]
+      end
+      let why = in_extract(bytes_to_list(read_file_raw(src)), dest)
+      if why != "" then
+        return ["refused", src, why]
+      end
+      let out = list_push(out, dest)
+    else
+      let out = list_push(out, src)
+    end
+    let k = k + 1
+  end
+  return ["ok", out]
+end
+
+make a function called in_install takes project, st, shipped, name, cons, sources, opts returns r
+  require (type_of(sources) == "list") and ((list_len(opts) == 3) or (list_len(opts) == 4))
+  let roots = []
+  if list_len(opts) == 4 then
+    let roots = opts[3]
+  end
+  let sdir = in_sources_dir(project)
+  if file_exists(sdir) then
+    in_rm_tree(sdir)
+  end
+  let m = in_materialize(project, sources, roots)
+  if m[0] != "ok" then
+    if file_exists(sdir) then
+      in_rm_tree(sdir)
+    end
+    return in_refused(name, "", "source", "source", m[1] + ": " + m[2])
+  end
+  let r = in_install_dirs(project, st, shipped, name, cons, m[1], [opts[0], opts[1], opts[2]])
+  if file_exists(sdir) then
+    in_rm_tree(sdir)
+  end
+  return r
+end
+
+make a function called in_install_dirs takes project, st, shipped, name, cons, sources, opts returns r
+  require (type_of(sources) == "list") and (list_len(opts) == 3)
+  let first_use = opts[0]
+  let update = opts[1]
+  let crash = opts[2]
+  let rec = in_recover(project, st)
+  if rec[0] == "refused" then
+    return in_refused(name, "", "recover", "recover", rec[1])
+  end
+  let req = rs_request(name, cons)
+  if req[0] == "error" then
+    return in_refused(name, "", "request", "malformed", req[1])
+  end
+  # 1. candidates
+  let verify = trust_ed25519_verifier()
+  let dirs = in_candidate_dirs(sources)
+  let cands = []
+  let refusals = []
+  let seen = []
+  let k = 0
+  while k < list_len(dirs) do
+    let e = in_examine(st, shipped, dirs[k], first_use, verify)
+    if e[0] == "ok" then
+      let key = e[1][1] + " " + e[1][2]
+      if rs_index_of(seen, key) < 0 then
+        let seen = list_push(seen, key)
+        let cands = list_push(cands, e[1])
+      end
+    else
+      let refusals = list_push(refusals, e[1])
+    end
+    let k = k + 1
+  end
+  # 2. resolution
+  let paths = []
+  let k = 0
+  while k < list_len(cands) do
+    let paths = list_push(paths, cands[k][0])
+    let k = k + 1
+  end
+  let u = rs_universe_read(paths)
+  if u[0] != "ok" then
+    return ["refused", list_push(refusals, [name, "", "resolve", "universe", rs_universe_error_text(u)])]
+  end
+  let res = rs_resolve(u[1], req)
+  if res[0] != "ok" then
+    return ["refused", list_push(refusals, [res[1], "", "resolve", "conflict", rs_result_text(res)])]
+  end
+  let chosen = []
+  let k = 0
+  while k < list_len(res[1]) do
+    let pick = res[1][k]
+    let j = 0
+    while j < list_len(cands) do
+      if (cands[j][1] == pick[0]) and (cands[j][2] == pick[1]) then
+        let chosen = list_push(chosen, cands[j])
+      end
+      let j = j + 1
+    end
+    let k = k + 1
+  end
+  # 3. the lock file
+  let lockpath = project + "/trust.lock"
+  if (not update) and file_exists(lockpath) then
+    let lr = trust_lock_read(bytes_to_list(read_file_raw(lockpath)))
+    if lr[0] != "ok" then
+      return in_refused(name, "", "lock", "malformed", lr[1])
+    end
+    let locked = []
+    let k = 0
+    while k < list_len(chosen) do
+      let c = chosen[k]
+      let lc = trust_lock_check(lr[1], c[1], c[2], c[3], c[6])
+      if lc[0] != "ok" then
+        let locked = list_push(locked, [c[1], c[2], "lock", "locked", lc[1]])
+      end
+      let k = k + 1
+    end
+    if list_len(locked) > 0 then
+      return ["refused", locked]
+    end
+  end
+  # 4. the plan
+  action_clear()
+  let facts = logic_store_new()
+  let goals = []
+  let k = 0
+  while k < list_len(chosen) do
+    let c = chosen[k]
+    let key = [c[1], c[2]]
+    let goals = list_push(goals, ["installed", key])
+    if in_installed_hash(project, c[1]) == c[6] then
+      rule_add_to(facts, "installed", key, [])
+    else
+      action_add("stage " + c[1], [], [["staged", key]], [], 1)
+      action_add("verify " + c[1], [["staged", key]], [["verified", key]], [], 1)
+      let pre = [["verified", key]]
+      # read already by rs_universe_read, so it reads
+      let m = rs_manifest_read(c[0] + "/manifest.pkg")
+      let deps = rs_m_depends(m[1])
+      let j = 0
+      while j < list_len(deps) do
+        let d = in_find(chosen, deps[j][0])
+        if d != false then
+          let pre = list_push(pre, ["installed", [d[1], d[2]]])
+        end
+        let j = j + 1
+      end
+      action_add("install " + c[1], pre, [["installed", key]], [], 1)
+    end
+    let k = k + 1
+  end
+  let steps = plan_in(facts, goals)
+  if list_len(steps) == 0 then
+    let k = 0
+    while k < list_len(chosen) do
+      if in_installed_hash(project, chosen[k][1]) != chosen[k][6] then
+        return in_refused(chosen[k][1], chosen[k][2], "plan", "no-plan", "no plan installs it")
+      end
+      let k = k + 1
+    end
+    return ["ok", []]
+  end
+  # staging and verifying, in the plan's order
+  let sdir = in_staging(project)
+  make_directory(project + "/packages")
+  make_directory(sdir)
+  let order = []
+  let k = 0
+  while k < list_len(steps) do
+    let label = step_name(steps[k])
+    let words = tr_manifest_words(label)
+    let c = in_find(chosen, words[1])
+    let staged = sdir + "/" + c[1] + "-" + c[2]
+    if words[0] == "stage" then
+      in_rm_tree(staged)
+      if not in_copy_package(c[0], staged, c[8]) then
+        in_rm_tree(sdir)
+        return in_refused(c[1], c[2], "stage", "copy", "the package could not be copied to " + staged)
+      end
+    elif words[0] == "verify" then
+      let v = trust_verify_pinned(st, c[7], staged, verify)
+      if (v[0] == "ok") and (sha256_file_hex(staged + "/manifest.pkg") != c[6]) then
+        let v = trust_err("manifest-changed", "stage", "the staged manifest is not the one examined")
+      end
+      if v[0] != "ok" then
+        in_rm_tree(sdir)
+        return in_refused(c[1], c[2], v[2], v[1], v[3])
+      end
+    else
+      let order = list_push(order, c)
+    end
+    if crash == words[0] then
+      return ["crashed", crash]
+    end
+    let k = k + 1
+  end
+  # 5. the commit
+  let entries = []
+  let report = []
+  let k = 0
+  while k < list_len(order) do
+    let c = order[k]
+    let entries = list_push(entries, [c[1], c[2], c[3], c[6], c[5], c[4]])
+    let report = list_push(report, [c[1], c[2], c[4], c[5]])
+    let k = k + 1
+  end
+  if not trs_replace(sdir + "/commit", in_commit_text(entries)) then
+    in_rm_tree(sdir)
+    return in_refused(name, "", "commit", "write", "the commit could not be written in " + sdir)
+  end
+  if crash == "commit" then
+    return ["crashed", "commit"]
+  end
+  let f = in_finish(project, st, entries, crash)
+  if f[0] != "ok" then
+    if f[0] == "crashed" then
+      return f
+    end
+    return in_refused(name, "", "commit", "finish", f[1])
+  end
+  return ["ok", report]
+end

@@ -1,0 +1,877 @@
+# X.509 certificates (RFC 5280) for a TLS client: DER read from a list of
+# bytes (ints), a certificate's fields, and the check of a chain from the
+# server's leaf through the intermediates it sent to a trusted root, with the
+# leaf's DNS names matched against the host (RFC 6125: one wildcard, the
+# whole leftmost label). Revocation is not checked.
+#
+#   x509_parse(der)                       -> ["ok", cert] or ["err", "cert", why]
+#   x509_check_chain(leaf, inters, roots, host, now)
+#                                         -> ["ok", leaf cert] or ["err", "cert", why]
+#     leaf a DER certificate, inters and roots lists of them, now Unix seconds
+#
+# Every read is bounded by the bytes it was given: malformed DER is an
+# ["err", "cert", "malformed: ..."], never a stop. Names are compared as their
+# DER bytes. Certificates are public: nothing here is secret.
+
+class X509Cert {
+  field tbs = []
+  field serial = 0
+  field sig_alg = ""
+  field issuer = []
+  field subject = []
+  field issuer_cn = ""
+  field subject_cn = ""
+  field not_before = 0
+  field not_after = 0
+  field key_alg = ""
+  field key_curve = ""
+  field key_n = 0
+  field key_e = 0
+  field key_n_bytes = []
+  field key_e_bytes = []
+  field key_point = []
+  field has_bc = false
+  field ca = false
+  field path_len = -1
+  field key_usage = -1
+  field dns_names = []
+  field eku = []
+  field unknown_critical = ""
+  field signature = []
+}
+
+# ---- DER ----
+
+# The TLV at at, within end: [tag, content start, content length, next], or
+# [] when it does not fit or uses a form DER does not.
+make a function called der_tlv takes b, at, end returns t
+  if (at < 0) or (at + 2 > end) or (end > list_len(b)) then
+    return []
+  end
+  let tag = b[at]
+  if (tag band 31) == 31 then
+    return []
+  end
+  let first = b[at + 1]
+  let start = at + 2
+  let len = first
+  if first >= 128 then
+    let count = first - 128
+    if (count < 1) or (count > 4) or (at + 2 + count > end) then
+      return []
+    end
+    let len = 0
+    let i = 0
+    while i < count do
+      let len = len * 256 + b[at + 2 + i]
+      let i = i + 1
+    end
+    let start = at + 2 + count
+  end
+  if start + len > end then
+    return []
+  end
+  let t = [tag, start, len, start + len]
+  ensure list_len(t) == 4
+  return t
+end
+
+# The TLV at at, which must have the tag; [] otherwise.
+make a function called der_expect takes b, at, end, tag returns t
+  let t = der_tlv(b, at, end)
+  if list_len(t) == 0 then
+    return []
+  end
+  if t[0] != tag then
+    return []
+  end
+  return t
+end
+
+make a function called der_slice takes b, start, len returns out
+  let out = []
+  let i = 0
+  while i < len do
+    let out = list_push(out, b[start + i])
+    let i = i + 1
+  end
+  ensure list_len(out) == len
+  return out
+end
+
+# An OID's content as dotted text.
+make a function called der_oid takes b, start, len returns text
+  if len < 1 then
+    return ""
+  end
+  let first = b[start]
+  let a = 2
+  if first < 40 then
+    let a = 0
+  elif first < 80 then
+    let a = 1
+  end
+  let parts = sb_new()
+  sb_push(parts, "" + a + "." + (first - 40 * a))
+  let v = 0
+  let i = 1
+  while i < len do
+    let v = v * 128 + (b[start + i] band 127)
+    if b[start + i] < 128 then
+      sb_push(parts, "." + v)
+      let v = 0
+    end
+    let i = i + 1
+  end
+  return sb_str(parts)
+end
+
+# An INTEGER's content as a non-negative integer (a leading 0 dropped).
+make a function called der_uint takes b, start, len returns x
+  let x = 0
+  let i = 0
+  while i < len do
+    let x = x * 256 + b[start + i]
+    let i = i + 1
+  end
+  ensure x >= 0
+  return x
+end
+
+# Two ASCII digits at at as a number.
+make a function called der_two takes b, at returns n
+  return (b[at] - 48) * 10 + (b[at + 1] - 48)
+end
+
+# Days from 1970-01-01 to y-m-d (Hinnant's days_from_civil).
+make a function called x509_days takes y, m, d returns days
+  let yy = y
+  if m <= 2 then
+    let yy = y - 1
+  end
+  let era = floor(yy / 400)
+  let yoe = yy - era * 400
+  let mp = (m + 9) % 12
+  let doy = floor((153 * mp + 2) / 5) + d - 1
+  let doe = yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+# UTCTime (23) or GeneralizedTime (24), ending Z, as Unix seconds; -1 when
+# malformed.
+make a function called der_time takes b, t returns secs
+  let at = t[1]
+  if (t[0] == 23) and (t[2] == 13) then
+    let y = der_two(b, at)
+    if y < 50 then
+      let y = 2000 + y
+    else
+      let y = 1900 + y
+    end
+    let at = at + 2
+  elif (t[0] == 24) and (t[2] == 15) then
+    let y = der_two(b, at) * 100 + der_two(b, at + 2)
+    let at = at + 4
+  else
+    return 0 - 1
+  end
+  let i = t[1]
+  while i < t[1] + t[2] - 1 do
+    if (b[i] < 48) or (b[i] > 57) then
+      return 0 - 1
+    end
+    let i = i + 1
+  end
+  if b[t[1] + t[2] - 1] != 90 then
+    return 0 - 1
+  end
+  let mo = der_two(b, at)
+  let d = der_two(b, at + 2)
+  let h = der_two(b, at + 4)
+  let mi = der_two(b, at + 6)
+  let s = der_two(b, at + 8)
+  if (mo < 1) or (mo > 12) or (d < 1) or (d > 31) or (h > 23) or (mi > 59) or (s > 60) then
+    return 0 - 1
+  end
+  return x509_days(y, mo, d) * 86400 + h * 3600 + mi * 60 + s
+end
+
+# A Name's common name (2.5.4.3), or "".
+make a function called der_cn takes b, t returns cn
+  let at = t[1]
+  let end = t[1] + t[2]
+  while at < end do
+    let set = der_expect(b, at, end, 49)
+    if list_len(set) == 0 then
+      return ""
+    end
+    let at2 = set[1]
+    while at2 < set[1] + set[2] do
+      let atv = der_expect(b, at2, set[1] + set[2], 48)
+      if list_len(atv) == 0 then
+        return ""
+      end
+      let oid = der_expect(b, atv[1], atv[1] + atv[2], 6)
+      if list_len(oid) == 0 then
+        return ""
+      end
+      let value = der_tlv(b, oid[3], atv[1] + atv[2])
+      if list_len(value) == 0 then
+        return ""
+      end
+      if der_oid(b, oid[1], oid[2]) == "2.5.4.3" then
+        let out = sb_new()
+        let i = 0
+        while i < value[2] do
+          sb_push(out, chr(b[value[1] + i]))
+          let i = i + 1
+        end
+        return sb_str(out)
+      end
+      let at2 = atv[3]
+    end
+    let at = set[3]
+  end
+  return ""
+end
+
+make a function called x509_err takes why returns r
+  return ["err", "cert", why]
+end
+
+# ---- extensions ----
+
+# Reads one extension's value into c; "" when it read, else why not.
+make a function called x509_extension takes c, b, oid, critical, v returns why
+  let vend = v[1] + v[2]
+  if oid == "2.5.29.19" then
+    let s = der_expect(b, v[1], vend, 48)
+    if list_len(s) == 0 then
+      return "malformed: basicConstraints"
+    end
+    c.has_bc = true
+    let at = s[1]
+    if at < s[1] + s[2] then
+      let t = der_tlv(b, at, s[1] + s[2])
+      if (list_len(t) > 0) and (t[0] == 1) then
+        c.ca = (t[2] == 1) and (b[t[1]] != 0)
+        let at = t[3]
+      end
+    end
+    if at < s[1] + s[2] then
+      let t = der_expect(b, at, s[1] + s[2], 2)
+      if list_len(t) == 0 then
+        return "malformed: basicConstraints"
+      end
+      c.path_len = der_uint(b, t[1], t[2])
+    end
+    return ""
+  end
+  if oid == "2.5.29.15" then
+    let t = der_expect(b, v[1], vend, 3)
+    if (list_len(t) == 0) or (t[2] < 2) then
+      return "malformed: keyUsage"
+    end
+    let ku = b[t[1] + 1] * 256
+    if t[2] > 2 then
+      let ku = ku + b[t[1] + 2]
+    end
+    c.key_usage = ku
+    return ""
+  end
+  if oid == "2.5.29.17" then
+    let s = der_expect(b, v[1], vend, 48)
+    if list_len(s) == 0 then
+      return "malformed: subjectAltName"
+    end
+    let names = []
+    let at = s[1]
+    while at < s[1] + s[2] do
+      let t = der_tlv(b, at, s[1] + s[2])
+      if list_len(t) == 0 then
+        return "malformed: subjectAltName"
+      end
+      if t[0] == 130 then
+        let n = sb_new()
+        let i = 0
+        while i < t[2] do
+          sb_push(n, chr(b[t[1] + i]))
+          let i = i + 1
+        end
+        let names = list_push(names, sb_str(n))
+      end
+      let at = t[3]
+    end
+    c.dns_names = names
+    return ""
+  end
+  if oid == "2.5.29.37" then
+    let s = der_expect(b, v[1], vend, 48)
+    if list_len(s) == 0 then
+      return "malformed: extKeyUsage"
+    end
+    let oids = []
+    let at = s[1]
+    while at < s[1] + s[2] do
+      let t = der_expect(b, at, s[1] + s[2], 6)
+      if list_len(t) == 0 then
+        return "malformed: extKeyUsage"
+      end
+      let oids = list_push(oids, der_oid(b, t[1], t[2]))
+      let at = t[3]
+    end
+    c.eku = oids
+    return ""
+  end
+  # subjectKeyIdentifier, authorityKeyIdentifier, certificatePolicies and
+  # the like say nothing this client checks; any other, marked critical, is
+  # a requirement it cannot meet (RFC 5280 4.2)
+  let known = ["2.5.29.14", "2.5.29.35", "2.5.29.32", "2.5.29.31", "1.3.6.1.5.5.7.1.1", "1.3.6.1.4.1.11129.2.4.2"]
+  if critical and (not contains_item(known, oid)) and (c.unknown_critical == "") then
+    c.unknown_critical = oid
+  end
+  return ""
+end
+
+make a function called contains_item takes items, x returns yes
+  let i = 0
+  while i < list_len(items) do
+    if items[i] == x then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- the certificate ----
+
+make a function called x509_parse takes der returns r
+  require type_of(der) == "list"
+  let b = der
+  let n = list_len(b)
+  let cert = der_expect(b, 0, n, 48)
+  if (list_len(cert) == 0) or (cert[3] != n) then
+    return x509_err("malformed: not one DER certificate")
+  end
+  let cend = cert[1] + cert[2]
+  let tbs = der_expect(b, cert[1], cend, 48)
+  if list_len(tbs) == 0 then
+    return x509_err("malformed: tbsCertificate")
+  end
+  let c = new("X509Cert")
+  c.tbs = der_slice(b, cert[1], tbs[3] - cert[1])
+  let tend = tbs[1] + tbs[2]
+  let at = tbs[1]
+  let t = der_tlv(b, at, tend)
+  if list_len(t) == 0 then
+    return x509_err("malformed: version")
+  end
+  if t[0] == 160 then
+    let at = t[3]
+  end
+  let t = der_expect(b, at, tend, 2)
+  if list_len(t) == 0 then
+    return x509_err("malformed: serial number")
+  end
+  c.serial = der_uint(b, t[1], t[2])
+  let alg = der_expect(b, t[3], tend, 48)
+  if list_len(alg) == 0 then
+    return x509_err("malformed: signature algorithm")
+  end
+  let issuer = der_expect(b, alg[3], tend, 48)
+  if list_len(issuer) == 0 then
+    return x509_err("malformed: issuer")
+  end
+  c.issuer = der_slice(b, issuer[1], issuer[2])
+  c.issuer_cn = der_cn(b, issuer)
+  let validity = der_expect(b, issuer[3], tend, 48)
+  if list_len(validity) == 0 then
+    return x509_err("malformed: validity")
+  end
+  let nb = der_tlv(b, validity[1], validity[1] + validity[2])
+  if list_len(nb) == 0 then
+    return x509_err("malformed: validity")
+  end
+  let na = der_tlv(b, nb[3], validity[1] + validity[2])
+  if list_len(na) == 0 then
+    return x509_err("malformed: validity")
+  end
+  c.not_before = der_time(b, nb)
+  c.not_after = der_time(b, na)
+  if (c.not_before < 0) or (c.not_after < 0) then
+    return x509_err("malformed: a time")
+  end
+  let subject = der_expect(b, validity[3], tend, 48)
+  if list_len(subject) == 0 then
+    return x509_err("malformed: subject")
+  end
+  c.subject = der_slice(b, subject[1], subject[2])
+  c.subject_cn = der_cn(b, subject)
+  let spki = der_expect(b, subject[3], tend, 48)
+  if list_len(spki) == 0 then
+    return x509_err("malformed: subject public key")
+  end
+  let why = x509_read_key(c, b, spki)
+  if why != "" then
+    return x509_err(why)
+  end
+  # issuerUniqueID [1] and subjectUniqueID [2] skipped; extensions [3]
+  let at = spki[3]
+  while at < tend do
+    let t = der_tlv(b, at, tend)
+    if list_len(t) == 0 then
+      return x509_err("malformed: after the key")
+    end
+    if t[0] == 163 then
+      let exts = der_expect(b, t[1], t[1] + t[2], 48)
+      if list_len(exts) == 0 then
+        return x509_err("malformed: extensions")
+      end
+      let at2 = exts[1]
+      while at2 < exts[1] + exts[2] do
+        let ext = der_expect(b, at2, exts[1] + exts[2], 48)
+        if list_len(ext) == 0 then
+          return x509_err("malformed: an extension")
+        end
+        let eend = ext[1] + ext[2]
+        let oid = der_expect(b, ext[1], eend, 6)
+        if list_len(oid) == 0 then
+          return x509_err("malformed: an extension")
+        end
+        let critical = false
+        let v = der_tlv(b, oid[3], eend)
+        if (list_len(v) > 0) and (v[0] == 1) then
+          let critical = (v[2] == 1) and (b[v[1]] != 0)
+          let v = der_tlv(b, v[3], eend)
+        end
+        if (list_len(v) == 0) or (v[0] != 4) then
+          return x509_err("malformed: an extension's value")
+        end
+        let why = x509_extension(c, b, der_oid(b, oid[1], oid[2]), critical, v)
+        if why != "" then
+          return x509_err(why)
+        end
+        let at2 = ext[3]
+      end
+    end
+    let at = t[3]
+  end
+  let salg = der_expect(b, tbs[3], cend, 48)
+  if list_len(salg) == 0 then
+    return x509_err("malformed: signatureAlgorithm")
+  end
+  let soid = der_expect(b, salg[1], salg[1] + salg[2], 6)
+  if list_len(soid) == 0 then
+    return x509_err("malformed: signatureAlgorithm")
+  end
+  c.sig_alg = der_oid(b, soid[1], soid[2])
+  let sv = der_expect(b, salg[3], cend, 3)
+  if (list_len(sv) == 0) or (sv[2] < 1) or (b[sv[1]] != 0) then
+    return x509_err("malformed: signatureValue")
+  end
+  c.signature = der_slice(b, sv[1] + 1, sv[2] - 1)
+  return ["ok", c]
+end
+
+# The SubjectPublicKeyInfo into c: RSA (n, e) or EC (curve, point).
+make a function called x509_read_key takes c, b, spki returns why
+  let send = spki[1] + spki[2]
+  let alg = der_expect(b, spki[1], send, 48)
+  if list_len(alg) == 0 then
+    return "malformed: key algorithm"
+  end
+  let oid = der_expect(b, alg[1], alg[1] + alg[2], 6)
+  if list_len(oid) == 0 then
+    return "malformed: key algorithm"
+  end
+  c.key_alg = der_oid(b, oid[1], oid[2])
+  let bits = der_expect(b, alg[3], send, 3)
+  if (list_len(bits) == 0) or (bits[2] < 1) then
+    return "malformed: key bits"
+  end
+  if c.key_alg == "1.2.840.113549.1.1.1" then
+    let s = der_expect(b, bits[1] + 1, bits[1] + bits[2], 48)
+    if list_len(s) == 0 then
+      return "malformed: RSA key"
+    end
+    let n = der_expect(b, s[1], s[1] + s[2], 2)
+    if list_len(n) == 0 then
+      return "malformed: RSA key"
+    end
+    let e = der_expect(b, n[3], s[1] + s[2], 2)
+    if list_len(e) == 0 then
+      return "malformed: RSA key"
+    end
+    # kept as bytes, made integers when a signature is checked with them
+    # (x509_rsa_key): a 2048-bit modulus made an integer byte by byte cost
+    # about 70 ms, for each of the system's roots on every handshake
+    c.key_n_bytes = der_slice(b, n[1], n[2])
+    c.key_e_bytes = der_slice(b, e[1], e[2])
+    return ""
+  end
+  if c.key_alg == "1.2.840.10045.2.1" then
+    let curve = der_expect(b, oid[3], alg[1] + alg[2], 6)
+    if list_len(curve) == 0 then
+      return "malformed: EC key's curve"
+    end
+    let cid = der_oid(b, curve[1], curve[2])
+    if cid == "1.2.840.10045.3.1.7" then
+      c.key_curve = "p256"
+    elif cid == "1.3.132.0.34" then
+      c.key_curve = "p384"
+    else
+      c.key_curve = cid
+    end
+    c.key_point = der_slice(b, bits[1] + 1, bits[2] - 1)
+    return ""
+  end
+  # another kind of key (Ed25519 and the like): read, and refused where it
+  # would sign
+  return ""
+end
+
+# ---- signatures ----
+
+# Whether issuer's key signs data with signature under the algorithm alg (an
+# OID), RSA PKCS#1 v1.5 or ECDSA; false for any other algorithm.
+make a function called x509_verify_with takes issuer, alg, data, signature returns ok
+  let hashes = [["1.2.840.113549.1.1.11", "sha256"], ["1.2.840.113549.1.1.12", "sha384"], ["1.2.840.113549.1.1.13", "sha512"], ["1.2.840.10045.4.3.2", "sha256"], ["1.2.840.10045.4.3.3", "sha384"]]
+  let h = ""
+  let i = 0
+  while i < list_len(hashes) do
+    if hashes[i][0] == alg then
+      let h = hashes[i][1]
+    end
+    let i = i + 1
+  end
+  if h == "" then
+    return false
+  end
+  if (alg == "1.2.840.113549.1.1.11") or (alg == "1.2.840.113549.1.1.12") or (alg == "1.2.840.113549.1.1.13") then
+    if issuer.key_alg != "1.2.840.113549.1.1.1" then
+      return false
+    end
+    let ne = x509_rsa_key(issuer)
+    return tls_rsa_pkcs1_verify(ne[0], ne[1], h, data, signature)
+  end
+  if (issuer.key_alg != "1.2.840.10045.2.1") or ((issuer.key_curve != "p256") and (issuer.key_curve != "p384")) then
+    return false
+  end
+  let rs = x509_ecdsa_rs(signature)
+  if list_len(rs) == 0 then
+    return false
+  end
+  let pt = issuer.key_point
+  let size = tls_curve(issuer.key_curve)[6]
+  if (list_len(pt) != 1 + 2 * size) or (pt[0] != 4) then
+    return false
+  end
+  let qx = tls_bytes_int(der_slice(pt, 1, size))
+  let qy = tls_bytes_int(der_slice(pt, 1 + size, size))
+  return tls_ecdsa_verify(issuer.key_curve, qx, qy, h, data, rs[0], rs[1])
+end
+
+# An ECDSA signature's DER SEQUENCE { r, s } as [r, s], or [].
+make a function called x509_ecdsa_rs takes sig returns rs
+  let s = der_expect(sig, 0, list_len(sig), 48)
+  if (list_len(s) == 0) or (s[3] != list_len(sig)) then
+    return []
+  end
+  let r = der_expect(sig, s[1], s[1] + s[2], 2)
+  if list_len(r) == 0 then
+    return []
+  end
+  let ss = der_expect(sig, r[3], s[1] + s[2], 2)
+  if list_len(ss) == 0 then
+    return []
+  end
+  return [der_uint(sig, r[1], r[2]), der_uint(sig, ss[1], ss[2])]
+end
+
+# ---- names ----
+
+make a function called x509_lower takes s returns low
+  let b = bytes_from_str(s)
+  let out = sb_new()
+  let i = 0
+  while i < bytes_len(b) do
+    let ch = bytes_get(b, i)
+    if (ch >= 65) and (ch <= 90) then
+      let ch = ch + 32
+    end
+    sb_push(out, chr(ch))
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# The labels of a DNS name, split at dots.
+make a function called x509_labels takes s returns labels
+  let b = bytes_from_str(s)
+  let labels = []
+  let cur = sb_new()
+  let i = 0
+  while i < bytes_len(b) do
+    let ch = bytes_get(b, i)
+    if ch == 46 then
+      let labels = list_push(labels, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, chr(ch))
+    end
+    let i = i + 1
+  end
+  let labels = list_push(labels, sb_str(cur))
+  return labels
+end
+
+# Whether a certificate's DNS name matches the host (RFC 6125 6.4): equal,
+# ignoring case, or "*" standing for the whole leftmost label of a host with
+# as many labels, the rest at least two labels.
+make a function called x509_name_matches takes pattern, host returns yes
+  let p = x509_labels(x509_lower(pattern))
+  let h = x509_labels(x509_lower(host))
+  if list_len(p) != list_len(h) then
+    return false
+  end
+  let i = 0
+  while i < list_len(p) do
+    if (i == 0) and (p[0] == "*") and (list_len(p) >= 3) then
+      if h[0] == "" then
+        return false
+      end
+    elif (p[i] != h[i]) or (p[i] == "") then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- chains ----
+
+# Why a certificate cannot be used at now, or "".
+make a function called x509_time_why takes c, now returns why
+  if (now < c.not_before) or (now > c.not_after) then
+    return "expired: " + c.subject_cn + " is valid from " + c.not_before + " to " + c.not_after + " (Unix seconds), not at " + now
+  end
+  if c.unknown_critical != "" then
+    return "unknown critical extension " + c.unknown_critical + " in " + c.subject_cn
+  end
+  return ""
+end
+
+# The system's roots (trust_roots(), spec 1.8) as lists of bytes, as the
+# chain check takes them.
+make a function called x509_system_roots returns roots
+  let sys = trust_roots()
+  let roots = []
+  let i = 0
+  while i < list_len(sys) do
+    let roots = list_push(roots, bytes_to_list(sys[i]))
+    let i = i + 1
+  end
+  ensure list_len(roots) == list_len(sys)
+  return roots
+end
+
+# Whether two certificates name the same subject with the same public key.
+make a function called x509_same_anchor takes a, b returns yes
+  if a.subject != b.subject then
+    return false
+  end
+  if a.key_alg != b.key_alg then
+    return false
+  end
+  if a.key_alg == "1.2.840.113549.1.1.1" then
+    return (a.key_n_bytes == b.key_n_bytes) and (a.key_e_bytes == b.key_e_bytes)
+  end
+  return (a.key_curve == b.key_curve) and (a.key_point == b.key_point)
+end
+
+# An RSA certificate's [n, e] as integers, made from its key's bytes once.
+make a function called x509_rsa_key takes c returns ne
+  if c.key_n == 0 then
+    c.key_n = tls_bytes_int(c.key_n_bytes)
+    c.key_e = tls_bytes_int(c.key_e_bytes)
+  end
+  return [c.key_n, c.key_e]
+end
+
+# A certificate's subject Name's bytes, found by walking to it alone, or []
+# when the DER is malformed: enough to choose which roots to read in full.
+make a function called x509_subject_of takes der returns subject
+  let n = list_len(der)
+  let cert = der_expect(der, 0, n, 48)
+  if list_len(cert) == 0 then
+    return []
+  end
+  let tbs = der_expect(der, cert[1], cert[1] + cert[2], 48)
+  if list_len(tbs) == 0 then
+    return []
+  end
+  let tend = tbs[1] + tbs[2]
+  let t = der_tlv(der, tbs[1], tend)
+  if list_len(t) == 0 then
+    return []
+  end
+  let at = tbs[1]
+  if t[0] == 160 then
+    let at = t[3]
+  end
+  # the serial, the signature algorithm, the issuer, the validity, then the subject
+  let k = 0
+  while k < 4 do
+    let t = der_tlv(der, at, tend)
+    if list_len(t) == 0 then
+      return []
+    end
+    let at = t[3]
+    let k = k + 1
+  end
+  let s = der_expect(der, at, tend, 48)
+  if list_len(s) == 0 then
+    return []
+  end
+  return der_slice(der, s[1], s[2])
+end
+
+make a function called x509_parse_all takes ders returns certs
+  let certs = []
+  let i = 0
+  while i < list_len(ders) do
+    let r = x509_parse(ders[i])
+    if r[0] != "ok" then
+      return r
+    end
+    let certs = list_push(certs, r[1])
+    let i = i + 1
+  end
+  return ["ok", certs]
+end
+
+# Root k, read once and kept in parsed (a vec of false or certificates);
+# false when it does not read.
+make a function called x509_root_at takes root_ders, parsed, k returns root
+  let got = vec_get(parsed, k)
+  if type_of(got) != "bool" then
+    return got
+  end
+  let r = x509_parse(root_ders[k])
+  if r[0] != "ok" then
+    return false
+  end
+  vec_set(parsed, k, r[1])
+  return r[1]
+end
+
+make a function called x509_check_chain takes leaf_der, inter_ders, root_ders, host, now returns r
+  let lr = x509_parse(leaf_der)
+  if lr[0] != "ok" then
+    return lr
+  end
+  let leaf = lr[1]
+  let ir = x509_parse_all(inter_ders)
+  if ir[0] != "ok" then
+    return ir
+  end
+  let inters = ir[1]
+  # the roots by subject alone; each read in full only when the path needs
+  # its subject (the system's 60 to 120 roots took seconds to read on every
+  # handshake). A root whose DER is malformed has no subject and is passed over.
+  let root_subjects = []
+  let parsed = vec_new()
+  let k = 0
+  while k < list_len(root_ders) do
+    let root_subjects = list_push(root_subjects, x509_subject_of(root_ders[k]))
+    vec_push(parsed, false)
+    let k = k + 1
+  end
+  # the leaf: its name, its key usage for signing the handshake, its purpose
+  let named = false
+  let i = 0
+  while i < list_len(leaf.dns_names) do
+    if x509_name_matches(leaf.dns_names[i], host) then
+      let named = true
+    end
+    let i = i + 1
+  end
+  if not named then
+    return x509_err("name: " + host + " is not among the certificate's names " + leaf.dns_names)
+  end
+  if (leaf.key_usage >= 0) and ((leaf.key_usage band 32768) == 0) then
+    return x509_err("key usage: the leaf's keyUsage has no digitalSignature")
+  end
+  if (list_len(leaf.eku) > 0) and (not contains_item(leaf.eku, "1.3.6.1.5.5.7.3.1")) and (not contains_item(leaf.eku, "2.5.29.37.0")) then
+    return x509_err("key usage: the leaf's extKeyUsage has no serverAuth")
+  end
+  let cur = leaf
+  let depth = 0
+  while depth < 8 do
+    let why = x509_time_why(cur, now)
+    if why != "" then
+      return x509_err(why)
+    end
+    # a certificate with a trusted root's name and key is that trust anchor
+    # (RFC 5280 6.1.1: an anchor is a name and a key), whoever signed this
+    # copy of it: a server may send a root cross-signed by an older one
+    if depth > 0 then
+      let k = 0
+      while k < list_len(root_subjects) do
+        if root_subjects[k] == cur.subject then
+          let root = x509_root_at(root_ders, parsed, k)
+          if (type_of(root) != "bool") and x509_same_anchor(root, cur) then
+            return ["ok", leaf]
+          end
+        end
+        let k = k + 1
+      end
+    end
+    # a trusted root that issued cur ends the path
+    let k = 0
+    while k < list_len(root_subjects) do
+      if root_subjects[k] == cur.issuer then
+        let root = x509_root_at(root_ders, parsed, k)
+        if (type_of(root) != "bool") and x509_verify_with(root, cur.sig_alg, cur.tbs, cur.signature) then
+          let rwhy = x509_time_why(root, now)
+          if rwhy != "" then
+            return x509_err(rwhy)
+          end
+          return ["ok", leaf]
+        end
+      end
+      let k = k + 1
+    end
+    # else an intermediate that issued it, and may issue
+    let next = false
+    let k = 0
+    while k < list_len(inters) do
+      let it = inters[k]
+      if (type_of(next) == "bool") and (it.subject == cur.issuer) and x509_verify_with(it, cur.sig_alg, cur.tbs, cur.signature) then
+        let next = it
+      end
+      let k = k + 1
+    end
+    if type_of(next) == "bool" then
+      if list_len(root_ders) == 0 then
+        return x509_err("untrusted: no root is trusted (no roots given)")
+      end
+      return x509_err("untrusted: no certificate given or trusted issued " + cur.subject_cn + " (issuer " + cur.issuer_cn + ")")
+    end
+    if (not next.has_bc) or (not next.ca) then
+      return x509_err("not a CA: " + next.subject_cn + " issued " + cur.subject_cn + " but is not a CA")
+    end
+    if (next.key_usage >= 0) and ((next.key_usage band 1024) == 0) then
+      return x509_err("key usage: " + next.subject_cn + "'s keyUsage has no keyCertSign")
+    end
+    # the intermediates between next and the leaf: as many as the path has
+    # climbed past
+    if (next.path_len >= 0) and (depth > next.path_len) then
+      return x509_err("path length: " + next.subject_cn + " allows " + next.path_len + " below it")
+    end
+    let cur = next
+    let depth = depth + 1
+  end
+  return x509_err("untrusted: the path is longer than 8")
+end

@@ -57,3 +57,9 @@ Feature: file_marshal edits: a change given by its context, and the shift it mak
   Scenario: an edit near the end of a large file costs about what one near its start does
     Given a text of 1 MB with one line near its start and one near its end that each say "here"
     Then changing the one near the end, with its position given, takes at most three times as long as changing the one near the start, the cheapest of three runs each
+
+  Scenario: a finder gives each place a pattern starts, one each time it is asked, and can be closed before the end
+    Given the text "a cat, a dog, a cat, a cat"
+    When a finder for "a cat" is asked four times
+    Then it gives 0, 14, 21 and -1, and its fibre has ended
+    And a finder for "a" asked once and then closed gives 0, and its fibre has ended

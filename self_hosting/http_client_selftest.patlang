@@ -5,14 +5,16 @@
 # URLs are taken apart as RFC 3986 says for http and https; a body comes by
 # its Content-Length, as chunks, or to the connection's end; redirects are
 # followed up to the limit given, a 303 going on as a GET; a server that goes
-# quiet gives a timeout; a POST carries its body; a refused connection and an
-# https URL (until the TLS client is in) give errors, not stops; and reading
+# quiet gives a timeout; a POST carries its body; a refused connection, and
+# https to a server that speaks no TLS, give errors, not stops (https itself
+# is packages/tls's server.feature, against openssl s_server); and reading
 # a body four times as long costs at most eight times as much, for a length
 # and for chunks (cpu_cycles of this thread alone, the server's not counted).
 
 include "lib/includes.patlang"
 include "lib/gherkin.patlang"
 include "lib/http_client.patlang"
+include "lib/cost_check.patlang"
 
 make a function called crlf returns t
   return chr(13) + chr(10)
@@ -165,20 +167,11 @@ make a function called serve_one takes conn returns more
   return true
 end
 
-# The cheapest of three readings of a body of n bytes at path, in cycles.
+# One reading of a body at path, in cycles.
 make a function called read_cost takes base, path returns cycles
-  let best = 0 - 1
-  let k = 0
-  while k < 3 do
-    let t = cpu_cycles()
-    let got = http_get(base + path)
-    let c = cpu_cycles() - t
-    if (best < 0) or (c < best) then
-      let best = c
-    end
-    let k = k + 1
-  end
-  return best
+  let t = cpu_cycles()
+  let got = http_get(base + path)
+  return cpu_cycles() - t
 end
 
 let ctx = ctx_new()
@@ -221,15 +214,14 @@ let r = http_get(base + "/missing")
 expect(ctx, "a 404 is a response, not an error", [r[0], r[1], r[3]], ["ok", 404, "not here"])
 let r = http_get("http://127.0.0.1:1/")
 expect(ctx, "a refused connection is an error, not a stop", [r[0], r[1]], ["err", "connect"])
-let r = http_get("https://127.0.0.1:" + port + "/len")
-expect(ctx, "https waits for the TLS client", [r[0], r[1]], ["err", "scheme"])
+let r = http_request("GET", "https://127.0.0.1:" + port + "/len", [], "", [["timeout_ms", 2000]])
+expect(ctx, "https to a server that speaks no TLS is a TLS error, not a stop", [r[0], r[1]], ["err", "tls"])
 
-let small = read_cost(base, "/big/65536")
-let large = read_cost(base, "/big/262144")
-expect(ctx, "a body four times as long costs at most eight times as much (Content-Length; " + small + " and " + large + " cycles)", large <= 8 * small, true)
-let small = read_cost(base, "/bigchk/65536")
-let large = read_cost(base, "/bigchk/262144")
-expect(ctx, "the same in chunks (" + small + " and " + large + " cycles)", large <= 8 * small, true)
+# each cost the cheapest of several readings after a warm-up (#284)
+let best = cheapest_cycles([|| do return read_cost(base, "/big/65536") end, || do return read_cost(base, "/big/262144") end], cost_rounds())
+expect(ctx, "a body four times as long costs at most eight times as much (Content-Length; " + best[0] + " and " + best[1] + " cycles)", best[1] <= 8 * best[0], true)
+let best = cheapest_cycles([|| do return read_cost(base, "/bigchk/65536") end, || do return read_cost(base, "/bigchk/262144") end], cost_rounds())
+expect(ctx, "the same in chunks (" + best[0] + " and " + best[1] + " cycles)", best[1] <= 8 * best[0], true)
 
 http_get(base + "/stop")
 expect(ctx, "the server ends when asked", thread_result(server), true)

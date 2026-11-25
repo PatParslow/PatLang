@@ -864,10 +864,11 @@ make a function called rt_mod_box takes m returns b
 end
 
 # Whether a and b take the word path: a modint held as a word with a word of
-# the same k, or with an int, which counts as the word it reduces to (spec
-# 1.14: its low k bits, two's complement for a negative). Anything else (a
-# word with a modint of another modulus, a bigint, another class) takes the
-# block path, which refuses what spec 1.14 refuses.
+# the same k, or with an int or a bigint, which counts as the word it reduces
+# to (spec 1.14: its low k bits, two's complement for a negative). Anything
+# else (a word with a modint of another modulus, another class) takes the
+# block path, which refuses what spec 1.14 refuses. (A bigint took the block
+# path until 2026-11-24, at about 200 times an int's cost.)
 make a function called rt_modw_fits takes a, b returns yes
   require value_live(a) and value_live(b)
   let wa = rt_mod_is_word(a)
@@ -875,9 +876,9 @@ make a function called rt_modw_fits takes a, b returns yes
   if wa and wb then
     let yes = value_type_word(a) == value_type_word(b)
   elif wa then
-    let yes = value_class(b) == 2
+    let yes = (value_class(b) == 2) or (value_class(b) == 4)
   elif wb then
-    let yes = value_class(a) == 2
+    let yes = (value_class(a) == 2) or (value_class(a) == 4)
   else
     let yes = false
   end
@@ -961,12 +962,15 @@ make a function called rt_modw_template takes a, b returns t
   return t
 end
 
-# The word of an operand on the word path: a modint's word, or an int's bits.
-# Combined with the other operand's secret word, what it gives is secret.
+# The word of an operand on the word path: a modint's word, an int's bits, or
+# a bigint's low 64 bits. Combined with the other operand's secret word, what
+# it gives is secret.
 make a function called rt_modw_w takes v returns w
-  require (value_class(v) == 15) or (value_class(v) == 2)
+  require (value_class(v) == 15) or (value_class(v) == 2) or (value_class(v) == 4)
   if value_class(v) == 2 then
     let w = v
+  elif value_class(v) == 4 then
+    let w = rt_bigint_low_word(v)
   else
     let w = value_data(v)
   end
@@ -2109,6 +2113,23 @@ make a function called rt_arith takes op, a, b returns r
   return r
 end
 
+# Whether a and b are each an integer or a rational, and at least one is a
+# rational: the operators then go straight to rationals.patlang, past the
+# tests for objects, strings, lists, modints, intervals, complex numbers and
+# floats, none of which can apply (#285; a rational add went through about
+# fifteen calls before it reached rational_add). Rationals raise no operator
+# events (spec 1.4).
+make a function called rt_exact_pair takes a, b returns yes
+  require value_live(a) and value_live(b)
+  let ca = value_class(a)
+  let cb = value_class(b)
+  let a_exact = (ca == 2) or (ca == 4) or (ca == 5)
+  let b_exact = (cb == 2) or (cb == 4) or (cb == 5)
+  let yes = a_exact and b_exact and ((ca == 5) or (cb == 5))
+  ensure value_class(yes) == 1
+  return yes
+end
+
 make a function called rt_complex_arith takes op, a, b returns r
   require (op >= 0) and (op <= 3) and rt_is_number(a) and rt_is_number(b)
   let ar = complex_re(a)
@@ -2162,6 +2183,11 @@ make a function called op_add takes a, b returns r
     ensure value_live(r)
     return r
   end
+  if rt_exact_pair(a, b) then
+    let r = rational_add(a, b)
+    ensure value_live(r)
+    return r
+  end
   if rt_is_object(a) then
     let r = send(a, "+", b)
     ensure value_live(r)
@@ -2207,6 +2233,11 @@ end
 # A string on either side of +: the two values' texts joined.
 make a function called op_add_quiet takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rational_add(a, b)
+    ensure value_live(r)
+    return r
+  end
   if rt_is_object(a) then
     let r = send(a, "+", b)
     ensure value_live(r)
@@ -2235,6 +2266,11 @@ end
 
 make a function called op_sub takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rational_sub(a, b)
+    ensure value_live(r)
+    return r
+  end
   if rt_is_object(a) then
     let r = send(a, "-", b)
     ensure value_live(r)
@@ -2253,6 +2289,11 @@ end
 
 make a function called op_mul takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rational_mul(a, b)
+    ensure value_live(r)
+    return r
+  end
   if rt_is_object(a) then
     let r = send(a, "*", b)
     ensure value_live(r)
@@ -2271,6 +2312,12 @@ end
 
 make a function called op_div takes a, b returns r
   require value_live(a) and value_live(b)
+  # a rational is never 0, so only an integer divisor needs the test
+  if rt_exact_pair(a, b) and ((value_class(b) == 5) or (b != 0)) then
+    let r = rational_div(a, b)
+    ensure value_live(r)
+    return r
+  end
   if rt_is_object(a) then
     let r = send(a, "/", b)
     ensure value_live(r)
@@ -2281,16 +2328,26 @@ make a function called op_div takes a, b returns r
     ensure value_live(r)
     return r
   end
-  # two ints that divide exactly: their quotient, the int the rationals would
-  # give, without making one (an exact division cost about 20 us that way)
-  if (value_class(a) == 2) and (value_class(b) == 2) then
-    if b != 0 then
-      let qr = int_divmod(a, b)
-      if qr[1] == 0 then
-        let r = qr[0]
+  # two ints: their quotient when they divide exactly, the int the rationals
+  # would give, without making one (an exact division cost about 20 us that
+  # way), and otherwise the fraction in lowest terms, by words when both are
+  # words (#285)
+  if (value_class(a) == 2) and (value_class(b) == 2) and (b != 0) then
+    if rt_small_ints(a, b, 62) then
+      if word_rem(a, b) == 0 then
+        let r = word_div(a, b)
         ensure value_live(r)
         return r
       end
+      let r = rational_make(a, b)
+      ensure value_live(r)
+      return r
+    end
+    let qr = int_divmod(a, b)
+    if qr[1] == 0 then
+      let r = qr[0]
+      ensure value_live(r)
+      return r
     end
   end
   rt_check_numbers(a, b)
@@ -2483,6 +2540,24 @@ end
 # a OP b for the four orderings. Each is a method of its left operand's class
 # (spec 1.4): an object is sent OP itself, never another operator derived
 # from <, so a class defines the ones it means.
+# a OP b for an int or a rational on each side, at least one a rational, op
+# 0 to 3 for <, >, <=, >= (#285: compared straight, past rt_order's tests).
+make a function called rt_exact_order takes a, b, op returns r
+  require rt_exact_pair(a, b) and (op >= 0) and (op <= 3)
+  let c = rational_cmp(a, b)
+  if op == 0 then
+    let r = c < 0
+  elif op == 1 then
+    let r = c > 0
+  elif op == 2 then
+    let r = c <= 0
+  else
+    let r = c >= 0
+  end
+  ensure value_class(r) == 1
+  return r
+end
+
 make a function called rt_order takes a, b, op returns r
   require value_live(a) and value_live(b) and (value_class(op) == 8)
   if rt_is_object(a) then
@@ -2511,6 +2586,11 @@ end
 
 make a function called op_lt takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rt_exact_order(a, b, 0)
+    ensure value_live(r)
+    return r
+  end
   let r = rt_order(a, b, "<")
   ensure value_live(r)
   return r
@@ -2518,6 +2598,11 @@ end
 
 make a function called op_gt takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rt_exact_order(a, b, 1)
+    ensure value_live(r)
+    return r
+  end
   let r = rt_order(a, b, ">")
   ensure value_live(r)
   return r
@@ -2525,6 +2610,11 @@ end
 
 make a function called op_le takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rt_exact_order(a, b, 2)
+    ensure value_live(r)
+    return r
+  end
   let r = rt_order(a, b, "<=")
   ensure value_live(r)
   return r
@@ -2532,6 +2622,11 @@ end
 
 make a function called op_ge takes a, b returns r
   require value_live(a) and value_live(b)
+  if rt_exact_pair(a, b) then
+    let r = rt_exact_order(a, b, 3)
+    ensure value_live(r)
+    return r
+  end
   let r = rt_order(a, b, ">=")
   ensure value_live(r)
   return r

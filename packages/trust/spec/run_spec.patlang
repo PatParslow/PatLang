@@ -976,14 +976,8 @@ end
 
 make a function called st_tr_check_log takes ctx returns ok
   require value_class(ctx) == 12
-  let oracle = tt_oracle()
-  let verify = |alg, pub, msg, sig| {
-    let out = str_trim(exec_capture("py", "-3", "-I", oracle, "verify", alg, pub, msg, sig))
-    let ok = out == "true"
-    ensure value_class(ok) == 1
-    return ok
-  }
-  ctx_set(ctx, "result", trust_check_log(tt_log(ctx), ctx_get(ctx, "pin"), verify))
+  # the signatures are checked in PatLang (ed25519.patlang); the oracle makes them
+  ctx_set(ctx, "result", trust_check_log(tt_log(ctx), ctx_get(ctx, "pin"), trust_ed25519_verifier()))
   let ok = true
   ensure value_class(ok) == 1
   return ok
@@ -1163,14 +1157,8 @@ end
 
 make a function called st_tr_verify takes ctx returns ok
   require value_class(ctx) == 12
-  let oracle = tt_oracle()
-  let verify = |alg, pub, msg, sig| {
-    let out = str_trim(exec_capture("py", "-3", "-I", oracle, "verify", alg, pub, msg, sig))
-    let ok = out == "true"
-    ensure value_class(ok) == 1
-    return ok
-  }
-  ctx_set(ctx, "result", trust_verify_package(tt_dir(ctx), ctx_get(ctx, "pin"), verify))
+  # the signatures are checked in PatLang (ed25519.patlang); the oracle makes them
+  ctx_set(ctx, "result", trust_verify_package(tt_dir(ctx), ctx_get(ctx, "pin"), trust_ed25519_verifier()))
   let ok = true
   ensure value_class(ok) == 1
   return ok
@@ -1241,7 +1229,435 @@ make a function called register_trust_steps takes ctx returns ok
   return ok
 end
 
+# ---- the trust store ----
+
+make a function called ts_rep takes c returns h
+  let b = sb_new()
+  let k = 0
+  while k < 64 do
+    sb_push(b, c)
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called st_ts_store takes ctx returns ok
+  let tag = random_bytes(4)
+  let dir = spec_out() + "/pkg_trust/store_" + tag[0] + "_" + tag[1] + "_" + tag[2] + "_" + tag[3]
+  ctx_set(ctx, "sdir", dir)
+  ctx_set(ctx, "store", trust_store_open(dir))
+  return true
+end
+
+make a function called st_ts_pin takes ctx returns ok
+  let r = trust_store_pin(ctx_get(ctx, "store"), step_arg(ctx, "p"), ts_rep(step_arg(ctx, "c")), "given")
+  return expect(ctx, "the pin is kept", r[0], "ok")
+end
+
+make a function called st_ts_reads_back takes ctx returns ok
+  let again = trust_store_open(ctx_get(ctx, "sdir"))
+  let r = trust_store_get(again, "zip")
+  return expect(ctx, "zip's entry", [r[0], r[1][1], r[1][2], r[1][3]], ["ok", ts_rep("a"), "given", 0])
+end
+
+make a function called st_ts_same_kept takes ctx returns ok
+  let r = trust_store_pin(ctx_get(ctx, "store"), "zip", ts_rep("a"), "given")
+  return expect(ctx, "pinning to the same hash", r[0], "ok")
+end
+
+make a function called st_ts_other_refused takes ctx returns ok
+  let r = trust_store_pin(ctx_get(ctx, "store"), "zip", ts_rep("b"), "given")
+  let a = expect(ctx, "pinning to another hash", r[0], "refused")
+  let b = expect(ctx, "naming both: " + r[1], str_contains(r[1], ts_rep("a")) and str_contains(r[1], ts_rep("b")), true)
+  return a and b
+end
+
+make a function called st_ts_unpin_repin takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  trust_store_unpin(st, "zip")
+  let r = trust_store_pin(st, "zip", ts_rep("b"), "given")
+  return expect(ctx, "pinned anew after unpinning", [r[0], trust_store_get(st, "zip")[1][1]], ["ok", ts_rep("b")])
+end
+
+make a function called st_ts_raise takes ctx returns ok
+  return expect(ctx, "the epoch raised", trust_store_raise(ctx_get(ctx, "store"), "zip", to_num(step_arg(ctx, "e"))), ["ok", to_num(step_arg(ctx, "e"))])
+end
+
+make a function called st_ts_rollback takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  let r2 = trust_store_check_epoch(st, "zip", 2)
+  let a = expect(ctx, "a log ending at 2: " + r2, [r2[0], str_contains("" + r2, "rolled-back")], ["refused", true])
+  let b = expect(ctx, "logs ending at 3 and 4", [trust_store_check_epoch(st, "zip", 3), trust_store_check_epoch(st, "zip", 4)], [["ok"], ["ok"]])
+  return a and b
+end
+
+make a function called st_ts_no_lower takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  let r = trust_store_raise(st, "zip", 2)
+  return expect(ctx, "raising to 2", [r, trust_store_get(st, "zip")[1][3]], [["ok", 3], 3])
+end
+
+make a function called st_ts_refuse_bad takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  let got = [trust_store_pin(st, "Zip", ts_rep("a"), "given")[0], trust_store_pin(st, "zip", "1234", "given")[0], trust_store_pin(st, "zip", ts_rep("a"), "trusted")[0]]
+  return expect(ctx, "each refused", got, ["refused", "refused", "refused"])
+end
+
+make a function called st_ts_bad_entry takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  trust_store_pin(st, "zip", ts_rep("a"), "given")
+  let path = st.dir + "/pins/zip"
+  let text = read_file(path)
+  let changed = "package zip" + chr(10) + "pin zz" + chr(10) + "source given" + chr(10) + "epoch 0" + chr(10) + "added 1" + chr(10)
+  write_file(path, changed)
+  let r = trust_store_get(st, "zip")
+  let a = expect(ctx, "the changed entry is refused: " + r, [r[0], str_contains("" + r, "not a hash")], ["err", true])
+  write_file(path, text)
+  return a
+end
+
+make a function called st_ts_half_written takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  trust_store_pin(st, "deflate", ts_rep("c"), "given")
+  write_file(st.dir + "/pins/deflate.tmp", "package defl")
+  let r = trust_store_get(st, "deflate")
+  return expect(ctx, "the entry beside the half-written file", [r[0], r[1][1]], ["ok", ts_rep("c")])
+end
+
+make a function called st_ts_shipped takes ctx returns ok
+  let text = "# shipped" + chr(10) + "pin zip " + ts_rep("a") + chr(10) + "pin deflate " + ts_rep("c") + chr(10)
+  let r = trust_read_pins(bytes_to_list(bytes_from_str(text)))
+  ctx_set(ctx, "shipped", r[1])
+  return expect(ctx, "the shipped pins", r[0], "ok")
+end
+
+make a function called st_ts_choose_deflate takes ctx returns ok
+  let r = trust_store_choose(ctx_get(ctx, "store"), "deflate", ctx_get(ctx, "shipped"))
+  return expect(ctx, "deflate's pin", r, ["ok", ts_rep("c"), "shipped", ""])
+end
+
+make a function called st_ts_choose_zip takes ctx returns ok
+  let r = trust_store_choose(ctx_get(ctx, "store"), "zip", ctx_get(ctx, "shipped"))
+  let a = expect(ctx, "zip's pin and source", [r[0], r[1], r[2]], ["ok", ts_rep("b"), "given"])
+  let b = expect(ctx, "a note that the shipped pin differs: " + r[3], str_contains(r[3], "shipped pin for zip"), true)
+  return a and b
+end
+
+make a function called st_ts_choose_none takes ctx returns ok
+  return expect(ctx, "tar's pin", trust_store_choose(ctx_get(ctx, "store"), "tar", ctx_get(ctx, "shipped")), ["none"])
+end
+
+make a function called st_ts_bad_pins takes ctx returns ok
+  let r = trust_read_pins(bytes_to_list(bytes_from_str("pin zip " + ts_rep("a") + chr(10) + "trust zip yes" + chr(10))))
+  return expect(ctx, "the shipped pins refused", r, ["err", "line 2 is not pin PACKAGE HASH"])
+end
+
+make a function called ts_pinner takes dir, w returns ok
+  let st = trust_store_open(dir)
+  let ok = true
+  let k = 0
+  while k < 10 do
+    let hex = "0123456789"
+    let h = ts_rep(substr(hex, k, 1))
+    if trust_store_pin(st, "p" + w + "_" + k, h, "given")[0] != "ok" then
+      let ok = false
+    end
+    let k = k + 1
+  end
+  return ok
+end
+
+make a function called st_ts_threads takes ctx returns ok
+  let dir = ctx_get(ctx, "sdir")
+  let ts = []
+  let w = 0
+  while w < 4 do
+    let ts = list_push(ts, thread_spawn(|d, n| do
+      return ts_pinner(d, n)
+    end, dir, w))
+    let w = w + 1
+  end
+  let rs = []
+  let k = 0
+  while k < 4 do
+    let rs = list_push(rs, thread_result(ts[k]))
+    let k = k + 1
+  end
+  return expect(ctx, "every thread's pins kept", rs, [true, true, true, true])
+end
+
+make a function called st_ts_forty takes ctx returns ok
+  let st = trust_store_open(ctx_get(ctx, "sdir"))
+  let good = 0
+  let w = 0
+  while w < 4 do
+    let k = 0
+    while k < 10 do
+      let r = trust_store_get(st, "p" + w + "_" + k)
+      if (r[0] == "ok") and (r[1][1] == ts_rep(substr("0123456789", k, 1))) then
+        let good = good + 1
+      end
+      let k = k + 1
+    end
+    let w = w + 1
+  end
+  return expect(ctx, "packages pinned to their own hashes", good, 40)
+end
+
+make a function called ts_lock_entries returns es
+  return [["zip", "0.2.0", ts_rep("a"), ts_rep("d")], ["deflate", "0.2.0", ts_rep("c"), ts_rep("e")]]
+end
+
+make a function called st_ts_lock_write takes ctx returns ok
+  let path = ctx_get(ctx, "sdir") + "/trust.lock"
+  ctx_set(ctx, "lock_path", path)
+  return expect(ctx, "the lock file written", trust_lock_write(path, ts_lock_entries()), true)
+end
+
+make a function called st_ts_lock_back takes ctx returns ok
+  let r = trust_lock_read(bytes_to_list(read_file_raw(ctx_get(ctx, "lock_path"))))
+  ctx_set(ctx, "lock", r[1])
+  return expect(ctx, "the lock file read back", r, ["ok", ts_lock_entries()])
+end
+
+make a function called st_ts_lock_pass takes ctx returns ok
+  let lock = ctx_get(ctx, "lock")
+  return expect(ctx, "zip as locked, and tar not named", [trust_lock_check(lock, "zip", "0.2.0", ts_rep("a"), ts_rep("d")), trust_lock_check(lock, "tar", "1.0.0", ts_rep("f"), ts_rep("f"))], [["ok"], ["ok"]])
+end
+
+make a function called st_ts_lock_refuse takes ctx returns ok
+  let lock = ctx_get(ctx, "lock")
+  let v = trust_lock_check(lock, "zip", "0.3.0", ts_rep("a"), ts_rep("d"))
+  let p = trust_lock_check(lock, "zip", "0.2.0", ts_rep("b"), ts_rep("d"))
+  let m = trust_lock_check(lock, "zip", "0.2.0", ts_rep("a"), ts_rep("f"))
+  let a = expect(ctx, "another version: " + v[1], [v[0], str_contains(v[1], "locked at 0.2.0")], ["refused", true])
+  let b = expect(ctx, "another pin: " + p[1], [p[0], str_contains(p[1], "locked to the pin")], ["refused", true])
+  let c = expect(ctx, "another manifest: " + m[1], [m[0], str_contains(m[1], "locked to the manifest")], ["refused", true])
+  return a and b and c
+end
+
+# ---- publishing ----
+
+make a function called st_tp_setup takes ctx returns ok
+  let tag = random_bytes(4)
+  let base = spec_out() + "/pkg_trust/pub_" + tag[0] + "_" + tag[1] + "_" + tag[2] + "_" + tag[3]
+  let pkg = base + "/demo"
+  make_directory(base)
+  make_directory(pkg)
+  let src = "make a function called demo_twice takes x returns y" + chr(10) + "  return x * 2" + chr(10) + "end" + chr(10)
+  write_file(pkg + "/demo.patlang", src)
+  let m = "package demo" + chr(10) + "version 1.0.0" + chr(10) + "entry demo.patlang" + chr(10) + "include demo.patlang" + chr(10) + "file demo.patlang sha256 " + sha256_file_hex(pkg + "/demo.patlang") + chr(10)
+  write_file(pkg + "/manifest.pkg", m)
+  ctx_set(ctx, "profile", base + "/profile")
+  ctx_set(ctx, "pkgdir", pkg)
+  return true
+end
+
+make a function called st_tp_keygen takes ctx returns ok
+  let r = trust_keygen(ctx_get(ctx, "profile"), step_arg(ctx, "k"))
+  ctx_set(ctx, "pub_" + step_arg(ctx, "k"), r[1])
+  return expect(ctx, "the key made", r[0], "ok")
+end
+
+make a function called st_tp_genesis takes ctx returns ok
+  let r = trust_genesis(ctx_get(ctx, "profile"), ctx_get(ctx, "pkgdir"), [step_arg(ctx, "k")])
+  ctx_set(ctx, "pin", r[1])
+  return expect(ctx, "the group founded: " + r, r[0], "ok")
+end
+
+make a function called st_tp_release takes ctx returns ok
+  let dir = ctx_get(ctx, "profile")
+  let pkg = ctx_get(ctx, "pkgdir")
+  let p = trust_propose(pkg)
+  let s = trust_sign_release(dir, pkg, "1.0.0", "owner")
+  let c = trust_certify(pkg, "1.0.0")
+  return expect(ctx, "proposed, signed, certified: " + [p, s, c], [p[0], s, c], ["ok", ["ok", 0], ["ok", 1]])
+end
+
+make a function called st_tp_verifies takes ctx returns ok
+  let r = trust_verify_package(ctx_get(ctx, "pkgdir"), ctx_get(ctx, "pin"), trust_ed25519_verifier())
+  return expect(ctx, "the verification: " + r, [r[0], r[1][0], r[1][1], r[1][2], list_len(r[1][3])], ["ok", "demo", "1.0.0", 0, 1])
+end
+
+make a function called st_tp_keygen_again takes ctx returns ok
+  let r = trust_keygen(ctx_get(ctx, "profile"), "owner")
+  return expect(ctx, "making owner again: " + r, [r[0], str_contains(r[1], "exists")], ["refused", true])
+end
+
+make a function called st_tp_key_file takes ctx returns ok
+  let text = read_file(ctx_get(ctx, "profile") + "/keys/owner")
+  let pub = ctx_get(ctx, "pub_owner")
+  let a = expect(ctx, "the key file", [str_len(text), trs_hash_ok(substr(text, 0, 64)), substr(text, 64, 1) == chr(10)], [65, true, true])
+  let b = expect(ctx, "the public key", [trs_hash_ok(pub), pub != substr(text, 0, 64)], [true, true])
+  return a and b
+end
+
+make a function called st_tp_genesis_again takes ctx returns ok
+  let r = trust_genesis(ctx_get(ctx, "profile"), ctx_get(ctx, "pkgdir"), ["owner"])
+  return expect(ctx, "founding again: " + r, [r[0], str_contains(r[1], "log exists")], ["refused", true])
+end
+
+make a function called st_tp_stranger takes ctx returns ok
+  let pkg = ctx_get(ctx, "pkgdir")
+  let p = trust_propose(pkg)
+  let r = trust_sign_release(ctx_get(ctx, "profile"), pkg, "1.0.0", "stranger")
+  return expect(ctx, "signing with stranger: " + r, [p[0], r[0], str_contains(r[1], "not a member")], ["ok", "refused", true])
+end
+
+make a function called st_tp_no_sigs takes ctx returns ok
+  let r = trust_certify(ctx_get(ctx, "pkgdir"), "1.0.0")
+  return expect(ctx, "certifying unsigned: " + r, [r[0], str_contains(r[1], "quorum is not met")], ["refused", true])
+end
+
+make a function called st_tp_change_manifest takes ctx returns ok
+  let path = ctx_get(ctx, "pkgdir") + "/manifest.pkg"
+  append_file(path, "summary changed after the release" + chr(10))
+  return true
+end
+
+make a function called st_tp_not_verifies takes ctx returns ok
+  let r = trust_verify_package(ctx_get(ctx, "pkgdir"), ctx_get(ctx, "pin"), trust_ed25519_verifier())
+  return expect(ctx, "the verification: " + r, [r[0], r[2]], ["err", "release"])
+end
+
+make a function called st_tp_withdraw_none takes ctx returns ok
+  let r = trust_withdraw(ctx_get(ctx, "profile"), ctx_get(ctx, "pkgdir"), "2.0.0", "never released", ["owner"])
+  return expect(ctx, "withdrawing 2.0.0: " + r, [r[0], str_contains(r[1], "no release of version 2.0.0")], ["refused", true])
+end
+
+make a function called st_tp_withdraw_unsigned takes ctx returns ok
+  let r = trust_withdraw(ctx_get(ctx, "profile"), ctx_get(ctx, "pkgdir"), "1.0.0", "unsigned", [])
+  let gone = file_exists(ctx_get(ctx, "pkgdir") + "/trust/withdraw/1.0.0.rec")
+  return expect(ctx, "withdrawing with no keys: " + r, [r[0], str_contains(r[1], "quorum is not met"), gone], ["refused", true, false])
+end
+
+make a function called st_tp_withdraw takes ctx returns ok
+  let r = trust_withdraw(ctx_get(ctx, "profile"), ctx_get(ctx, "pkgdir"), step_arg(ctx, "v"), step_arg(ctx, "why"), [step_arg(ctx, "k")])
+  return expect(ctx, "withdrawn: " + r, r, ["ok", 1])
+end
+
+make a function called st_tp_withdrawn takes ctx returns ok
+  let r = trust_verify_package(ctx_get(ctx, "pkgdir"), ctx_get(ctx, "pin"), trust_ed25519_verifier())
+  return expect(ctx, "the verification: " + r, r, ["err", "withdrawn", "withdrawal", step_arg(ctx, "what")])
+end
+
+# ---- verifying against the store ----
+
+make a function called tv_check takes ctx returns r
+  let shipped = ctx_get(ctx, "shipped")
+  if type_of(shipped) != "list" then
+    let shipped = []
+  end
+  return trust_verify_pinned(ctx_get(ctx, "store"), shipped, ctx_get(ctx, "pkgdir"), trust_ed25519_verifier())
+end
+
+# a store of its own, and no shipped pins until a step names them
+make a function called st_tv_store takes ctx returns ok
+  ctx_set(ctx, "shipped", [])
+  return st_ts_store(ctx)
+end
+
+make a function called st_tv_pin_genesis takes ctx returns ok
+  let r = trust_store_pin(ctx_get(ctx, "store"), "demo", ctx_get(ctx, "pin"), "given")
+  return expect(ctx, "demo pinned: " + r, r[0], "ok")
+end
+
+make a function called st_tv_shipped takes ctx returns ok
+  ctx_set(ctx, "shipped", [["demo", ctx_get(ctx, "pin")]])
+  return true
+end
+
+make a function called st_tv_ok takes ctx returns ok
+  let r = tv_check(ctx)
+  return expect(ctx, "the verification: " + r, [r[0], r[1][0], r[1][1], r[1][2], list_len(r[1][3]), r[1][4], r[1][5]], ["ok", "demo", "1.0.0", 0, 1, step_arg(ctx, "s"), ""])
+end
+
+make a function called st_tv_unpinned takes ctx returns ok
+  let r = tv_check(ctx)
+  return expect(ctx, "the verification: " + r, [r[0], r[1], r[2], str_contains(r[3], "demo is not pinned"), str_contains(r[3], "pkg pin demo")], ["err", "unpinned", "pin", true, true])
+end
+
+make a function called st_tv_store_wins takes ctx returns ok
+  let r = tv_check(ctx)
+  return expect(ctx, "the verification: " + r, [r[0], r[1], r[2], str_contains(r[3], "the shipped pin for demo is " + ctx_get(ctx, "pin"))], ["err", "pin-mismatch", "genesis", true])
+end
+
+make a function called st_tv_seen takes ctx returns ok
+  let r = trust_store_raise(ctx_get(ctx, "store"), "demo", 2)
+  return expect(ctx, "the epoch raised: " + r, r, ["ok", 2])
+end
+
+make a function called st_tv_rolled_back takes ctx returns ok
+  let r = tv_check(ctx)
+  return expect(ctx, "the verification: " + r, [r[0], r[1], r[2], str_contains(r[3], "rolled-back log")], ["err", "rolled-back", "epoch", true])
+end
+
+make a function called st_tv_still_two takes ctx returns ok
+  let r = trust_store_get(ctx_get(ctx, "store"), "demo")
+  return expect(ctx, "demo's entry: " + r, [r[0], r[1][3]], ["ok", 2])
+end
+
+make a function called st_tv_change_file takes ctx returns ok
+  append_file(ctx_get(ctx, "pkgdir") + "/" + step_arg(ctx, "f"), "# changed after the release" + chr(10))
+  return true
+end
+
+make a function called st_tv_files takes ctx returns ok
+  let r = tv_check(ctx)
+  return expect(ctx, "the verification: " + r, [r[0], r[1], r[2], str_contains(r[3], "demo.patlang")], ["err", "file-mismatch", "files", true])
+end
+
 let ctx = ctx_new()
 register_trust_steps(ctx)
+step(ctx, "withdrawing version 2.0.0 is refused, saying no such release is proposed", "st_tp_withdraw_none")
+step(ctx, "withdrawing version 1.0.0 with no keys is refused, saying the quorum is not met", "st_tp_withdraw_unsigned")
+step(ctx, "version {v} is withdrawn with {k}, for the reason \"{why}\"", "st_tp_withdraw")
+step(ctx, "the package does not verify, at the withdrawal, saying {what}", "st_tp_withdrawn")
+step(ctx, "a consumer's trust store in a directory of its own", "st_tv_store")
+step(ctx, "demo is pinned to its genesis hash, given", "st_tv_pin_genesis")
+step(ctx, "the shipped pins name demo's genesis hash", "st_tv_shipped")
+step(ctx, "the package verifies against the store at version 1.0.0, epoch 0, with 1 signer, its pin {s}", "st_tv_ok")
+step(ctx, "the package is refused at the pin, saying demo is not pinned and naming pkg pin", "st_tv_unpinned")
+step(ctx, "the package is refused at the genesis, its hash not the pin, telling that the shipped pin differs from the store's", "st_tv_store_wins")
+step(ctx, "the store has seen demo's log at epoch 2", "st_tv_seen")
+step(ctx, "the package is refused at the epoch, saying the log is rolled back", "st_tv_rolled_back")
+step(ctx, "the store still holds epoch 2 for demo", "st_tv_still_two")
+step(ctx, "the package's file {f} is changed after the release", "st_tv_change_file")
+step(ctx, "the package is refused at the files, naming demo.patlang", "st_tv_files")
+step(ctx, "a publisher's profile and a package named demo at version 1.0.0", "st_tp_setup")
+step(ctx, "a key named {k} is made", "st_tp_keygen")
+step(ctx, "the package's group is founded with the key {k}", "st_tp_genesis")
+step(ctx, "its release is proposed, signed with owner and certified", "st_tp_release")
+step(ctx, "the package verifies against the genesis hash, at version 1.0.0, epoch 0, with 1 signer", "st_tp_verifies")
+step(ctx, "making a key named owner again is refused", "st_tp_keygen_again")
+step(ctx, "the key file holds 64 lowercase hex digits and the public key printed is another 64", "st_tp_key_file")
+step(ctx, "founding the group again is refused, saying the log exists", "st_tp_genesis_again")
+step(ctx, "after the release is proposed, signing it with stranger is refused, saying the key is not a member", "st_tp_stranger")
+step(ctx, "certifying it with no signatures is refused, saying the quorum is not met", "st_tp_no_sigs")
+step(ctx, "the package's manifest is changed after the release", "st_tp_change_manifest")
+step(ctx, "the package does not verify, at the release's manifest check", "st_tp_not_verifies")
+step(ctx, "a trust store in a directory of its own", "st_ts_store")
+step(ctx, "{p} is pinned to the hash \"{c}\" repeated 64 times, given", "st_ts_pin")
+step(ctx, "zip's entry reads back, from the store opened again, as that pin, the source given and the epoch 0", "st_ts_reads_back")
+step(ctx, "pinning zip to that hash again keeps its entry", "st_ts_same_kept")
+step(ctx, "pinning zip to the hash \"b\" repeated 64 times is refused, naming both hashes", "st_ts_other_refused")
+step(ctx, "after zip is unpinned, pinning it to the hash \"b\" repeated 64 times is kept", "st_ts_unpin_repin")
+step(ctx, "zip's epoch is raised to {e}", "st_ts_raise")
+step(ctx, "a log ending at epoch 2 is refused as rolled back, and one ending at 3 or 4 is not", "st_ts_rollback")
+step(ctx, "raising zip's epoch to 2 leaves it at 3", "st_ts_no_lower")
+step(ctx, "a package name with a capital letter, a pin that is not a hash, and the source \"trusted\" are each refused", "st_ts_refuse_bad")
+step(ctx, "an entry whose pin field was changed to \"zz\" is refused when read, saying its pin is not a hash", "st_ts_bad_entry")
+step(ctx, "a file left half written beside an entry is not read, and the entry beside it reads as before", "st_ts_half_written")
+step(ctx, "the shipped pins \"pin zip \" with \"a\" repeated 64 times, and \"pin deflate \" with \"c\" repeated 64 times", "st_ts_shipped")
+step(ctx, "the pin to use for deflate is the shipped one, its source shipped", "st_ts_choose_deflate")
+step(ctx, "the pin to use for zip is the store's, its source given, with a note that the shipped pin differs", "st_ts_choose_zip")
+step(ctx, "the pin to use for tar is none", "st_ts_choose_none")
+step(ctx, "shipped pins with a line that is not pin PACKAGE HASH are refused, naming the line", "st_ts_bad_pins")
+step(ctx, "4 threads each pin a package of their own, 10 packages each", "st_ts_threads")
+step(ctx, "all 40 packages read back pinned to their own hashes", "st_ts_forty")
+step(ctx, "a lock file is written naming zip 0.2.0 and deflate 0.2.0 with their pins and manifests", "st_ts_lock_write")
+step(ctx, "it reads back as written", "st_ts_lock_back")
+step(ctx, "checking zip 0.2.0 with its pin and manifest passes, and checking a package it does not name passes", "st_ts_lock_pass")
+step(ctx, "checking zip 0.3.0, zip with another pin, or zip with another manifest is each refused, saying which", "st_ts_lock_refuse")
 # --list names the feature files (the gates run each); a failure exits 1
-run_suite(ctx, ["packages/trust/spec/records.feature", "packages/trust/spec/log.feature", "packages/trust/spec/release.feature"], argv())
+run_suite(ctx, ["packages/trust/spec/records.feature", "packages/trust/spec/log.feature", "packages/trust/spec/release.feature", "packages/trust/spec/store.feature", "packages/trust/spec/publish.feature", "packages/trust/spec/pinned.feature"], argv())

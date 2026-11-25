@@ -7,7 +7,9 @@
 include "../../../self_hosting/lib/includes.patlang"
 include "../../../self_hosting/lib/gherkin.patlang"
 include "../plain.patlang"
-include "../update.patlang"
+include "../goals.patlang"
+include "../../file_marshal/service.patlang"
+include "../../../self_hosting/lib/v2_engines.patlang"
 
 make a function called tt_lines takes b returns lines
   let out = []
@@ -191,6 +193,10 @@ make a function called tt_restructure takes ctx returns done
   let text = ctx_get(ctx, "text")
   if ctx_get(ctx, "format") == "plain" then
     ctx_set(ctx, "tree", ts_plain(tt_st(ctx), text))
+  elif ctx_get(ctx, "format") == "gherkin" then
+    ctx_set(ctx, "tree", ts_gherkin(tt_st(ctx), text))
+  elif ctx_get(ctx, "format") == "patlang" then
+    ctx_set(ctx, "tree", ts_patlang(tt_st(ctx), text))
   elif ctx_get(ctx, "format") == "html" then
     let got = ts_html(tt_st(ctx), text)
     ctx_set(ctx, "tree", got[0])
@@ -273,13 +279,16 @@ make a function called tt_outline_into takes u, depth, b returns done
     let k = k + 1
   end
   sb_push(b, ts_kind(u))
-  if ts_kind(u) == "section" then
+  if (ts_kind(u) == "section") and (ts_attr(u, "title") != "") then
     sb_push(b, " " + ts_attr(u, "title"))
   end
   if ts_kind(u) == "code" then
     if ts_attr(u, "lang") != "" then
       sb_push(b, " " + ts_attr(u, "lang"))
     end
+  end
+  if ts_kind(u) == "step" then
+    sb_push(b, " " + ts_attr(u, "keyword"))
   end
   let kids = ts_children(u)
   if (list_len(kids) > 0) and (ts_kind(kids[0]) == "sentence") then
@@ -472,8 +481,11 @@ end
 # n random edits, each applied, the tree updated and compared with a full read:
 # [edits whose trees differed, the first such edit's description]
 make a function called tu_random takes ctx, n, seed returns got
+  return tu_random_with(ctx, n, seed, tu_pieces())
+end
+
+make a function called tu_random_with takes ctx, n, seed, ps returns got
   let st = tt_st(ctx)
-  let ps = tu_pieces()
   let s = seed
   let bad = 0
   let first = ""
@@ -584,7 +596,352 @@ make a function called st_tu_large_cost takes ctx returns ok
   return a and b and c
 end
 
+# ---- facts ----
+
+make a function called tf_md takes ctx returns ok
+  return tt_set_text(ctx, step_doc(ctx), "markdown")
+end
+
+make a function called tf_store_of takes tree returns store
+  let store = logic_store_new()
+  ts_to_facts(tree, store, "doc")
+  ts_add_document_rules(store)
+  return store
+end
+
+make a function called st_tf_numbered takes ctx returns ok
+  let ids = ts_ids()
+  let tree = ts_number(ids, ctx_get(ctx, "tree"))
+  ctx_set(ctx, "ids", ids)
+  ctx_set(ctx, "ntree", tree)
+  ctx_set(ctx, "store", tf_store_of(tree))
+  return true
+end
+
+# the texts of the units a rule finds, sorted
+make a function called tf_found_texts takes store, tree, text, rule returns texts
+  let got = solve_in(store, rule, [logic_var("X")])
+  let out = []
+  let k = 0
+  while k < list_len(got) do
+    let sp = ts_span_of(tree, got[k][0])
+    let out = list_push(out, bytes_to_str(bytes_slice(text, sp[0], sp[1] - sp[0])))
+    let k = k + 1
+  end
+  return out
+end
+
+make a function called st_tf_long takes ctx returns ok
+  let found = tf_found_texts(ctx_get(ctx, "store"), ctx_get(ctx, "ntree"), ctx_get(ctx, "text"), "long_sentence")
+  let a = expect(ctx, "long sentences found", list_len(found), 1)
+  if list_len(found) != 1 then
+    return false
+  end
+  return a and expect(ctx, "the long sentence", starts_with(found[0], "This sentence goes on"), true)
+end
+
+make a function called st_tf_empty takes ctx returns ok
+  let got = solve_in(ctx_get(ctx, "store"), "empty_section", [logic_var("X")])
+  let titles = []
+  let k = 0
+  while k < list_len(got) do
+    let titles = list_push(titles, ts_attr(ts_unit_by_id(ctx_get(ctx, "ntree"), got[k][0]), "title"))
+    let k = k + 1
+  end
+  return expect(ctx, "empty sections", titles, ["Empty"])
+end
+
+make a function called st_tf_code takes ctx returns ok
+  return expect(ctx, "code with no language", list_len(solve_in(ctx_get(ctx, "store"), "untitled_code", [logic_var("X")])), 1)
+end
+
+make a function called tf_count takes store returns n
+  let preds = [["unit", 3], ["child", 3], ["attr", 3], ["words", 2]]
+  let n = 0
+  let k = 0
+  while k < list_len(preds) do
+    let args = []
+    let j = 0
+    while j < preds[k][1] do
+      let args = list_push(args, logic_var("V" + j))
+      let j = j + 1
+    end
+    let n = n + list_len(solve_in(store, preds[k][0], args))
+    let k = k + 1
+  end
+  return n
+end
+
+make a function called st_tf_edit takes ctx returns ok
+  let text = ctx_get(ctx, "text")
+  let tree = ctx_get(ctx, "ntree")
+  let store = ctx_get(ctx, "store")
+  ctx_set(ctx, "total", tf_count(store))
+  let w = ts_walk(tree, "sentence")
+  let u = ts_walk_next(w)
+  while (u != false) and (tt_of(ctx, u) != "A short sentence.") do
+    let u = ts_walk_next(w)
+  end
+  let b = sb_new()
+  sb_push(b, "A sentence that was short")
+  let i = 0
+  while i < 45 do
+    sb_push(b, " and longer")
+    let i = i + 1
+  end
+  sb_push(b, ".")
+  let r = fm_apply_batch(text, [ts_edit_for(text, u, sb_str(b))])
+  let a = expect(ctx, "the edit applies", r[0], "ok")
+  let updated = ts_renumber(ctx_get(ctx, "ids"), tree, ts_update(tt_st(ctx), tree, r[1], r[2])[0])
+  ctx_set(ctx, "counts", ts_facts_update(store, "doc", tree, updated))
+  ctx_set(ctx, "ntree", updated)
+  ctx_set(ctx, "text", r[1])
+  return a
+end
+
+make a function called st_tf_fifth takes ctx returns ok
+  let c = ctx_get(ctx, "counts")
+  return expect(ctx, "facts taken out " + c[0] + ", added " + c[1] + ", of " + ctx_get(ctx, "total"), (c[0] + c[1]) * 5 < ctx_get(ctx, "total"), true)
+end
+
+make a function called st_tf_two_long takes ctx returns ok
+  let text = ctx_get(ctx, "text")
+  let mine = tf_found_texts(ctx_get(ctx, "store"), ctx_get(ctx, "ntree"), text, "long_sentence")
+  let fresh_tree = ts_number(ts_ids(), ts_markdown(tt_st(ctx), text))
+  let fresh = tf_found_texts(tf_store_of(fresh_tree), fresh_tree, text, "long_sentence")
+  ctx_set(ctx, "fresh_tree", fresh_tree)
+  let a = expect(ctx, "long sentences after the edit", list_len(mine), 2)
+  let b = expect(ctx, "the same as over a fresh read", mine, fresh)
+  return a and b
+end
+
+make a function called st_tf_as_many takes ctx returns ok
+  return expect(ctx, "facts in the store", tf_count(ctx_get(ctx, "store")), tf_count(tf_store_of(ctx_get(ctx, "fresh_tree"))))
+end
+
+# ---- Gherkin ----
+
+make a function called tgk_sample returns text
+  let nl = chr(10)
+  let q = chr(34) + chr(34) + chr(34)
+  let b = sb_new()
+  let lines = ["# a comment", "@smoke", "Feature: Ordering", "  A description. It has two sentences.", "", "  Background:", "    Given a shop", "", "  Rule: stock is kept", "", "    @fast", "    Scenario: buying one", "      When I buy " + chr(34) + "tea" + chr(34), "      Then the stock is", "        | item | count |", "        | tea  | 9     |", "", "    Scenario Outline: buying many", "      When I buy <n>", "      Then I am told", "        " + q, "        thanks", "        " + q, "", "      Examples:", "        | n |", "        | 2 |"]
+  let k = 0
+  while k < list_len(lines) do
+    sb_push(b, lines[k] + nl)
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called st_tgk_sample takes ctx returns ok
+  return tt_set_text(ctx, tgk_sample(), "gherkin")
+end
+
+make a function called st_tgk_tags takes ctx returns ok
+  let tree = ctx_get(ctx, "tree")
+  let heads = ts_all(tree, "heading")
+  let one = ""
+  let feature = ""
+  let k = 0
+  while k < list_len(heads) do
+    if ts_attr(heads[k], "title") == "buying one" then
+      let one = ts_attr(heads[k], "tags")
+    end
+    if ts_attr(heads[k], "title") == "Ordering" then
+      let feature = ts_attr(heads[k], "tags")
+    end
+    let k = k + 1
+  end
+  return expect(ctx, "the tags", [one, feature], ["@fast", "@smoke"])
+end
+
+make a function called st_tgk_random takes ctx returns ok
+  ctx_set(ctx, "random", tu_random_with(ctx, 150, 5, tgk_pieces()))
+  return true
+end
+
+make a function called tgk_pieces returns ps
+  let q = chr(34) + chr(34) + chr(34)
+  return [chr(10), chr(10) + chr(10), "a", ".", " ", "Scenario: ", "Feature: ", "Given ", "Then ", "| x |", "@tag ", "# ", q, "  ", "Examples:", "Rule: "]
+end
+
+# ---- PatLang source ----
+
+make a function called tps_sample returns text
+  let q = chr(34)
+  let lines = ["# A small program. It shows the units.", "let start = 1", "", "# ---- Helpers ----", "", "# Doubles a number.", "make a function called double takes x returns y", "  let y = x * 2", "  return y", "end", "", "make a function called describe takes p returns s", "  if p.x > 0 then", "    return " + q + "right" + q, "  end", "  return " + q + "left" + q, "end", "", "# ---- Objects ----", "", "class Point {", "  field x = 0", "  field y = 0", "}", "", "let p = new(" + q + "Point" + q + ")", "print(describe(p))"]
+  let b = sb_new()
+  let k = 0
+  while k < list_len(lines) do
+    sb_push(b, lines[k] + chr(10))
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called st_tps_sample takes ctx returns ok
+  return tt_set_text(ctx, tps_sample(), "patlang")
+end
+
+make a function called tps_titles takes u, kind returns titles
+  let out = []
+  let kids = ts_children(u)
+  let k = 0
+  while k < list_len(kids) do
+    if ts_kind(kids[k]) == kind then
+      let out = list_push(out, ts_attr(kids[k], "title"))
+    end
+    let k = k + 1
+  end
+  return out
+end
+
+make a function called st_tps_holds takes ctx returns ok
+  let tree = ctx_get(ctx, "tree")
+  let h = ts_find(tree, [["section", "Helpers"]])
+  let o = ts_find(tree, [["section", "Objects"]])
+  return expect(ctx, "the functions and the class", [tps_titles(h[1], "function"), tps_titles(o[1], "class")], [["double", "describe"], ["Point"]])
+end
+
+make a function called tps_pieces returns ps
+  return [chr(10), chr(10) + chr(10), "end", "}", "make a function called f takes a returns b", "class C {", "# ", "# ---- S ----", "  ", "let a = 1", "x", ".", " "]
+end
+
+make a function called st_tps_random takes ctx returns ok
+  ctx_set(ctx, "random", tu_random_with(ctx, 200, 3, tps_pieces()))
+  return true
+end
+
+make a function called st_tg_fill takes ctx returns ok
+  let r = ts_fill_sections(tt_st(ctx), ctx_get(ctx, "ids"), ctx_get(ctx, "store"), "doc", ctx_get(ctx, "ntree"), ctx_get(ctx, "text"), step_arg(ctx, "filler"))
+  let a = expect(ctx, "the goal is carried out", r[0], "ok")
+  if r[0] != "ok" then
+    print("  (" + r[1] + ")")
+    return false
+  end
+  ctx_set(ctx, "before_tree", ctx_get(ctx, "ntree"))
+  ctx_set(ctx, "text", r[1])
+  ctx_set(ctx, "ntree", r[2])
+  ctx_set(ctx, "steps", r[3])
+  return a
+end
+
+make a function called st_tg_one_step takes ctx returns ok
+  let steps = ctx_get(ctx, "steps")
+  let a = expect(ctx, "the plan's steps", list_len(steps), 1)
+  if list_len(steps) != 1 then
+    return false
+  end
+  let id = step_values(steps[0])[1]
+  let b = expect(ctx, "the step's section", ts_attr(ts_unit_by_id(ctx_get(ctx, "before_tree"), id), "title"), "Empty")
+  return a and b
+end
+
+make a function called st_tg_filled takes ctx returns ok
+  let tree = ctx_get(ctx, "ntree")
+  let text = ctx_get(ctx, "text")
+  let got = ts_find(tree, [["section", "Guide"], ["section", "Empty"], ["paragraph", 1]])
+  let a = expect(ctx, "Empty's paragraph", [got[0], bytes_to_str(ts_bytes_of(text, got[1]))], ["ok", "To be written."])
+  let b = expect(ctx, "empty sections", solve_in(ctx_get(ctx, "store"), "empty_section", [logic_var("X")]), [])
+  let fresh = ts_number(ts_ids(), ts_markdown(tt_st(ctx), text))
+  let c = expect(ctx, "the facts are as many as a fresh read's", tf_count(ctx_get(ctx, "store")), tf_count(tf_store_of(fresh)))
+  return a and b and c
+end
+
+# ---- a goal pursued through the files service ----
+
+make a function called st_tg_service takes ctx returns ok
+  let tag = random_bytes(4)
+  let dir = spec_out() + "/text_structure_goal_" + tag[0] + "_" + tag[1] + "_" + tag[2] + "_" + tag[3]
+  make_directory(dir)
+  make_directory(dir + "/root")
+  make_directory(dir + "/store")
+  let s = new("FileService")
+  s.root = dir + "/root"
+  s.store = dir + "/store"
+  write_file_bytes(dir + "/root/doc.md", ctx_get(ctx, "text"))
+  ctx_set(ctx, "service", s)
+  return true
+end
+
+make a function called st_tg_pursue takes ctx returns ok
+  let s = ctx_get(ctx, "service")
+  # the other client's rename, made once, as the first batch arrives
+  let other = vec_new()
+  vec_push(other, false)
+  let call = |req| do
+    if (req[0] == "edit") and (vec_get(other, 0) == false) then
+      vec_set(other, 0, true)
+      let now = fs_handle(s, ["read", "doc.md"])
+      let rn = fm_with_old(fm_edit("## ", chr(10), "Blank"), "Empty")
+      fs_handle(s, ["edit", "doc.md", now[1], [rn], "other"])
+    end
+    return fs_handle(s, req)
+  end
+  let r = ts_pursue_sections(tt_st(ctx), call, "doc.md", "goal", step_arg(ctx, "filler"))
+  ctx_set(ctx, "pursued", r)
+  return expect(ctx, "the pursuit: " + r, r[0], "ok")
+end
+
+make a function called st_tg_two_rounds takes ctx returns ok
+  let r = ctx_get(ctx, "pursued")
+  return expect(ctx, "rounds and refusals", [r[2], r[3]], [2, 1])
+end
+
+make a function called st_tg_blank_filled takes ctx returns ok
+  let s = ctx_get(ctx, "service")
+  let text = fs_handle(s, ["read", "doc.md"])[2]
+  let tree = ts_markdown(tt_st(ctx), text)
+  let got = ts_find(tree, [["section", "Guide"], ["section", "Blank"], ["paragraph", 1]])
+  let a = expect(ctx, "Blank's paragraph", [got[0], bytes_to_str(ts_bytes_of(text, got[1]))], ["ok", "To be written."])
+  let store = tf_store_of(ts_number(ts_ids(), tree))
+  let b = expect(ctx, "empty sections", solve_in(store, "empty_section", [logic_var("X")]), [])
+  return a and b
+end
+
+make a function called st_tg_refusing takes ctx returns ok
+  let text = ctx_get(ctx, "text")
+  let call = |req| do
+    if req[0] == "read" then
+      return ["ok", 4, text]
+    end
+    return ["refused", 0, "the context was not found", 4]
+  end
+  ctx_set(ctx, "pursued", ts_pursue_sections(tt_st(ctx), call, "doc.md", "goal", "To be written."))
+  return true
+end
+
+make a function called st_tg_refused_once takes ctx returns ok
+  let r = ctx_get(ctx, "pursued")
+  return expect(ctx, "the pursuit: " + r, [r[0], str_contains(r[1], "the context was not found"), r[2], r[3]], ["refused", true, 4, 1])
+end
+
 let ctx = ctx_new()
+step(ctx, "the text is a file kept by the files service, and another client renames the section \"Empty\" to \"Blank\" just before the plan's first batch arrives", "st_tg_service")
+step(ctx, "the goal that every section has content is pursued through the service, with the filler \"{filler}\"", "st_tg_pursue")
+step(ctx, "it took two rounds, the first batch refused", "st_tg_two_rounds")
+step(ctx, "the file's section \"Blank\" now holds the paragraph \"To be written.\", and empty_section finds none in it", "st_tg_blank_filled")
+step(ctx, "the goal that every section has content is pursued through a service that refuses every batch and changes nothing", "st_tg_refusing")
+step(ctx, "the pursuit is refused after one round, giving the service's reason", "st_tg_refused_once")
+step(ctx, "the PatLang sample with sections, functions, a class, comments and statements", "st_tps_sample")
+step(ctx, "the section \"Helpers\" holds the functions \"double\" and \"describe\", and \"Objects\" the class \"Point\"", "st_tps_holds")
+step(ctx, "200 random PatLang edits are made one at a time, from seed 3", "st_tps_random")
+step(ctx, "the Gherkin sample with a rule, an outline, a table and a doc string", "st_tgk_sample")
+step(ctx, "the heading \"buying one\" has the tags \"@fast\", and the feature's the tags \"@smoke\"", "st_tgk_tags")
+step(ctx, "150 random Gherkin edits are made one at a time, from seed 5", "st_tgk_random")
+step(ctx, "the goal that every section has content is planned and carried out, with the filler \"{filler}\"", "st_tg_fill")
+step(ctx, "the plan has one step, for the section \"Empty\"", "st_tg_one_step")
+step(ctx, "the section \"Empty\" now holds the paragraph \"To be written.\", empty_section finds none, and the facts are a fresh read's", "st_tg_filled")
+step(ctx, "the Markdown document for the facts", "tf_md")
+step(ctx, "its tree numbered and put in a store as facts, with the document rules", "st_tf_numbered")
+step(ctx, "long_sentence finds one sentence, starting \"This sentence goes on\"", "st_tf_long")
+step(ctx, "empty_section finds the section \"Empty\"", "st_tf_empty")
+step(ctx, "untitled_code finds one code block", "st_tf_code")
+step(ctx, "the short sentence is made long by an edit, and the tree and the facts are updated from its shifts", "st_tf_edit")
+step(ctx, "fewer than a fifth of the facts were taken out or added", "st_tf_fifth")
+step(ctx, "long_sentence finds two sentences, the same as over a fresh read of the new text", "st_tf_two_long")
+step(ctx, "the store holds as many facts as a fresh read's would", "st_tf_as_many")
 step(ctx, "a Markdown text of headings, paragraphs, a list, a quote, code and a table", "st_tu_md")
 step(ctx, "a plain text of titles and paragraphs", "st_tu_plain")
 step(ctx, "200 random edits are made one at a time, each deleting up to 3 bytes and inserting up to 3 pieces of line breaks, letters, full stops, \"#\", \"- \", \"```\", \"> \", \"|\", \"===\" and spaces, from seed 7", "st_tu_random_md")
@@ -624,4 +981,4 @@ step(ctx, "the lines of SentenceBreakTest.txt", "st_tt_lines")
 step(ctx, "each gives exactly the breaks it marks, all 512 of them", "st_tt_conform")
 step(ctx, "the bytes of \"é—a\" and the bytes 255, 65 and 226, 130", "st_tt_bytes")
 step(ctx, "they read as 233, 8212, 97 at 0, 2, 5, and as 65533, 65, 65533, 65533", "st_tt_decoded")
-run_suite(ctx, ["packages/text_structure/spec/sentences.feature", "packages/text_structure/spec/structure.feature", "packages/text_structure/spec/html.feature", "packages/text_structure/spec/update.feature"], argv())
+run_suite(ctx, ["packages/text_structure/spec/sentences.feature", "packages/text_structure/spec/structure.feature", "packages/text_structure/spec/html.feature", "packages/text_structure/spec/update.feature", "packages/text_structure/spec/facts.feature", "packages/text_structure/spec/gherkin.feature", "packages/text_structure/spec/patlang_source.feature"], argv())

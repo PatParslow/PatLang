@@ -1,0 +1,413 @@
+# The signature checks of a TLS 1.3 client, on public data: RSA PKCS#1 v1.5
+# (RFC 8017 8.2.2) with SHA-256, SHA-384 or SHA-512, RSA-PSS (RFC 8017
+# 9.1.2) with SHA-256 and a salt as long as the hash (RFC 8446 4.2.3), and
+# ECDSA (FIPS 186-4 6.4) on P-256 with SHA-256 and P-384 with SHA-384.
+#
+#   tls_rsa_pkcs1_verify(n, e, alg, msg, sig)     -> whether it verifies
+#   tls_rsa_pss_verify(n, e, alg, msg, sig)       -> the same
+#   tls_ecdsa_verify(curve, qx, qy, alg, msg, r, s) -> the same
+#   tls_curve(name)                               -> "p256" or "p384"'s constants
+#   tls_ec_mul(c, k, x, y)                        -> k times (x, y): [x, y], or [] for infinity
+#
+# n, e, qx, qy, r and s are integers; msg and sig lists of bytes (ints). The
+# arithmetic is on modints, and a value read out of one is revealed with
+# mod_reveal: everything here is public, and the constant-time check lists
+# each reveal as declared rather than reporting it.
+
+# ---- bytes and integers ----
+
+make a function called tls_bytes_int takes bytes returns x
+  require type_of(bytes) == "list"
+  let x = 0
+  let i = 0
+  while i < list_len(bytes) do
+    let x = x * 256 + bytes[i]
+    let i = i + 1
+  end
+  ensure x >= 0
+  return x
+end
+
+# x as len bytes, big-endian; [] when it does not fit.
+make a function called tls_int_bytes takes x, len returns bytes
+  require (x >= 0) and (len >= 0)
+  let out = []
+  let v = x
+  let i = 0
+  while i < len do
+    let r = v % 256
+    let out = list_push(out, r)
+    let v = (v - r) / 256
+    let i = i + 1
+  end
+  if v != 0 then
+    return []
+  end
+  let bytes = []
+  let i = len - 1
+  while i >= 0 do
+    let bytes = list_push(bytes, out[i])
+    let i = i - 1
+  end
+  ensure (list_len(bytes) == len) or (list_len(bytes) == 0)
+  return bytes
+end
+
+# How many bytes n takes.
+make a function called tls_byte_len takes n returns k
+  require n >= 1
+  let k = 0
+  let v = n
+  while v > 0 do
+    let v = (v - v % 256) / 256
+    let k = k + 1
+  end
+  ensure k >= 1
+  return k
+end
+
+# The digest of public bytes, as ints.
+make a function called tls_public_digest takes alg, bytes returns digest
+  require ((alg == "sha256") or (alg == "sha384") or (alg == "sha512")) and (type_of(bytes) == "list")
+  if alg == "sha512" then
+    let d = sha512(bytes)
+  else
+    let d = tls_hash(alg, bytes)
+  end
+  let digest = []
+  let i = 0
+  while i < list_len(d) do
+    let digest = list_push(digest, mod_reveal(d[i]))
+    let i = i + 1
+  end
+  ensure list_len(digest) == list_len(d)
+  return digest
+end
+
+# ---- RSA ----
+
+# s^e mod n as k bytes, or [] when s is out of range.
+make a function called tls_rsa_public takes n, e, sig, k returns em
+  require (n >= 3) and (e >= 3)
+  if list_len(sig) != k then
+    return []
+  end
+  let s = tls_bytes_int(sig)
+  if s >= n then
+    return []
+  end
+  let m = mod_reveal(pow(mod_make(s, n), e))
+  let em = tls_int_bytes(m, k)
+  ensure type_of(em) == "list"
+  return em
+end
+
+# The DER DigestInfo prefix of each hash (RFC 8017 9.2, note 1).
+make a function called tls_digest_info takes alg returns prefix
+  require (alg == "sha256") or (alg == "sha384") or (alg == "sha512")
+  if alg == "sha256" then
+    return tls_hex_bytes("3031300d060960864801650304020105000420")
+  end
+  if alg == "sha384" then
+    return tls_hex_bytes("3041300d060960864801650304020205000430")
+  end
+  return tls_hex_bytes("3051300d060960864801650304020305000440")
+end
+
+make a function called tls_rsa_pkcs1_verify takes n, e, alg, msg, sig returns ok
+  require (type_of(msg) == "list") and (type_of(sig) == "list")
+  let k = tls_byte_len(n)
+  let em = tls_rsa_public(n, e, sig, k)
+  if list_len(em) == 0 then
+    return false
+  end
+  let t = tls_digest_info(alg) + tls_public_digest(alg, msg)
+  if k < list_len(t) + 11 then
+    return false
+  end
+  let want = [0, 1]
+  let i = 0
+  while i < k - list_len(t) - 3 do
+    let want = list_push(want, 255)
+    let i = i + 1
+  end
+  let want = list_push(want, 0) + t
+  let ok = em == want
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# MGF1 (RFC 8017 B.2.1) of seed to len bytes.
+make a function called tls_mgf1 takes alg, seed, len returns mask
+  let mask = []
+  let c = 0
+  while list_len(mask) < len do
+    let block = tls_public_digest(alg, seed + [(c shr 24) band 255, (c shr 16) band 255, (c shr 8) band 255, c band 255])
+    let i = 0
+    while (i < list_len(block)) and (list_len(mask) < len) do
+      let mask = list_push(mask, block[i])
+      let i = i + 1
+    end
+    let c = c + 1
+  end
+  ensure list_len(mask) == len
+  return mask
+end
+
+# The number of bits of an integer from its big-endian bytes.
+make a function called tls_bit_len takes bytes returns bits
+  require list_len(bytes) >= 1
+  let top = bytes[0]
+  let b = 0
+  while top > 0 do
+    let top = top shr 1
+    let b = b + 1
+  end
+  let bits = 8 * (list_len(bytes) - 1) + b
+  ensure bits >= 0
+  return bits
+end
+
+make a function called tls_rsa_pss_verify takes n, e, alg, msg, sig returns ok
+  require (type_of(msg) == "list") and (type_of(sig) == "list")
+  let k = tls_byte_len(n)
+  let mod_bits = tls_bit_len(tls_int_bytes(n, k))
+  let em_bits = mod_bits - 1
+  let em_len = (em_bits + 7 - (em_bits + 7) % 8) / 8
+  let h_len = tls_hash_len(alg)
+  let s_len = h_len
+  if list_len(sig) != k then
+    return false
+  end
+  let s = tls_bytes_int(sig)
+  if s >= n then
+    return false
+  end
+  let m = mod_reveal(pow(mod_make(s, n), e))
+  let em = tls_int_bytes(m, em_len)
+  if (list_len(em) == 0) or (em_len < h_len + s_len + 2) or (em[em_len - 1] != 188) then
+    return false
+  end
+  let db_len = em_len - h_len - 1
+  let masked = []
+  let i = 0
+  while i < db_len do
+    let masked = list_push(masked, em[i])
+    let i = i + 1
+  end
+  let hh = []
+  let i = db_len
+  while i < db_len + h_len do
+    let hh = list_push(hh, em[i])
+    let i = i + 1
+  end
+  # the leftmost 8 * em_len - em_bits bits of masked must be zero
+  let spare = 8 * em_len - em_bits
+  let keep = 255 shr spare
+  if (masked[0] band (255 - keep)) != 0 then
+    return false
+  end
+  let mask = tls_mgf1(alg, hh, db_len)
+  let db = []
+  let i = 0
+  while i < db_len do
+    let db = list_push(db, masked[i] bxor mask[i])
+    let i = i + 1
+  end
+  let db = list_set(db, 0, db[0] band keep)
+  # zeros, then 1, then the salt
+  let i = 0
+  while i < db_len - s_len - 1 do
+    if db[i] != 0 then
+      return false
+    end
+    let i = i + 1
+  end
+  if db[db_len - s_len - 1] != 1 then
+    return false
+  end
+  let salt = []
+  let i = db_len - s_len
+  while i < db_len do
+    let salt = list_push(salt, db[i])
+    let i = i + 1
+  end
+  let m2 = [0, 0, 0, 0, 0, 0, 0, 0] + tls_public_digest(alg, msg) + salt
+  let ok = tls_public_digest(alg, m2) == hh
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# ---- the NIST curves ----
+
+# [name, p, b, gx, gy, n, bytes]: y^2 = x^3 - 3x + b over the integers
+# modulo p, the generator (gx, gy) of order n.
+make a function called tls_curve takes name returns c
+  require (name == "p256") or (name == "p384")
+  if name == "p256" then
+    let c = ["p256", tls_bytes_int(tls_hex_bytes("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")), tls_bytes_int(tls_hex_bytes("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")), tls_bytes_int(tls_hex_bytes("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")), tls_bytes_int(tls_hex_bytes("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")), tls_bytes_int(tls_hex_bytes("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")), 32]
+  else
+    let c = ["p384", tls_bytes_int(tls_hex_bytes("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff")), tls_bytes_int(tls_hex_bytes("b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef")), tls_bytes_int(tls_hex_bytes("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7")), tls_bytes_int(tls_hex_bytes("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")), tls_bytes_int(tls_hex_bytes("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973")), 48]
+  end
+  ensure list_len(c) == 7
+  return c
+end
+
+# Whether (x, y), integers, is on the curve.
+make a function called tls_ec_on_curve takes c, x, y returns ok
+  let p = c[1]
+  if (x < 0) or (x >= p) or (y < 0) or (y >= p) then
+    return false
+  end
+  let mx = mod_make(x, p)
+  let my = mod_make(y, p)
+  # b made a modint first: c[2], read from a list, could be any value to the
+  # constant-time check, and + with a text would print the modint's residue
+  let b = mod_make(c[2], p)
+  let ok = mod_reveal(my * my - (mx * mx * mx - 3 * mx + b)) == 0
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# Points in Jacobian coordinates [X, Y, Z], modints modulo p; Z = 0 is the
+# point at infinity.
+make a function called tls_ec_double takes pt returns r
+  let x = pt[0]
+  let y = pt[1]
+  let z = pt[2]
+  if mod_reveal(z) == 0 then
+    return pt
+  end
+  let delta = z * z
+  let gamma = y * y
+  let beta = x * gamma
+  let alpha = 3 * (x - delta) * (x + delta)
+  let x3 = alpha * alpha - 8 * beta
+  let z3 = (y + z) * (y + z) - gamma - delta
+  let y3 = alpha * (4 * beta - x3) - 8 * gamma * gamma
+  let r = [x3, y3, z3]
+  ensure list_len(r) == 3
+  return r
+end
+
+make a function called tls_ec_add takes a, b returns r
+  if mod_reveal(a[2]) == 0 then
+    return b
+  end
+  if mod_reveal(b[2]) == 0 then
+    return a
+  end
+  let z1z1 = a[2] * a[2]
+  let z2z2 = b[2] * b[2]
+  let u1 = a[0] * z2z2
+  let u2 = b[0] * z1z1
+  let s1 = a[1] * b[2] * z2z2
+  let s2 = b[1] * a[2] * z1z1
+  let h = u2 - u1
+  let rr = 2 * (s2 - s1)
+  if mod_reveal(h) == 0 then
+    if mod_reveal(rr) == 0 then
+      return tls_ec_double(a)
+    end
+    let zero = a[2] - a[2]
+    return [zero + 1, zero + 1, zero]
+  end
+  let i = (2 * h) * (2 * h)
+  let j = h * i
+  let v = u1 * i
+  let x3 = rr * rr - j - 2 * v
+  let y3 = rr * (v - x3) - 2 * s1 * j
+  let z3 = ((a[2] + b[2]) * (a[2] + b[2]) - z1z1 - z2z2) * h
+  let r = [x3, y3, z3]
+  ensure list_len(r) == 3
+  return r
+end
+
+# A Jacobian point as affine integers [x, y], or [] for infinity.
+make a function called tls_ec_affine takes c, pt returns xy
+  if mod_reveal(pt[2]) == 0 then
+    return []
+  end
+  let zi = mod_make(1, c[1]) / pt[2]
+  let zi2 = zi * zi
+  let xy = [mod_reveal(pt[0] * zi2), mod_reveal(pt[1] * zi2 * zi)]
+  ensure list_len(xy) == 2
+  return xy
+end
+
+make a function called tls_ec_point takes c, x, y returns pt
+  let p = c[1]
+  let pt = [mod_make(x, p), mod_make(y, p), mod_make(1, p)]
+  ensure list_len(pt) == 3
+  return pt
+end
+
+# u1 * P + u2 * Q (Shamir's trick: one doubling a bit, and an addition of P,
+# Q or P + Q), for public scalars below n; affine [x, y] or [].
+make a function called tls_ec_mul2 takes c, u1, px, py, u2, qx, qy returns xy
+  let p = c[1]
+  let pp = tls_ec_point(c, px, py)
+  let qq = tls_ec_point(c, qx, qy)
+  let both = tls_ec_add(pp, qq)
+  let b1 = tls_int_bytes(u1, c[6])
+  let b2 = tls_int_bytes(u2, c[6])
+  let acc = [mod_make(1, p), mod_make(1, p), mod_make(0, p)]
+  let i = 0
+  while i < 8 * c[6] do
+    let acc = tls_ec_double(acc)
+    let shift = 7 - i % 8
+    let byte_at = (i - i % 8) / 8
+    let bit1 = (b1[byte_at] shr shift) band 1
+    let bit2 = (b2[byte_at] shr shift) band 1
+    if (bit1 == 1) and (bit2 == 1) then
+      let acc = tls_ec_add(acc, both)
+    elif bit1 == 1 then
+      let acc = tls_ec_add(acc, pp)
+    elif bit2 == 1 then
+      let acc = tls_ec_add(acc, qq)
+    end
+    let i = i + 1
+  end
+  let xy = tls_ec_affine(c, acc)
+  ensure type_of(xy) == "list"
+  return xy
+end
+
+make a function called tls_ec_mul takes c, k, x, y returns xy
+  let xy = tls_ec_mul2(c, k, x, y, 0, x, y)
+  ensure type_of(xy) == "list"
+  return xy
+end
+
+make a function called tls_ecdsa_verify takes cname, qx, qy, alg, msg, r, s returns ok
+  require type_of(msg) == "list"
+  let c = tls_curve(cname)
+  let n = c[5]
+  if (r < 1) or (r >= n) or (s < 1) or (s >= n) then
+    return false
+  end
+  if not tls_ec_on_curve(c, qx, qy) then
+    return false
+  end
+  # the hash's leftmost bits, as many as n has (FIPS 186-4 6.4): both
+  # curves' n have a whole number of bytes, so the leftmost c[6] bytes, the
+  # whole hash when it is no longer
+  let digest = tls_public_digest(alg, msg)
+  let lead = []
+  let i = 0
+  while (i < list_len(digest)) and (i < c[6]) do
+    let lead = list_push(lead, digest[i])
+    let i = i + 1
+  end
+  let e = tls_bytes_int(lead)
+  let w = mod_make(1, n) / mod_make(s, n)
+  let u1 = mod_reveal(mod_make(e, n) * w)
+  let u2 = mod_reveal(mod_make(r, n) * w)
+  let xy = tls_ec_mul2(c, u1, c[3], c[4], u2, qx, qy)
+  if list_len(xy) == 0 then
+    return false
+  end
+  let ok = xy[0] % n == r
+  ensure value_class(ok) == 1
+  return ok
+end

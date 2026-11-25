@@ -15,10 +15,10 @@
 # requirer like any package, named "@request" (no package name can start
 # with @), version "0.0.0"; a request without a constraint is >= 0.0.0.
 #
-# The rule store is one per process, and rule_add has no inverse, so a
-# process resolves once: rs_resolve and rs_cli_facts both assert the whole
-# universe, and a second call in the same process would see both sets of
-# facts. rs_assert_facts is the only function here that calls rule_add.
+# Each resolution asserts its facts and rules in a rule store of its own
+# (logic_store_new), and every search solves in that store alone, so a
+# process may resolve any number of times, each seeing only its own
+# universe. rs_assert_facts is the only function here that adds rules.
 include "manifest.patlang"
 
 # ---- universes ----
@@ -149,7 +149,7 @@ end
 # Asserts the universe's facts, the request's (when request is [name,
 # constraints] rather than []) and the rules. Gives [pkg_available count,
 # pkg_requires count, versions known, version_order count].
-make a function called rs_assert_facts takes ms, request returns counts
+make a function called rs_assert_facts takes kb, ms, request returns counts
   require (value_class(ms) == 9) and (value_class(request) == 9)
   let avail = 0
   let reqs = 0
@@ -157,7 +157,7 @@ make a function called rs_assert_facts takes ms, request returns counts
   while i < list_len(ms) do
     let name = rs_m_name(ms[i])
     let ver = rs_m_version(ms[i])
-    rule_add("pkg_available", [name, ver], [])
+    rule_add_to(kb, "pkg_available", [name, ver], [])
     let avail = avail + 1
     let deps = rs_m_depends(ms[i])
     let k = 0
@@ -165,7 +165,7 @@ make a function called rs_assert_facts takes ms, request returns counts
       let cs = deps[k][1]
       let j = 0
       while j < list_len(cs) do
-        rule_add("pkg_requires", [name, ver, deps[k][0], cs[j][0], cs[j][1]], [])
+        rule_add_to(kb, "pkg_requires", [name, ver, deps[k][0], cs[j][0], cs[j][1]], [])
         let reqs = reqs + 1
         let j = j + 1
       end
@@ -177,7 +177,7 @@ make a function called rs_assert_facts takes ms, request returns counts
     let cs = request[1]
     let j = 0
     while j < list_len(cs) do
-      rule_add("pkg_requires", ["@request", "0.0.0", request[0], cs[j][0], cs[j][1]], [])
+      rule_add_to(kb, "pkg_requires", ["@request", "0.0.0", request[0], cs[j][0], cs[j][1]], [])
       let reqs = reqs + 1
       let j = j + 1
     end
@@ -187,22 +187,27 @@ make a function called rs_assert_facts takes ms, request returns counts
   while i < list_len(known) do
     let j = 0
     while j < list_len(known) do
-      rule_add("version_order", [known[i][1], known[j][1], rs_fields_order(known[i][0], known[j][0])], [])
+      rule_add_to(kb, "version_order", [known[i][1], known[j][1], rs_fields_order(known[i][0], known[j][0])], [])
       let j = j + 1
     end
     let i = i + 1
   end
-  rule satisfies(V, ge, Min) :- version_order(V, Min, gt).
-  rule satisfies(V, ge, Min) :- version_order(V, Min, eq).
-  rule satisfies(V, gt, Min) :- version_order(V, Min, gt).
-  rule satisfies(V, le, Max) :- version_order(V, Max, lt).
-  rule satisfies(V, le, Max) :- version_order(V, Max, eq).
-  rule satisfies(V, lt, Max) :- version_order(V, Max, lt).
-  rule satisfies(V, eq, W) :- version_order(V, W, eq).
-  rule dep_candidate(Pkg, PVer, Dep, DVer) :-
-      pkg_requires(Pkg, PVer, Dep, Op, Bound),
-      pkg_available(Dep, DVer),
-      satisfies(DVer, Op, Bound).
+  let v = logic_var("V")
+  let w = logic_var("W")
+  let bound = logic_var("Bound")
+  rule_add_to(kb, "satisfies", [v, "ge", bound], [["version_order", [v, bound, "gt"]]])
+  rule_add_to(kb, "satisfies", [v, "ge", bound], [["version_order", [v, bound, "eq"]]])
+  rule_add_to(kb, "satisfies", [v, "gt", bound], [["version_order", [v, bound, "gt"]]])
+  rule_add_to(kb, "satisfies", [v, "le", bound], [["version_order", [v, bound, "lt"]]])
+  rule_add_to(kb, "satisfies", [v, "le", bound], [["version_order", [v, bound, "eq"]]])
+  rule_add_to(kb, "satisfies", [v, "lt", bound], [["version_order", [v, bound, "lt"]]])
+  rule_add_to(kb, "satisfies", [v, "eq", w], [["version_order", [v, w, "eq"]]])
+  let pkg = logic_var("Pkg")
+  let pver = logic_var("PVer")
+  let dep = logic_var("Dep")
+  let dver = logic_var("DVer")
+  let op = logic_var("Op")
+  rule_add_to(kb, "dep_candidate", [pkg, pver, dep, dver], [["pkg_requires", [pkg, pver, dep, op, bound]], ["pkg_available", [dep, dver]], ["satisfies", [dver, op, bound]]])
   let counts = [avail, reqs, list_len(known), list_len(known) * list_len(known)]
   ensure list_len(counts) == 4
   return counts
@@ -305,9 +310,9 @@ make a function called rs_name_id takes names, name returns id
 end
 
 # The state for a search, from the pkg_available facts.
-make a function called rs_state_new takes unused returns st
-  require value_live(unused)
-  let avail = rs_sort(solve("pkg_available", [logic_var("Name"), logic_var("Ver")]), "first")
+make a function called rs_state_new takes kb returns st
+  require value_live(kb)
+  let avail = rs_sort(solve_in(kb, "pkg_available",[logic_var("Name"), logic_var("Ver")]), "first")
   let names = []
   let versions = []
   let offsets = []
@@ -338,8 +343,8 @@ make a function called rs_state_new takes unused returns st
   vec_push(conflict, [])
   let tried = vec_new()
   vec_push(tried, 0)
-  let st = [names, versions, offsets, rs_vec_filled(n, 0 - 1), rs_vec_filled(n, false), rs_vec_filled(n, []), rs_stack_new(0), rs_stack_new(0), rs_vec_filled(total, []), conflict, tried]
-  ensure list_len(st) == 11
+  let st = [names, versions, offsets, rs_vec_filled(n, 0 - 1), rs_vec_filled(n, false), rs_vec_filled(n, []), rs_stack_new(0), rs_stack_new(0), rs_vec_filled(total, []), conflict, tried, kb]
+  ensure list_len(st) == 12
   return st
 end
 
@@ -369,10 +374,10 @@ end
 # meets them all exactly when it has as many solutions as P has constraints
 # on D.
 make a function called rs_dep_info takes st, pname, pver returns info
-  require (list_len(st) == 11) and (value_class(pname) == 8) and (value_class(pver) == 8)
+  require (list_len(st) == 12) and (value_class(pname) == 8) and (value_class(pver) == 8)
   let names = st[0]
   let versions = st[1]
-  let reqs = solve("pkg_requires", [pname, pver, logic_var("Dep"), logic_var("Op"), logic_var("Bound")])
+  let reqs = solve_in(st[11], "pkg_requires", [pname, pver, logic_var("Dep"), logic_var("Op"), logic_var("Bound")])
   let deps = []
   let counts = []
   let i = 0
@@ -400,7 +405,7 @@ make a function called rs_dep_info takes st, pname, pver returns info
     let k = k + 1
   end
   let tally = rs_vec_filled(total, 0)
-  let cands = solve("dep_candidate", [pname, pver, logic_var("Dep"), logic_var("DVer")])
+  let cands = solve_in(st[11], "dep_candidate", [pname, pver, logic_var("Dep"), logic_var("DVer")])
   let i = 0
   while i < list_len(cands) do
     let k = rs_index_of(deps, cands[i][2])
@@ -431,7 +436,7 @@ end
 
 # rs_dep_info for a chosen version, asked of the facts once.
 make a function called rs_dep_info_of takes st, id, vi returns info
-  require (list_len(st) == 11) and (id >= 0) and (vi >= 0)
+  require (list_len(st) == 12) and (id >= 0) and (vi >= 0)
   let slot = st[2][id] + vi
   let info = vec_get(st[8], slot)
   if value_class(info) != 9 then
@@ -449,7 +454,7 @@ end
 # Keeps the first conflict met: the package, and its requirers as
 # [package, version] pairs.
 make a function called rs_note_conflict takes st, dep, requirers returns done
-  require (list_len(st) == 11) and (value_class(dep) == 8) and (value_class(requirers) == 9)
+  require (list_len(st) == 12) and (value_class(dep) == 8) and (value_class(requirers) == 9)
   if list_len(vec_get(st[9], 0)) == 0 then
     vec_set(st[9], 0, [dep, requirers])
   end
@@ -495,7 +500,7 @@ end
 
 # The version indices of a package every requirer accepts, newest first.
 make a function called rs_candidates takes st, id returns cands
-  require (list_len(st) == 11) and (id >= 0)
+  require (list_len(st) == 12) and (id >= 0)
   let all = []
   let vi = 0
   while vi < list_len(st[1][id]) do
@@ -518,7 +523,7 @@ end
 # is still possible: false when one has no version available, or is chosen
 # already at a version this requirer does not accept.
 make a function called rs_add_deps takes st, pname, pver, info returns ok
-  require (list_len(st) == 11) and (value_class(info) == 9)
+  require (list_len(st) == 12) and (value_class(info) == 9)
   let k = 0
   while k < list_len(info) do
     let dep = info[k][0]
@@ -554,7 +559,7 @@ end
 
 # Undoes the trail back to length n and the agenda back to length a.
 make a function called rs_undo takes st, n, a returns done
-  require (list_len(st) == 11) and (n >= 0) and (a >= 0)
+  require (list_len(st) == 12) and (n >= 0) and (a >= 0)
   let t = rs_stack_len(st[7])
   while t > n do
     let e = rs_stack_get(st[7], t - 1)
@@ -578,7 +583,7 @@ end
 # newest first, backtracking when a choice leaves a later package without
 # one. Whether it found a choice for all of them.
 make a function called rs_search takes st, pos returns found
-  require (list_len(st) == 11) and (pos >= 0)
+  require (list_len(st) == 12) and (pos >= 0)
   if pos >= rs_stack_len(st[6]) then
     let found = true
     ensure found
@@ -616,9 +621,9 @@ make a function called rs_search takes st, pos returns found
 end
 
 # A requirer's constraints on a package, from the pkg_requires facts.
-make a function called rs_constraints_of takes pname, pver, dep returns cs
+make a function called rs_constraints_of takes kb, pname, pver, dep returns cs
   require (value_class(pname) == 8) and (value_class(pver) == 8) and (value_class(dep) == 8)
-  let sols = solve("pkg_requires", [pname, pver, dep, logic_var("Op"), logic_var("Bound")])
+  let sols = solve_in(kb, "pkg_requires",[pname, pver, dep, logic_var("Op"), logic_var("Bound")])
   let out = []
   let i = 0
   while i < list_len(sols) do
@@ -635,9 +640,9 @@ end
 #   ["ok", [[name, version], ...] by name, versions tried]
 #   ["conflict", package, [[requirer, version, constraints], ...],
 #    available versions newest first, versions tried]
-make a function called rs_choose takes request returns result
+make a function called rs_choose takes kb, request returns result
   require (value_class(request) == 9) and (list_len(request) == 2)
-  let st = rs_state_new(0)
+  let st = rs_state_new(kb)
   let found = rs_add_deps(st, "@request", "0.0.0", rs_dep_info(st, "@request", "0.0.0"))
   if found then
     let found = rs_search(st, 0)
@@ -663,7 +668,7 @@ make a function called rs_choose takes request returns result
   let i = 0
   while i < list_len(c[1]) do
     let p = c[1][i]
-    let who = list_push(who, [p[0], p[1], rs_constraints_of(p[0], p[1], dep)])
+    let who = list_push(who, [p[0], p[1], rs_constraints_of(kb, p[0], p[1], dep)])
     let i = i + 1
   end
   let available = []
@@ -676,12 +681,13 @@ make a function called rs_choose takes request returns result
   return result
 end
 
-# Resolves a request [name, constraints] over a universe's manifests. Call
-# once per process: see the head of this file.
+# Resolves a request [name, constraints] over a universe's manifests, in a
+# rule store of its own.
 make a function called rs_resolve takes ms, request returns result
   require (value_class(ms) == 9) and (value_class(request) == 9) and (list_len(request) == 2)
-  rs_assert_facts(ms, request)
-  let result = rs_choose(request)
+  let kb = logic_store_new()
+  rs_assert_facts(kb, ms, request)
+  let result = rs_choose(kb, request)
   ensure (result[0] == "ok") or (result[0] == "conflict")
   return result
 end
@@ -781,9 +787,9 @@ make a function called rs_cli_resolve takes name, cons, paths returns r
   return r
 end
 
-make a function called rs_solutions_text takes b, pred, query returns n
+make a function called rs_solutions_text takes b, kb, pred, query returns n
   require (value_class(pred) == 8) and (value_class(query) == 9)
-  let sols = solve(pred, query)
+  let sols = solve_in(kb, pred, query)
   let i = 0
   while i < list_len(sols) do
     sb_push(b, pred)
@@ -811,13 +817,14 @@ make a function called rs_cli_facts takes paths returns r
     ensure list_len(r) == 2
     return r
   end
-  rs_assert_facts(u[1], [])
+  let kb = logic_store_new()
+  rs_assert_facts(kb, u[1], [])
   let b = sb_new()
-  rs_solutions_text(b, "pkg_available", [logic_var("Name"), logic_var("Ver")])
-  rs_solutions_text(b, "pkg_requires", [logic_var("Pkg"), logic_var("PVer"), logic_var("Dep"), logic_var("Op"), logic_var("Bound")])
-  rs_solutions_text(b, "version_order", [logic_var("A"), logic_var("B"), logic_var("Order")])
-  rs_solutions_text(b, "satisfies", [logic_var("V"), logic_var("Op"), logic_var("Bound")])
-  rs_solutions_text(b, "dep_candidate", [logic_var("Pkg"), logic_var("PVer"), logic_var("Dep"), logic_var("DVer")])
+  rs_solutions_text(b, kb, "pkg_available", [logic_var("Name"), logic_var("Ver")])
+  rs_solutions_text(b, kb, "pkg_requires", [logic_var("Pkg"), logic_var("PVer"), logic_var("Dep"), logic_var("Op"), logic_var("Bound")])
+  rs_solutions_text(b, kb, "version_order", [logic_var("A"), logic_var("B"), logic_var("Order")])
+  rs_solutions_text(b, kb, "satisfies", [logic_var("V"), logic_var("Op"), logic_var("Bound")])
+  rs_solutions_text(b, kb, "dep_candidate", [logic_var("Pkg"), logic_var("PVer"), logic_var("Dep"), logic_var("DVer")])
   let r = [0, rs_trim(sb_str(b))]
   ensure list_len(r) == 2
   return r

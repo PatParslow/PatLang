@@ -35,3 +35,13 @@ Feature: an integer is an int exactly when it fits in 64 bits (spec 1.3)
     Given bigint dividends and divisors of many sizes, and consecutive Fibonacci numbers of about 50 and 200 digits
     When each is divided, and each Fibonacci fraction is reduced
     Then q * b + r gives back the dividend with the remainder smaller than the divisor, and the larger reduction costs at most 16 times the smaller
+
+  Scenario: rational arithmetic is exact on small parts and large, ints and rationals mixed
+    Given 399 pairs of random operands from a fixed seed: ints, and rationals with parts under 2^31 and past it, of both signs
+    When each pair is added, subtracted, multiplied, divided and compared
+    Then every result is what Python's fractions give for the same pair
+
+  Scenario: arithmetic on rationals with parts under 2^31 costs a small part of the general path's
+    Given 1/3 and 2/7, and 2147483659/3, whose part past 2^31 takes the general path
+    When each of +, -, *, / and < is done 20000 times on 1/3 and 2/7, and on 2147483659/3 and 2/7
+    Then each on the small parts costs at most a quarter of the same, the loop around it not counted, on the large part

@@ -63,7 +63,12 @@ the whole result (Knuth, TAOCP 4.5.1), so adding 1/k to a fraction of many
 digits costs about one division by k. `/` of two ints that divide exactly
 gives their int quotient without making a rational, and costs about what
 their remainder does (compiled, the machine's division, inline); it went
-through the rationals, and cost about 20 us, until 2026-11-23.
+through the rationals, and cost about 20 us, until 2026-11-23. An operation
+on rationals whose numerators and denominators are all under 2^31 costs
+about what making one value on the heap does, a comparison less: the
+products of their parts fit a machine word, so it is word arithmetic and one
+gcd on words. Before 2026-11-24 each went through the operators' general
+dispatch and a list per gcd step, at four to five times that (#285).
 
 ### 1.4 Operators are methods, and raise ordinary events
 
@@ -234,7 +239,12 @@ running it.
   wait_ms)` asks one DNS server over UDP for a name's A records, following a CNAME the
   answer gives, and gives `[]` for a name the server says is not there or when no answer
   comes within `wait_ms`, twice. Both stop a program that has not declared
-  `tcp_allow_remote()`. IPv6 is not covered.
+  `tcp_allow_remote()`. IPv6 is not covered. `trust_roots()` gives the system's trusted
+  root certificates, each a `bytes` holding one DER certificate: on Windows the ROOT store
+  (CRYPT32), on Linux the first of `/etc/ssl/certs/ca-certificates.crt`,
+  `/etc/pki/tls/certs/ca-bundle.crt` and `/etc/ssl/cert.pem` there is, its PEM decoded; `[]`
+  in a browser, which gives a program none. It needs no declaration: it reads, and connects
+  to nothing.
   A connection nothing accepts stops it too; `tcp_try_connect` gives `-1` there instead, and
   takes the same addresses.
 - The runtime's locks go to whichever waiting thread is running when the lock comes free, not
@@ -698,7 +708,13 @@ byte into a field or a field element's low byte out of it.
   printing convert between modints and other values, and their time may depend on the values
   converted. The constant-time check (2.7) is how this is tested. A modint modulo 2^k for k
   up to 64 costs about what an int does, being held as a word (2.1); nothing else about it
-  differs from any other modint.
+  differs from any other modint. Two of one k added, subtracted, multiplied, compared or
+  combined bitwise, one shifted by an int count from 0 to k (and below 64), and `rotl` and
+  `rotr` of one, are the machine's instructions in a compiled program (since 2026-11-24 for
+  the shifts and rotations, which were calls of about 1,000 and 660 cycles before). An
+  integer operand beside one, a bigint included, costs
+  about what an int operand does: its low k bits are taken from its digits. (A bigint took
+  the general path until 2026-11-24, at about 200 times the cost.)
 
 ### 1.15 Worlds
 

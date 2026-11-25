@@ -23,6 +23,51 @@ Already there to reuse:
 - The opt-in pattern: `object_names_explicit()` (runtime/objects.patlang) sets a
   flag in the world's state (worlds.patlang).
 
+## Status (2026-11-24)
+- **Stage 2 done**, in `packages/tls` (0.2.2): SHA-256 on modints and SHA-384
+  (added to `sha512`), HMAC, HKDF and TLS 1.3's labels (`kdf.patlang`,
+  `hash.feature`, the key schedule passing `--constant-time`); AES-128 and
+  AES-128-GCM with a computed S-box on packed 64-bit modints (`aes.patlang`,
+  `aes.feature`: FIPS-197 C.1 and the GCM test cases 1 to 4); RSA PKCS#1 v1.5
+  and PSS, ECDSA on P-256 and P-384, and ECDHE on P-256 by a ladder over the
+  complete formulas of Renes, Costello and Batina (`sig.patlang`,
+  `ecdh.patlang`, `sig.feature`, against Python's cryptography).
+- **Stage 3 done**: `x509.patlang` (DER, certificates, chains to a root by
+  name and key, RFC 6125 names, an unknown critical extension refused,
+  malformed DER refused and never a stop) and `trust_roots()` in the runtime
+  (spec 1.8: CRYPT32's ROOT store on Windows, the PEM bundle on Linux, none in
+  a browser). The test PKI is made by `spec/make_certs.py` with Python's
+  cryptography rather than openssl, whose 3.0 cannot back-date a certificate
+  without `openssl ca`'s database. Every root of this machine reads (60 on
+  Windows, 120 on Linux).
+- **Stage 4 done**: `tls13.patlang`, the client. It follows RFC 8448's
+  section 3 trace byte for byte (`tls13.feature`: the secrets, its Finished,
+  its application data and close_notify records). `server.feature` runs it
+  against `openssl s_server -tls1_3` with the test PKI: ECDSA and RSA-PSS
+  CertificateVerify, AES-128-GCM alone, a HelloRetryRequest for P-256,
+  `lib/http_client.patlang`'s `https://`, and the refusals (no trusted root, a
+  wrong name, an expired leaf). The client runs as a Linux build under WSL
+  beside the server: this machine's WSL forwards no localhost connection from
+  Windows. Manual checks over the internet, trusting the system's roots:
+  `www.google.com` and `www.rfc-editor.org` answer on Windows (handshakes of
+  about 4.5 s) and Linux (9 to 11 s, with other work running); `example.org`
+  closes the connection on Linux before a 15 to 35 s handshake ends, and on
+  Windows its roots are not in the ROOT store, which Windows fills only as its
+  own chain building fetches roots, so a program reading it sees part of what
+  Windows trusts.
+- `--constant-time` passes for ChaCha20-Poly1305 and AES-128-GCM (each with its
+  tag's verdict declared), the key schedule, and ECDHE on P-256 (its public
+  key, the peer's point being on the curve, and the result not being
+  infinity declared): `constant_time.feature`. A value read from a list is
+  known to the check only as some value, so the AES and P-256 code makes each
+  such value a modint again with `mod_make` before arithmetic, once a block
+  or a step; reading constants from a list in the inner functions made
+  AES-GCM's check report 200 places and run 2.7 hours, against 306 seconds.
+- Cost: a handshake is mostly the public-key checks on modints whose modulus
+  is not a power of two (#285); sealing costs about 146,000 cycles a byte with
+  ChaCha20-Poly1305 and 172,000 with AES-128-GCM, compiled.
+- Stage 5, the crawler, is next.
+
 ## Status (2026-11-22)
 - Done before Stage 2: modints modulo 2^k held as words (e43d710e); SHA-512
   and X25519/Ed25519 moved into the `sha512` and `curve25519` packages, so

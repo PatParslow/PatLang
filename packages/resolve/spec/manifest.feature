@@ -46,7 +46,7 @@ Feature: resolve package: reading manifests
   Scenario: This package's own manifest reads
     Given the manifest "packages/resolve/manifest.pkg"
     When it is read
-    Then it reads as package "resolve" version "0.1.0"
+    Then it reads as package "resolve" version "0.2.0"
     And its entry is "resolve.patlang"
     And its dependencies are ""
 

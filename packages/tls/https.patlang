@@ -1,0 +1,209 @@
+# A GET over HTTPS for packages that fetch (the installer's https sources):
+# HTTP/1.0, so a body is its Content-Length or everything to the close, never
+# chunks; up to five redirects to https URLs followed. A full HTTP client is
+# self_hosting/lib/http_client.patlang, which a package cannot include once
+# installed elsewhere (#286).
+#
+#   tls_https_get(url, roots, max_bytes) -> ["ok", status, body] or ["err", code, why]
+#     url        an https:// URL: a host, an optional port, a path
+#     roots      the roots to trust (DER certificates as lists of bytes); []
+#                means the system's
+#     max_bytes  the longest response, head and body
+#   body is a list of bytes. Codes: "url", "connect", "tls", "protocol",
+#   "too-large", "redirects". A host other than this machine needs the
+#   program to have declared tcp_allow_remote() (spec 1.8).
+
+# [host, port, path] of an https URL, or [] when it is not one.
+make a function called tls_url_parts takes url returns parts
+  let b = tls_text_bytes(url)
+  let lead = tls_text_bytes("https://")
+  if (list_len(b) <= 8) or (der_slice(b, 0, 8) != lead) then
+    return []
+  end
+  let i = 8
+  let host = []
+  while (i < list_len(b)) and (b[i] != 47) and (b[i] != 58) do
+    let host = list_push(host, b[i])
+    let i = i + 1
+  end
+  if list_len(host) == 0 then
+    return []
+  end
+  let port = 443
+  if (i < list_len(b)) and (b[i] == 58) then
+    let port = 0
+    let i = i + 1
+    while (i < list_len(b)) and (b[i] >= 48) and (b[i] <= 57) do
+      let port = port * 10 + b[i] - 48
+      let i = i + 1
+    end
+  end
+  let path = "/"
+  if i < list_len(b) then
+    let path = bytes_to_str(bytes_from_list(der_slice(b, i, list_len(b) - i)))
+  end
+  return [bytes_to_str(bytes_from_list(host)), port, path]
+end
+
+# The response's [status, headers (lower-case name, value), body], or [].
+make a function called tls_http_parse takes got returns r
+  let n = list_len(got)
+  let at = 0
+  while (at + 3 < n) and (not ((got[at] == 13) and (got[at + 1] == 10) and (got[at + 2] == 13) and (got[at + 3] == 10))) do
+    let at = at + 1
+  end
+  if at + 3 >= n then
+    return []
+  end
+  let head = bytes_to_str(bytes_from_list(der_slice(got, 0, at)))
+  let lines = tls_http_lines(head)
+  if (list_len(lines) == 0) or (str_len(lines[0]) < 12) then
+    return []
+  end
+  let status = to_num(substr(lines[0], 9, 3))
+  let headers = []
+  let k = 1
+  while k < list_len(lines) do
+    let colon = tls_str_find(lines[k], ":")
+    if colon > 0 then
+      let headers = list_push(headers, [x509_lower(substr(lines[k], 0, colon)), tls_trim(substr(lines[k], colon + 1, str_len(lines[k]) - colon - 1))])
+    end
+    let k = k + 1
+  end
+  let body = der_slice(got, at + 4, n - at - 4)
+  return [status, headers, body]
+end
+
+make a function called tls_http_lines takes text returns lines
+  let b = tls_text_bytes(text)
+  let lines = []
+  let cur = sb_new()
+  let i = 0
+  while i < list_len(b) do
+    if b[i] == 10 then
+      let lines = list_push(lines, sb_str(cur))
+      let cur = sb_new()
+    elif b[i] != 13 then
+      sb_push(cur, chr(b[i]))
+    end
+    let i = i + 1
+  end
+  let lines = list_push(lines, sb_str(cur))
+  return lines
+end
+
+# The first index of what in text, or -1 (short ASCII).
+make a function called tls_str_find takes text, what returns at
+  let n = str_len(text)
+  let m = str_len(what)
+  let i = 0
+  while i + m <= n do
+    if substr(text, i, m) == what then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called tls_trim takes s returns t
+  let b = tls_text_bytes(s)
+  let lo = 0
+  let hi = list_len(b)
+  while (lo < hi) and ((b[lo] == 32) or (b[lo] == 9)) do
+    let lo = lo + 1
+  end
+  while (hi > lo) and ((b[hi - 1] == 32) or (b[hi - 1] == 9)) do
+    let hi = hi - 1
+  end
+  return bytes_to_str(bytes_from_list(der_slice(b, lo, hi - lo)))
+end
+
+make a function called tls_header_of takes headers, name returns value
+  let k = 0
+  while k < list_len(headers) do
+    if headers[k][0] == name then
+      return headers[k][1]
+    end
+    let k = k + 1
+  end
+  return ""
+end
+
+# One GET, no redirects followed: ["ok", status, headers, body] or an error.
+make a function called tls_https_once takes parts, roots, max_bytes returns r
+  let conn = tcp_try_connect(parts[0], parts[1])
+  if conn < 0 then
+    return ["err", "connect", "no connection to " + parts[0] + ":" + parts[1]]
+  end
+  let c = tls13_new(tls_io_tcp(conn), parts[0])
+  c.roots = roots
+  let hs = tls13_handshake(c)
+  if hs[0] != "ok" then
+    tcp_close(conn)
+    return hs
+  end
+  let req = "GET " + parts[2] + " HTTP/1.0" + chr(13) + chr(10) + "Host: " + parts[0] + chr(13) + chr(10) + "User-Agent: PatLang-tls" + chr(13) + chr(10) + chr(13) + chr(10)
+  if not tls13_send(c, tls_text_bytes(req)) then
+    tcp_close(conn)
+    return ["err", "connect", "the request could not be sent"]
+  end
+  let got = []
+  let going = true
+  while going do
+    let d = tls13_recv(c)
+    if d[0] == "data" then
+      let got = got + d[1]
+      if list_len(got) > max_bytes then
+        tcp_close(conn)
+        return ["err", "too-large", "the response is over " + max_bytes + " bytes"]
+      end
+    elif d[0] == "eof" then
+      let going = false
+    else
+      tcp_close(conn)
+      return d
+    end
+  end
+  tcp_close(conn)
+  let parsed = tls_http_parse(got)
+  if list_len(parsed) == 0 then
+    return ["err", "protocol", "no HTTP response head"]
+  end
+  let body = parsed[2]
+  let cl = tls_header_of(parsed[1], "content-length")
+  if cl != "" then
+    let want = to_num(cl)
+    if list_len(body) < want then
+      return ["err", "protocol", "the body ended at " + list_len(body) + " of " + want + " bytes"]
+    end
+    let body = der_slice(body, 0, want)
+  end
+  return ["ok", parsed[0], parsed[1], body]
+end
+
+make a function called tls_https_get takes url, roots, max_bytes returns r
+  let current = url
+  let hops = 0
+  while hops <= 5 do
+    let parts = tls_url_parts(current)
+    if list_len(parts) == 0 then
+      return ["err", "url", current + ": not an https:// URL"]
+    end
+    let got = tls_https_once(parts, roots, max_bytes)
+    if got[0] != "ok" then
+      return got
+    end
+    let location = tls_header_of(got[2], "location")
+    if ((got[1] == 301) or (got[1] == 302) or (got[1] == 303) or (got[1] == 307) or (got[1] == 308)) and (location != "") then
+      if substr(location, 0, 1) == "/" then
+        let location = "https://" + parts[0] + ":" + parts[1] + location
+      end
+      let current = location
+      let hops = hops + 1
+    else
+      return ["ok", got[1], got[3]]
+    end
+  end
+  return ["err", "redirects", "more than 5 redirects"]
+end

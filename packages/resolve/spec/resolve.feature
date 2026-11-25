@@ -4,7 +4,7 @@ Feature: resolve package: choosing one version per package
   satisfies every requirer, newer versions first. When no choice works it
   reports the package it could not choose, each requirer with its
   constraints from the facts, and the versions available. Each resolution
-  runs in a process of its own, since the rule store has no retraction.
+  has a rule store of its own, so one process may resolve many times.
 
   Scenario: zip takes the newest 0.1.x deflate
     When resolving "zip" from "basic"
@@ -69,6 +69,15 @@ Feature: resolve package: choosing one version per package
     And the conflict has 1 requirer
     And the conflict lists "requirer m 1.0.0: >= 1.0.0"
     And the conflict lists "available none"
+
+  Scenario: Resolutions in one process each see only their own universe
+    When resolving "zip" from "basic" in this process
+    Then the choice is "deflate 0.1.5, zip 0.1.0"
+    When resolving "deflate" from "cycle" in this process
+    Then resolution fails on "deflate"
+    And the conflict lists "available none"
+    When resolving "a" from "cycle" in this process
+    Then the choice is "a 1.0.0, b 1.0.0"
 
   Scenario: A requested package nobody provides
     When resolving "nothing" from "basic"

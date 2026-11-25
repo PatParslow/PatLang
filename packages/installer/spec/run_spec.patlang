@@ -1,0 +1,367 @@
+# Runs packages/installer/spec/*.feature, from the repository root:
+#
+#   ./self_hosting/build/v2.exe packages/installer/spec/run_spec.patlang packages/installer/build/run_spec.exe --workers 2
+#   ./packages/installer/build/run_spec.exe [feature file]
+#
+# Each scenario publishes its own small packages with the trust package's
+# publishing functions, under spec_out()/pkg_installer/, and installs them
+# into a project there. The exit code is 0 when every check passes, 1
+# otherwise.
+include "../../../self_hosting/lib/includes.patlang"
+include "../../../self_hosting/lib/gherkin.patlang"
+include "../../../self_hosting/lib/v2_engines.patlang"
+include "../../../self_hosting/lib/program_run.patlang"
+include "../installer.patlang"
+
+make a function called ip_tag returns t
+  let tag = random_bytes(4)
+  return tag[0] + "_" + tag[1] + "_" + tag[2] + "_" + tag[3]
+end
+
+make a function called ip_write_package takes dir, name, version, depends, body returns ok
+  make_directory(dir)
+  write_file(dir + "/" + name + ".patlang", body)
+  let b = sb_new()
+  sb_push(b, "package " + name + chr(10) + "version " + version + chr(10) + "entry " + name + ".patlang" + chr(10) + "include " + name + ".patlang" + chr(10))
+  if depends != "" then
+    sb_push(b, "depends " + depends + chr(10))
+  end
+  sb_push(b, "file " + name + ".patlang sha256 " + sha256_file_hex(dir + "/" + name + ".patlang") + chr(10))
+  write_file(dir + "/manifest.pkg", sb_str(b))
+  return true
+end
+
+# proposed, signed with owner and certified: whether all three were
+make a function called ip_release takes profile, dir, version returns ok
+  let p = trust_propose(dir)
+  let s = trust_sign_release(profile, dir, version, "owner")
+  let c = trust_certify(dir, version)
+  return (p[0] == "ok") and (s[0] == "ok") and (c[0] == "ok")
+end
+
+make a function called st_ip_sources takes ctx returns ok
+  let base = spec_out() + "/pkg_installer/run_" + ip_tag()
+  let profile = base + "/profile"
+  let src = base + "/src"
+  make_directory(spec_out() + "/pkg_installer")
+  make_directory(base)
+  make_directory(src)
+  let key = trust_keygen(profile, "owner")
+  ip_write_package(src + "/deflate", "deflate", "0.2.0", "", "make a function called deflate_twice takes x returns y" + chr(10) + "  return x * 2" + chr(10) + "end" + chr(10))
+  ip_write_package(src + "/zip", "zip", "0.2.0", "deflate >= 0.2.0, < 0.3.0", "include \"../deflate/deflate.patlang\"" + chr(10) + "make a function called zip_four takes x returns y" + chr(10) + "  return deflate_twice(deflate_twice(x))" + chr(10) + "end" + chr(10))
+  let gd = trust_genesis(profile, src + "/deflate", ["owner"])
+  let gz = trust_genesis(profile, src + "/zip", ["owner"])
+  let rd = ip_release(profile, src + "/deflate", "0.2.0")
+  let rz = ip_release(profile, src + "/zip", "0.2.0")
+  ctx_set(ctx, "base", base)
+  ctx_set(ctx, "profile", profile)
+  ctx_set(ctx, "src", src)
+  ctx_set(ctx, "pin_deflate", gd[1])
+  ctx_set(ctx, "pin_zip", gz[1])
+  return expect(ctx, "the sources published", [key[0], gd[0], gz[0], rd, rz], ["ok", "ok", "ok", true, true])
+end
+
+make a function called st_ip_store takes ctx returns ok
+  let base = ctx_get(ctx, "base")
+  let st = trust_store_open(base + "/store")
+  let a = trust_store_pin(st, "deflate", ctx_get(ctx, "pin_deflate"), "given")
+  let b = trust_store_pin(st, "zip", ctx_get(ctx, "pin_zip"), "given")
+  make_directory(base + "/project")
+  ctx_set(ctx, "store", st)
+  ctx_set(ctx, "project", base + "/project")
+  return expect(ctx, "both pinned", [a[0], b[0]], ["ok", "ok"])
+end
+
+make a function called ip_install takes ctx, project, first_use, update, crash returns r
+  return in_install(project, ctx_get(ctx, "store"), [], "zip", "any", [ctx_get(ctx, "src")], [first_use, update, crash])
+end
+
+make a function called st_ip_install takes ctx returns ok
+  let r = ip_install(ctx, ctx_get(ctx, "project"), false, false, "")
+  ctx_set(ctx, "report", r)
+  return expect(ctx, "the install: " + r, r[0], "ok")
+end
+
+make a function called st_ip_install_first_use takes ctx returns ok
+  let r = ip_install(ctx, ctx_get(ctx, "project"), true, false, "")
+  ctx_set(ctx, "report", r)
+  return expect(ctx, "the install: " + r, r[0], "ok")
+end
+
+make a function called st_ip_report_given takes ctx returns ok
+  return expect(ctx, "the report", ctx_get(ctx, "report"), ["ok", [["deflate", "0.2.0", "given", 0], ["zip", "0.2.0", "given", 0]]])
+end
+
+make a function called st_ip_report_first_use takes ctx returns ok
+  return expect(ctx, "the report", ctx_get(ctx, "report"), ["ok", [["deflate", "0.2.0", "given", 0], ["zip", "0.2.0", "first-use", 0]]])
+end
+
+make a function called ip_holds_both takes ctx, project returns ok
+  let st = ctx_get(ctx, "store")
+  let verify = trust_ed25519_verifier()
+  let d = trust_verify_pinned(st, [], project + "/packages/deflate", verify)
+  let z = trust_verify_pinned(st, [], project + "/packages/zip", verify)
+  return expect(ctx, "deflate and zip installed: " + [d, z], [d[0], d[1][1], z[0], z[1][1]], ["ok", "0.2.0", "ok", "0.2.0"])
+end
+
+make a function called st_ip_holds takes ctx returns ok
+  return ip_holds_both(ctx, ctx_get(ctx, "project"))
+end
+
+make a function called ip_lock_want takes ctx, dversion, ddir returns es
+  let src = ctx_get(ctx, "src")
+  return [["deflate", dversion, ctx_get(ctx, "pin_deflate"), sha256_file_hex(src + "/" + ddir + "/manifest.pkg")], ["zip", "0.2.0", ctx_get(ctx, "pin_zip"), sha256_file_hex(src + "/zip/manifest.pkg")]]
+end
+
+make a function called ip_lock_of takes project returns r
+  return trust_lock_read(bytes_to_list(read_file_raw(project + "/trust.lock")))
+end
+
+make a function called st_ip_lock takes ctx returns ok
+  return expect(ctx, "trust.lock", ip_lock_of(ctx_get(ctx, "project")), ["ok", ip_lock_want(ctx, "0.2.0", "deflate")])
+end
+
+make a function called st_ip_no_staging takes ctx returns ok
+  return expect(ctx, "packages/.staging is gone", file_exists(ctx_get(ctx, "project") + "/packages/.staging"), false)
+end
+
+make a function called st_ip_tamper takes ctx returns ok
+  append_file(ctx_get(ctx, "src") + "/deflate/deflate.patlang", "# changed after the release" + chr(10))
+  return true
+end
+
+# the install is refused, and among its reasons one for package at stage
+make a function called ip_refused_at takes ctx, package, stage, text returns ok
+  let r = ip_install(ctx, ctx_get(ctx, "project"), false, false, "")
+  let found = false
+  if r[0] == "refused" then
+    let k = 0
+    while k < list_len(r[1]) do
+      let e = r[1][k]
+      if (e[0] == package) and (e[2] == stage) and str_contains(e[4], text) then
+        let found = true
+      end
+      let k = k + 1
+    end
+  end
+  return expect(ctx, "refused, " + package + " at " + stage + ": " + r, [r[0], found], ["refused", true])
+end
+
+make a function called st_ip_refused_files takes ctx returns ok
+  return ip_refused_at(ctx, "deflate", "files", "deflate.patlang")
+end
+
+make a function called st_ip_untouched takes ctx returns ok
+  return expect(ctx, "packages/ holds", list_dir(ctx_get(ctx, "project") + "/packages"), [])
+end
+
+make a function called st_ip_withdraw takes ctx returns ok
+  let r = trust_withdraw(ctx_get(ctx, "profile"), ctx_get(ctx, "src") + "/deflate", "0.2.0", step_arg(ctx, "why"), ["owner"])
+  return expect(ctx, "withdrawn: " + r, r, ["ok", 1])
+end
+
+make a function called st_ip_refused_withdrawn takes ctx returns ok
+  return ip_refused_at(ctx, "deflate", "withdrawal", "a bad build")
+end
+
+make a function called st_ip_unpin takes ctx returns ok
+  return expect(ctx, "zip unpinned", trust_store_unpin(ctx_get(ctx, "store"), "zip"), "OK")
+end
+
+make a function called st_ip_refused_unpinned takes ctx returns ok
+  return ip_refused_at(ctx, "zip", "pin", "zip is not pinned")
+end
+
+make a function called st_ip_first_use_pin takes ctx returns ok
+  let r = trust_store_get(ctx_get(ctx, "store"), "zip")
+  return expect(ctx, "zip's entry: " + r, [r[0], r[1][1], r[1][2]], ["ok", ctx_get(ctx, "pin_zip"), "first-use"])
+end
+
+# Each crash point, in a project of its own: before the commit is written,
+# packages/ holds nothing installed and the next run clears the staging;
+# from then on, the next run finishes the install.
+make a function called st_ip_crashes takes ctx returns ok
+  let st = ctx_get(ctx, "store")
+  let points = ["stage", "verify", "install", "commit", "move", "store", "lock"]
+  let all = true
+  let k = 0
+  while k < list_len(points) do
+    let p = points[k]
+    let project = ctx_get(ctx, "base") + "/crash_" + p
+    make_directory(project)
+    let r = ip_install(ctx, project, false, false, p)
+    let a = expect(ctx, p + ": stopped", r, ["crashed", p])
+    if k < 3 then
+      let held = list_dir(project + "/packages")
+      let b = expect(ctx, p + ": packages/ holds only the staging", held, [".staging/"])
+      let c = expect(ctx, p + ": the next run clears it", in_recover(project, st), ["cleared"])
+      let d = expect(ctx, p + ": and packages/ holds nothing", list_dir(project + "/packages"), [])
+    else
+      let b = expect(ctx, p + ": the next run finishes it", in_recover(project, st), ["finished"])
+      let c = ip_holds_both(ctx, project)
+      let d = expect(ctx, p + ": the lock names both", ip_lock_of(project), ["ok", ip_lock_want(ctx, "0.2.0", "deflate")])
+      let e = expect(ctx, p + ": no staging is left", file_exists(project + "/packages/.staging"), false)
+      let d = d and e
+    end
+    let all = all and a and b and c and d
+    let k = k + 1
+  end
+  return all
+end
+
+make a function called st_ip_new_deflate takes ctx returns ok
+  let src = ctx_get(ctx, "src")
+  let from = src + "/deflate"
+  let to = src + "/deflate_021"
+  let copied = in_copy_tree(from, to)
+  let mf = read_file(to + "/manifest.pkg")
+  write_file(to + "/manifest.pkg", sed("s/version 0.2.0/version 0.2.1/", mf))
+  let r = ip_release(ctx_get(ctx, "profile"), to, "0.2.1")
+  return expect(ctx, "deflate 0.2.1 released", [copied, r], [true, true])
+end
+
+make a function called st_ip_refused_locked takes ctx returns ok
+  return ip_refused_at(ctx, "deflate", "lock", "deflate is locked at 0.2.0")
+end
+
+make a function called st_ip_update takes ctx returns ok
+  let project = ctx_get(ctx, "project")
+  let r = ip_install(ctx, project, false, true, "")
+  let a = expect(ctx, "the update: " + r, r, ["ok", [["deflate", "0.2.1", "given", 0]]])
+  let b = expect(ctx, "trust.lock", ip_lock_of(project), ["ok", ip_lock_want(ctx, "0.2.1", "deflate_021")])
+  return a and b
+end
+
+# ---- sources.feature: zip archives and https URLs (S6) ----
+
+# The entries of a package directory as shipped (no spec/, build/, tools/),
+# under prefix, as zip_build takes them.
+make a function called is_entries takes dir, prefix returns entries
+  let entries = []
+  let names = list_dir(dir)
+  let k = 0
+  while k < list_len(names) do
+    let n = names[k]
+    if in_ends_with(n, "/") then
+      let sub = substr(n, 0, str_len(n) - 1)
+      if (sub != "spec") and (sub != "build") and (sub != "tools") then
+        let entries = entries + is_entries(dir + "/" + sub, prefix + sub + "/")
+      end
+    else
+      let entries = list_push(entries, [prefix + n, read_file_raw(dir + "/" + n), "deflated"])
+    end
+    let k = k + 1
+  end
+  return entries
+end
+
+make a function called is_make_archive takes ctx, extra returns ok
+  let base = spec_out() + "/pkg_installer/src_" + ip_tag()
+  make_directory(spec_out() + "/pkg_installer")
+  make_directory(base)
+  let entries = is_entries("packages/zip", "zip/") + is_entries("packages/deflate", "deflate/") + extra
+  write_file_bytes(base + "/source.zip", zip_build(entries))
+  make_directory(base + "/project")
+  ctx_set(ctx, "base", base)
+  ctx_set(ctx, "archive", base + "/source.zip")
+  ctx_set(ctx, "project", base + "/project")
+  return true
+end
+
+make a function called st_is_archive takes ctx returns ok
+  return is_make_archive(ctx, [])
+end
+
+make a function called st_is_archive_escape takes ctx returns ok
+  return is_make_archive(ctx, [["../escaped.txt", bytes_from_str("out of bounds"), "stored"]])
+end
+
+make a function called st_is_install takes ctx returns ok
+  let base = ctx_get(ctx, "base")
+  let st = trust_store_open(base + "/store")
+  let shipped = trust_read_pins(bytes_to_list(read_file_raw("packages/trust.pins")))[1]
+  let r = in_install(ctx_get(ctx, "project"), st, shipped, "zip", "any", [ctx_get(ctx, "archive")], [false, false, ""])
+  ctx_set(ctx, "report", r)
+  return true
+end
+
+make a function called st_is_installed takes ctx returns ok
+  let r = ctx_get(ctx, "report")
+  let project = ctx_get(ctx, "project")
+  let names = []
+  if r[0] == "ok" then
+    let k = 0
+    while k < list_len(r[1]) do
+      let names = list_push(names, [r[1][k][0], r[1][k][2]])
+      let k = k + 1
+    end
+  end
+  let lock = read_file(project + "/trust.lock")
+  let got = [r[0], names, str_contains(lock, "package deflate 0.2.0"), str_contains(lock, "package zip 0.2.0"), file_exists(project + "/packages/.sources")]
+  return expect(ctx, "installed from the archive: " + r, got, ["ok", [["deflate", "shipped"], ["zip", "shipped"]], true, true, false])
+end
+
+make a function called st_is_refused_escape takes ctx returns ok
+  let r = ctx_get(ctx, "report")
+  let project = ctx_get(ctx, "project")
+  let detail = ""
+  if r[0] == "refused" then
+    let detail = "" + r[1]
+  end
+  let escaped = file_exists(project + "/packages/.sources/escaped.txt") or file_exists(project + "/packages/escaped.txt") or file_exists(project + "/escaped.txt")
+  let got = [r[0], str_contains(detail, "../escaped.txt"), escaped, file_exists(project + "/packages/zip")]
+  return expect(ctx, "refused: " + detail, got, ["refused", true, false, false])
+end
+
+# The https case runs live: a Linux build of spec/live_install.patlang under
+# WSL serves the archive with openssl s_server and installs from its URL.
+make a function called st_is_https takes ctx returns ok
+  if not has_program("wsl") then
+    return expect(ctx, "wsl is on the PATH", false, true)
+  end
+  let v = exec_capture("wsl", "-d", "Ubuntu-24.04", "-e", "openssl", "version")
+  if not str_contains(v, "OpenSSL") then
+    return expect(ctx, "openssl is in WSL's Ubuntu-24.04", str_trim(v), "OpenSSL")
+  end
+  is_make_archive(ctx, [])
+  let base = ctx_get(ctx, "base")
+  let out = spec_out() + "/pkg_installer/live_install"
+  let b = v2_compile(["packages/installer/spec/live_install.patlang", out, "--linux", "--workers", "4"])
+  if not contains_text(b[0], "v2: " + out) then
+    return expect(ctx, "the live installer builds", b[0], "v2: " + out)
+  end
+  let w = v2_wsl_path(path_absolute(base))
+  let got = exec_capture("wsl", "-d", "Ubuntu-24.04", "--cd", w, "-e", v2_wsl_path(path_absolute(out)), w, v2_wsl_path(path_absolute("packages/tls/spec/data/certs")), v2_wsl_path(path_absolute("packages/trust.pins")))
+  return expect(ctx, "installed from https", str_trim(got), "[ok, [deflate, zip]]")
+end
+
+let ctx = ctx_new()
+step(ctx, "a zip archive holding the repository's zip and deflate packages", "st_is_archive")
+step(ctx, "a zip archive holding the repository's zip and deflate packages and an entry named \"../escaped.txt\"", "st_is_archive_escape")
+step(ctx, "zip is installed from the archive, with the repository's shipped pins", "st_is_install")
+step(ctx, "deflate then zip are installed, each with its pin shipped, trust.lock names both, and nothing is left under packages/.sources", "st_is_installed")
+step(ctx, "the install is refused, naming the entry, no escaped.txt is written beside packages/, and nothing is installed", "st_is_refused_escape")
+step(ctx, "installing zip from https://localhost of the archive, served by openssl s_server and trusting the test root, installs deflate then zip", "st_is_https")
+step(ctx, "sources holding deflate 0.2.0, and zip 0.2.0 depending on deflate, each released by a group of its own", "st_ip_sources")
+step(ctx, "a consumer's trust store pinning both genesis hashes, and an empty project", "st_ip_store")
+step(ctx, "zip is installed from the sources, pinning on first use", "st_ip_install_first_use")
+step(ctx, "zip is installed from the sources", "st_ip_install")
+step(ctx, "the report lists deflate 0.2.0 and then zip 0.2.0, each pinned given, at epoch 0", "st_ip_report_given")
+step(ctx, "the report lists deflate 0.2.0 pinned given and zip 0.2.0 pinned on first use", "st_ip_report_first_use")
+step(ctx, "the project holds deflate and zip, each verifying where it is installed", "st_ip_holds")
+step(ctx, "the project's trust.lock names deflate 0.2.0 and zip 0.2.0 with their pins and manifests", "st_ip_lock")
+step(ctx, "no staging directory is left", "st_ip_no_staging")
+step(ctx, "deflate's file in the sources is changed after its release", "st_ip_tamper")
+step(ctx, "installing zip is refused, naming deflate and its file check", "st_ip_refused_files")
+step(ctx, "the project's packages/ holds nothing", "st_ip_untouched")
+step(ctx, "deflate 0.2.0 is withdrawn in the sources, for the reason \"{why}\"", "st_ip_withdraw")
+step(ctx, "installing zip is refused, naming deflate and its withdrawal", "st_ip_refused_withdrawn")
+step(ctx, "zip is unpinned in the store", "st_ip_unpin")
+step(ctx, "installing zip is refused, saying zip is not pinned", "st_ip_refused_unpinned")
+step(ctx, "the store holds zip's genesis hash, its source first-use", "st_ip_first_use_pin")
+step(ctx, "an install of zip stopped after each of its steps leaves packages/ as it was before the commit is written, and whole after the next run from then on", "st_ip_crashes")
+step(ctx, "the sources gain deflate 0.2.1, released by deflate's group", "st_ip_new_deflate")
+step(ctx, "installing zip again is refused, saying deflate is locked at 0.2.0", "st_ip_refused_locked")
+step(ctx, "installing zip again with updating allowed installs deflate 0.2.1, and the lock names it", "st_ip_update")
+# --list names the feature files (the gates run each); a failure exits 1
+run_suite(ctx, ["packages/installer/spec/install.feature", "packages/installer/spec/sources.feature"], argv())

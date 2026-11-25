@@ -209,9 +209,9 @@ against a Python oracle in its features like the existing three.
 |-------|--------|-----------|
 | P0 | layout, manifest, three packages, `verify_manifest` | done |
 | P1 | manifest reader as facts; version order facts; `dep_candidate` and the every-constraint check | built 2026-11-08: features over 38 hand-written manifests and generated universes resolve, and report conflicts with their requirers (127 checks) |
-| P2 | installation plans; fetch from a repository checkout; install side by side | `pkg install zip` installs deflate then zip into an empty directory, and a program including zip from there runs |
+| P2 | installation plans; fetch from a repository checkout; install side by side | `pkg install zip` installs deflate then zip into an empty directory, and a program including zip from there runs. Built 2026-11-23 as `package-trust.md` S5 (`packages/installer`), with signed packages from directories in place of a repository checkout: the scenarios install deflate then zip, and a program including the installed zip ran (by hand, through `pkg install`); the repository's own packages wait on their groups |
 | P3 | the `pkg` tool with signals and progress | `pkg resolve`, `install`, `verify` and `list` pass their features; a `status` query answers during a fetch |
-| P4 | trust (`package-trust.md` T1 to T5) | `pkg install` refuses a tampered or withdrawn package |
+| P4 | trust (`package-trust.md` T1 to T5) | `pkg install` refuses a tampered or withdrawn package. Built 2026-11-23 (`packages/installer/spec/install.feature`) |
 | P5 | format packages | each passes its features against its oracle |
 | P6 | other sources | an archive over HTTP installs the same bytes as the repository source |
 
